@@ -1,0 +1,1388 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="撮影地">
+<meta name="theme-color" content="#0a0a0f">
+<title>撮影地カレンダー</title>
+
+<!-- PWA manifest (inline) -->
+<link rel="manifest" href="data:application/json;charset=utf-8,%7B%22name%22%3A%22%E6%92%AE%E5%BD%B1%E5%9C%B0%E3%82%AB%E3%83%AC%E3%83%B3%E3%83%80%E3%83%BC%22%2C%22short_name%22%3A%22%E6%92%AE%E5%BD%B1%E5%9C%B0%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230a0a0f%22%2C%22theme_color%22%3A%22%230a0a0f%22%7D">
+
+<!-- Apple touch icon (SVG→base64 inline) -->
+<link rel="apple-touch-icon" href="data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='38' fill='%230a0a0f'/%3E%3Ctext x='90' y='115' font-size='80' text-anchor='middle'%3E%F0%9F%93%8D%3C/text%3E%3C/svg%3E">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;overscroll-behavior:none;}
+  body{
+    font-family:'Noto Sans JP','Hiragino Sans',sans-serif;
+    background:#0a0a0f; color:#e8e4dc;
+    min-height:100vh; min-height:-webkit-fill-available;
+  }
+  #app{
+    display:flex; flex-direction:column; align-items:center;
+    min-height:100vh; min-height:-webkit-fill-available;
+    padding-bottom:env(safe-area-inset-bottom);
+  }
+  ::-webkit-scrollbar{width:4px;}
+  ::-webkit-scrollbar-thumb{background:#555;border-radius:2px;}
+  input,textarea,select,button{font-family:inherit;}
+  button{cursor:pointer;}
+  .flash{position:fixed;inset:0;background:#fff;pointer-events:none;opacity:0;transition:opacity .4s;z-index:999;}
+  .flash.on{opacity:.45;}
+  /* calendar day */
+  .cal-day{
+    aspect-ratio:1;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;border-radius:8px;gap:3px;
+    transition:background .15s;
+  }
+  .cal-day.has{cursor:pointer;}
+  .dot{width:5px;height:5px;border-radius:50%;}
+  /* modal overlay */
+  .overlay{
+    position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:200;
+    display:flex;align-items:center;justify-content:center;padding:20px;
+  }
+  .modal-box{
+    border-radius:14px;padding:24px;width:100%;max-width:380px;
+    max-height:80vh;overflow-y:auto;
+  }
+  /* shutter spin */
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .spin{animation:spin 1s linear infinite;}
+  /* safe area top padding — ステータスバー(約50px) + 余白16px を確保 */
+  .safe-top{padding-top:max(72px, calc(env(safe-area-inset-top) + 16px));}
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+
+<script>
+'use strict';
+const {useState,useCallback,useEffect,useRef} = React;
+const h = React.createElement;
+
+// ── constants ─────────────────────────────────────────
+const WEEKDAYS = ['日','月','火','水','木','金','土'];
+const FOLDER_COLORS = ['#c8b89a','#7eb8a4','#a07eb8','#e08080','#7896d0','#c8a060','#80b880'];
+const BG_PRESETS = [
+  {label:'ダーク',   bg:'#0a0a0f'},
+  {label:'チャコール',bg:'#1c1c22'},
+  {label:'ネイビー', bg:'#0d1117'},
+  {label:'フォレスト',bg:'#0f1a12'},
+  {label:'ライト',   bg:'#f5f2ee'},
+  {label:'クリーム', bg:'#faf6ef'},
+  {label:'スカイ',   bg:'#e8f0f8'},
+  {label:'ペーパー', bg:'#f0ede6'},
+];
+const STORAGE_KEY = 'photo-location-v1';
+
+// ── weather ───────────────────────────────────────────
+const WEATHERS = [
+  {id:'sunny',    icon:'☀️',  label:'晴れ'},
+  {id:'cloudy',   icon:'⛅',  label:'曇り'},
+  {id:'overcast', icon:'☁️',  label:'曇天'},
+  {id:'rainy',    icon:'🌧️', label:'雨'},
+  {id:'stormy',   icon:'⛈️', label:'雷雨'},
+  {id:'snowy',    icon:'❄️',  label:'雪'},
+  {id:'foggy',    icon:'🌫️', label:'霧'},
+  {id:'windy',    icon:'💨',  label:'風'},
+  {id:'hot',      icon:'🌡️', label:'猛暑'},
+  {id:'night',    icon:'🌙',  label:'夜'},
+];
+
+// ── utils ─────────────────────────────────────────────
+function fmt(d){ return d.toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'}); }
+function toYMD(d){ return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
+
+function luminance(hex){
+  const h2=hex.replace('#','');
+  const r=parseInt(h2.slice(0,2),16)/255,g=parseInt(h2.slice(2,4),16)/255,b=parseInt(h2.slice(4,6),16)/255;
+  const lin=c=>c<=0.04045?c/12.92:Math.pow((c+0.055)/1.055,2.4);
+  return 0.2126*lin(r)+0.7152*lin(g)+0.0722*lin(b);
+}
+function isDark(hex){ return luminance(hex)<0.4; }
+
+function makeTheme(bg){
+  const d=isDark(bg);
+  return {
+    bg,
+    text:        d?'#e8e4dc':'#1a1814',
+    textSub:     d?'#888':'#666',
+    textMuted:   d?'#555':'#999',
+    textFaint:   d?'#333':'#bbb',
+    accent:      d?'#c8b89a':'#7a6a52',
+    accentBg:    d?'rgba(200,184,154,0.12)':'rgba(100,80,50,0.1)',
+    accentBorder:d?'rgba(200,184,154,0.25)':'rgba(100,80,50,0.25)',
+    cardBg:      d?'rgba(255,255,255,0.03)':'rgba(0,0,0,0.04)',
+    cardBorder:  d?'rgba(255,255,255,0.07)':'rgba(0,0,0,0.08)',
+    divider:     d?'rgba(255,255,255,0.06)':'rgba(0,0,0,0.08)',
+    inputBg:     d?'rgba(255,255,255,0.04)':'rgba(0,0,0,0.04)',
+    inputBorder: d?'rgba(200,184,154,0.2)':'rgba(100,80,50,0.2)',
+    modalBg:     d?'#141418':'#ffffff',
+    sun:         d?'#c06060':'#c04040',
+    sat:         d?'#6080c0':'#4060b0',
+    tabActive:   d?'#c8b89a':'#7a6a52',
+    tabActiveTxt:d?'#0a0a0f':'#ffffff',
+  };
+}
+
+// ── storage ───────────────────────────────────────────
+function loadState(){
+  try{
+    const s=localStorage.getItem(STORAGE_KEY);
+    if(s) return JSON.parse(s);
+  }catch{}
+  return null;
+}
+function saveState(state){
+  try{ localStorage.setItem(STORAGE_KEY,JSON.stringify(state)); }catch{}
+}
+
+// ── Modal ─────────────────────────────────────────────
+function Modal({title,onClose,children,th}){
+  return h('div',{className:'overlay',onClick:onClose},
+    h('div',{className:'modal-box',style:{background:th.modalBg,border:`1px solid ${th.accentBorder}`},onClick:e=>e.stopPropagation()},
+      h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:18}},
+        h('div',{style:{fontSize:15,fontWeight:500,color:th.text}},title),
+        h('button',{onClick:onClose,style:{background:'none',border:'none',color:th.textSub,fontSize:22,lineHeight:1,padding:4}},'×')
+      ),
+      children
+    )
+  );
+}
+
+// ── Confirm ───────────────────────────────────────────
+function Confirm({message,onOk,onCancel,th}){
+  return h('div',{className:'overlay',style:{zIndex:300}},
+    h('div',{style:{background:th.modalBg,border:'1px solid rgba(255,80,80,0.35)',borderRadius:14,padding:24,width:'100%',maxWidth:300,textAlign:'center'}},
+      h('div',{style:{fontSize:14,color:th.text,marginBottom:20,lineHeight:1.7,whiteSpace:'pre-line'}},message),
+      h('div',{style:{display:'flex',gap:10,justifyContent:'center'}},
+        h('button',{onClick:onCancel,style:{background:'none',border:`1px solid ${th.cardBorder}`,borderRadius:8,color:th.textSub,padding:'8px 18px',fontSize:13}},'キャンセル'),
+        h('button',{onClick:onOk,style:{background:'rgba(255,80,80,0.15)',border:'1px solid rgba(255,80,80,0.5)',borderRadius:8,color:'#ff8080',padding:'8px 18px',fontSize:13}},'削除する')
+      )
+    )
+  );
+}
+
+// ── Compass ───────────────────────────────────────────
+function Compass({th, locating, gpsPos}){
+  const [heading, setHeading] = useState(null);   // degrees, null = unknown
+  const [permErr, setPermErr] = useState(false);
+  const headingRef = useRef(null);
+  const rafRef     = useRef(null);
+  const targetRef  = useRef(0);
+  const currentRef = useRef(0);
+
+  // smooth rotation via RAF
+  function tick(){
+    const diff = targetRef.current - currentRef.current;
+    // shortest path
+    let d = ((diff % 360) + 540) % 360 - 180;
+    currentRef.current += d * 0.12;
+    if(headingRef.current){
+      headingRef.current.style.transform = `rotate(${-currentRef.current}deg)`;
+    }
+    rafRef.current = requestAnimationFrame(tick);
+  }
+
+  useEffect(()=>{
+    rafRef.current = requestAnimationFrame(tick);
+    return ()=>cancelAnimationFrame(rafRef.current);
+  },[]);
+
+  useEffect(()=>{
+    let cleanup = ()=>{};
+    function onOrientation(e){
+      // webkitCompassHeading = iOS true north; alpha = generic (south-referenced on some)
+      let deg = e.webkitCompassHeading ?? (e.alpha != null ? (360 - e.alpha) : null);
+      if(deg == null) return;
+      targetRef.current = deg;
+      setHeading(Math.round(deg));
+    }
+
+    if(typeof DeviceOrientationEvent !== 'undefined'){
+      // iOS 13+ requires permission
+      if(typeof DeviceOrientationEvent.requestPermission === 'function'){
+        DeviceOrientationEvent.requestPermission()
+          .then(state=>{
+            if(state==='granted'){
+              window.addEventListener('deviceorientationabsolute', onOrientation, true);
+              window.addEventListener('deviceorientation', onOrientation, true);
+              cleanup = ()=>{
+                window.removeEventListener('deviceorientationabsolute', onOrientation, true);
+                window.removeEventListener('deviceorientation', onOrientation, true);
+              };
+            } else { setPermErr(true); }
+          }).catch(()=>setPermErr(true));
+      } else {
+        window.addEventListener('deviceorientationabsolute', onOrientation, true);
+        window.addEventListener('deviceorientation', onOrientation, true);
+        cleanup = ()=>{
+          window.removeEventListener('deviceorientationabsolute', onOrientation, true);
+          window.removeEventListener('deviceorientation', onOrientation, true);
+        };
+      }
+    }
+    return ()=>cleanup();
+  },[]);
+
+  const accent = th.accent;
+  const dim    = isDark(th.bg) ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
+  const dimMid = isDark(th.bg) ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)';
+
+  // cardinal direction label
+  function cardinalDir(deg){
+    if(deg==null) return '---';
+    const dirs=['N','NE','E','SE','S','SW','W','NW'];
+    return dirs[Math.round(deg/45)%8];
+  }
+
+  return h('div',{style:{
+    position:'relative', width:'100%', borderRadius:16,
+    background: isDark(th.bg)?'rgba(255,255,255,0.02)':'rgba(0,0,0,0.03)',
+    border:`1px solid ${th.accentBorder}`,
+    display:'flex', flexDirection:'column', alignItems:'center',
+    padding:'20px 16px 16px', gap:12, overflow:'hidden',
+  }},
+    // corner brackets
+    ...['tl','tr','bl','br'].map(p=>h('div',{key:p,style:{
+      position:'absolute', width:14, height:14, zIndex:2, pointerEvents:'none',
+      borderTop:   p[0]==='t'?`2px solid ${accent}`:'none',
+      borderBottom:p[0]==='b'?`2px solid ${accent}`:'none',
+      borderLeft:  p[1]==='l'?`2px solid ${accent}`:'none',
+      borderRight: p[1]==='r'?`2px solid ${accent}`:'none',
+      top:p[0]==='t'?8:'auto', bottom:p[0]==='b'?8:'auto',
+      left:p[1]==='l'?8:'auto', right:p[1]==='r'?8:'auto',
+    }})),
+
+    // compass rose
+    h('div',{style:{position:'relative', width:190, height:190, flexShrink:0}},
+
+      // outer ring
+      h('div',{style:{
+        position:'absolute', inset:0, borderRadius:'50%',
+        border:`1px solid ${dimMid}`,
+        background:`radial-gradient(circle, ${isDark(th.bg)?'#111':'#f0ede6'} 0%, ${isDark(th.bg)?'#0a0a0f':'#e8e4dc'} 100%)`,
+      }}),
+
+      // tick marks (every 30°)
+      ...[...Array(12)].map((_,i)=>{
+        const a = i*30, major = i%3===0;
+        const r = 90;
+        const rad = (a-90)*Math.PI/180;
+        const x1 = 95 + (r - (major?12:7)) * Math.cos(rad);
+        const y1 = 95 + (r - (major?12:7)) * Math.sin(rad);
+        const x2 = 95 + r * Math.cos(rad);
+        const y2 = 95 + r * Math.sin(rad);
+        return h('svg',{key:i,style:{position:'absolute',inset:0,width:'100%',height:'100%',overflow:'visible'},viewBox:'0 0 190 190'},
+          h('line',{x1,y1,x2,y2,stroke:major?dimMid:dim,strokeWidth:major?1.5:1})
+        );
+      }),
+
+      // rotating needle group
+      h('div',{ref:headingRef,style:{
+        position:'absolute', inset:0,
+        transformOrigin:'50% 50%',
+        // initial will be set by RAF
+      }},
+        // N label
+        h('div',{style:{
+          position:'absolute', top:4, left:'50%', transform:'translateX(-50%)',
+          fontSize:13, fontWeight:700, color:'#e05050', fontFamily:'DM Mono', letterSpacing:1,
+        }},'N'),
+        // S label
+        h('div',{style:{
+          position:'absolute', bottom:4, left:'50%', transform:'translateX(-50%)',
+          fontSize:11, fontWeight:400, color:th.textMuted, fontFamily:'DM Mono',
+        }},'S'),
+        // E label
+        h('div',{style:{
+          position:'absolute', right:6, top:'50%', transform:'translateY(-50%)',
+          fontSize:11, color:th.textMuted, fontFamily:'DM Mono',
+        }},'E'),
+        // W label
+        h('div',{style:{
+          position:'absolute', left:6, top:'50%', transform:'translateY(-50%)',
+          fontSize:11, color:th.textMuted, fontFamily:'DM Mono',
+        }},'W'),
+
+        // needle (SVG triangle)
+        h('svg',{style:{position:'absolute',inset:0,width:'100%',height:'100%'},viewBox:'0 0 190 190',overflow:'visible'},
+          // north (red)
+          h('polygon',{points:'95,28 100,95 90,95',fill:'#e05050',opacity:0.95}),
+          // south (accent)
+          h('polygon',{points:'95,162 100,95 90,95',fill:accent,opacity:0.7}),
+          // center dot
+          h('circle',{cx:95,cy:95,r:6,fill:th.modalBg,stroke:accent,strokeWidth:1.5}),
+          h('circle',{cx:95,cy:95,r:2.5,fill:accent}),
+        )
+      ),
+
+      // fixed crosshair ring
+      h('div',{style:{
+        position:'absolute', inset:'30%',
+        borderRadius:'50%', border:`1px dashed ${dimMid}`,
+        pointerEvents:'none',
+      }}),
+    ),
+
+    // degree display
+    h('div',{style:{display:'flex',alignItems:'baseline',gap:8}},
+      h('span',{style:{fontFamily:'DM Mono',fontSize:28,fontWeight:400,color:accent,letterSpacing:1}},
+        heading!=null ? String(heading).padStart(3,'0')+'°' : '---'
+      ),
+      h('span',{style:{fontFamily:'DM Mono',fontSize:14,color:th.textSub,minWidth:28}},
+        cardinalDir(heading)
+      )
+    ),
+
+    // gps coords row
+    h('div',{style:{display:'flex',justifyContent:'space-between',width:'100%',
+      padding:'6px 10px', borderRadius:8, background:isDark(th.bg)?'rgba(255,255,255,0.03)':'rgba(0,0,0,0.04)',
+      border:`1px solid ${th.cardBorder}`}},
+      gpsPos
+        ? h(React.Fragment, null,
+            h('span',{style:{fontFamily:'DM Mono',fontSize:10,color:th.textSub}},
+              gpsPos.lat.toFixed(5)+',  '+gpsPos.lng.toFixed(5)),
+            h('span',{style:{fontFamily:'DM Mono',fontSize:10,color:th.textMuted}},'±'+gpsPos.acc+'m')
+          )
+        : h('span',{style:{fontFamily:'DM Mono',fontSize:10,color:th.textFaint,margin:'0 auto'}},
+            locating ? '位置情報取得中...' : '記録ボタンで位置を取得')
+    ),
+
+    // permission error
+    permErr && h('div',{style:{fontSize:11,color:'#ff9090',textAlign:'center'}},
+      'コンパスの許可が必要です（設定 › Safari › モーションと画面の向き）'
+    )
+  );
+}
+
+// ── App ───────────────────────────────────────────────
+function App(){
+  // load persisted state
+  const persisted = loadState();
+  const [folders,setFolders] = useState(persisted?.folders || [{id:'f1',name:'未分類',color:'#888'}]);
+  const [records,setRecords] = useState(persisted?.records || []);
+  const [bgColor,setBgColor] = useState(persisted?.bgColor || '#0a0a0f');
+
+  // persist on change — lastActive も一緒に保存
+  useEffect(()=>{ saveState({folders,records,bgColor}); },[folders,records,bgColor]);
+
+  // 5分以上経過していたら記録画面にリセット
+  const RESET_MS = 5 * 60 * 1000;
+  useEffect(()=>{
+    const LS_KEY = 'photo-loc-active';
+    // 起動時：前回の終了時刻をチェック
+    const last = parseInt(localStorage.getItem(LS_KEY)||'0', 10);
+    if(last && Date.now() - last >= RESET_MS){
+      setView('record');
+      setSelFolder(null);
+      setSelDate(null);
+    }
+    // 定期的に「生存時刻」を更新（10秒ごと）
+    const timer = setInterval(()=>{
+      localStorage.setItem(LS_KEY, Date.now());
+    }, 10000);
+    // 即時も記録
+    localStorage.setItem(LS_KEY, Date.now());
+    return ()=>clearInterval(timer);
+  },[]);
+
+  // update theme-color meta
+  useEffect(()=>{
+    document.querySelector('meta[name=theme-color]').content=bgColor;
+    document.body.style.background=bgColor;
+    document.body.style.color=makeTheme(bgColor).text;
+  },[bgColor]);
+
+  const th = makeTheme(bgColor);
+  const inputSt = {width:'100%',background:th.inputBg,border:`1px solid ${th.inputBorder}`,borderRadius:8,color:th.text,fontSize:14,padding:'9px 12px',outline:'none'};
+
+  // nav
+  const [view,setView]                   = useState('record');
+  const [selFolder,setSelFolder]         = useState(null);
+  const [selDate,setSelDate]             = useState(null);
+  const [calY,setCalY]                   = useState(new Date().getFullYear());
+  const [calM,setCalM]                   = useState(new Date().getMonth());
+
+  // record form
+  const [memo,setMemo]         = useState('');
+  const [tgtFolder,setTgtFolder] = useState(null);
+  const [locating,setLocating] = useState(false);
+  const [locErr,setLocErr]     = useState(null);
+  const [flash,setFlash]       = useState(false);
+  const [okMsg,setOkMsg]       = useState(null);
+
+  // gps position for map preview
+  const [gpsPos,setGpsPos] = useState(null);
+
+  // weather
+  const [weather,setWeather]           = useState(null); // selected WEATHERS item id
+  const [showWeatherPicker,setShowWeatherPicker] = useState(false);
+
+  // modals
+  const [showFolderModal,setShowFolderModal] = useState(false);
+  const [editingFolder,setEditingFolder]     = useState(null);
+  const [fName,setFName]                     = useState('');
+  const [fColor,setFColor]                   = useState(FOLDER_COLORS[0]);
+  const [confirm,setConfirm]                 = useState(null);
+  const [moveModal,setMoveModal]             = useState(null);
+  const [editingMemo,setEditingMemo]         = useState(null); // {id, text}
+  const [editingPlace,setEditingPlace]       = useState(null); // {id, text}
+  const [editingCoords,setEditingCoords]     = useState(null); // {id, text}
+  const [manualCoords,setManualCoords]       = useState('');   // for record view input
+  const [showManualInput,setShowManualInput] = useState(false);
+  const [showSettings,setShowSettings]       = useState(false);
+  const [customBg,setCustomBg]               = useState(bgColor);
+  const [showDataModal,setShowDataModal]     = useState(false);
+  const [importMsg,setImportMsg]             = useState(null);
+
+  // ── export / import ──
+  function exportData(){
+    const data = JSON.stringify({folders,records,bgColor,exportedAt:new Date().toISOString()},null,2);
+    const blob = new Blob([data],{type:'application/json'});
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    const date = new Date().toISOString().slice(0,10);
+    a.href = url; a.download = `photo-location-${date}.json`;
+    a.click(); URL.revokeObjectURL(url);
+  }
+  function importData(e){
+    const file = e.target.files?.[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ev=>{
+      try{
+        const d = JSON.parse(ev.target.result);
+        if(!d.folders||!d.records) throw new Error('invalid');
+        setFolders(d.folders);
+        setRecords(d.records);
+        if(d.bgColor) setBgColor(d.bgColor);
+        setImportMsg(`✓ ${d.records.length}件の記録を復元しました`);
+      }catch{
+        setImportMsg('⚠ ファイルの形式が正しくありません');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value=''; // reset so same file can be re-selected
+  }
+
+  // folder ops
+  function openNewFolder(){ setEditingFolder(null);setFName('');setFColor(FOLDER_COLORS[Math.floor(Math.random()*FOLDER_COLORS.length)]);setShowFolderModal(true); }
+  function openEditFolder(f){ setEditingFolder(f);setFName(f.name);setFColor(f.color);setShowFolderModal(true); }
+  function saveFolder(){
+    const name=fName.trim()||'新しいフォルダー';
+    if(editingFolder){
+      setFolders(p=>p.map(f=>f.id===editingFolder.id?{...f,name,color:fColor}:f));
+      if(selFolder?.id===editingFolder.id) setSelFolder(sf=>({...sf,name,color:fColor}));
+    } else {
+      setFolders(p=>[...p,{id:`f${Date.now()}`,name,color:fColor}]);
+    }
+    setShowFolderModal(false);
+  }
+  function deleteFolder(fid){
+    setFolders(p=>p.filter(f=>f.id!==fid));
+    setRecords(p=>p.map(r=>r.folderId===fid?{...r,folderId:null}:r));
+    if(selFolder?.id===fid){setSelFolder(null);setView('folders');}
+  }
+
+  // record ops
+  const saveRecord = useCallback(()=>{
+    setLocating(true);setLocErr(null);setOkMsg(null);
+    if(!navigator.geolocation){setLocErr('このブラウザは位置情報に対応していません');setLocating(false);return;}
+    navigator.geolocation.getCurrentPosition(
+      async pos=>{
+        const now=new Date();
+        const fid=tgtFolder||folders[0]?.id||null;
+        const lat=pos.coords.latitude, lng=pos.coords.longitude;
+
+        // 逆ジオコーディング（OpenStreetMap Nominatim）
+        let place = null;
+        try{
+          const res = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&accept-language=ja`,
+            {headers:{'Accept-Language':'ja'}}
+          );
+          const data = await res.json();
+          const a = data.address||{};
+          // 市区町村レベルで取得（細かい順に試みる）
+          place = a.city||a.town||a.village||a.county||a.state||null;
+          // 都道府県も付ける
+          if(place && a.state && a.state!==place) place = a.state+' '+place;
+        }catch{}
+
+        const rec={id:Date.now(),folderId:fid,date:toYMD(now),time:fmt(now),
+          lat,lng,accuracy:Math.round(pos.coords.accuracy),
+          memo:memo.trim(),weather,place};
+        setRecords(p=>[rec,...p]);
+        setGpsPos({lat,lng,acc:Math.round(pos.coords.accuracy)});
+        setMemo('');setFlash(true);
+        const fn=folders.find(f=>f.id===fid)?.name||'未分類';
+        setOkMsg(`📍 記録しました${place?' — '+place:''} → ${fn}`);
+        setTimeout(()=>setFlash(false),600);
+        setLocating(false);
+      },
+      err=>{
+        const m={1:'位置情報の許可が必要です',2:'位置情報を取得できませんでした',3:'タイムアウトしました'};
+        setLocErr(m[err.code]||'エラーが発生しました');setLocating(false);
+      },
+      {enableHighAccuracy:true,timeout:12000}
+    );
+  },[memo,tgtFolder,folders,weather]);
+
+  function deleteRecord(id){ setRecords(p=>p.filter(r=>r.id!==id)); }
+  function moveRecord(id,newFid){ setRecords(p=>p.map(r=>r.id===id?{...r,folderId:newFid}:r));setMoveModal(null); }
+
+  // 座標パース："34.262, 135.375" or "34.262 135.375" などに対応
+  function parseCoords(str){
+    const cleaned = str.replace(/[（）()]/g,'').trim();
+    const m = cleaned.match(/(-?\d+\.?\d*)[,\s]+(-?\d+\.?\d*)/);
+    if(!m) return null;
+    const lat=parseFloat(m[1]), lng=parseFloat(m[2]);
+    if(isNaN(lat)||isNaN(lng)) return null;
+    if(lat<-90||lat>90||lng<-180||lng>180) return null;
+    return {lat,lng};
+  }
+
+  // 手入力座標で記録
+  async function saveManualRecord(){
+    const coords = parseCoords(manualCoords);
+    if(!coords){ setLocErr('座標の形式が正しくありません（例：34.262, 135.375）'); return; }
+    setLocating(true); setLocErr(null); setOkMsg(null);
+    const now=new Date();
+    const fid=tgtFolder||folders[0]?.id||null;
+    let place=null;
+    try{
+      const res=await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${coords.lat}&lon=${coords.lng}&format=json&accept-language=ja`);
+      const data=await res.json();
+      const a=data.address||{};
+      place=a.city||a.town||a.village||a.county||a.state||null;
+      if(place&&a.state&&a.state!==place) place=a.state+' '+place;
+    }catch{}
+    const rec={id:Date.now(),folderId:fid,date:toYMD(now),time:fmt(now),
+      lat:coords.lat,lng:coords.lng,accuracy:null,memo:memo.trim(),weather,place};
+    setRecords(p=>[rec,...p]);
+    setGpsPos({lat:coords.lat,lng:coords.lng,acc:null});
+    setManualCoords(''); setMemo(''); setFlash(true); setShowManualInput(false);
+    const fn=folders.find(f=>f.id===fid)?.name||'未分類';
+    setOkMsg(`📍 手入力で記録${place?' — '+place:''} → ${fn}`);
+    setTimeout(()=>setFlash(false),600);
+    setLocating(false);
+  }
+
+  // 既存記録の座標を更新
+  function saveEditCoords(id){
+    const coords=parseCoords(editingCoords.text);
+    if(!coords){ alert('座標の形式が正しくありません'); return; }
+    setRecords(p=>p.map(r=>r.id===id?{...r,lat:coords.lat,lng:coords.lng,accuracy:null}:r));
+    setEditingCoords(null);
+  }
+
+  // calendar
+  const activeRecs = selFolder ? records.filter(r=>r.folderId===selFolder.id) : records;
+  const firstDay   = new Date(calY,calM,1).getDay();
+  const daysInM    = new Date(calY,calM+1,0).getDate();
+  const today      = toYMD(new Date());
+  const byDate     = activeRecs.reduce((a,r)=>{if(!a[r.date])a[r.date]=[];a[r.date].push(r);return a;},{});
+  const prevM = ()=>{ if(calM===0){setCalM(11);setCalY(y=>y-1);}else setCalM(m=>m-1); };
+  const nextM = ()=>{ if(calM===11){setCalM(0);setCalY(y=>y+1);}else setCalM(m=>m+1); };
+  function openDay(ymd){setSelDate(ymd);setView('detail');}
+  const dayRecs = selDate?(byDate[selDate]||[]):[];
+
+  // ── render ───────────────────────────────────────────
+  return h('div',{id:'app',style:{background:bgColor,color:th.text,minHeight:'100vh',display:'flex',flexDirection:'column',alignItems:'center',transition:'background .4s,color .3s'}},
+
+    // flash
+    h('div',{className:`flash${flash?' on':''}`}),
+
+    // confirm
+    confirm && h(Confirm,{th,message:confirm.type==='record'?'この記録を削除しますか？':'フォルダーを削除しますか？\n（記録はフォルダーなしになります）',
+      onOk:()=>{
+        if(confirm.type==='record'){deleteRecord(confirm.id);if(dayRecs.length<=1)setView('calendar');}
+        else deleteFolder(confirm.id);
+        setConfirm(null);
+      },
+      onCancel:()=>setConfirm(null)
+    }),
+
+    // move modal
+    moveModal && h(Modal,{title:'フォルダーを移動',onClose:()=>setMoveModal(null),th},
+      folders.map(f=>h('div',{key:f.id,onClick:()=>moveRecord(moveModal,f.id),
+        style:{display:'flex',alignItems:'center',gap:12,padding:'12px 14px',borderRadius:8,cursor:'pointer',marginBottom:6,background:th.cardBg,border:`1px solid ${th.cardBorder}`}},
+        h('div',{style:{width:10,height:10,borderRadius:'50%',background:f.color,flexShrink:0}}),
+        h('span',{style:{fontSize:14,color:th.text}},f.name),
+        h('span',{style:{marginLeft:'auto',fontSize:11,color:th.textMuted,fontFamily:'DM Mono'}},records.filter(r=>r.folderId===f.id).length+'件')
+      ))
+    ),
+
+    // folder modal
+    showFolderModal && h(Modal,{title:editingFolder?'フォルダーを編集':'新しいフォルダー',onClose:()=>setShowFolderModal(false),th},
+      h('div',{style:{marginBottom:16}},
+        h('label',{style:{fontSize:11,color:th.textSub,letterSpacing:2,display:'block',marginBottom:8}},'フォルダー名'),
+        h('input',{style:inputSt,value:fName,onChange:e=>setFName(e.target.value),placeholder:'フォルダー名を入力',
+          onKeyDown:e=>e.key==='Enter'&&saveFolder(),autoFocus:true})
+      ),
+      h('div',{style:{marginBottom:20}},
+        h('label',{style:{fontSize:11,color:th.textSub,letterSpacing:2,display:'block',marginBottom:10}},'カラー'),
+        h('div',{style:{display:'flex',gap:10,flexWrap:'wrap'}},
+          FOLDER_COLORS.map(c=>h('div',{key:c,onClick:()=>setFColor(c),style:{
+            width:22,height:22,borderRadius:'50%',background:c,cursor:'pointer',flexShrink:0,
+            border:`2px solid ${fColor===c?'white':'transparent'}`,
+            outline:fColor===c?`2px solid ${c}`:'none',outlineOffset:2,transition:'transform .15s'
+          }}))
+        )
+      ),
+      editingFolder && h('div',{style:{marginBottom:14}},
+        h('button',{onClick:()=>{setConfirm({type:'folder',id:editingFolder.id});setShowFolderModal(false);},
+          style:{background:'none',border:'1px solid rgba(255,80,80,0.3)',borderRadius:8,color:'rgba(255,120,120,0.7)',padding:'8px 16px',fontSize:13}},
+          'フォルダーを削除')
+      ),
+      h('button',{onClick:saveFolder,style:{width:'100%',background:th.accentBg,border:`1px solid ${th.accentBorder}`,
+        borderRadius:8,color:th.accent,padding:'10px',fontSize:14}},
+        editingFolder?'変更を保存':'作成する')
+    ),
+
+    // data management modal
+    showDataModal && h(Modal,{title:'データの引き継ぎ',onClose:()=>setShowDataModal(false),th},
+      // stats
+      h('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:20}},
+        h('div',{style:{padding:'12px',borderRadius:10,background:th.cardBg,border:`1px solid ${th.cardBorder}`,textAlign:'center'}},
+          h('div',{style:{fontFamily:'DM Mono',fontSize:22,color:th.accent}},records.length),
+          h('div',{style:{fontSize:11,color:th.textMuted,marginTop:2}},'件の記録')
+        ),
+        h('div',{style:{padding:'12px',borderRadius:10,background:th.cardBg,border:`1px solid ${th.cardBorder}`,textAlign:'center'}},
+          h('div',{style:{fontFamily:'DM Mono',fontSize:22,color:th.accent}},folders.length),
+          h('div',{style:{fontSize:11,color:th.textMuted,marginTop:2}},'フォルダー')
+        )
+      ),
+      // export
+      h('div',{style:{marginBottom:12}},
+        h('div',{style:{fontSize:11,color:th.textSub,letterSpacing:2,marginBottom:8}},'📤 バックアップ'),
+        h('button',{onClick:exportData,style:{
+          width:'100%',background:th.accentBg,border:`1px solid ${th.accentBorder}`,
+          borderRadius:10,color:th.accent,padding:'12px',fontSize:14,cursor:'pointer',
+          display:'flex',alignItems:'center',justifyContent:'center',gap:8,fontFamily:'inherit',
+        }},
+          h('span',{style:{fontSize:18}},'💾'),
+          'JSONファイルに保存'
+        ),
+        h('div',{style:{fontSize:11,color:th.textFaint,marginTop:6,textAlign:'center'}},
+          'ダウンロードしたファイルを新しい端末で読み込むと復元できます')
+      ),
+      h('div',{style:{height:1,background:th.divider,margin:'16px 0'}}),
+      // import
+      h('div',null,
+        h('div',{style:{fontSize:11,color:th.textSub,letterSpacing:2,marginBottom:8}},'📥 復元・インポート'),
+        h('label',{style:{
+          display:'flex',alignItems:'center',justifyContent:'center',gap:8,
+          width:'100%',padding:'12px',borderRadius:10,cursor:'pointer',
+          background:th.cardBg,border:`1px dashed ${th.accentBorder}`,
+          color:th.textSub,fontSize:14,fontFamily:'inherit',
+        }},
+          h('span',{style:{fontSize:18}},'📂'),
+          'バックアップファイルを選択',
+          h('input',{type:'file',accept:'.json',onChange:importData,
+            style:{display:'none'}})
+        ),
+        importMsg && h('div',{style:{
+          marginTop:10,padding:'10px 14px',borderRadius:8,fontSize:13,
+          background: importMsg.startsWith('✓') ? th.accentBg : 'rgba(255,80,80,0.08)',
+          border: `1px solid ${importMsg.startsWith('✓') ? th.accentBorder : 'rgba(255,80,80,0.3)'}`,
+          color: importMsg.startsWith('✓') ? th.accent : '#ff9090',
+        }},importMsg)
+      ),
+      h('div',{style:{height:1,background:th.divider,margin:'16px 0'}}),
+      h('div',{style:{fontSize:11,color:th.textFaint,lineHeight:1.7}},
+        '① 今の端末で「JSONファイルに保存」\n② 新しい端末でこのアプリを開く\n③「バックアップファイルを選択」で読み込む'
+      )
+    ),
+
+    // weather picker modal
+    showWeatherPicker && h(Modal,{title:'天気を選択',onClose:()=>setShowWeatherPicker(false),th},
+      h('div',{style:{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:8,marginBottom:16}},
+        WEATHERS.map(w=>h('div',{key:w.id,onClick:()=>{setWeather(w.id);setShowWeatherPicker(false);},
+          style:{display:'flex',flexDirection:'column',alignItems:'center',gap:4,cursor:'pointer',
+            padding:'8px 4px',borderRadius:10,
+            background:weather===w.id?th.accentBg:'transparent',
+            border:`1px solid ${weather===w.id?th.accent:'transparent'}`,
+            transition:'all .15s'}},
+          h('span',{style:{fontSize:26}},w.icon),
+          h('span',{style:{fontSize:10,color:weather===w.id?th.accent:th.textMuted}},w.label)
+        ))
+      ),
+      weather && h('button',{onClick:()=>{setWeather(null);setShowWeatherPicker(false);},
+        style:{background:'none',border:`1px solid ${th.cardBorder}`,borderRadius:8,
+          color:th.textSub,padding:'8px 16px',fontSize:13,width:'100%'}},
+        '天気をクリア')
+    ),
+
+    // settings modal
+    showSettings && h(Modal,{title:'背景カラー',onClose:()=>setShowSettings(false),th},      h('div',{style:{marginBottom:16}},
+        h('label',{style:{fontSize:11,color:th.textSub,letterSpacing:2,display:'block',marginBottom:10}},'プリセット'),
+        h('div',{style:{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}},
+          BG_PRESETS.map(p=>h('div',{key:p.bg,onClick:()=>{setBgColor(p.bg);setCustomBg(p.bg);},
+            style:{display:'flex',flexDirection:'column',alignItems:'center',gap:6,cursor:'pointer'}},
+            h('div',{style:{width:40,height:40,borderRadius:10,background:p.bg,
+              border:`2px solid ${bgColor===p.bg?'#c8b89a':'rgba(128,128,128,0.2)'}`,
+              boxShadow:bgColor===p.bg?'0 0 0 3px rgba(200,184,154,0.25)':'none',transition:'all .15s'}}),
+            h('span',{style:{fontSize:10,color:th.textSub}},p.label)
+          ))
+        )
+      ),
+      h('div',{style:{marginBottom:16}},
+        h('label',{style:{fontSize:11,color:th.textSub,letterSpacing:2,display:'block',marginBottom:10}},'カスタムカラー'),
+        h('div',{style:{display:'flex',alignItems:'center',gap:12}},
+          h('input',{type:'color',value:customBg,onChange:e=>{setCustomBg(e.target.value);setBgColor(e.target.value);},
+            style:{width:44,height:44,borderRadius:8,border:'none',cursor:'pointer',padding:0,background:'none'}}),
+          h('div',{style:{flex:1}},
+            h('div',{style:{fontFamily:'DM Mono',fontSize:13,color:th.text}},customBg.toUpperCase()),
+            h('div',{style:{fontSize:11,color:th.textSub,marginTop:2}},isDark(customBg)?'🌙 ダーク背景':'☀️ ライト背景')
+          )
+        )
+      ),
+      h('div',{style:{padding:'12px 14px',borderRadius:10,background:bgColor,border:`1px solid ${th.accentBorder}`}},
+        h('div',{style:{fontSize:12,color:th.text,fontWeight:500}},'プレビュー'),
+        h('div',{style:{fontSize:11,color:th.textSub,marginTop:3}},'テキストの見え方'),
+        h('div',{style:{display:'flex',gap:8,marginTop:8}},
+          h('span',{style:{fontSize:10,padding:'3px 8px',borderRadius:4,background:th.accentBg,color:th.accent,border:`1px solid ${th.accentBorder}`}},'アクセント'),
+          h('span',{style:{fontSize:10,padding:'3px 8px',borderRadius:4,background:th.cardBg,color:th.textSub,border:`1px solid ${th.cardBorder}`}},'サブ')
+        )
+      )
+    ),
+
+    // ── header ──
+    h('div',{style:{width:'100%',maxWidth:480,padding:'max(64px, calc(env(safe-area-inset-top) + 20px)) 20px 0'}},
+      h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}},
+        h('div',null,
+          h('div',{style:{display:'flex',alignItems:'baseline',gap:10,marginBottom:4}},
+            h('span',{style:{fontSize:11,letterSpacing:3,color:th.textMuted,fontFamily:'DM Mono'}},'PHOTO'),
+            h('span',{style:{fontSize:11,letterSpacing:3,color:th.accent,fontFamily:'DM Mono'}},'LOCATION')
+          ),
+          h('h1',{style:{fontSize:21,fontWeight:300,letterSpacing:1,color:th.text}},'撮影地カレンダー')
+        ),
+        h('div',{style:{display:'flex',gap:8,alignItems:'flex-start',marginTop:4}},
+          h('button',{onClick:()=>{setShowDataModal(true);setImportMsg(null);},
+            style:{background:th.accentBg,border:`1px solid ${th.accentBorder}`,borderRadius:8,
+              color:th.accent,padding:'7px 10px',fontSize:16,lineHeight:1}},
+            '💾'),
+          h('button',{onClick:()=>setShowSettings(true),
+            style:{background:th.accentBg,border:`1px solid ${th.accentBorder}`,borderRadius:8,
+              color:th.accent,padding:'7px 10px',fontSize:16,lineHeight:1}},
+            '🎨')
+        )
+      ),
+      h('div',{style:{height:1,background:`linear-gradient(90deg,${th.accent}66,transparent)`,margin:'12px 0 0'}})
+    ),
+
+    // ── tabs ──
+    h('div',{style:{width:'100%',maxWidth:480,display:'flex',padding:'12px 20px 0',gap:4}},
+      [['folders','📁 フォルダー'],['calendar','📅 カレンダー'],['record','📍 記録する']].map(([id,label])=>
+        h('button',{key:id,onClick:()=>{setView(id);setLocErr(null);setOkMsg(null);},style:{
+          padding:'7px 12px',fontSize:12,borderRadius:6,border:'none',fontWeight:view===id?500:300,
+          color:view===id?th.tabActiveTxt:th.textSub,
+          background:view===id?th.tabActive:'transparent',transition:'all .2s'
+        }},label)
+      )
+    ),
+
+    // ── body ──
+    h('div',{style:{width:'100%',maxWidth:480,padding:'18px 20px',flex:1}},
+
+      // ══ FOLDERS ══
+      view==='folders' && h('div',null,
+        h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}},
+          h('div',{style:{fontSize:11,color:th.textMuted,letterSpacing:2}},'フォルダー一覧'),
+          h('button',{onClick:openNewFolder,style:{background:'none',border:`1px solid ${th.accentBorder}`,
+            borderRadius:6,color:th.accent,padding:'5px 12px',fontSize:12}},
+            '＋ 新規')
+        ),
+        // all records
+        h('div',{style:{marginBottom:14,borderRadius:12,background:th.cardBg,border:`1px solid ${th.accentBorder}`,overflow:'hidden'}},
+          // top row
+          h('div',{style:{display:'flex',alignItems:'center',gap:14,padding:16}},
+            h('div',{style:{width:36,height:36,borderRadius:10,background:th.accentBg,
+              display:'flex',alignItems:'center',justifyContent:'center',fontSize:18,flexShrink:0}},'🗂'),
+            h('div',{style:{flex:1}},
+              h('div',{style:{fontSize:14,color:th.text,marginBottom:2}},'すべての記録'),
+              h('div',{style:{fontSize:11,color:th.textMuted,fontFamily:'DM Mono'}},records.length+'件')
+            )
+          ),
+          // button row
+          h('div',{style:{display:'flex',borderTop:`1px solid ${th.divider}`}},
+            h('button',{onClick:()=>{setSelFolder(null);setView('calendar');},
+              style:{flex:1,background:'none',border:'none',borderRight:`1px solid ${th.divider}`,
+                color:th.accent,padding:'10px',fontSize:12,cursor:'pointer',fontFamily:'inherit',
+                display:'flex',alignItems:'center',justifyContent:'center',gap:5}},
+              '📅 カレンダー'),
+            h('button',{onClick:()=>{setSelFolder(null);setView('list');},
+              style:{flex:1,background:'none',border:'none',
+                color:th.accent,padding:'10px',fontSize:12,cursor:'pointer',fontFamily:'inherit',
+                display:'flex',alignItems:'center',justifyContent:'center',gap:5}},
+              '📋 一覧')
+          )
+        ),
+        h('div',{style:{height:1,background:th.divider,marginBottom:14}}),
+        folders.map(f=>{
+          const cnt=records.filter(r=>r.folderId===f.id).length;
+          return h('div',{key:f.id,style:{display:'flex',alignItems:'center',gap:14,padding:16,
+            borderRadius:12,background:th.cardBg,border:`1px solid ${th.cardBorder}`,marginBottom:10}},
+            h('div',{style:{width:4,height:40,borderRadius:2,background:f.color,flexShrink:0}}),
+            h('div',{style:{flex:1,minWidth:0,cursor:'pointer'},onClick:()=>{setSelFolder(f);setView('calendar');}},
+              h('div',{style:{fontSize:14,color:th.text,marginBottom:2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},f.name),
+              h('div',{style:{fontSize:11,color:th.textMuted,fontFamily:'DM Mono'}},cnt+'件の撮影地')
+            ),
+            h('button',{onClick:e=>{e.stopPropagation();openEditFolder(f);},
+              style:{background:'none',border:'none',color:th.textSub,fontSize:16,padding:4}},'✎'),
+            h('span',{style:{color:th.textFaint,fontSize:18,cursor:'pointer'},
+              onClick:()=>{setSelFolder(f);setView('calendar');}},'›')
+          );
+        }),
+        folders.length===0 && h('div',{style:{textAlign:'center',color:th.textMuted,fontSize:13,padding:40}},
+          'フォルダーがありません')
+      ),
+
+      // ══ CALENDAR / DETAIL / LIST ══
+      (view==='calendar'||view==='detail'||view==='list') && h('div',null,
+        // breadcrumb
+        h('div',{style:{display:'flex',alignItems:'center',gap:8,marginBottom:14,flexWrap:'wrap'}},
+          h('button',{onClick:()=>setView('folders'),
+            style:{background:'none',border:'none',color:th.textSub,fontSize:12,padding:'2px 0'}},'📁 フォルダー'),
+          h('span',{style:{color:th.textFaint}},'›'),
+          selFolder
+            ? h('span',{style:{fontSize:12,color:th.accent,display:'flex',alignItems:'center',gap:5}},
+                h('span',{style:{width:8,height:8,borderRadius:'50%',background:selFolder.color,display:'inline-block'}}),
+                selFolder.name)
+            : h('span',{style:{fontSize:12,color:th.textSub}},'すべて'),
+          view==='detail' && h(React.Fragment,null,
+            h('span',{style:{color:th.textFaint}},'›'),
+            h('span',{style:{fontSize:12,color:th.textSub}},selDate)
+          )
+        ),
+
+        // ── LIST ──
+        view==='list' && h('div',null,
+          h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}},
+            h('div',{style:{fontSize:11,color:th.textMuted,letterSpacing:2}},
+              '全'+records.length+'件'),
+            h('button',{onClick:()=>setView('calendar'),
+              style:{background:'none',border:`1px solid ${th.accentBorder}`,borderRadius:6,
+                color:th.accent,padding:'5px 10px',fontSize:11,cursor:'pointer',fontFamily:'inherit'}},
+              '📅 カレンダーで見る')
+          ),
+          records.length===0 && h('div',{style:{textAlign:'center',color:th.textFaint,fontSize:13,padding:40}},'記録がありません'),
+          [...records].sort((a,b)=>b.id-a.id).map((r,idx)=>{
+            const fol=folders.find(f=>f.id===r.folderId);
+            const wt=r.weather?WEATHERS.find(w=>w.id===r.weather):null;
+            return h('div',{key:r.id,style:{marginBottom:10,padding:'13px 14px',borderRadius:10,
+              background:th.cardBg,border:`1px solid ${th.cardBorder}`}},
+              h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:10}},
+                h('div',{style:{flex:1,minWidth:0}},
+                  // header row
+                  h('div',{style:{display:'flex',alignItems:'center',gap:7,marginBottom:4,flexWrap:'wrap'}},
+                    h('span',{style:{fontFamily:'DM Mono',fontSize:11,color:th.textSub}},r.date+' '+r.time),
+                    fol&&h('span',{style:{fontSize:10,color:fol.color,background:fol.color+'22',
+                      border:`1px solid ${fol.color}44`,borderRadius:4,padding:'1px 6px'}},fol.name),
+                    wt&&h('span',{style:{fontSize:13}},wt.icon)
+                  ),
+                  // place (市町村) — tap to edit
+                  editingPlace?.id===r.id
+                    ? h('div',{style:{display:'flex',gap:6,marginBottom:4,alignItems:'center'}},
+                        h('span',{style:{fontSize:11,color:th.accent,flexShrink:0}},'📌'),
+                        h('input',{autoFocus:true,value:editingPlace.text,
+                          onChange:e=>setEditingPlace(p=>({...p,text:e.target.value})),
+                          onKeyDown:e=>{
+                            if(e.key==='Enter'){
+                              setRecords(p=>p.map(rec=>rec.id===r.id?{...rec,place:editingPlace.text.trim()||null}:rec));
+                              setEditingPlace(null);
+                            }
+                            if(e.key==='Escape') setEditingPlace(null);
+                          },
+                          style:{flex:1,background:th.inputBg,border:`1px solid ${th.accent}`,
+                            borderRadius:6,color:th.accent,fontSize:13,padding:'3px 8px',
+                            outline:'none',fontFamily:'inherit',fontWeight:500}}),
+                        h('button',{onClick:()=>{
+                            setRecords(p=>p.map(rec=>rec.id===r.id?{...rec,place:editingPlace.text.trim()||null}:rec));
+                            setEditingPlace(null);
+                          },style:{background:th.accentBg,border:`1px solid ${th.accentBorder}`,borderRadius:5,
+                            color:th.accent,padding:'3px 6px',fontSize:11,cursor:'pointer',fontFamily:'inherit',flexShrink:0}},'保存'),
+                        h('button',{onClick:()=>setEditingPlace(null),
+                          style:{background:'none',border:`1px solid ${th.cardBorder}`,borderRadius:5,
+                            color:th.textSub,padding:'3px 6px',fontSize:11,cursor:'pointer',fontFamily:'inherit',flexShrink:0}},'✕')
+                      )
+                    : h('div',{style:{display:'flex',alignItems:'center',gap:5,marginBottom:4,cursor:'text'},
+                        onClick:()=>setEditingPlace({id:r.id,text:r.place||''})},
+                        h('span',{style:{fontSize:11,color:th.accent,flexShrink:0}},'📌'),
+                        h('span',{style:{fontSize:13,color:r.place?th.accent:th.textFaint,fontWeight:r.place?500:400,flex:1}},
+                          r.place||'場所を追加...'),
+                        h('span',{style:{fontSize:11,color:th.textMuted,flexShrink:0}},'✎')
+                      ),
+                  // memo inline edit
+                  editingMemo?.id===r.id
+                    ? h('div',{style:{marginBottom:6}},
+                        h('textarea',{autoFocus:true,rows:2,value:editingMemo.text,
+                          onChange:e=>setEditingMemo(m=>({...m,text:e.target.value})),
+                          onKeyDown:e=>{
+                            if(e.key==='Enter'&&!e.shiftKey){
+                              e.preventDefault();
+                              setRecords(p=>p.map(rec=>rec.id===r.id?{...rec,memo:editingMemo.text.trim()}:rec));
+                              setEditingMemo(null);
+                            }
+                            if(e.key==='Escape') setEditingMemo(null);
+                          },
+                          style:{width:'100%',background:th.inputBg,border:`1px solid ${th.accent}`,
+                            borderRadius:8,color:th.text,fontSize:13,padding:'7px 10px',
+                            outline:'none',resize:'none',fontFamily:'inherit'}}),
+                        h('div',{style:{display:'flex',gap:8,marginTop:5}},
+                          h('button',{onClick:()=>{
+                              setRecords(p=>p.map(rec=>rec.id===r.id?{...rec,memo:editingMemo.text.trim()}:rec));
+                              setEditingMemo(null);
+                            },style:{background:th.accentBg,border:`1px solid ${th.accentBorder}`,borderRadius:6,
+                              color:th.accent,padding:'4px 12px',fontSize:12,cursor:'pointer',fontFamily:'inherit'}},'保存'),
+                          h('button',{onClick:()=>setEditingMemo(null),
+                            style:{background:'none',border:`1px solid ${th.cardBorder}`,borderRadius:6,
+                              color:th.textSub,padding:'4px 12px',fontSize:12,cursor:'pointer',fontFamily:'inherit'}},'キャンセル')
+                        )
+                      )
+                    : h('div',{style:{display:'flex',alignItems:'flex-start',gap:5,marginBottom:4,cursor:'text'},
+                        onClick:()=>setEditingMemo({id:r.id,text:r.memo||''})},
+                        h('span',{style:{fontSize:13,color:r.memo?th.text:th.textFaint,flex:1,lineHeight:1.5}},
+                          r.memo||'メモを追加...'),
+                        h('span',{style:{fontSize:11,color:th.textMuted,flexShrink:0,marginTop:1}},'✎')
+                      ),
+                  // coords — tap to edit
+                  editingCoords?.id===r.id
+                    ? h('div',{style:{marginTop:2,marginBottom:2}},
+                        h('input',{autoFocus:true,value:editingCoords.text,
+                          onChange:e=>setEditingCoords(c=>({...c,text:e.target.value})),
+                          onKeyDown:e=>{
+                            if(e.key==='Enter') saveEditCoords(r.id);
+                            if(e.key==='Escape') setEditingCoords(null);
+                          },
+                          placeholder:'34.26274, 135.37541',
+                          style:{width:'100%',background:th.inputBg,border:`1px solid ${th.accent}`,
+                            borderRadius:6,color:th.text,fontSize:12,padding:'4px 8px',
+                            outline:'none',fontFamily:'DM Mono',marginBottom:5}}),
+                        h('div',{style:{display:'flex',gap:6}},
+                          h('button',{onClick:()=>saveEditCoords(r.id),
+                            style:{background:th.accentBg,border:`1px solid ${th.accentBorder}`,borderRadius:5,
+                              color:th.accent,padding:'3px 10px',fontSize:11,cursor:'pointer',fontFamily:'inherit'}},'保存'),
+                          h('button',{onClick:()=>setEditingCoords(null),
+                            style:{background:'none',border:`1px solid ${th.cardBorder}`,borderRadius:5,
+                              color:th.textSub,padding:'3px 10px',fontSize:11,cursor:'pointer',fontFamily:'inherit'}},'キャンセル')
+                        )
+                      )
+                    : h('div',{style:{display:'flex',alignItems:'center',gap:4,cursor:'text'},
+                        onClick:()=>setEditingCoords({id:r.id,text:r.lat.toFixed(5)+', '+r.lng.toFixed(5)})},
+                        h('span',{style:{fontFamily:'DM Mono',fontSize:10,color:th.textMuted,flex:1}},
+                          r.lat.toFixed(5)+', '+r.lng.toFixed(5)),
+                        h('span',{style:{fontSize:10,color:th.textFaint}},'✎')
+                      )
+                ),
+                h('div',{style:{display:'flex',flexDirection:'column',gap:5,alignItems:'flex-end',flexShrink:0}},
+                  h('a',{href:`https://www.google.com/maps?q=${r.lat},${r.lng}`,target:'_blank',
+                    style:{color:th.accent,textDecoration:'none',fontSize:11,
+                      border:`1px solid ${th.accentBorder}`,borderRadius:6,padding:'4px 8px',whiteSpace:'nowrap'}},'🗺 地図'),
+                  h('button',{onClick:()=>setMoveModal(r.id),
+                    style:{background:'none',border:`1px solid ${th.inputBorder}`,color:th.textSub,
+                      borderRadius:4,padding:'3px 8px',fontSize:11,cursor:'pointer',fontFamily:'inherit'}},'移動'),
+                  h('button',{onClick:()=>setConfirm({type:'record',id:r.id}),
+                    style:{background:'none',border:'1px solid rgba(255,80,80,0.3)',color:'rgba(255,120,120,0.7)',
+                      borderRadius:4,padding:'3px 8px',fontSize:11,cursor:'pointer',fontFamily:'inherit'}},'削除')
+                )
+              )
+            );
+          })
+        ),
+
+        // calendar grid
+        view==='calendar' && h('div',null,
+          h('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}},
+            h('button',{onClick:prevM,style:{background:'none',border:'none',color:th.textSub,fontSize:22,padding:'4px 8px'}},'‹'),
+            h('div',{style:{fontFamily:'DM Mono',fontSize:14,color:th.text,letterSpacing:2}},
+              calY,h('span',{style:{color:th.textMuted,fontSize:11,margin:'0 4px'}},'年'),
+              String(calM+1).padStart(2,'0'),h('span',{style:{color:th.textMuted,fontSize:11,margin:'0 4px'}},'月')
+            ),
+            h('button',{onClick:nextM,style:{background:'none',border:'none',color:th.textSub,fontSize:22,padding:'4px 8px'}},'›')
+          ),
+          h('div',{style:{display:'grid',gridTemplateColumns:'repeat(7,1fr)',marginBottom:6}},
+            WEEKDAYS.map((d,i)=>h('div',{key:d,style:{textAlign:'center',fontSize:11,padding:'4px 0',
+              color:i===0?th.sun:i===6?th.sat:th.textMuted}},d))
+          ),
+          h('div',{style:{display:'grid',gridTemplateColumns:'repeat(7,1fr)',gap:2}},
+            [...Array(firstDay)].map((_,i)=>h('div',{key:'e'+i,className:'cal-day'})),
+            [...Array(daysInM)].map((_,i)=>{
+              const day=i+1;
+              const ymd=`${calY}-${String(calM+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+              const isToday=ymd===today;
+              const recs=byDate[ymd]||[];
+              const hasRec=recs.length>0;
+              const col=(firstDay+i)%7;
+              const dotClr=hasRec?(folders.find(f=>f.id===recs[0].folderId)?.color||th.accent):null;
+              return h('div',{key:day,className:`cal-day${hasRec?' has':''}`,
+                onClick:()=>hasRec&&openDay(ymd),
+                style:{background:isToday?th.accentBg:'transparent'}},
+                h('span',{style:{fontSize:13,fontFamily:'DM Mono',fontWeight:isToday?500:300,
+                  color:isToday?th.accent:col===0?th.sun:col===6?th.sat:th.textSub}},day),
+                hasRec&&h('div',{className:'dot',style:{background:dotClr}})
+              );
+            })
+          ),
+          h('div',{style:{marginTop:20,padding:'14px 16px',borderRadius:8,background:th.cardBg,border:`1px solid ${th.accentBorder}`}},
+            h('div',{style:{fontSize:11,color:th.textMuted,letterSpacing:2,marginBottom:8}},'今月の記録'),
+            (()=>{
+              const key=`${calY}-${String(calM+1).padStart(2,'0')}`;
+              const recs=activeRecs.filter(r=>r.date.startsWith(key));
+              return recs.length>0
+                ? h('div',{style:{fontFamily:'DM Mono',fontSize:18,color:th.accent}},
+                    recs.length,h('span',{style:{fontSize:12,color:th.textMuted,marginLeft:4}},'件'),
+                    h('span',{style:{fontSize:11,color:th.textFaint,marginLeft:10}},[...new Set(recs.map(r=>r.date))].length+'日間'))
+                : h('div',{style:{fontSize:13,color:th.textFaint}},'この月の記録はありません');
+            })()
+          ),
+          h('div',{style:{marginTop:8,fontSize:11,color:th.textFaint,textAlign:'center'}},'● のある日付をタップすると詳細が見られます')
+        ),
+
+        // detail
+        view==='detail'&&selDate && h('div',null,
+          h('button',{onClick:()=>setView('calendar'),
+            style:{background:'none',border:'none',color:th.accent,fontSize:14,display:'flex',alignItems:'center',gap:6,padding:'4px 0',marginBottom:14}},
+            '‹ カレンダーに戻る'),
+          h('div',{style:{marginBottom:16}},
+            h('div',{style:{fontFamily:'DM Mono',fontSize:12,color:th.textMuted,marginBottom:3}},selDate.replace(/-/g,'/')),
+            h('div',{style:{fontSize:17,fontWeight:300,color:th.text}},'撮影地 '+dayRecs.length+'件')
+          ),
+          dayRecs.length===0&&h('div',{style:{fontSize:13,color:th.textFaint}},'記録がありません'),
+          dayRecs.map((r,idx)=>{
+            const fol=folders.find(f=>f.id===r.folderId);
+            const wt=r.weather?WEATHERS.find(w=>w.id===r.weather):null;
+            return h('div',{key:r.id,style:{marginBottom:12,padding:'14px 16px',borderRadius:10,
+              background:th.cardBg,border:`1px solid ${th.cardBorder}`}},
+              h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:10}},
+                h('div',{style:{flex:1,minWidth:0}},
+                  h('div',{style:{display:'flex',alignItems:'center',gap:8,marginBottom:4,flexWrap:'wrap'}},
+                    h('span',{style:{fontFamily:'DM Mono',fontSize:11,color:th.textSub}},'#'+(idx+1)+' '+r.time),
+                    fol&&h('span',{style:{fontSize:10,color:fol.color,background:fol.color+'22',
+                      border:`1px solid ${fol.color}44`,borderRadius:4,padding:'1px 6px'}},fol.name),
+                    // weather badge with tap-to-change
+                    h('span',{
+                      onClick:()=>{
+                        const cur=r.weather;
+                        const idx2=WEATHERS.findIndex(w=>w.id===cur);
+                        const next=WEATHERS[(idx2+1)%WEATHERS.length];
+                        setRecords(p=>p.map(rec=>rec.id===r.id?{...rec,weather:next.id}:rec));
+                      },
+                      title:'タップして天気を変更',
+                      style:{fontSize:11,cursor:'pointer',padding:'1px 7px',borderRadius:4,
+                        background:th.accentBg,border:`1px solid ${th.accentBorder}`,
+                        color:th.accent,display:'flex',alignItems:'center',gap:4,userSelect:'none'}},
+                      wt?h(React.Fragment,null,h('span',null,wt.icon),' ',wt.label)
+                        :h('span',{style:{color:th.textMuted}},'＋天気')
+                    )
+                  ),
+                  // place (市町村) — tap to edit
+                  editingPlace?.id===r.id
+                    ? h('div',{style:{display:'flex',gap:6,marginBottom:5,alignItems:'center'}},
+                        h('span',{style:{fontSize:11,color:th.accent,flexShrink:0}},'📌'),
+                        h('input',{autoFocus:true,value:editingPlace.text,
+                          onChange:e=>setEditingPlace(p=>({...p,text:e.target.value})),
+                          onKeyDown:e=>{
+                            if(e.key==='Enter'){
+                              setRecords(p=>p.map(rec=>rec.id===r.id?{...rec,place:editingPlace.text.trim()||null}:rec));
+                              setEditingPlace(null);
+                            }
+                            if(e.key==='Escape') setEditingPlace(null);
+                          },
+                          style:{flex:1,background:th.inputBg,border:`1px solid ${th.accent}`,
+                            borderRadius:6,color:th.accent,fontSize:13,padding:'3px 8px',
+                            outline:'none',fontFamily:'inherit',fontWeight:500}}),
+                        h('button',{onClick:()=>{
+                            setRecords(p=>p.map(rec=>rec.id===r.id?{...rec,place:editingPlace.text.trim()||null}:rec));
+                            setEditingPlace(null);
+                          },style:{background:th.accentBg,border:`1px solid ${th.accentBorder}`,borderRadius:5,
+                            color:th.accent,padding:'3px 8px',fontSize:11,cursor:'pointer',fontFamily:'inherit',flexShrink:0}},'保存'),
+                        h('button',{onClick:()=>setEditingPlace(null),
+                          style:{background:'none',border:`1px solid ${th.cardBorder}`,borderRadius:5,
+                            color:th.textSub,padding:'3px 8px',fontSize:11,cursor:'pointer',fontFamily:'inherit',flexShrink:0}},'✕')
+                      )
+                    : h('div',{style:{display:'flex',alignItems:'center',gap:5,marginBottom:5,cursor:'text'},
+                        onClick:()=>setEditingPlace({id:r.id,text:r.place||''})},
+                        h('span',{style:{fontSize:11,color:th.accent,flexShrink:0}},'📌'),
+                        h('span',{style:{fontSize:13,color:r.place?th.accent:th.textFaint,fontWeight:r.place?500:400,flex:1}},
+                          r.place||'場所を追加...'),
+                        h('span',{style:{fontSize:11,color:th.textMuted,flexShrink:0}},'✎')
+                      ),
+                  // memo — tap to edit inline
+                  editingMemo?.id===r.id
+                    ? h('div',{style:{marginBottom:6}},
+                        h('textarea',{
+                          autoFocus:true,
+                          rows:3,
+                          value:editingMemo.text,
+                          onChange:e=>setEditingMemo(m=>({...m,text:e.target.value})),
+                          onKeyDown:e=>{
+                            if(e.key==='Enter'&&!e.shiftKey){
+                              e.preventDefault();
+                              setRecords(p=>p.map(rec=>rec.id===r.id?{...rec,memo:editingMemo.text.trim()}:rec));
+                              setEditingMemo(null);
+                            }
+                            if(e.key==='Escape') setEditingMemo(null);
+                          },
+                          style:{width:'100%',background:th.inputBg,border:`1px solid ${th.accent}`,
+                            borderRadius:8,color:th.text,fontSize:13,padding:'8px 10px',
+                            outline:'none',resize:'none',fontFamily:'inherit'},
+                        }),
+                        h('div',{style:{display:'flex',gap:8,marginTop:6}},
+                          h('button',{
+                            onClick:()=>{
+                              setRecords(p=>p.map(rec=>rec.id===r.id?{...rec,memo:editingMemo.text.trim()}:rec));
+                              setEditingMemo(null);
+                            },
+                            style:{background:th.accentBg,border:`1px solid ${th.accentBorder}`,borderRadius:6,
+                              color:th.accent,padding:'5px 14px',fontSize:12,cursor:'pointer',fontFamily:'inherit'},
+                          },'保存'),
+                          h('button',{
+                            onClick:()=>setEditingMemo(null),
+                            style:{background:'none',border:`1px solid ${th.cardBorder}`,borderRadius:6,
+                              color:th.textSub,padding:'5px 14px',fontSize:12,cursor:'pointer',fontFamily:'inherit'},
+                          },'キャンセル')
+                        )
+                      )
+                    : h('div',{
+                        style:{display:'flex',alignItems:'flex-start',gap:6,marginBottom:5,cursor:'text',
+                          minHeight:20},
+                        onClick:()=>setEditingMemo({id:r.id,text:r.memo||''}),
+                        title:'タップしてメモを編集',
+                      },
+                        h('span',{style:{fontSize:14,color:r.memo?th.text:th.textFaint,flex:1,lineHeight:1.5}},
+                          r.memo||'メモを追加...'),
+                        h('span',{style:{fontSize:12,color:th.textMuted,flexShrink:0,marginTop:1}},'✎')
+                      ),
+                  // coords — tap to edit
+                  editingCoords?.id===r.id
+                    ? h('div',{style:{marginTop:4,marginBottom:4}},
+                        h('div',{style:{fontSize:10,color:th.textMuted,marginBottom:4}},
+                          'Googleマップからコピーした座標を貼り付け'),
+                        h('input',{autoFocus:true,value:editingCoords.text,
+                          onChange:e=>setEditingCoords(c=>({...c,text:e.target.value})),
+                          onKeyDown:e=>{
+                            if(e.key==='Enter') saveEditCoords(r.id);
+                            if(e.key==='Escape') setEditingCoords(null);
+                          },
+                          placeholder:'34.26274, 135.37541',
+                          style:{width:'100%',background:th.inputBg,border:`1px solid ${th.accent}`,
+                            borderRadius:6,color:th.text,fontSize:12,padding:'5px 8px',
+                            outline:'none',fontFamily:'DM Mono',marginBottom:6}}),
+                        h('div',{style:{display:'flex',gap:6}},
+                          h('button',{onClick:()=>saveEditCoords(r.id),
+                            style:{background:th.accentBg,border:`1px solid ${th.accentBorder}`,borderRadius:5,
+                              color:th.accent,padding:'3px 10px',fontSize:11,cursor:'pointer',fontFamily:'inherit'}},'保存'),
+                          h('button',{onClick:()=>setEditingCoords(null),
+                            style:{background:'none',border:`1px solid ${th.cardBorder}`,borderRadius:5,
+                              color:th.textSub,padding:'3px 10px',fontSize:11,cursor:'pointer',fontFamily:'inherit'}},'キャンセル')
+                        )
+                      )
+                    : h('div',{style:{display:'flex',alignItems:'center',gap:4,marginTop:4,cursor:'text'},
+                        onClick:()=>setEditingCoords({id:r.id,text:r.lat.toFixed(5)+', '+r.lng.toFixed(5)})},
+                        h('span',{style:{fontFamily:'DM Mono',fontSize:10,color:th.textMuted,flex:1}},
+                          r.lat.toFixed(5)+', '+r.lng.toFixed(5)),
+                        h('span',{style:{fontSize:10,color:th.textFaint}},'✎'),
+                        r.accuracy&&h('span',{style:{fontFamily:'DM Mono',fontSize:10,color:th.textFaint,marginLeft:4}},'±'+r.accuracy+'m')
+                      )
+                ),
+                h('div',{style:{display:'flex',flexDirection:'column',gap:6,alignItems:'flex-end',flexShrink:0}},
+                  h('a',{href:`https://www.google.com/maps?q=${r.lat},${r.lng}`,target:'_blank',
+                    style:{display:'inline-flex',alignItems:'center',gap:5,color:th.accent,textDecoration:'none',
+                      fontSize:12,border:`1px solid ${th.accentBorder}`,borderRadius:6,padding:'5px 10px',whiteSpace:'nowrap'}},
+                    '🗺 地図'),
+                  h('button',{onClick:()=>setMoveModal(r.id),
+                    style:{background:'none',border:`1px solid ${th.inputBorder}`,color:th.textSub,
+                      borderRadius:4,padding:'4px 10px',fontSize:12}},'移動'),
+                  h('button',{onClick:()=>setConfirm({type:'record',id:r.id}),
+                    style:{background:'none',border:'1px solid rgba(255,80,80,0.3)',color:'rgba(255,120,120,0.7)',
+                      borderRadius:4,padding:'4px 10px',fontSize:12}},'削除')
+                )
+              )
+            );
+          })
+        )
+      ),
+
+      // ══ RECORD ══
+      view==='record' && h('div',{style:{display:'flex',flexDirection:'column',gap:16}},
+
+        // ── 大きな記録ボタン ──
+        h('div',{style:{
+          display:'flex',flexDirection:'column',alignItems:'center',gap:12,
+          padding:'28px 20px 24px',borderRadius:16,
+          background:th.cardBg,border:`1px solid ${th.accentBorder}`,
+          position:'relative',
+        }},
+          // weather badge（右上）
+          h('div',{onClick:()=>setShowWeatherPicker(true),
+            style:{position:'absolute',top:12,right:12,
+              display:'flex',alignItems:'center',gap:5,cursor:'pointer',
+              background:isDark(th.bg)?'rgba(0,0,0,0.4)':'rgba(255,255,255,0.7)',
+              backdropFilter:'blur(6px)',borderRadius:20,padding:'5px 10px',
+              border:`1px solid ${weather?th.accent+'66':th.cardBorder}`,transition:'all .2s'}},
+            weather
+              ? h(React.Fragment,null,
+                  h('span',{style:{fontSize:18}},WEATHERS.find(w=>w.id===weather)?.icon),
+                  h('span',{style:{fontSize:11,color:th.accent}},WEATHERS.find(w=>w.id===weather)?.label))
+              : h(React.Fragment,null,
+                  h('span',{style:{fontSize:15}},'🌤️'),
+                  h('span',{style:{fontSize:11,color:th.textMuted}},'天気'))
+          ),
+
+          // shutter button — big
+          h('button',{onClick:saveRecord,disabled:locating,
+            className:locating?'spin':'',
+            style:{background:'none',border:`3px solid ${th.accent}`,borderRadius:'50%',
+              width:110,height:110,display:'flex',alignItems:'center',justifyContent:'center',
+              cursor:'pointer',transition:'transform .1s',flexShrink:0}},
+            h('div',{style:{width:84,height:84,borderRadius:'50%',
+              background:locating?'transparent':th.accentBg,
+              display:'flex',alignItems:'center',justifyContent:'center',fontSize:36}},
+              locating?'⏳':'📷')
+          ),
+          h('div',{style:{textAlign:'center'}},
+            h('div',{style:{fontSize:15,color:th.text,fontWeight:300,marginBottom:3}},
+              locating?'位置情報取得中...':`タップして記録`),
+            h('div',{style:{fontSize:11,color:th.textMuted}},
+              locating?'しばらくお待ちください':'現在地・天気を自動取得')
+          ),
+
+          // error / success
+          locErr&&h('div',{style:{width:'100%',padding:'8px 12px',borderRadius:8,
+            background:'rgba(255,80,80,0.08)',border:'1px solid rgba(255,80,80,0.25)',
+            color:'#ff9090',fontSize:12,textAlign:'center'}},'⚠ '+locErr),
+          okMsg&&h('div',{style:{width:'100%',padding:'8px 12px',borderRadius:8,
+            background:th.accentBg,border:`1px solid ${th.accentBorder}`,
+            color:th.accent,fontSize:12,textAlign:'center'}},okMsg)
+        ),
+
+        // ── 詳細設定（折りたたみ） ──
+        h('div',{style:{borderRadius:12,background:th.cardBg,border:`1px solid ${th.cardBorder}`,overflow:'hidden'}},
+          // toggle header
+          h('div',{onClick:()=>setShowManualInput(v=>!v),
+            style:{display:'flex',alignItems:'center',justifyContent:'space-between',
+              padding:'12px 16px',cursor:'pointer',userSelect:'none'}},
+            h('span',{style:{fontSize:12,color:th.textSub}},showManualInput?'▲ 詳細設定':'▼ 詳細設定（フォルダー・メモ・座標入力）'),
+            h('span',{style:{fontSize:11,color:th.textMuted}},
+              [tgtFolder&&folders.find(f=>f.id===tgtFolder)?.name, memo&&'メモあり'].filter(Boolean).join('・')||'')
+          ),
+          // expanded content
+          showManualInput && h('div',{style:{padding:'0 16px 16px',display:'flex',flexDirection:'column',gap:14,
+            borderTop:`1px solid ${th.divider}`}},
+            h('div',{style:{paddingTop:14}}),
+
+            // folder
+            h('div',null,
+              h('label',{style:{fontSize:11,color:th.textSub,letterSpacing:2,display:'block',marginBottom:8}},'保存先フォルダー'),
+              h('select',{value:tgtFolder||'',onChange:e=>setTgtFolder(e.target.value||null),
+                style:{...inputSt,appearance:'none',cursor:'pointer'}},
+                folders.map(f=>h('option',{key:f.id,value:f.id},f.name)),
+                folders.length===0&&h('option',{value:''},'フォルダーなし')
+              )
+            ),
+
+            // memo
+            h('div',null,
+              h('label',{style:{fontSize:11,color:th.textSub,letterSpacing:2,display:'block',marginBottom:8}},'メモ（任意）'),
+              h('textarea',{value:memo,onChange:e=>setMemo(e.target.value),rows:2,
+                placeholder:'場所の名前や撮影メモ...',style:{...inputSt,resize:'none'}})
+            ),
+
+            // manual coords
+            h('div',null,
+              h('label',{style:{fontSize:11,color:th.textSub,letterSpacing:2,display:'block',marginBottom:6}},
+                '📋 座標を貼り付けて記録（電波なし・GPS修正）'),
+              h('div',{style:{fontSize:11,color:th.textFaint,marginBottom:8}},
+                'Googleマップで場所を長押し → 座標をタップしてコピー'),
+              h('input',{value:manualCoords,onChange:e=>setManualCoords(e.target.value),
+                placeholder:'例: 34.26274, 135.37541',
+                onKeyDown:e=>e.key==='Enter'&&saveManualRecord(),
+                style:{...inputSt,fontFamily:'DM Mono',fontSize:13,marginBottom:8}}),
+              h('button',{onClick:saveManualRecord,disabled:locating||!manualCoords.trim(),
+                style:{width:'100%',background:th.accentBg,border:`1px solid ${th.accentBorder}`,
+                  borderRadius:8,color:th.accent,padding:'9px',fontSize:13,cursor:'pointer',
+                  fontFamily:'inherit',opacity:manualCoords.trim()?1:0.4}},
+                '📍 この座標で記録する')
+            )
+          )
+        ),
+
+        // ── 最近の記録 ──
+        records.length>0&&h('div',null,
+          h('div',{style:{fontSize:11,color:th.textMuted,letterSpacing:2,marginBottom:10}},'最近の記録'),
+          records.slice(0,3).map(r=>{
+            const fol=folders.find(f=>f.id===r.folderId);
+            const wt=r.weather?WEATHERS.find(w=>w.id===r.weather):null;
+            return h('div',{key:r.id,style:{padding:'11px 13px',borderRadius:8,marginBottom:7,
+              background:th.cardBg,border:`1px solid ${th.cardBorder}`,
+              display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}},
+              h('div',{style:{flex:1,minWidth:0}},
+                h('div',{style:{display:'flex',alignItems:'center',gap:6,marginBottom:r.place||r.memo?3:0}},
+                  h('span',{style:{fontFamily:'DM Mono',fontSize:11,color:th.textSub}},r.date+' '+r.time),
+                  fol&&h('span',{style:{fontSize:10,color:fol.color}},fol.name),
+                  wt&&h('span',{style:{fontSize:12}},wt.icon)
+                ),
+                r.place&&h('div',{style:{fontSize:12,color:th.accent,marginBottom:1}},'📌 '+r.place),
+                r.memo&&h('div',{style:{fontSize:12,color:th.text,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},r.memo)
+              ),
+              h('a',{href:`https://www.google.com/maps?q=${r.lat},${r.lng}`,target:'_blank',
+                style:{color:th.accent,textDecoration:'none',fontSize:12,flexShrink:0,
+                  border:`1px solid ${th.accentBorder}`,borderRadius:6,padding:'5px 9px'}},'🗺')
+            );
+          })
+        )
+      )
+    ),
+
+    // footer
+    h('div',{style:{padding:'10px 20px',fontSize:10,color:th.textFaint,letterSpacing:1,textAlign:'center'}},
+      '位置情報はデバイス内にのみ保存されます')
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('app')).render(h(App));
+</script>
+
+<!-- Service Worker for offline support -->
+<script>
+if('serviceWorker' in navigator){
+  const swCode = `
+    const CACHE='photo-loc-v1';
+    const ASSETS=[
+      'https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500&family=DM+Mono:wght@400;500&display=swap',
+      'https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js',
+      'https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js',
+    ];
+    self.addEventListener('install',e=>{
+      e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS).catch(()=>{})));
+      self.skipWaiting();
+    });
+    self.addEventListener('activate',e=>{
+      e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));
+      self.clients.claim();
+    });
+    self.addEventListener('fetch',e=>{
+      e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request)));
+    });
+  `;
+  const blob = new Blob([swCode],{type:'application/javascript'});
+  const url  = URL.createObjectURL(blob);
+  navigator.serviceWorker.register(url).catch(()=>{});
+}
+</script>
+</body>
+</html>
