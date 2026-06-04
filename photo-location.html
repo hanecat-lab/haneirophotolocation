@@ -548,8 +548,9 @@ function App(){
   const [showDataModal,setShowDataModal]     = useState(false);
   const [importMsg,setImportMsg]             = useState(null);
   const [importName,setImportName]           = useState('');
-  const [showMergeImport,setShowMergeImport] = useState(false);
-  const [showFolderExport,setShowFolderExport] = useState(false);
+  const [pendingMerge,setPendingMerge]           = useState(null);
+  const [showMergeImport,setShowMergeImport]     = useState(false);
+  const [showFolderExport,setShowFolderExport]   = useState(false);
 
   // -- export / import --
   function exportData(){
@@ -608,6 +609,57 @@ function App(){
           setRecords(d.records);
           if(d.bgColor) setBgColor(d.bgColor);
           setImportMsg(`✓ ${d.records.length}件の記録を復元しました`);
+        }
+      }catch{
+        setImportMsg('⚠ ファイルの形式が正しくありません');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value='';
+  }
+
+  function mergeOwnData(e){
+    const file = e.target.files?.[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ev=>{
+      try{
+        const d = JSON.parse(ev.target.result);
+        if(!d.folders||!d.records) throw new Error('invalid');
+        const now = Date.now();
+
+        // フォルダーIDのマッピング（既存フォルダーと名前が一致すれば再利用）
+        const folderMap = {};
+        const addFolders = [];
+        d.folders.forEach((f,i)=>{
+          const existing = folders.find(ef=>ef.name===f.name);
+          if(existing){
+            folderMap[f.id] = existing.id;
+          } else {
+            const newId = `imported_${now}_${i}`;
+            folderMap[f.id] = newId;
+            addFolders.push({...f, id:newId});
+          }
+        });
+
+        // 重複チェック（日時+座標）
+        const existingKeys = new Set(records.map(r=>`${r.date}_${r.time}_${r.lat.toFixed(4)}_${r.lng.toFixed(4)}`));
+        const newRecs = d.records.filter(r=>!existingKeys.has(`${r.date}_${r.time}_${r.lat.toFixed(4)}_${r.lng.toFixed(4)}`));
+        const dupRecs = d.records.filter(r=>existingKeys.has(`${r.date}_${r.time}_${r.lat.toFixed(4)}_${r.lng.toFixed(4)}`));
+
+        const doImport = (includedup)=>{
+          if(addFolders.length>0) setFolders(p=>[...p,...addFolders]);
+          const toAdd = includedup
+            ? d.records.map((r,i)=>({...r,id:now+i+1,folderId:folderMap[r.folderId]||null}))
+            : newRecs.map((r,i)=>({...r,id:now+i+1,folderId:folderMap[r.folderId]||null}));
+          setRecords(p=>[...p,...toAdd]);
+          setImportMsg(`✓ ${toAdd.length}件を追加しました${dupRecs.length>0&&!includedup?' (重複'+dupRecs.length+'件はスキップ)':''}`);
+        };
+
+        if(dupRecs.length>0){
+          setPendingMerge({addFolders, newRecs, allRecs:d.records.map((r,i)=>({...r,id:now+i+1,folderId:folderMap[r.folderId]||null})), dupCount:dupRecs.length, skipRecs:newRecs.map((r,i)=>({...r,id:now+i+1,folderId:folderMap[r.folderId]||null}))});
+          setConfirm({type:'mergeOwn', message:`${dupRecs.length}件の重複する記録があります。\n上書きして追加しますか？`});
+        } else {
+          doImport(false);
         }
       }catch{
         setImportMsg('⚠ ファイルの形式が正しくありません');
@@ -917,7 +969,39 @@ function App(){
     h('div',{className:`flash${flash?' on':''}`}),
 
     // confirm
-    confirm && h(Confirm,{th,message:confirm.message||(confirm.type==='record'?'この記録を削除しますか？':'フォルダーを削除しますか？\n（記録はフォルダーなしになります）'),
+    confirm && confirm.type==='mergeOwn' && h('div',{className:'overlay',style:{zIndex:300}},
+      h('div',{style:{background:th.modalBg,border:`1px solid ${th.cardBorder}`,borderRadius:14,padding:24,width:'100%',maxWidth:320,textAlign:'center'}},
+        h('div',{style:{fontSize:14,color:th.text,marginBottom:20,lineHeight:1.7,whiteSpace:'pre-line'}},confirm.message),
+        h('div',{style:{display:'flex',flexDirection:'column',gap:8}},
+          h('button',{onClick:()=>{
+            if(pendingMerge){
+              if(pendingMerge.addFolders.length>0) setFolders(p=>[...p,...pendingMerge.addFolders]);
+              setRecords(p=>[...p,...pendingMerge.allRecs]);
+              setImportMsg(`✓ ${pendingMerge.allRecs.length}件を追加しました`);
+              setPendingMerge(null);
+            }
+            setConfirm(null);
+          },style:{background:th.accentBg,border:`1px solid ${th.accentBorder}`,
+            borderRadius:8,color:th.accent,padding:'9px',fontSize:13,cursor:'pointer',fontFamily:'inherit'}},
+            '上書きして全て追加'),
+          h('button',{onClick:()=>{
+            if(pendingMerge){
+              if(pendingMerge.addFolders.length>0) setFolders(p=>[...p,...pendingMerge.addFolders]);
+              setRecords(p=>[...p,...pendingMerge.skipRecs]);
+              setImportMsg(`✓ ${pendingMerge.skipRecs.length}件を追加しました（重複${pendingMerge.dupCount}件はスキップ）`);
+              setPendingMerge(null);
+            }
+            setConfirm(null);
+          },style:{background:'none',border:`1px solid ${th.cardBorder}`,
+            borderRadius:8,color:th.textSub,padding:'9px',fontSize:13,cursor:'pointer',fontFamily:'inherit'}},
+            '重複をスキップして追加'),
+          h('button',{onClick:()=>{setPendingMerge(null);setConfirm(null);},style:{background:'none',border:'none',
+            color:th.textFaint,padding:'6px',fontSize:12,cursor:'pointer',fontFamily:'inherit'}},
+            'キャンセル')
+        )
+      )
+    ),
+    confirm && confirm.type!=='mergeOwn' && h(Confirm,{th,message:confirm.message||(confirm.type==='record'?'この記録を削除しますか？':'フォルダーを削除しますか？\n（記録はフォルダーなしになります）'),
       onLite: confirm.type==='deleteFiltered' ? ()=>{
         setRecords(p=>p.map(r=>confirm.filterFn(r)
           ? {id:r.id,folderId:r.folderId,date:r.date,time:r.time,lat:r.lat,lng:r.lng,place:r.place,fav:r.fav,visitCount:r.visitCount,lite:true}
@@ -1118,6 +1202,24 @@ function App(){
         h('div',{style:{flex:1,height:1,background:th.divider}}),
         h('div',{style:{fontSize:10,color:th.textMuted,letterSpacing:2,whiteSpace:'nowrap',padding:'0 8px'}},'復元・インポート'),
         h('div',{style:{flex:1,height:1,background:th.divider}})
+      ),
+      h('div',{style:{marginBottom:12}},
+        h('div',{style:{fontSize:11,color:th.textSub,letterSpacing:2,marginBottom:8}},'📂 データを追加'),
+        h('div',{style:{fontSize:11,color:th.text,opacity:0.6,marginBottom:8,lineHeight:1.7}},
+          '別のファイルの記録を自分のデータとして追加します。',h('br'),
+          'フォルダー名が同じ場合は既存フォルダーに統合されます。',h('br'),
+          '重複する記録は確認してから追加できます。'
+        ),
+        h('label',{style:{
+          display:'flex',alignItems:'center',justifyContent:'center',gap:8,
+          width:'100%',padding:'12px',borderRadius:10,cursor:'pointer',
+          background:th.cardBg,border:`1px dashed ${th.cardBorder}`,
+          color:th.textSub,fontSize:14,fontFamily:'inherit',
+        }},
+          h('span',{style:{fontSize:18}},'📂'),
+          'ファイルを選択して追加',
+          h('input',{type:'file',accept:'.json',onChange:mergeOwnData,style:{display:'none'}})
+        )
       ),
       h('div',null,
         h('div',{style:{fontSize:11,color:th.textSub,letterSpacing:2,marginBottom:8}},'📥 バックアップから復元'),
