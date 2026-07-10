@@ -239,6 +239,13 @@ const repo={
   async deletePrompt(promptId){
     return reqAsPromise('prompts','readwrite',s=>s.delete(promptId));
   },
+  async toggleFavorite(promptId){
+    const p=await reqAsPromise('prompts','readonly',s=>s.get(promptId));
+    if(!p) return;
+    p.favorite=!p.favorite;
+    p.updatedAt=Date.now();
+    return reqAsPromise('prompts','readwrite',s=>s.put(p));
+  },
   async saveFile(blob,fileName){
     const fileKey=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)
       +'_'+fileName.replace(/[^A-Za-z0-9._-]/g,'_');
@@ -247,7 +254,76 @@ const repo={
   },
   async getFile(fileKey){ return reqAsPromise('files','readonly',s=>s.get(fileKey)); },
   async deleteFile(fileKey){ return reqAsPromise('files','readwrite',s=>s.delete(fileKey)); },
+
+  /* ===== バックアップ（JSONエクスポート/インポート） ===== */
+  async exportAll(){
+    const [items,logs,profiles,prompts]=await Promise.all([
+      reqAsPromise('items','readonly',s=>s.getAll()),
+      reqAsPromise('logs','readonly',s=>s.getAll()),
+      reqAsPromise('profiles','readonly',s=>s.getAll()),
+      reqAsPromise('prompts','readonly',s=>s.getAll()),
+    ]);
+    const fileKeys=new Set();
+    items.forEach(it=>{
+      if(it.fileKey) fileKeys.add(it.fileKey);
+      (it.fileKeys||[]).forEach(k=>fileKeys.add(k));
+    });
+    const files={};
+    for(const key of fileKeys){
+      const blob=await repo.getFile(key);
+      if(blob) files[key]=await blobToDataUri(blob);
+    }
+    return {version:1,exportedAt:new Date().toISOString(),items,logs,profiles,prompts,files};
+  },
+  /* インポートは既存データを保持したまま追加する（上書き・削除はしない）。
+     アイテムIDはstore側で新規採番し直し、sourceItemIdの親子関係とログのitemIdは
+     新IDにマッピングして貼り替える。添付ファイルも新しいfileKeyで保存し直す。
+     profiles/promptsはbusiness key（profileId/promptId）なのでそのままupsertする。 */
+  async importAll(data){
+    if(!data||!Array.isArray(data.items)) throw new Error('不正なバックアップファイルです');
+
+    const fileKeyMap={};
+    for(const [oldKey,dataUri] of Object.entries(data.files||{})){
+      const blob=await dataUriToBlob(dataUri);
+      fileKeyMap[oldKey]=await repo.saveFile(blob,'restored.jpg');
+    }
+
+    const idMap={};
+    const pendingSourceLinks=[];
+    for(const it of data.items){
+      const {id:oldId,sourceItemId:oldSourceItemId,...rest}=it;
+      if(rest.fileKey) rest.fileKey=fileKeyMap[rest.fileKey]||null;
+      if(rest.fileKeys) rest.fileKeys=rest.fileKeys.map(k=>fileKeyMap[k]).filter(Boolean);
+      rest.sourceItemId=null;
+      const newId=await reqAsPromise('items','readwrite',s=>s.add(rest));
+      idMap[oldId]=newId;
+      if(oldSourceItemId!=null) pendingSourceLinks.push({newId,oldSourceItemId});
+    }
+    for(const {newId,oldSourceItemId} of pendingSourceLinks){
+      const mapped=idMap[oldSourceItemId];
+      if(mapped==null) continue;
+      const item=await reqAsPromise('items','readonly',s=>s.get(newId));
+      item.sourceItemId=mapped;
+      await reqAsPromise('items','readwrite',s=>s.put(item));
+    }
+
+    let logCount=0;
+    for(const log of (data.logs||[])){
+      const newItemId=idMap[log.itemId];
+      if(newItemId==null) continue;
+      const {id,...rest}=log;
+      rest.itemId=newItemId;
+      await reqAsPromise('logs','readwrite',s=>s.add(rest));
+      logCount++;
+    }
+
+    for(const p of (data.profiles||[])) await reqAsPromise('profiles','readwrite',s=>s.put(p));
+    for(const p of (data.prompts||[])) await reqAsPromise('prompts','readwrite',s=>s.put(p));
+
+    return {itemCount:data.items.length,logCount};
+  },
 };
+window._repo=repo; /* テスト用に公開 */
 
 /* ===== 出力プロファイルのテンプレート描画 ===== */
 function renderTemplate(template,item){
@@ -327,6 +403,19 @@ async function copyText(text){
     ta.value=text; document.body.appendChild(ta); ta.select();
     const ok=document.execCommand('copy'); ta.remove(); return ok;
   }
+}
+/* バックアップのJSONに画像を埋め込むためのBlob⇔dataURI変換 */
+function blobToDataUri(blob){
+  return new Promise((resolve,reject)=>{
+    const r=new FileReader();
+    r.onload=()=>resolve(r.result);
+    r.onerror=()=>reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+async function dataUriToBlob(dataUri){
+  const res=await fetch(dataUri);
+  return res.blob();
 }
 
 /* ===== スタイル ===== */
@@ -543,6 +632,10 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
     await repo.deletePrompt(p.promptId);
     setPrompts(await repo.fetchPrompts());
   };
+  const toggleFavoritePrompt=async(p)=>{
+    await repo.toggleFavorite(p.promptId);
+    setPrompts(await repo.fetchPrompts());
+  };
   const finalize=async()=>{
     const now=Date.now();
     const fin={title:`${title}（確定版）`,content,rawContent:item.rawContent,
@@ -580,15 +673,25 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
     h('div',{style:{padding:'12px 16px 0'}},
       h('button',{style:{...S.primaryBtn,width:'100%'},onClick:save},'保存')),
 
-    /* ===== プロンプトでコピー（本文の下・検索＋折りたたみ一覧） ===== */
+    /* ===== プロンプトでコピー（本文の下・お気に入り＋検索＋折りたたみ一覧） ===== */
     h('div',{style:S.sectionTitle},'プロンプトでコピー（外部AIに貼り付け）'),
+    (()=>{
+      const favorites=prompts.filter(p=>p.favorite);
+      if(favorites.length===0) return null;
+      return h('div',{style:{display:'flex',flexWrap:'wrap',gap:6,margin:'0 16px 8px'}},
+        favorites.map(p=>h('button',{key:p.promptId,
+          style:{...S.badge,cursor:'pointer',border:'1px solid rgba(255,196,0,.4)',
+            background:'rgba(255,196,0,.12)',color:'#ffd166'},
+          onClick:()=>copyWithPrompt(p)},'⭐ '+p.name)));
+    })(),
     h('div',{style:{position:'relative',margin:'0 16px'}},
       h('input',{style:S.input,placeholder:'プロンプトを検索…',value:promptQuery,
         onChange:e=>setPromptQuery(e.target.value)}),
-      (()=>{ /* 入力予測：一致するプロンプト名を候補表示、タップでコピー */
+      (()=>{ /* 入力予測：一致するプロンプト名を候補表示（お気に入り優先）、タップでコピー */
         const q=promptQuery.trim();
         if(!q) return null;
-        const hits=prompts.filter(p=>p.name.includes(q)||p.promptText.includes(q)).slice(0,5);
+        const hits=prompts.filter(p=>p.name.includes(q)||p.promptText.includes(q))
+          .sort((a,b)=>(b.favorite?1:0)-(a.favorite?1:0)).slice(0,5);
         if(hits.length===0) return null;
         return h('div',{style:{position:'absolute',left:0,right:0,top:'100%',zIndex:15,
           background:'#1c2333',border:'1px solid rgba(122,150,208,.4)',borderRadius:10,
@@ -596,7 +699,7 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
           hits.map(p=>h('button',{key:p.promptId,
             style:{display:'block',width:'100%',textAlign:'left',padding:'11px 14px',
               background:'none',border:'none',color:'#e8e4dc',fontSize:14},
-            onClick:()=>copyWithPrompt(p)},'✨ '+p.name)));
+            onClick:()=>copyWithPrompt(p)},(p.favorite?'⭐':'✨')+' '+p.name)));
       })()),
     h('button',{style:{background:'none',border:'none',color:'#a8bce0',fontSize:13,
         padding:'10px 16px 2px',textAlign:'left',width:'100%'},
@@ -606,8 +709,11 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
       prompts
         .filter(p=>{const q=promptQuery.trim();
           return !q||p.name.includes(q)||p.promptText.includes(q);})
+        .sort((a,b)=>(b.favorite?1:0)-(a.favorite?1:0))
         .map(p=>h('div',{key:p.promptId,
           style:{display:'flex',alignItems:'center',gap:4}},
+          h('button',{style:S.iconBtn,title:p.favorite?'お気に入り解除':'お気に入りに追加',
+            onClick:()=>toggleFavoritePrompt(p)},p.favorite?'⭐':'☆'),
           h('button',{style:{...S.sheetItem,flex:1,borderRadius:10,padding:'10px 8px'},
             onClick:()=>copyWithPrompt(p)},
             '✨',h('span',{style:{flex:1}},p.name)),
@@ -658,11 +764,22 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
 }
 
 /* ===== 一覧（Inbox） ===== */
-function InboxView({items,onOpen,onAdd,busy}){
+function InboxView({items,onOpen,onAdd,busy,onExport,onImportFile}){
+  const importRef=useRef(null);
   return h('div',{style:S.page},
     h('div',{style:S.header},
       h('div',{style:S.title},'AI Workspace'),
-      busy && h('span',{style:S.sub},busy)),
+      busy && h('span',{style:S.sub},busy),
+      h('input',{type:'file',accept:'.json,application/json',ref:importRef,
+        style:{display:'none'},
+        onChange:e=>{
+          const f=e.target.files[0];
+          if(f) onImportFile(f);
+          e.target.value='';
+        }}),
+      h('button',{style:S.iconBtn,title:'バックアップをエクスポート',onClick:onExport},'⬇️'),
+      h('button',{style:S.iconBtn,title:'バックアップをインポート',
+        onClick:()=>importRef.current.click()},'⬆️')),
     items.length===0
       ? h('div',{style:{textAlign:'center',color:'#888',marginTop:100,lineHeight:2}},
           h('div',{style:{fontSize:40}},'🗂️'),
@@ -811,10 +928,46 @@ function App(){
     setView({name:'edit',id});
   };
 
+  /* バックアップ: 全データ＋添付画像をJSONにエクスポート */
+  const exportBackup=async()=>{
+    const data=await repo.exportAll();
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    const date=new Date().toISOString().slice(0,10);
+    a.href=url; a.download=`ai-workspace-backup-${date}.json`;
+    a.click(); URL.revokeObjectURL(url);
+    showToast('バックアップをエクスポートしました');
+  };
+  /* バックアップの読み込み: 既存データは保持したまま追加する（上書き・削除はしない） */
+  const importBackup=async(file)=>{
+    let data;
+    try{
+      data=JSON.parse(await file.text());
+    }catch(e){
+      showToast('JSONの読み込みに失敗しました'); return;
+    }
+    if(!data||!Array.isArray(data.items)){
+      showToast('不正なバックアップファイルです'); return;
+    }
+    if(!confirm(`「${file.name}」を読み込みます。\nアイテム${data.items.length}件を追加します（既存のデータは残ります）。よろしいですか？`))
+      return;
+    setBusy('インポート中…');
+    try{
+      const result=await repo.importAll(data);
+      await reload();
+      setProfiles(await repo.fetchProfiles());
+      showToast(`インポート完了: アイテム${result.itemCount}件・ログ${result.logCount}件`);
+    }catch(e){
+      showToast('インポートに失敗しました: '+(e.message||e));
+    }
+    setBusy('');
+  };
+
   return h(React.Fragment,null,
     view.name==='inbox'
       ? h(InboxView,{items,busy,onOpen:id=>setView({name:'edit',id}),
-          onAdd:()=>setSheetOpen(true)})
+          onAdd:()=>setSheetOpen(true),onExport:exportBackup,onImportFile:importBackup})
       : h(EditView,{itemId:view.id,profiles,showToast,
           onBack:()=>setView({name:'inbox'}),onChanged:reload}),
     sheetOpen && h(AddSheet,{onClose:()=>setSheetOpen(false),
