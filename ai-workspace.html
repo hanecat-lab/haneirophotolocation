@@ -111,11 +111,13 @@ const DEFAULT_PROFILES = [
 /* 外部AI（ChatGPT/Claude等）に貼り付ける用のプロンプト。ユーザーが追加登録できる。
    本文を先に読める（プロンプトコピー結果を単独で使いやすい）よう{{content}}を先頭に置く。 */
 const DEFAULT_PROMPTS = [
-  {promptId:'dedupe_cleanup', name:'重複削除・整形',
+  {promptId:'dedupe_cleanup', name:'重複削除・整形', category:'整形',
    promptText:'{{content}}\n\n----\n上記は書類や画面を連続撮影した複数画像のOCRテキストです。\n次のルールで整えて、本文だけを出力してください。\n- 画像間で重複している部分は1回だけ残して削除する\n- OCRの誤認識と思われる箇所は文脈から自然に修正する\n- 内容の追加・省略・要約はしない'},
-  {promptId:'summary_bullets', name:'要約（箇条書き）',
+  {promptId:'summary_bullets', name:'要約（箇条書き）', category:'要約',
    promptText:'{{content}}\n\n----\n上記の文章を、重要な点を漏らさず日本語の箇条書きで要約してください。'},
 ];
+/* カテゴリ未設定のプロンプトはUI上この名前で扱う */
+const UNCATEGORIZED='未分類';
 /* 旧テンプレート（本文が末尾）。既存ユーザーのデータを新テンプレートへ移行する際の比較用。
    ユーザーが自分で編集済みの場合（旧文言と不一致）は上書きしない。 */
 const OLD_DEFAULT_PROMPTS_TEXT = {
@@ -218,16 +220,23 @@ const repo={
       });
       return;
     }
-    /* 既存ユーザー向け移行: 未編集の旧デフォルトプロンプトだけ新テンプレートに更新する */
+    /* 既存ユーザー向け移行 */
     const existing=await reqAsPromise('prompts','readonly',s=>s.getAll());
-    const toMigrate=DEFAULT_PROMPTS.filter(def=>{
+    const DEFAULT_CATEGORY={dedupe_cleanup:'整形',summary_bullets:'要約'};
+    /* (a) 未編集の旧デフォルトプロンプトは新テンプレートに丸ごと更新する */
+    const textMigrate=DEFAULT_PROMPTS.filter(def=>{
       const cur=existing.find(p=>p.promptId===def.promptId);
       return cur && cur.promptText===OLD_DEFAULT_PROMPTS_TEXT[def.promptId];
     });
-    if(toMigrate.length===0) return;
+    /* (b) デフォルトプロンプトにカテゴリが無い場合だけ補完する（本文の編集内容は触らない） */
+    const catMigrate=existing.filter(p=>
+      DEFAULT_CATEGORY[p.promptId] && p.category===undefined &&
+      !textMigrate.some(t=>t.promptId===p.promptId));
+    if(textMigrate.length===0 && catMigrate.length===0) return;
     await reqAsPromise('prompts','readwrite',s=>{
       let last;
-      toMigrate.forEach(p=>{last=s.put({...p,updatedAt:Date.now()});});
+      textMigrate.forEach(p=>{last=s.put({...p,updatedAt:Date.now()});});
+      catMigrate.forEach(p=>{last=s.put({...p,category:DEFAULT_CATEGORY[p.promptId],updatedAt:Date.now()});});
       return last;
     });
   },
@@ -547,13 +556,14 @@ function CopyModal({profiles,onClose,onSelect}){
 }
 
 /* ===== プロンプト追加・編集フォーム ===== */
-function PromptFormModal({initial,onClose,onSaved}){
+function PromptFormModal({initial,categories,onClose,onSaved}){
   const [form,setForm]=useState(initial);
   const save=async()=>{
     if(!form.name.trim()||!form.promptText.trim()) return;
     await repo.savePrompt({
       promptId: form.promptId || ('user_'+Date.now().toString(36)),
       name: form.name.trim(),
+      category: (form.category||'').trim(),
       promptText: form.promptText,
     });
     onSaved();
@@ -565,6 +575,11 @@ function PromptFormModal({initial,onClose,onSaved}){
       h('input',{style:{...S.input,marginBottom:10},placeholder:'プロンプト名',
         value:form.name,autoFocus:!form.promptId,
         onChange:e=>setForm({...form,name:e.target.value})}),
+      h('input',{style:{...S.input,marginBottom:10},placeholder:'ジャンル（省略可・例: 整形 / 要約 / 翻訳）',
+        list:'prompt-category-list',value:form.category||'',
+        onChange:e=>setForm({...form,category:e.target.value})}),
+      h('datalist',{id:'prompt-category-list'},
+        (categories||[]).map(c=>h('option',{key:c,value:c}))),
       h('textarea',{style:{...S.textarea,minHeight:160},
         placeholder:'プロンプト本文（本文は自動で先頭に追加されます。位置を指定したい場合は{{content}}を使用）',
         value:form.promptText,
@@ -592,6 +607,7 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
   const [promptQuery,setPromptQuery]=useState('');
   const [promptListOpen,setPromptListOpen]=useState(false);
   const [promptForm,setPromptForm]=useState(null);
+  const [promptCategory,setPromptCategory]=useState(''); /* ''=すべて */
 
   const reload=useCallback(async()=>{
     const it=await repo.fetchItem(itemId);
@@ -706,22 +722,45 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
       onClick:()=>setPromptListOpen(!promptListOpen)},
       `${promptListOpen?'▾':'▸'} プロンプト一覧（${prompts.length}件）`),
     promptListOpen && h('div',{style:{padding:'2px 12px 0'}},
+      /* ジャンル絞り込みチップ（すべて + 各カテゴリ・件数付き、未分類は最後） */
+      (()=>{
+        const counts={};
+        prompts.forEach(p=>{const c=(p.category||'').trim()||UNCATEGORIZED;
+          counts[c]=(counts[c]||0)+1;});
+        const cats=Object.keys(counts).sort((a,b)=>
+          a===UNCATEGORIZED?1:b===UNCATEGORIZED?-1:a.localeCompare(b,'ja'));
+        if(cats.length<=1) return null; /* カテゴリが1種類以下ならチップ不要 */
+        const chip=(key,label,active)=>h('button',{key,
+          style:{...S.badge,cursor:'pointer',whiteSpace:'nowrap',
+            border:active?'1px solid rgba(122,150,208,.7)':'1px solid rgba(255,255,255,.12)',
+            background:active?'rgba(122,150,208,.28)':'rgba(255,255,255,.04)',
+            color:active?'#dbe4f5':'#aaa'},
+          onClick:()=>setPromptCategory(active&&key!==''?'':key)},label);
+        return h('div',{style:{display:'flex',flexWrap:'wrap',gap:6,padding:'0 4px 8px'}},
+          chip('','すべて',promptCategory===''),
+          cats.map(c=>chip(c,`${c} (${counts[c]})`,promptCategory===c)));
+      })(),
       prompts
         .filter(p=>{const q=promptQuery.trim();
           return !q||p.name.includes(q)||p.promptText.includes(q);})
+        .filter(p=>{if(!promptCategory) return true;
+          return ((p.category||'').trim()||UNCATEGORIZED)===promptCategory;})
         .sort((a,b)=>(b.favorite?1:0)-(a.favorite?1:0))
         .map(p=>h('div',{key:p.promptId,
           style:{display:'flex',alignItems:'center',gap:4}},
           h('button',{style:S.iconBtn,title:p.favorite?'お気に入り解除':'お気に入りに追加',
             onClick:()=>toggleFavoritePrompt(p)},p.favorite?'⭐':'☆'),
-          h('button',{style:{...S.sheetItem,flex:1,borderRadius:10,padding:'10px 8px'},
+          h('button',{style:{...S.sheetItem,flex:1,borderRadius:10,padding:'10px 8px',
+              alignItems:'center'},
             onClick:()=>copyWithPrompt(p)},
-            '✨',h('span',{style:{flex:1}},p.name)),
+            '✨',h('span',{style:{flex:1}},p.name),
+            h('span',{style:{...S.sub,flexShrink:0}},(p.category||'').trim()||UNCATEGORIZED)),
           h('button',{style:S.iconBtn,title:'編集',
-            onClick:()=>setPromptForm({promptId:p.promptId,name:p.name,promptText:p.promptText})},'✏️'),
+            onClick:()=>setPromptForm({promptId:p.promptId,name:p.name,
+              category:p.category||'',promptText:p.promptText})},'✏️'),
           h('button',{style:S.iconBtn,title:'削除',onClick:()=>removePrompt(p)},'🗑️'))),
       h('button',{style:{...S.ghostBtn,width:'100%',marginTop:6},
-        onClick:()=>setPromptForm({name:'',promptText:''})},'＋ プロンプトを追加')),
+        onClick:()=>setPromptForm({name:'',category:'',promptText:''})},'＋ プロンプトを追加')),
 
     (()=>{
       const keys=item.fileKeys || (item.fileKey?[item.fileKey]:[]);
@@ -758,6 +797,8 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
     h('div',{style:{height:40}}),
     copyOpen && h(CopyModal,{profiles,onClose:()=>setCopyOpen(false),onSelect:copyWith}),
     promptForm && h(PromptFormModal,{initial:promptForm,
+      categories:[...new Set(prompts.map(p=>(p.category||'').trim()).filter(Boolean))]
+        .sort((a,b)=>a.localeCompare(b,'ja')),
       onClose:()=>setPromptForm(null),
       onSaved:async()=>{setPromptForm(null);setPrompts(await repo.fetchPrompts());}}),
   );
