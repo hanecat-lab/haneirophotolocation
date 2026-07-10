@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="author" content="haneiro2026">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>AI Workspace</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+html,body{height:100%;}
+body{font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
+  background:#0d1117;color:#e8e4dc;overscroll-behavior-y:none;}
+button{font-family:inherit;cursor:pointer;}
+textarea,input{font-family:inherit;}
+::-webkit-scrollbar{width:6px;height:6px;}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.15);border-radius:3px;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+
+<script>
+"use strict";
+/* ===== バージョン管理・自動更新 ===== */
+const APP_VERSION="20260710-000000"; /* GitHub Actionsが自動更新するため手動で変更しない */
+
+async function checkForUpdate(){
+  try{
+    const res=await fetch(location.href.split("?")[0]+"?_v="+Date.now(),
+      {cache:"no-store"});
+    if(!res.ok) return;
+    const txt=await res.text();
+    const m=txt.match(/APP_VERSION="([^"]+)"/);
+    if(m && m[1] && m[1]!==APP_VERSION){
+      showUpdateBanner(m[1]);
+    }
+  }catch(e){}
+}
+function showUpdateBanner(newVer){
+  if(document.getElementById("updateBanner")) return; /* 重複防止 */
+  const b=document.createElement("div");
+  b.id="updateBanner";
+  b.style.cssText="position:fixed;top:0;left:0;right:0;z-index:9999;"
+    +"background:#1565c0;color:#fff;display:flex;align-items:center;"
+    +"padding:10px 14px;gap:10px;font-size:13px;";
+  b.innerHTML='<span style="flex:1;">🆕 新しいバージョンがあります</span>'
+    +'<button onclick="location.reload(true)" style="background:#fff;color:#1565c0;'
+    +'border:none;border-radius:8px;padding:6px 12px;font-weight:700;cursor:pointer;'
+    +'font-size:13px;">更新する</button>'
+    +'<button onclick="this.parentElement.remove()" style="background:none;border:none;'
+    +'color:#fff;font-size:18px;cursor:pointer;padding:0 4px;">×</button>';
+  document.body.prepend(b);
+}
+/* 起動時1回 + 60分ごとにチェック */
+setTimeout(checkForUpdate, 3000); /* 起動直後は3秒後 */
+setInterval(checkForUpdate, 60*60*1000);
+
+/* ===== バージョン表示（左下・印刷時非表示） ===== */
+(function(){
+  var st=document.createElement('style');
+  st.textContent='@media print{#appVerBadge{display:none!important}}';
+  document.head.appendChild(st);
+  var v=document.createElement('div');
+  v.id='appVerBadge';
+  v.textContent='ver.'+APP_VERSION;
+  v.style.cssText='position:fixed;bottom:4px;left:6px;font-size:10px;color:#888;opacity:.75;z-index:9998;pointer-events:none;';
+  document.body.appendChild(v);
+})();
+</script>
+
+<script>
+'use strict';
+const {useState,useEffect,useCallback,useRef} = React;
+const h = React.createElement;
+
+/* =====================================================================
+   AI Workspace（Web版）
+   - あらゆる情報を再利用可能な資産(WorkspaceItem)として扱うナレッジワークスペース
+   - 出力プロファイル駆動：コピーは必ずOutputProfileのテンプレートを通す
+   - ナレッジグラフ：sourceItemId で発生源→成果物の依存関係を追跡
+   - 全データはIndexedDBにローカル保存（サーバーレス・APIキー不要）
+   - OCRはTesseract.js（CDN・端末内処理・要ネット接続※初回モデル取得）
+   ===================================================================== */
+
+/* ===== 定数 ===== */
+const ROLES = {
+  input:      {label:'入力',        icon:'📥'},
+  aiResponse: {label:'AI回答',      icon:'🤖'},
+  finalized:  {label:'確定版',      icon:'✅'},
+  template:   {label:'テンプレート', icon:'📋'},
+};
+const LOG_ACTIONS = {
+  create:      {label:'作成',     icon:'＋'},
+  edit:        {label:'編集',     icon:'✏️'},
+  ocr:         {label:'OCR',      icon:'🔍'},
+  copy:        {label:'コピー',   icon:'📄'},
+  aiInference: {label:'AI実行',   icon:'🤖'},
+  workflowRun: {label:'ワークフロー実行', icon:'▶️'},
+};
+const DEFAULT_PROFILES = [
+  {profileId:'plain_text',    name:'プレーンテキスト',        formatType:'text',
+   templateText:'{{content}}'},
+  {profileId:'markdown_spec', name:'Markdown（見出し付き）',  formatType:'markdown',
+   templateText:'## {{title}}\n\n{{content}}\n'},
+  {profileId:'json_summary',  name:'JSONサマリー',            formatType:'json',
+   templateText:'{\n  "title": "{{title}}",\n  "content": "{{content}}"\n}'},
+];
+
+/* ===== IndexedDB ===== */
+const DB_NAME='ai-workspace-v1', DB_VER=1;
+let _db=null;
+function openDb(){
+  if(_db) return Promise.resolve(_db);
+  return new Promise((resolve,reject)=>{
+    const req=indexedDB.open(DB_NAME,DB_VER);
+    req.onupgradeneeded=e=>{
+      const db=e.target.result;
+      const items=db.createObjectStore('items',{keyPath:'id',autoIncrement:true});
+      items.createIndex('sourceItemId','sourceItemId');
+      const logs=db.createObjectStore('logs',{keyPath:'id',autoIncrement:true});
+      logs.createIndex('itemId','itemId');
+      db.createObjectStore('profiles',{keyPath:'profileId'});
+      db.createObjectStore('files'); /* key=fileKey, value=Blob */
+    };
+    req.onsuccess=()=>{_db=req.result;resolve(_db);};
+    req.onerror=()=>reject(req.error);
+  });
+}
+function tx(store,mode,fn){
+  return openDb().then(db=>new Promise((resolve,reject)=>{
+    const t=db.transaction(store,mode);
+    const result=fn(t.objectStore(store));
+    t.oncomplete=()=>resolve(result && result.result!==undefined ? result.result : result);
+    t.onerror=()=>reject(t.error);
+  }));
+}
+function reqAsPromise(store,mode,fn){
+  return openDb().then(db=>new Promise((resolve,reject)=>{
+    const t=db.transaction(store,mode);
+    const req=fn(t.objectStore(store));
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error);
+  }));
+}
+
+/* ===== リポジトリ ===== */
+const repo={
+  async fetchAllItems(){
+    const items=await reqAsPromise('items','readonly',s=>s.getAll());
+    return items.sort((a,b)=>b.createdAt-a.createdAt);
+  },
+  async fetchItem(id){ return reqAsPromise('items','readonly',s=>s.get(id)); },
+  async saveItem(item){
+    item.updatedAt=Date.now();
+    const id=await reqAsPromise('items','readwrite',s=>s.put(item));
+    item.id=id;
+    return id;
+  },
+  async deleteItem(id){
+    const logs=await reqAsPromise('logs','readonly',s=>s.index('itemId').getAll(id));
+    await reqAsPromise('logs','readwrite',s=>{
+      logs.forEach(l=>s.delete(l.id));
+      return s.count(); /* ダミーの最終リクエスト */
+    });
+    return reqAsPromise('items','readwrite',s=>s.delete(id));
+  },
+  async fetchDerived(id){
+    return reqAsPromise('items','readonly',s=>s.index('sourceItemId').getAll(id));
+  },
+  async saveLog(itemId,action,description){
+    return reqAsPromise('logs','readwrite',s=>s.put({
+      itemId, action, description, executedAt:Date.now(),
+    }));
+  },
+  async fetchLogs(itemId){
+    const logs=await reqAsPromise('logs','readonly',s=>s.index('itemId').getAll(itemId));
+    return logs.sort((a,b)=>b.executedAt-a.executedAt);
+  },
+  async seedProfiles(){
+    const count=await reqAsPromise('profiles','readonly',s=>s.count());
+    if(count>0) return;
+    await reqAsPromise('profiles','readwrite',s=>{
+      let last;
+      DEFAULT_PROFILES.forEach(p=>{last=s.put({...p,updatedAt:Date.now()});});
+      return last;
+    });
+  },
+  async fetchProfiles(){ return reqAsPromise('profiles','readonly',s=>s.getAll()); },
+  async saveFile(blob,fileName){
+    const fileKey=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)
+      +'_'+fileName.replace(/[^A-Za-z0-9._-]/g,'_');
+    await reqAsPromise('files','readwrite',s=>s.put(blob,fileKey));
+    return fileKey;
+  },
+  async getFile(fileKey){ return reqAsPromise('files','readonly',s=>s.get(fileKey)); },
+  async deleteFile(fileKey){ return reqAsPromise('files','readwrite',s=>s.delete(fileKey)); },
+};
+
+/* ===== 出力プロファイルのテンプレート描画 ===== */
+function renderTemplate(template,item){
+  return template
+    .replaceAll('{{title}}',item.title||'')
+    .replaceAll('{{content}}',item.content||'')
+    .replaceAll('{{rawContent}}',item.rawContent||'');
+}
+
+/* ===== OCR（Tesseract.js を遅延ロード） ===== */
+let _tesseractLoading=null;
+function loadTesseract(){
+  if(window.Tesseract) return Promise.resolve();
+  if(_tesseractLoading) return _tesseractLoading;
+  _tesseractLoading=new Promise((resolve,reject)=>{
+    const s=document.createElement('script');
+    s.src='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+    s.onload=()=>resolve();
+    s.onerror=()=>{_tesseractLoading=null;reject(new Error('OCRライブラリの読み込みに失敗しました（ネット接続を確認してください）'));};
+    document.head.appendChild(s);
+  });
+  return _tesseractLoading;
+}
+async function runOcr(blob,onProgress){
+  await loadTesseract();
+  const result=await window.Tesseract.recognize(blob,'jpn+eng',{
+    logger:m=>{ if(m.status==='recognizing text') onProgress(m.progress); },
+  });
+  /* 日本語OCRは文字間に不要な半角スペースが入りやすいので軽く整形 */
+  return result.data.text.replace(/([぀-ヿ一-鿿]) (?=[぀-ヿ一-鿿])/g,'$1').trim();
+}
+
+/* ===== ユーティリティ ===== */
+function fmtDate(ts){
+  const d=new Date(ts), p=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}/${p(d.getMonth()+1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+async function copyText(text){
+  try{ await navigator.clipboard.writeText(text); return true; }
+  catch(e){
+    const ta=document.createElement('textarea');
+    ta.value=text; document.body.appendChild(ta); ta.select();
+    const ok=document.execCommand('copy'); ta.remove(); return ok;
+  }
+}
+
+/* ===== スタイル ===== */
+const S={
+  page:{maxWidth:640,margin:'0 auto',minHeight:'100vh',display:'flex',flexDirection:'column'},
+  header:{position:'sticky',top:0,zIndex:10,background:'rgba(13,17,23,.92)',
+    backdropFilter:'blur(8px)',padding:'14px 16px',display:'flex',alignItems:'center',gap:10,
+    borderBottom:'1px solid rgba(255,255,255,.07)'},
+  title:{fontSize:17,fontWeight:700,flex:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'},
+  iconBtn:{background:'none',border:'none',color:'#e8e4dc',fontSize:18,padding:'6px 8px',borderRadius:8},
+  card:{background:'rgba(255,255,255,.03)',border:'1px solid rgba(255,255,255,.07)',
+    borderRadius:12,padding:'12px 14px',margin:'0 12px 8px',cursor:'pointer'},
+  badge:{display:'inline-flex',alignItems:'center',gap:4,background:'rgba(122,150,208,.15)',
+    border:'1px solid rgba(122,150,208,.3)',borderRadius:999,padding:'1px 8px',fontSize:11,color:'#a8bce0'},
+  sub:{fontSize:11,color:'#888'},
+  fab:{position:'fixed',right:18,bottom:26,width:56,height:56,borderRadius:18,
+    background:'#7a96d0',color:'#0d1117',fontSize:28,border:'none',
+    boxShadow:'0 4px 16px rgba(0,0,0,.45)',zIndex:20},
+  sheetWrap:{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',zIndex:30,
+    display:'flex',alignItems:'flex-end',justifyContent:'center'},
+  sheet:{background:'#161b26',borderRadius:'16px 16px 0 0',width:'100%',maxWidth:640,
+    padding:'10px 0 24px'},
+  sheetItem:{display:'flex',alignItems:'center',gap:12,width:'100%',padding:'14px 20px',
+    background:'none',border:'none',color:'#e8e4dc',fontSize:15,textAlign:'left'},
+  modalWrap:{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',zIndex:30,
+    display:'flex',alignItems:'center',justifyContent:'center',padding:16},
+  modal:{background:'#161b26',borderRadius:16,width:'100%',maxWidth:480,padding:20},
+  input:{width:'100%',background:'rgba(255,255,255,.05)',border:'1px solid rgba(255,255,255,.15)',
+    borderRadius:10,color:'#e8e4dc',padding:'10px 12px',fontSize:15,outline:'none'},
+  textarea:{width:'100%',background:'rgba(255,255,255,.05)',border:'1px solid rgba(255,255,255,.15)',
+    borderRadius:10,color:'#e8e4dc',padding:'10px 12px',fontSize:15,outline:'none',
+    resize:'vertical',lineHeight:1.6},
+  primaryBtn:{background:'#7a96d0',color:'#0d1117',border:'none',borderRadius:10,
+    padding:'10px 18px',fontSize:14,fontWeight:700},
+  ghostBtn:{background:'none',color:'#a8bce0',border:'1px solid rgba(122,150,208,.4)',
+    borderRadius:10,padding:'10px 18px',fontSize:14},
+  dangerBtn:{background:'rgba(224,128,128,.15)',color:'#e08080',
+    border:'1px solid rgba(224,128,128,.4)',borderRadius:10,padding:'10px 18px',fontSize:14},
+  sectionTitle:{fontSize:12,fontWeight:700,color:'#888',margin:'20px 16px 8px',letterSpacing:.5},
+  toast:{position:'fixed',bottom:96,left:'50%',transform:'translateX(-50%)',zIndex:40,
+    background:'#2a3548',color:'#e8e4dc',borderRadius:10,padding:'10px 18px',fontSize:13,
+    boxShadow:'0 4px 16px rgba(0,0,0,.5)',whiteSpace:'nowrap'},
+};
+
+/* ===== 小物コンポーネント ===== */
+function RoleBadge({role}){
+  const r=ROLES[role]||ROLES.input;
+  return h('span',{style:S.badge},r.icon+' '+r.label);
+}
+function Toast({msg}){ return msg? h('div',{style:S.toast},msg):null; }
+
+/* ===== 添付画像 ===== */
+function AttachedImage({fileKey}){
+  const [url,setUrl]=useState(null);
+  useEffect(()=>{
+    let revoke=null;
+    repo.getFile(fileKey).then(blob=>{
+      if(blob){ revoke=URL.createObjectURL(blob); setUrl(revoke); }
+    });
+    return ()=>{ if(revoke) URL.revokeObjectURL(revoke); };
+  },[fileKey]);
+  if(!url) return h('div',{style:{...S.sub,margin:'0 16px'}},'画像を読み込み中…');
+  return h('img',{src:url,style:{maxWidth:'calc(100% - 32px)',margin:'0 16px',
+    borderRadius:12,border:'1px solid rgba(255,255,255,.1)'}});
+}
+
+/* ===== 追加シート ===== */
+function AddSheet({onClose,onPickImage,onAddText}){
+  const fileRef=useRef(null);
+  const ocrRef=useRef(true);
+  return h('div',{style:S.sheetWrap,onClick:onClose},
+    h('div',{style:S.sheet,onClick:e=>e.stopPropagation()},
+      h('input',{type:'file',accept:'image/*',ref:fileRef,style:{display:'none'},
+        onChange:e=>{
+          const f=e.target.files[0];
+          if(f){ onPickImage(f,ocrRef.current); }
+          e.target.value='';
+        }}),
+      h('button',{style:S.sheetItem,onClick:()=>{ocrRef.current=true;fileRef.current.click();}},
+        '🔍',h('span',null,'画像からOCR',
+          h('div',{style:S.sub},'端末内で文字認識（初回はモデル取得のためネット接続が必要）'))),
+      h('button',{style:S.sheetItem,onClick:()=>{ocrRef.current=false;fileRef.current.click();}},
+        '🖼️',h('span',null,'画像を取り込むだけ',
+          h('div',{style:S.sub},'OCRせずに画像を資産として保存'))),
+      h('button',{style:S.sheetItem,onClick:onAddText},
+        '📝',h('span',null,'テキストを追加')),
+    ));
+}
+
+/* ===== テキスト追加モーダル ===== */
+function AddTextModal({onClose,onSave}){
+  const [title,setTitle]=useState('');
+  const [text,setText]=useState('');
+  return h('div',{style:S.modalWrap,onClick:onClose},
+    h('div',{style:S.modal,onClick:e=>e.stopPropagation()},
+      h('div',{style:{fontSize:16,fontWeight:700,marginBottom:14}},'テキストを追加'),
+      h('input',{style:{...S.input,marginBottom:10},placeholder:'タイトル（省略可）',
+        value:title,onChange:e=>setTitle(e.target.value)}),
+      h('textarea',{style:{...S.textarea,minHeight:120},placeholder:'本文',autoFocus:true,
+        value:text,onChange:e=>setText(e.target.value)}),
+      h('div',{style:{display:'flex',gap:10,justifyContent:'flex-end',marginTop:14}},
+        h('button',{style:S.ghostBtn,onClick:onClose},'キャンセル'),
+        h('button',{style:S.primaryBtn,disabled:!text.trim(),
+          onClick:()=>{ if(text.trim()) onSave(title.trim(),text); }},'追加'),
+      )));
+}
+
+/* ===== コピー（出力プロファイル選択）モーダル ===== */
+function CopyModal({profiles,onClose,onSelect}){
+  return h('div',{style:S.modalWrap,onClick:onClose},
+    h('div',{style:S.modal,onClick:e=>e.stopPropagation()},
+      h('div',{style:{fontSize:16,fontWeight:700,marginBottom:6}},'出力プロファイルを選んでコピー'),
+      h('div',{style:{...S.sub,marginBottom:12}},'コピーは必ず出力形式（プロファイル）を通します'),
+      profiles.map(p=>h('button',{key:p.profileId,style:{...S.sheetItem,borderRadius:10},
+        onClick:()=>onSelect(p)},
+        '📄',h('span',null,p.name,h('div',{style:S.sub},p.formatType)))),
+    ));
+}
+
+/* ===== 編集画面 ===== */
+function EditView({itemId,onBack,onChanged,showToast,profiles}){
+  const [item,setItem]=useState(null);
+  const [source,setSource]=useState(null);
+  const [derived,setDerived]=useState([]);
+  const [logs,setLogs]=useState([]);
+  const [title,setTitle]=useState('');
+  const [content,setContent]=useState('');
+  const [copyOpen,setCopyOpen]=useState(false);
+
+  const reload=useCallback(async()=>{
+    const it=await repo.fetchItem(itemId);
+    if(!it){ onBack(); return; }
+    setItem(it); setTitle(it.title); setContent(it.content||'');
+    setSource(it.sourceItemId ? await repo.fetchItem(it.sourceItemId) : null);
+    setDerived(await repo.fetchDerived(itemId));
+    setLogs(await repo.fetchLogs(itemId));
+  },[itemId,onBack]);
+  useEffect(()=>{ reload(); },[reload]);
+
+  if(!item) return h('div',{style:{padding:40,textAlign:'center',color:'#888'}},'読み込み中…');
+
+  const save=async()=>{
+    await repo.saveItem({...item,title,content});
+    await repo.saveLog(item.id,'edit','内容を編集');
+    showToast('保存しました'); reload(); onChanged();
+  };
+  const copyWith=async(profile)=>{
+    setCopyOpen(false);
+    const ok=await copyText(renderTemplate(profile.templateText,{...item,title,content}));
+    await repo.saveLog(item.id,'copy',`「${profile.name}」形式でコピー`);
+    showToast(ok?`「${profile.name}」形式でコピーしました`:'コピーに失敗しました');
+    reload();
+  };
+  const finalize=async()=>{
+    const now=Date.now();
+    const fin={title:`${title}（確定版）`,content,rawContent:item.rawContent,
+      role:'finalized',sourceItemId:item.id,fileKey:null,
+      metadata:{source:'finalize',sourceItemId:item.id},createdAt:now,updatedAt:now};
+    const newId=await repo.saveItem(fin);
+    await repo.saveLog(newId,'create',`「${title}」から確定版を作成`);
+    showToast('確定版を作成しました'); reload(); onChanged();
+  };
+  const remove=async()=>{
+    if(!confirm('このアイテムと操作ログ、添付ファイルを削除します。よろしいですか？')) return;
+    if(item.fileKey) await repo.deleteFile(item.fileKey);
+    await repo.deleteItem(item.id);
+    onChanged(); onBack();
+  };
+
+  return h('div',{style:S.page},
+    h('div',{style:S.header},
+      h('button',{style:S.iconBtn,onClick:onBack},'←'),
+      h('div',{style:S.title},item.title),
+      h('button',{style:S.iconBtn,title:'コピー',onClick:()=>setCopyOpen(true)},'📄'),
+      h('button',{style:S.iconBtn,title:'確定版を作成',onClick:finalize},'✅'),
+      h('button',{style:S.iconBtn,title:'削除',onClick:remove},'🗑️'),
+    ),
+    h('div',{style:{padding:'14px 16px 0',display:'flex',alignItems:'center',gap:8}},
+      h(RoleBadge,{role:item.role}),
+      h('span',{style:{...S.sub,marginLeft:'auto'}},'更新: '+fmtDate(item.updatedAt))),
+    h('div',{style:{padding:'12px 16px 0'}},
+      h('input',{style:S.input,value:title,placeholder:'タイトル',
+        onChange:e=>setTitle(e.target.value)})),
+    h('div',{style:{padding:'10px 16px 0'}},
+      h('textarea',{style:{...S.textarea,minHeight:200},value:content,placeholder:'本文',
+        onChange:e=>setContent(e.target.value)})),
+    h('div',{style:{padding:'12px 16px 0'}},
+      h('button',{style:{...S.primaryBtn,width:'100%'},onClick:save},'保存')),
+
+    item.fileKey && h(React.Fragment,null,
+      h('div',{style:S.sectionTitle},'添付画像'),
+      h(AttachedImage,{fileKey:item.fileKey})),
+
+    (source||derived.length>0) && h(React.Fragment,null,
+      h('div',{style:S.sectionTitle},'関連（ナレッジグラフ）'),
+      source && h('div',{style:{...S.card,display:'flex',alignItems:'center',gap:8},
+        onClick:()=>{onBack();setTimeout(()=>window._openItem&&window._openItem(source.id),0);}},
+        ROLES[source.role]?.icon||'📥',
+        h('div',{style:{flex:1,minWidth:0}},
+          h('div',{style:{whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}},source.title),
+          h('div',{style:S.sub},'元アイテム')),'›'),
+      derived.map(d=>h('div',{key:d.id,style:{...S.card,display:'flex',alignItems:'center',gap:8},
+        onClick:()=>{onBack();setTimeout(()=>window._openItem&&window._openItem(d.id),0);}},
+        ROLES[d.role]?.icon||'📥',
+        h('div',{style:{flex:1,minWidth:0}},
+          h('div',{style:{whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}},d.title),
+          h('div',{style:S.sub},'派生アイテム')),'›'))),
+
+    h('div',{style:S.sectionTitle},'操作ログ'),
+    logs.length===0
+      ? h('div',{style:{...S.sub,margin:'0 16px 24px'}},'ログはまだありません')
+      : logs.map(l=>h('div',{key:l.id,
+          style:{display:'flex',gap:10,alignItems:'baseline',padding:'6px 16px',fontSize:13}},
+          h('span',null,(LOG_ACTIONS[l.action]||{}).icon||'・'),
+          h('span',{style:{flex:1}},l.description||(LOG_ACTIONS[l.action]||{}).label||l.action),
+          h('span',{style:S.sub},fmtDate(l.executedAt)))),
+    h('div',{style:{height:40}}),
+    copyOpen && h(CopyModal,{profiles,onClose:()=>setCopyOpen(false),onSelect:copyWith}),
+  );
+}
+
+/* ===== 一覧（Inbox） ===== */
+function InboxView({items,onOpen,onAdd,busy}){
+  return h('div',{style:S.page},
+    h('div',{style:S.header},
+      h('div',{style:S.title},'AI Workspace'),
+      busy && h('span',{style:S.sub},busy)),
+    items.length===0
+      ? h('div',{style:{textAlign:'center',color:'#888',marginTop:100,lineHeight:2}},
+          h('div',{style:{fontSize:40}},'🗂️'),
+          'アイテムがありません',h('br'),
+          h('span',{style:S.sub},'右下の＋から画像OCRまたはテキストを追加'))
+      : h('div',{style:{paddingTop:10,paddingBottom:110}},
+          items.map(it=>{
+            const snippet=(it.content||'').replace(/\n/g,' ').slice(0,80);
+            return h('div',{key:it.id,style:S.card,onClick:()=>onOpen(it.id)},
+              h('div',{style:{display:'flex',alignItems:'center',gap:8,marginBottom:4}},
+                h('span',null,(ROLES[it.role]||{}).icon||'📥'),
+                h('div',{style:{fontWeight:600,flex:1,minWidth:0,whiteSpace:'nowrap',
+                  overflow:'hidden',textOverflow:'ellipsis'}},it.title)),
+              snippet && h('div',{style:{fontSize:13,color:'#aaa',marginBottom:6,
+                overflow:'hidden',display:'-webkit-box',WebkitLineClamp:2,
+                WebkitBoxOrient:'vertical'}},snippet),
+              h('div',{style:{display:'flex',alignItems:'center',gap:8}},
+                h(RoleBadge,{role:it.role}),
+                it.fileKey && h('span',{style:S.sub},'📎'),
+                h('span',{style:{...S.sub,marginLeft:'auto'}},fmtDate(it.createdAt))));
+          })),
+    h('button',{style:S.fab,onClick:onAdd},'＋'),
+  );
+}
+
+/* ===== アプリ本体 ===== */
+function App(){
+  const [items,setItems]=useState([]);
+  const [profiles,setProfiles]=useState([]);
+  const [view,setView]=useState({name:'inbox'});
+  const [sheetOpen,setSheetOpen]=useState(false);
+  const [textModal,setTextModal]=useState(false);
+  const [busy,setBusy]=useState('');
+  const [toast,setToast]=useState('');
+
+  const showToast=useCallback(msg=>{
+    setToast(msg); setTimeout(()=>setToast(''),2200);
+  },[]);
+  const reload=useCallback(async()=>{ setItems(await repo.fetchAllItems()); },[]);
+
+  useEffect(()=>{
+    (async()=>{
+      await repo.seedProfiles();
+      setProfiles(await repo.fetchProfiles());
+      await reload();
+    })();
+  },[reload]);
+
+  /* 関連アイテムからの画面遷移用フック */
+  useEffect(()=>{ window._openItem=id=>setView({name:'edit',id}); },[]);
+
+  const addText=async(title,text)=>{
+    setTextModal(false);
+    const now=Date.now();
+    const id=await repo.saveItem({
+      title:title||('TEXT_'+now), content:text, rawContent:text,
+      role:'input', sourceItemId:null, fileKey:null,
+      metadata:{source:'text'}, createdAt:now, updatedAt:now});
+    await repo.saveLog(id,'create','テキスト入力から作成');
+    await reload(); showToast('追加しました');
+  };
+
+  const importImage=async(file,withOcr)=>{
+    setSheetOpen(false);
+    const now=Date.now();
+    /* 1. 先に画像を保存（OCR失敗・中断でも画像は失われない） */
+    setBusy('画像を保存中…');
+    const fileKey=await repo.saveFile(file,file.name||('image_'+now+'.jpg'));
+    let text='', ocrError=null, ocrMs=0;
+    if(withOcr){
+      try{
+        const t0=Date.now();
+        setBusy('OCR準備中…');
+        text=await runOcr(file,p=>setBusy('OCR中… '+Math.round(p*100)+'%'));
+        ocrMs=Date.now()-t0;
+      }catch(e){ ocrError=String(e.message||e); }
+    }
+    setBusy('');
+    const id=await repo.saveItem({
+      title:'OCR_'+now, content:text, rawContent:text,
+      role:'input', sourceItemId:null, fileKey,
+      metadata:{source:'image',fileName:file.name,fileSize:file.size,
+        ocrDurationMs:ocrMs,...(ocrError?{ocrError}:{})},
+      createdAt:now, updatedAt:now});
+    await repo.saveLog(id,'ocr',
+      withOcr ? (ocrError?('OCR失敗（画像は保存済み）: '+ocrError):'画像から文字を抽出')
+              : '画像を取り込み（OCRなし）');
+    await reload();
+    showToast(ocrError?'OCRに失敗しましたが画像は保存しました':'追加しました');
+    setView({name:'edit',id});
+  };
+
+  return h(React.Fragment,null,
+    view.name==='inbox'
+      ? h(InboxView,{items,busy,onOpen:id=>setView({name:'edit',id}),
+          onAdd:()=>setSheetOpen(true)})
+      : h(EditView,{itemId:view.id,profiles,showToast,
+          onBack:()=>setView({name:'inbox'}),onChanged:reload}),
+    sheetOpen && h(AddSheet,{onClose:()=>setSheetOpen(false),
+      onPickImage:importImage,
+      onAddText:()=>{setSheetOpen(false);setTextModal(true);}}),
+    textModal && h(AddTextModal,{onClose:()=>setTextModal(false),onSave:addText}),
+    h(Toast,{msg:toast}),
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(h(App));
+</script>
+</body>
+</html>
