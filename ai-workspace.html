@@ -108,13 +108,20 @@ const DEFAULT_PROFILES = [
   {profileId:'json_summary',  name:'JSONサマリー',            formatType:'json',
    templateText:'{\n  "title": "{{title}}",\n  "content": "{{content}}"\n}'},
 ];
-/* 外部AI（ChatGPT/Claude等）に貼り付ける用のプロンプト。ユーザーが追加登録できる */
+/* 外部AI（ChatGPT/Claude等）に貼り付ける用のプロンプト。ユーザーが追加登録できる。
+   本文を先に読める（プロンプトコピー結果を単独で使いやすい）よう{{content}}を先頭に置く。 */
 const DEFAULT_PROMPTS = [
   {promptId:'dedupe_cleanup', name:'重複削除・整形',
-   promptText:'以下は書類や画面を連続撮影した複数画像のOCRテキストです。\n次のルールで整えて、本文だけを出力してください。\n- 画像間で重複している部分は1回だけ残して削除する\n- OCRの誤認識と思われる箇所は文脈から自然に修正する\n- 内容の追加・省略・要約はしない\n\n----\n{{content}}'},
+   promptText:'{{content}}\n\n----\n上記は書類や画面を連続撮影した複数画像のOCRテキストです。\n次のルールで整えて、本文だけを出力してください。\n- 画像間で重複している部分は1回だけ残して削除する\n- OCRの誤認識と思われる箇所は文脈から自然に修正する\n- 内容の追加・省略・要約はしない'},
   {promptId:'summary_bullets', name:'要約（箇条書き）',
-   promptText:'以下の文章を、重要な点を漏らさず日本語の箇条書きで要約してください。\n\n----\n{{content}}'},
+   promptText:'{{content}}\n\n----\n上記の文章を、重要な点を漏らさず日本語の箇条書きで要約してください。'},
 ];
+/* 旧テンプレート（本文が末尾）。既存ユーザーのデータを新テンプレートへ移行する際の比較用。
+   ユーザーが自分で編集済みの場合（旧文言と不一致）は上書きしない。 */
+const OLD_DEFAULT_PROMPTS_TEXT = {
+  dedupe_cleanup:'以下は書類や画面を連続撮影した複数画像のOCRテキストです。\n次のルールで整えて、本文だけを出力してください。\n- 画像間で重複している部分は1回だけ残して削除する\n- OCRの誤認識と思われる箇所は文脈から自然に修正する\n- 内容の追加・省略・要約はしない\n\n----\n{{content}}',
+  summary_bullets:'以下の文章を、重要な点を漏らさず日本語の箇条書きで要約してください。\n\n----\n{{content}}',
+};
 
 /* ===== IndexedDB ===== */
 const DB_NAME='ai-workspace-v1', DB_VER=2;
@@ -203,10 +210,24 @@ const repo={
   async fetchProfiles(){ return reqAsPromise('profiles','readonly',s=>s.getAll()); },
   async seedPrompts(){
     const count=await reqAsPromise('prompts','readonly',s=>s.count());
-    if(count>0) return;
+    if(count===0){
+      await reqAsPromise('prompts','readwrite',s=>{
+        let last;
+        DEFAULT_PROMPTS.forEach(p=>{last=s.put({...p,updatedAt:Date.now()});});
+        return last;
+      });
+      return;
+    }
+    /* 既存ユーザー向け移行: 未編集の旧デフォルトプロンプトだけ新テンプレートに更新する */
+    const existing=await reqAsPromise('prompts','readonly',s=>s.getAll());
+    const toMigrate=DEFAULT_PROMPTS.filter(def=>{
+      const cur=existing.find(p=>p.promptId===def.promptId);
+      return cur && cur.promptText===OLD_DEFAULT_PROMPTS_TEXT[def.promptId];
+    });
+    if(toMigrate.length===0) return;
     await reqAsPromise('prompts','readwrite',s=>{
       let last;
-      DEFAULT_PROMPTS.forEach(p=>{last=s.put({...p,updatedAt:Date.now()});});
+      toMigrate.forEach(p=>{last=s.put({...p,updatedAt:Date.now()});});
       return last;
     });
   },
@@ -234,6 +255,18 @@ function renderTemplate(template,item){
     .replaceAll('{{title}}',item.title||'')
     .replaceAll('{{content}}',item.content||'')
     .replaceAll('{{rawContent}}',item.rawContent||'');
+}
+
+/* プロンプトコピー用の描画。{{content}}が書かれていればその位置（意図した配置）を尊重するが、
+   書き忘れていても本文が抜け落ちないよう自動で追加する（別コピー不要にするため）。
+   自動追加時は本文を先頭に、プロンプト指示文を後ろにする
+   （コピー結果を単独で読む/使う場合に本文がすぐ見えるようにするため）。 */
+function renderPromptCopy(promptText,item){
+  const rendered=renderTemplate(promptText,item);
+  if(promptText.includes('{{content}}')) return rendered;
+  const body=(item.content||'').trim();
+  if(!body) return rendered;
+  return body+'\n\n----\n'+rendered.replace(/^\s+/,'');
 }
 
 /* ===== 連続画像OCRの重複トリム =====
@@ -444,11 +477,12 @@ function PromptFormModal({initial,onClose,onSaved}){
         value:form.name,autoFocus:!form.promptId,
         onChange:e=>setForm({...form,name:e.target.value})}),
       h('textarea',{style:{...S.textarea,minHeight:160},
-        placeholder:'プロンプト本文（{{content}} の位置に本文が差し込まれます）',
+        placeholder:'プロンプト本文（本文は自動で先頭に追加されます。位置を指定したい場合は{{content}}を使用）',
         value:form.promptText,
         onChange:e=>setForm({...form,promptText:e.target.value})}),
       h('div',{style:{...S.sub,marginTop:6}},
-        '使える差し込み: {{title}} / {{content}} / {{rawContent}}'),
+        '{{content}}を書かなくても本文は自動で先頭に付きます。位置を指定したい場合は '+
+        '{{title}} / {{content}} / {{rawContent}} が使えます'),
       h('div',{style:{display:'flex',gap:10,justifyContent:'flex-end',marginTop:14}},
         h('button',{style:S.ghostBtn,onClick:onClose},'キャンセル'),
         h('button',{style:S.primaryBtn,
@@ -497,7 +531,7 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
   };
   const copyWithPrompt=async(prompt)=>{
     setPromptQuery('');
-    const ok=await copyText(renderTemplate(prompt.promptText,{...item,title,content}));
+    const ok=await copyText(renderPromptCopy(prompt.promptText,{...item,title,content}));
     await repo.saveLog(item.id,'copy',`プロンプト「${prompt.name}」でコピー`);
     showToast(ok
       ?`プロンプト「${prompt.name}」でコピーしました。AIに貼り付けてください`
