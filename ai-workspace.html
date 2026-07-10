@@ -108,9 +108,16 @@ const DEFAULT_PROFILES = [
   {profileId:'json_summary',  name:'JSONサマリー',            formatType:'json',
    templateText:'{\n  "title": "{{title}}",\n  "content": "{{content}}"\n}'},
 ];
+/* 外部AI（ChatGPT/Claude等）に貼り付ける用のプロンプト。ユーザーが追加登録できる */
+const DEFAULT_PROMPTS = [
+  {promptId:'dedupe_cleanup', name:'重複削除・整形',
+   promptText:'以下は書類や画面を連続撮影した複数画像のOCRテキストです。\n次のルールで整えて、本文だけを出力してください。\n- 画像間で重複している部分は1回だけ残して削除する\n- OCRの誤認識と思われる箇所は文脈から自然に修正する\n- 内容の追加・省略・要約はしない\n\n----\n{{content}}'},
+  {promptId:'summary_bullets', name:'要約（箇条書き）',
+   promptText:'以下の文章を、重要な点を漏らさず日本語の箇条書きで要約してください。\n\n----\n{{content}}'},
+];
 
 /* ===== IndexedDB ===== */
-const DB_NAME='ai-workspace-v1', DB_VER=1;
+const DB_NAME='ai-workspace-v1', DB_VER=2;
 let _db=null;
 function openDb(){
   if(_db) return Promise.resolve(_db);
@@ -118,12 +125,17 @@ function openDb(){
     const req=indexedDB.open(DB_NAME,DB_VER);
     req.onupgradeneeded=e=>{
       const db=e.target.result;
-      const items=db.createObjectStore('items',{keyPath:'id',autoIncrement:true});
-      items.createIndex('sourceItemId','sourceItemId');
-      const logs=db.createObjectStore('logs',{keyPath:'id',autoIncrement:true});
-      logs.createIndex('itemId','itemId');
-      db.createObjectStore('profiles',{keyPath:'profileId'});
-      db.createObjectStore('files'); /* key=fileKey, value=Blob */
+      if(e.oldVersion<1){
+        const items=db.createObjectStore('items',{keyPath:'id',autoIncrement:true});
+        items.createIndex('sourceItemId','sourceItemId');
+        const logs=db.createObjectStore('logs',{keyPath:'id',autoIncrement:true});
+        logs.createIndex('itemId','itemId');
+        db.createObjectStore('profiles',{keyPath:'profileId'});
+        db.createObjectStore('files'); /* key=fileKey, value=Blob */
+      }
+      if(e.oldVersion<2){
+        db.createObjectStore('prompts',{keyPath:'promptId'});
+      }
     };
     req.onsuccess=()=>{_db=req.result;resolve(_db);};
     req.onerror=()=>reject(req.error);
@@ -189,6 +201,23 @@ const repo={
     });
   },
   async fetchProfiles(){ return reqAsPromise('profiles','readonly',s=>s.getAll()); },
+  async seedPrompts(){
+    const count=await reqAsPromise('prompts','readonly',s=>s.count());
+    if(count>0) return;
+    await reqAsPromise('prompts','readwrite',s=>{
+      let last;
+      DEFAULT_PROMPTS.forEach(p=>{last=s.put({...p,updatedAt:Date.now()});});
+      return last;
+    });
+  },
+  async fetchPrompts(){ return reqAsPromise('prompts','readonly',s=>s.getAll()); },
+  async savePrompt(p){
+    p.updatedAt=Date.now();
+    return reqAsPromise('prompts','readwrite',s=>s.put(p));
+  },
+  async deletePrompt(promptId){
+    return reqAsPromise('prompts','readwrite',s=>s.delete(promptId));
+  },
   async saveFile(blob,fileName){
     const fileKey=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)
       +'_'+fileName.replace(/[^A-Za-z0-9._-]/g,'_');
@@ -206,6 +235,29 @@ function renderTemplate(template,item){
     .replaceAll('{{content}}',item.content||'')
     .replaceAll('{{rawContent}}',item.rawContent||'');
 }
+
+/* ===== 連続画像OCRの重複トリム =====
+   前の画像の末尾と次の画像の先頭が重なって写っている場合に、
+   空白・改行を無視した文字列一致で重複部分を検出し、次テキストの先頭から削る。
+   OCRの誤認識で一致しない場合は削らない（プロンプトでのAI仕上げに委ねる）。 */
+function trimOverlap(prev, next){
+  const norm=s=>s.replace(/\s+/g,'');
+  const nPrev=norm(prev), nNext=norm(next);
+  const max=Math.min(nPrev.length, nNext.length, 300);
+  let found=0;
+  for(let k=max;k>=10;k--){
+    if(nPrev.endsWith(nNext.slice(0,k))){ found=k; break; }
+  }
+  if(!found) return {text:next, trimmed:false};
+  /* 正規化でfound文字ぶんに相当するnext原文の位置を求めて切除 */
+  let count=0, cut=0;
+  while(cut<next.length && count<found){
+    if(!/\s/.test(next[cut])) count++;
+    cut++;
+  }
+  return {text:next.slice(cut).replace(/^\s+/,''), trimmed:true};
+}
+window._trimOverlap=trimOverlap; /* テスト用に公開 */
 
 /* ===== OCR（Tesseract.js を遅延ロード） ===== */
 let _tesseractLoading=null;
@@ -309,8 +361,9 @@ function AttachedImage({fileKey}){
 }
 
 /* ===== 追加シート ===== */
-function AddSheet({onClose,onPickImage,onAddText}){
+function AddSheet({onClose,onPickImage,onPickImages,onAddText}){
   const fileRef=useRef(null);
+  const multiRef=useRef(null);
   const ocrRef=useRef(true);
   return h('div',{style:S.sheetWrap,onClick:onClose},
     h('div',{style:S.sheet,onClick:e=>e.stopPropagation()},
@@ -320,6 +373,16 @@ function AddSheet({onClose,onPickImage,onAddText}){
           if(f){ onPickImage(f,ocrRef.current); }
           e.target.value='';
         }}),
+      h('input',{type:'file',accept:'image/*',multiple:true,ref:multiRef,
+        style:{display:'none'},'data-testid':'multi-image-input',
+        onChange:e=>{
+          const files=[...e.target.files];
+          if(files.length>0){ onPickImages(files); }
+          e.target.value='';
+        }}),
+      h('button',{style:S.sheetItem,onClick:()=>multiRef.current.click()},
+        '📚',h('span',null,'複数画像から文章を登録（ワークフロー）',
+          h('div',{style:S.sub},'選んだ順にOCR→結合。重なった部分は自動削除＋プロンプトで仕上げ'))),
       h('button',{style:S.sheetItem,onClick:()=>{ocrRef.current=true;fileRef.current.click();}},
         '🔍',h('span',null,'画像からOCR',
           h('div',{style:S.sub},'端末内で文字認識（初回はモデル取得のためネット接続が必要）'))),
@@ -361,6 +424,69 @@ function CopyModal({profiles,onClose,onSelect}){
     ));
 }
 
+/* ===== プロンプトライブラリ（一覧・コピー・追加/編集/削除） ===== */
+function PromptLibraryModal({onClose,onCopy}){
+  const [prompts,setPrompts]=useState(null);
+  const [form,setForm]=useState(null); /* null | {promptId?,name,promptText} */
+  const reload=useCallback(async()=>{ setPrompts(await repo.fetchPrompts()); },[]);
+  useEffect(()=>{ reload(); },[reload]);
+
+  const saveForm=async()=>{
+    if(!form.name.trim()||!form.promptText.trim()) return;
+    await repo.savePrompt({
+      promptId: form.promptId || ('user_'+Date.now().toString(36)),
+      name: form.name.trim(),
+      promptText: form.promptText,
+    });
+    setForm(null); reload();
+  };
+  const removePrompt=async(p)=>{
+    if(!confirm(`プロンプト「${p.name}」を削除しますか？`)) return;
+    await repo.deletePrompt(p.promptId); reload();
+  };
+
+  if(form){
+    return h('div',{style:S.modalWrap,onClick:()=>setForm(null)},
+      h('div',{style:S.modal,onClick:e=>e.stopPropagation()},
+        h('div',{style:{fontSize:16,fontWeight:700,marginBottom:14}},
+          form.promptId?'プロンプトを編集':'プロンプトを追加'),
+        h('input',{style:{...S.input,marginBottom:10},placeholder:'プロンプト名',
+          value:form.name,autoFocus:!form.promptId,
+          onChange:e=>setForm({...form,name:e.target.value})}),
+        h('textarea',{style:{...S.textarea,minHeight:160},
+          placeholder:'プロンプト本文（{{content}} の位置に本文が差し込まれます）',
+          value:form.promptText,
+          onChange:e=>setForm({...form,promptText:e.target.value})}),
+        h('div',{style:{...S.sub,marginTop:6}},
+          '使える差し込み: {{title}} / {{content}} / {{rawContent}}'),
+        h('div',{style:{display:'flex',gap:10,justifyContent:'flex-end',marginTop:14}},
+          h('button',{style:S.ghostBtn,onClick:()=>setForm(null)},'キャンセル'),
+          h('button',{style:S.primaryBtn,
+            disabled:!form.name.trim()||!form.promptText.trim(),
+            onClick:saveForm},'保存'))));
+  }
+
+  return h('div',{style:S.modalWrap,onClick:onClose},
+    h('div',{style:{...S.modal,maxHeight:'80vh',overflowY:'auto'},
+      onClick:e=>e.stopPropagation()},
+      h('div',{style:{fontSize:16,fontWeight:700,marginBottom:6}},'プロンプトでコピー'),
+      h('div',{style:{...S.sub,marginBottom:12}},
+        '選ぶと本文を差し込んだプロンプトをコピー。ChatGPT/Claude等に貼り付けて使います'),
+      prompts===null
+        ? h('div',{style:S.sub},'読み込み中…')
+        : prompts.map(p=>h('div',{key:p.promptId,
+            style:{display:'flex',alignItems:'center',gap:4,marginBottom:2}},
+            h('button',{style:{...S.sheetItem,flex:1,borderRadius:10,padding:'12px 10px'},
+              onClick:()=>onCopy(p)},
+              '✨',h('span',{style:{flex:1}},p.name)),
+            h('button',{style:S.iconBtn,title:'編集',
+              onClick:()=>setForm({promptId:p.promptId,name:p.name,promptText:p.promptText})},'✏️'),
+            h('button',{style:S.iconBtn,title:'削除',
+              onClick:()=>removePrompt(p)},'🗑️'))),
+      h('button',{style:{...S.ghostBtn,width:'100%',marginTop:10},
+        onClick:()=>setForm({name:'',promptText:''})},'＋ プロンプトを追加')));
+}
+
 /* ===== 編集画面 ===== */
 function EditView({itemId,onBack,onChanged,showToast,profiles}){
   const [item,setItem]=useState(null);
@@ -370,6 +496,7 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
   const [title,setTitle]=useState('');
   const [content,setContent]=useState('');
   const [copyOpen,setCopyOpen]=useState(false);
+  const [promptOpen,setPromptOpen]=useState(false);
 
   const reload=useCallback(async()=>{
     const it=await repo.fetchItem(itemId);
@@ -395,6 +522,15 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
     showToast(ok?`「${profile.name}」形式でコピーしました`:'コピーに失敗しました');
     reload();
   };
+  const copyWithPrompt=async(prompt)=>{
+    setPromptOpen(false);
+    const ok=await copyText(renderTemplate(prompt.promptText,{...item,title,content}));
+    await repo.saveLog(item.id,'copy',`プロンプト「${prompt.name}」でコピー`);
+    showToast(ok
+      ?`プロンプト「${prompt.name}」でコピーしました。AIに貼り付けてください`
+      :'コピーに失敗しました');
+    reload();
+  };
   const finalize=async()=>{
     const now=Date.now();
     const fin={title:`${title}（確定版）`,content,rawContent:item.rawContent,
@@ -406,7 +542,8 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
   };
   const remove=async()=>{
     if(!confirm('このアイテムと操作ログ、添付ファイルを削除します。よろしいですか？')) return;
-    if(item.fileKey) await repo.deleteFile(item.fileKey);
+    const keys=item.fileKeys || (item.fileKey?[item.fileKey]:[]);
+    for(const k of keys) await repo.deleteFile(k);
     await repo.deleteItem(item.id);
     onChanged(); onBack();
   };
@@ -415,6 +552,7 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
     h('div',{style:S.header},
       h('button',{style:S.iconBtn,onClick:onBack},'←'),
       h('div',{style:S.title},item.title),
+      h('button',{style:S.iconBtn,title:'プロンプトでコピー',onClick:()=>setPromptOpen(true)},'✨'),
       h('button',{style:S.iconBtn,title:'コピー',onClick:()=>setCopyOpen(true)},'📄'),
       h('button',{style:S.iconBtn,title:'確定版を作成',onClick:finalize},'✅'),
       h('button',{style:S.iconBtn,title:'削除',onClick:remove},'🗑️'),
@@ -431,9 +569,14 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
     h('div',{style:{padding:'12px 16px 0'}},
       h('button',{style:{...S.primaryBtn,width:'100%'},onClick:save},'保存')),
 
-    item.fileKey && h(React.Fragment,null,
-      h('div',{style:S.sectionTitle},'添付画像'),
-      h(AttachedImage,{fileKey:item.fileKey})),
+    (()=>{
+      const keys=item.fileKeys || (item.fileKey?[item.fileKey]:[]);
+      return keys.length>0 && h(React.Fragment,null,
+        h('div',{style:S.sectionTitle},
+          keys.length>1?`添付画像（${keys.length}枚）`:'添付画像'),
+        keys.map(k=>h('div',{key:k,style:{marginBottom:8}},
+          h(AttachedImage,{fileKey:k}))));
+    })(),
 
     (source||derived.length>0) && h(React.Fragment,null,
       h('div',{style:S.sectionTitle},'関連（ナレッジグラフ）'),
@@ -460,6 +603,7 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
           h('span',{style:S.sub},fmtDate(l.executedAt)))),
     h('div',{style:{height:40}}),
     copyOpen && h(CopyModal,{profiles,onClose:()=>setCopyOpen(false),onSelect:copyWith}),
+    promptOpen && h(PromptLibraryModal,{onClose:()=>setPromptOpen(false),onCopy:copyWithPrompt}),
   );
 }
 
@@ -487,7 +631,9 @@ function InboxView({items,onOpen,onAdd,busy}){
                 WebkitBoxOrient:'vertical'}},snippet),
               h('div',{style:{display:'flex',alignItems:'center',gap:8}},
                 h(RoleBadge,{role:it.role}),
-                it.fileKey && h('span',{style:S.sub},'📎'),
+                (it.fileKeys&&it.fileKeys.length>0
+                  ? h('span',{style:S.sub},`📎${it.fileKeys.length>1?it.fileKeys.length:''}`)
+                  : it.fileKey && h('span',{style:S.sub},'📎')),
                 h('span',{style:{...S.sub,marginLeft:'auto'}},fmtDate(it.createdAt))));
           })),
     h('button',{style:S.fab,onClick:onAdd},'＋'),
@@ -512,6 +658,7 @@ function App(){
   useEffect(()=>{
     (async()=>{
       await repo.seedProfiles();
+      await repo.seedPrompts();
       setProfiles(await repo.fetchProfiles());
       await reload();
     })();
@@ -561,6 +708,59 @@ function App(){
     setView({name:'edit',id});
   };
 
+  /* ワークフロー: 複数画像→順次OCR→重複トリム結合→1アイテム登録→ログ */
+  const importMultipleImages=async(files)=>{
+    setSheetOpen(false);
+    if(files.length===0) return;
+    const now=Date.now();
+
+    /* 1. 先に全画像を保存（OCR失敗・中断でも画像は失われない） */
+    const fileKeys=[];
+    for(let i=0;i<files.length;i++){
+      setBusy(`画像を保存中… ${i+1}/${files.length}`);
+      fileKeys.push(await repo.saveFile(files[i],
+        files[i].name||`image_${now}_${i+1}.jpg`));
+    }
+
+    /* 2. 選んだ順に連続OCR */
+    const rawParts=[], okTexts=[], ocrErrors=[];
+    for(let i=0;i<files.length;i++){
+      try{
+        const text=await runOcr(files[i],
+          p=>setBusy(`OCR中 ${i+1}/${files.length} … ${Math.round(p*100)}%`));
+        rawParts.push(`----- 画像${i+1} -----\n${text}`);
+        okTexts.push(text);
+      }catch(e){
+        ocrErrors.push(`画像${i+1}: ${String(e.message||e)}`);
+        rawParts.push(`----- 画像${i+1}（OCR失敗） -----`);
+      }
+    }
+    setBusy('');
+
+    /* 3. 重なった部分を自動トリムしながら結合 */
+    let merged='', trimmedCount=0;
+    for(const t of okTexts){
+      if(!merged){ merged=t.trim(); continue; }
+      const r=trimOverlap(merged,t);
+      if(r.trimmed) trimmedCount++;
+      if(r.text.trim()) merged=merged.replace(/\s+$/,'')+'\n'+r.text.trim();
+    }
+
+    /* 4. 1つのアイテムとして登録 */
+    const id=await repo.saveItem({
+      title:'まとめ読取_'+now, content:merged, rawContent:rawParts.join('\n\n'),
+      role:'input', sourceItemId:null, fileKey:null, fileKeys,
+      metadata:{source:'multiImage', imageCount:files.length, trimmedCount,
+        ...(ocrErrors.length?{ocrErrors}:{})},
+      createdAt:now, updatedAt:now});
+    await repo.saveLog(id,'workflowRun',
+      `複数画像OCRワークフロー（${files.length}枚・重複トリム${trimmedCount}箇所`+
+      (ocrErrors.length?`・OCR失敗${ocrErrors.length}枚`:'')+'）');
+    await reload();
+    showToast('登録しました。✨のプロンプトコピーでAI仕上げができます');
+    setView({name:'edit',id});
+  };
+
   return h(React.Fragment,null,
     view.name==='inbox'
       ? h(InboxView,{items,busy,onOpen:id=>setView({name:'edit',id}),
@@ -569,6 +769,7 @@ function App(){
           onBack:()=>setView({name:'inbox'}),onChanged:reload}),
     sheetOpen && h(AddSheet,{onClose:()=>setSheetOpen(false),
       onPickImage:importImage,
+      onPickImages:importMultipleImages,
       onAddText:()=>{setSheetOpen(false);setTextModal(true);}}),
     textModal && h(AddTextModal,{onClose:()=>setTextModal(false),onSave:addText}),
     h(Toast,{msg:toast}),
