@@ -354,6 +354,25 @@ function renderPromptCopy(promptText,item){
   return body+'\n\n----\n'+rendered.replace(/^\s+/,'');
 }
 
+/* {{content}}プレースホルダとその前後の「----」区切りを取り除き、指示文だけを返す
+   （まとめてコピー時に本文を重複させないため） */
+function extractInstructionText(promptText,item){
+  const stripped=promptText.replace('{{content}}','').trim()
+    .replace(/^----\s*/,'').replace(/\s*----$/,'');
+  return renderTemplate(stripped,item).trim();
+}
+
+/* 複数プロンプトのまとめてコピー：本文は1回だけ先頭に、各プロンプトの指示文を
+   【プロンプト名】ラベル付きで後ろに並べる（同じ本文を複数のAIチャットで使い分けたい場合に、
+   コピーをやり直さずに済むようにする） */
+function renderCombinedPromptCopy(selectedPrompts,item){
+  const body=(item.content||'').trim();
+  const blocks=selectedPrompts.map(p=>
+    `【${p.name}】\n${extractInstructionText(p.promptText,item)}`);
+  if(!body) return blocks.join('\n\n');
+  return body+'\n\n----\n'+blocks.join('\n\n');
+}
+
 /* ===== 連続画像OCRの重複トリム =====
    前の画像の末尾と次の画像の先頭が重なって写っている場合に、
    空白・改行を無視した文字列一致で重複部分を検出し、次テキストの先頭から削る。
@@ -608,6 +627,7 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
   const [promptListOpen,setPromptListOpen]=useState(false);
   const [promptForm,setPromptForm]=useState(null);
   const [promptCategory,setPromptCategory]=useState(''); /* ''=すべて */
+  const [selectedPromptIds,setSelectedPromptIds]=useState(()=>new Set());
 
   const reload=useCallback(async()=>{
     const it=await repo.fetchItem(itemId);
@@ -641,6 +661,24 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
     showToast(ok
       ?`プロンプト「${prompt.name}」でコピーしました。AIに貼り付けてください`
       :'コピーに失敗しました');
+    reload();
+  };
+  const toggleSelectPrompt=(promptId)=>{
+    setSelectedPromptIds(prev=>{
+      const next=new Set(prev);
+      if(next.has(promptId)) next.delete(promptId); else next.add(promptId);
+      return next;
+    });
+  };
+  const copySelectedPrompts=async()=>{
+    const selected=prompts.filter(p=>selectedPromptIds.has(p.promptId));
+    if(selected.length===0) return;
+    const ok=await copyText(renderCombinedPromptCopy(selected,{...item,title,content}));
+    await repo.saveLog(item.id,'copy',`プロンプト${selected.length}件でまとめてコピー`);
+    showToast(ok
+      ?`プロンプト${selected.length}件でまとめてコピーしました。AIに貼り付けてください`
+      :'コピーに失敗しました');
+    setSelectedPromptIds(new Set());
     reload();
   };
   const removePrompt=async(p)=>{
@@ -722,6 +760,14 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
       onClick:()=>setPromptListOpen(!promptListOpen)},
       `${promptListOpen?'▾':'▸'} プロンプト一覧（${prompts.length}件）`),
     promptListOpen && h('div',{style:{padding:'2px 12px 0'}},
+      /* 複数選択中のみ表示するアクションバー（同じ本文を複数プロンプトでまとめてコピー） */
+      selectedPromptIds.size>0 && h('div',{style:{display:'flex',alignItems:'center',gap:8,
+          padding:'6px 4px',margin:'0 0 6px'}},
+        h('span',{style:S.sub},`${selectedPromptIds.size}件選択中`),
+        h('button',{style:{...S.primaryBtn,padding:'6px 14px',fontSize:13,width:'auto'},
+          onClick:copySelectedPrompts},'まとめてコピー'),
+        h('button',{style:{...S.ghostBtn,padding:'6px 14px',fontSize:13,width:'auto'},
+          onClick:()=>setSelectedPromptIds(new Set())},'解除')),
       /* ジャンル絞り込みチップ（すべて + 各カテゴリ・件数付き、未分類は最後） */
       (()=>{
         const counts={};
@@ -748,6 +794,8 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
         .sort((a,b)=>(b.favorite?1:0)-(a.favorite?1:0))
         .map(p=>h('div',{key:p.promptId,
           style:{display:'flex',alignItems:'center',gap:4}},
+          h('input',{type:'checkbox',checked:selectedPromptIds.has(p.promptId),
+            onChange:()=>toggleSelectPrompt(p.promptId)}),
           h('button',{style:S.iconBtn,title:p.favorite?'お気に入り解除':'お気に入りに追加',
             onClick:()=>toggleFavoritePrompt(p)},p.favorite?'⭐':'☆'),
           h('button',{style:{...S.sheetItem,flex:1,borderRadius:10,padding:'10px 8px',
@@ -805,7 +853,7 @@ function EditView({itemId,onBack,onChanged,showToast,profiles}){
 }
 
 /* ===== 一覧（Inbox） ===== */
-function InboxView({items,onOpen,onAdd,busy,onExport,onImportFile}){
+function InboxView({items,onOpen,onAdd,busy,onExport,onImportFile,onAddPrompt}){
   const importRef=useRef(null);
   return h('div',{style:S.page},
     h('div',{style:S.header},
@@ -818,6 +866,7 @@ function InboxView({items,onOpen,onAdd,busy,onExport,onImportFile}){
           if(f) onImportFile(f);
           e.target.value='';
         }}),
+      h('button',{style:S.iconBtn,title:'プロンプトを追加',onClick:onAddPrompt},'✨+'),
       h('button',{style:S.iconBtn,title:'バックアップをエクスポート',onClick:onExport},'⬇️'),
       h('button',{style:S.iconBtn,title:'バックアップをインポート',
         onClick:()=>importRef.current.click()},'⬆️')),
@@ -855,6 +904,8 @@ function App(){
   const [view,setView]=useState({name:'inbox'});
   const [sheetOpen,setSheetOpen]=useState(false);
   const [textModal,setTextModal]=useState(false);
+  const [homePromptForm,setHomePromptForm]=useState(null);
+  const [homePromptCategories,setHomePromptCategories]=useState([]);
   const [busy,setBusy]=useState('');
   const [toast,setToast]=useState('');
 
@@ -874,6 +925,15 @@ function App(){
 
   /* 関連アイテムからの画面遷移用フック */
   useEffect(()=>{ window._openItem=id=>setView({name:'edit',id}); },[]);
+
+  /* ホーム画面からもプロンプトを追加できるようにする（アイテムを開かなくてよい） */
+  const openAddPromptFromHome=async()=>{
+    const prompts=await repo.fetchPrompts();
+    setHomePromptCategories(
+      [...new Set(prompts.map(p=>(p.category||'').trim()).filter(Boolean))]
+        .sort((a,b)=>a.localeCompare(b,'ja')));
+    setHomePromptForm({name:'',category:'',promptText:''});
+  };
 
   const addText=async(title,text)=>{
     setTextModal(false);
@@ -1008,9 +1068,14 @@ function App(){
   return h(React.Fragment,null,
     view.name==='inbox'
       ? h(InboxView,{items,busy,onOpen:id=>setView({name:'edit',id}),
-          onAdd:()=>setSheetOpen(true),onExport:exportBackup,onImportFile:importBackup})
+          onAdd:()=>setSheetOpen(true),onExport:exportBackup,onImportFile:importBackup,
+          onAddPrompt:openAddPromptFromHome})
       : h(EditView,{itemId:view.id,profiles,showToast,
           onBack:()=>setView({name:'inbox'}),onChanged:reload}),
+    homePromptForm && h(PromptFormModal,{initial:homePromptForm,
+      categories:homePromptCategories,
+      onClose:()=>setHomePromptForm(null),
+      onSaved:()=>{setHomePromptForm(null);showToast('プロンプトを追加しました');}}),
     sheetOpen && h(AddSheet,{onClose:()=>setSheetOpen(false),
       onPickImage:importImage,
       onPickImages:importMultipleImages,
