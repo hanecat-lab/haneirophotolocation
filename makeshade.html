@@ -3,12 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AR影シミュレーター V2 - 仮想の壁で日当たりチェック</title>
+    <title>影シミュレーター V3 - 3D/AR対応版</title>
     <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/suncalc@1.9.2/suncalc.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Arial', sans-serif; background: #000; color: #fff; overflow: hidden; }
+        body { font-family: 'Arial', sans-serif; background: #222; color: #fff; overflow: hidden; }
         .ui-panel {
             position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
             background: rgba(0, 0, 0, 0.85); padding: 15px; border-radius: 12px;
@@ -16,41 +16,56 @@
         }
         .control-group { margin-bottom: 12px; }
         label { display: block; font-size: 13px; margin-bottom: 5px; color: #ccc; }
-        input[type="time"], input[type="range"], button, input[type="number"] {
+        input[type="time"], input[type="range"], button {
             width: 100%; padding: 10px; border: none; border-radius: 6px; font-size: 14px;
         }
-        input[type="time"], input[type="number"] { background: #333; color: #fff; }
+        input[type="time"] { background: #333; color: #fff; }
         button { background: #4CAF50; color: white; font-weight: bold; cursor: pointer; margin-top: 5px; }
-        button:active { transform: scale(0.98); }
         #place-wall-btn.active { background: #f44336; }
         .height-val { float: right; color: #4CAF50; font-weight: bold; }
         .top-info {
             position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.7);
             padding: 10px; border-radius: 8px; font-size: 12px; z-index: 1000;
         }
-        .sun-info { color: #FFD700; font-weight: bold; margin-bottom: 4px; }
+        .error-msg {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background: rgba(255,0,0,0.8); padding: 20px; border-radius: 10px;
+            text-align: center; z-index: 2000; display: none; width: 80%;
+        }
     </style>
 </head>
 <body>
-    <a-scene embedded arjs="sourceType: webcam; debugUIEnabled: false;" cursor="rayOrigin: mouse" raycaster="objects: .clickable">
-        <!-- カメラ -->
-        <a-camera position="0 1.6 0"></a-camera>
+    <div id="camera-error" class="error-msg">
+        カメラが起動できませんでした。<br>
+        HTTPS環境で開くか、ブラウザのカメラ権限を確認してください。<br><br>
+        <button onclick="this.parentElement.style.display='none'" style="background:#333">3Dモードで続行</button>
+    </div>
+
+    <!-- カメラが動かない場合も3Dとして動くように、AR.jsの依存を外した構成 -->
+    <a-scene shadow="type: pcfsoft" cursor="rayOrigin: mouse" raycaster="objects: .clickable">
+        <!-- 背景（カメラが動かない時用） -->
+        <a-sky color="#444"></a-sky>
+
+        <!-- カメラ（PC/スマホ両対応） -->
+        <a-entity id="camera-rig" position="0 0 5">
+            <a-camera look-controls wasd-controls position="0 1.6 0"></a-camera>
+        </a-entity>
 
         <!-- 太陽光（影の設定） -->
         <a-light id="sun" type="directional" intensity="0.8" position="0 10 0" 
-                 light="castShadow: true; shadowCameraLeft: -10; shadowCameraRight: 10; shadowCameraTop: 10; shadowCameraBottom: -10;"></a-light>
+                 light="castShadow: true; shadowCameraLeft: -15; shadowCameraRight: 15; shadowCameraTop: 15; shadowCameraBottom: -15; shadowMapHeight: 1024; shadowMapWidth: 1024;"></a-light>
         <a-light type="ambient" intensity="0.4"></a-light>
 
-        <!-- 地面（影だけを受け取る） -->
-        <a-plane id="ground" position="0 0 0" rotation="-90 0 0" width="100" height="100" 
-                 class="clickable" material="color: #fff; transparent: true; opacity: 0.2;" shadow="receive: true"></a-plane>
+        <!-- 地面（影を受け取る） -->
+        <a-plane id="ground" position="0 0 0" rotation="-90 0 0" width="50" height="50" 
+                 class="clickable" material="color: #666; roughness: 1;" shadow="receive: true"></a-plane>
 
         <a-entity id="walls-container"></a-entity>
     </a-scene>
 
     <div class="top-info">
-        <div class="sun-info" id="sun-position">太陽の位置: 計算中...</div>
-        <div>緯度: <span id="lat-val">35.69</span> / 経度: <span id="lng-val">139.69</span></div>
+        <div id="sun-position" style="color:#FFD700; font-weight:bold;">太陽の位置を計算中...</div>
+        <div id="geo-info">位置情報: 取得中...</div>
     </div>
 
     <div class="ui-panel">
@@ -66,9 +81,6 @@
 
         <button id="place-wall-btn">壁を配置する (OFF)</button>
         <button id="clear-walls-btn" style="background: #555;">すべて削除</button>
-        <div style="font-size: 11px; color: #888; text-align: center; margin-top: 8px;">
-            ※配置をONにして地面をタップしてください
-        </div>
     </div>
 
     <script>
@@ -80,42 +92,39 @@
         
         let isPlacing = false;
         let currentHeight = 3.0;
-        let latitude = 35.6895;
+        let latitude = 35.6895; // デフォルト：東京
         let longitude = 139.6917;
 
-        // GPS取得（可能な場合）
+        // GPS取得
         if (navigator.geolocation) {
             navigator.geolocation.getCurrentPosition(pos => {
                 latitude = pos.coords.latitude;
                 longitude = pos.coords.longitude;
-                document.getElementById('lat-val').textContent = latitude.toFixed(2);
-                document.getElementById('lng-val').textContent = longitude.toFixed(2);
+                document.getElementById('geo-info').textContent = `位置: ${latitude.toFixed(2)}, ${longitude.toFixed(2)}`;
                 updateSun();
+            }, () => {
+                document.getElementById('geo-info').textContent = "位置: 東京(デフォルト)";
             });
         }
 
-        // 高さレバーの更新
+        // 高さ更新
         document.getElementById('wall-height').addEventListener('input', (e) => {
             currentHeight = parseFloat(e.target.value);
             heightDisplay.textContent = currentHeight.toFixed(1) + 'm';
         });
 
-        // 配置モード切り替え
+        // 配置モード
         placeBtn.addEventListener('click', () => {
             isPlacing = !isPlacing;
             placeBtn.textContent = isPlacing ? '地面をタップして配置' : '壁を配置する (OFF)';
             placeBtn.className = isPlacing ? 'active' : '';
         });
 
-        // 地面クリック時の処理
+        // 配置処理
         ground.addEventListener('click', (evt) => {
             if (!isPlacing) return;
-            
-            // クリックされた座標を取得
             const point = evt.detail.intersection.point;
             createWall(point.x, point.z);
-            
-            // 配置モードを終了
             isPlacing = false;
             placeBtn.textContent = '壁を配置する (OFF)';
             placeBtn.className = '';
@@ -136,7 +145,6 @@
             wallsContainer.innerHTML = '';
         });
 
-        // 太陽位置の更新
         function updateSun() {
             const timeStr = document.getElementById('time-input').value;
             const [h, m] = timeStr.split(':').map(Number);
@@ -147,16 +155,20 @@
             const alt = sun.altitude * (180 / Math.PI);
             const azi = sun.azimuth * (180 / Math.PI);
 
-            // A-Frameの座標系に合わせて回転を設定
-            // 太陽の向き（ライトの向き）を調整
+            // 太陽光の角度設定
             sunLight.setAttribute('rotation', `${-alt} ${azi + 180} 0`);
-            
             document.getElementById('sun-position').textContent = 
                 `太陽: 高度 ${alt.toFixed(1)}° / 方位 ${(azi + 180).toFixed(1)}°`;
         }
 
         document.getElementById('time-input').addEventListener('input', updateSun);
         updateSun();
+
+        // カメラ起動チェック
+        navigator.mediaDevices.getUserMedia({video: true}).catch(err => {
+            console.log("Camera error:", err);
+            // AR.jsを使わないシンプルな3Dモードとして動作を継続
+        });
     </script>
 </body>
 </html>
