@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>日陰シミュレーター / Compass v2.9</title>
+<title>日陰シミュレーター / Compass v3.1</title>
 <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/aframe-orbit-controls@1.3.2/dist/aframe-orbit-controls.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/suncalc/1.9.0/suncalc.min.js"></script>
@@ -28,11 +28,9 @@
 <div class="panel top"><div class="row"><span id="sunInfo" class="yellow">太陽: --</span><button id="sensorBtn" class="btn mini">🧭 センサーを開始</button></div><div class="hud"><span>向き <strong id="headingText">N (0°)</strong></span><span class="strip" id="strip">NW N NE E SE S SW W</span></div><div id="mode" class="mode">手動モード / スライダーで基準方位を調整</div><div id="sensorDebug" class="hint">raw: -- / offset: -- / calibrated: -- / filtered: --</div><div class="cal"><button id="calBtn" class="btn dark mini">現在の向きを0°に再設定</button><button id="stopBtn" class="btn dark mini">センサー停止</button></div></div>
 
 <div class="panel bottom">
-  <!-- 時刻スライダーエリア -->
   <div id="timeSection" class="time">
     <span>時刻</span><output id="timeOut">12:00</output><input id="time" type="range" min="300" max="1140" value="720">
   </div>
-  <!-- 設定スライダーエリア（初期非表示・同じ場所で展開） -->
   <div id="settingSection" class="settings-grid" style="display:none;">
     <div class="ctrl"><label>壁高 <output id="whOut">3.0m</output></label><input id="wh" type="range" min="1" max="15" step=".5" value="3"></div>
     <div class="ctrl"><label>壁幅 <output id="wwOut">4.0m</output></label><input id="ww" type="range" min=".5" max="20" step=".5" value="4"></div>
@@ -41,6 +39,7 @@
   </div>
   <div class="buttons">
     <button id="settingsBtn" class="btn dark">⚙ 設定</button>
+    <button id="viewBtn" class="btn purple">👤 人目線</button>
     <button id="wallBtn" class="btn">壁を追加</button>
     <button id="humanBtn" class="btn purple">人を追加</button>
     <button id="clearBtn" class="btn red">全削除</button>
@@ -48,14 +47,12 @@
 </div>
 
 <script>
-const $=id=>document.getElementById(id), root=$('world-root'), light=$('sun-light'), wallsEl=$('walls'), humansEl=$('humans'), previewEl=$('preview-container'), sceneEl=$('scene');
+const $=id=>document.getElementById(id), root=$('world-root'), light=$('sun-light'), wallsEl=$('walls'), humansEl=$('humans'), previewEl=$('preview-container'), sceneEl=$('scene'), cameraEl=$('camera');
 let walls=[],humans=[],heading=0,rawHeading=null,latestRawHeading=null,offset=0,tracking=false,raf=0,sourceType='none';
-let placingType=null;
-let lastIntersectPoint = null;
+let placingType=null, lastIntersectPoint = null;
+let currentHumanViewIndex = -1; // -1: 通常俯瞰, 0以上: 対象人物のインデックス
 const lat=34.27,lon=135.38;
 
-const today = new Date();
-// 日付入力があれば連動させるが今回は省略または維持
 function norm(v){return (v%360+360)%360} function signed(v){return ((v+180)%360+360)%360-180}
 function dir(v){return ['N','NE','E','SE','S','SW','W','NW'][Math.floor((norm(v)+22.5)/45)%8]}
 function updateHUD(v){
@@ -67,76 +64,59 @@ function updateHUD(v){
 function updateDebug(raw,calibrated){$('sensorDebug').textContent=`source: ${sourceType} / raw: ${raw==null?'--':raw.toFixed(1)+'°'} / offset: ${offset.toFixed(1)}° / calibrated: ${calibrated==null?'--':calibrated.toFixed(1)+'°'} / filtered: ${heading.toFixed(1)}°`}
 function setHeading(v){heading=norm(v); updateHUD(heading);}
 function circularLowPass(target,alpha=.38){const targetNorm=norm(target),difference=Math.abs(signed(targetNorm-heading));if(difference>30){resetCircularFilter(targetNorm);return}const r=targetNorm*Math.PI/180;const s=Math.sin(r),c=Math.cos(r);filterSin=(1-alpha)*filterSin+alpha*s;filterCos=(1-alpha)*filterCos+alpha*c;heading=norm(Math.atan2(filterSin,filterCos)*180/Math.PI)}
-function resetCircularFilter(value){const r=norm(value)*Math.PI/180;filterSin=Math.sin(r);filterCos=Math.cos(r);heading=norm(value)}
+function resetCircularFilter(value){const r=norm(value)*Math.PI/180;filterSin=Math.sin(r);filterCos=Math.sin(r);heading=norm(value)}
 function requestRender(){if(!raf)raf=requestAnimationFrame(()=>{raf=0;root.setAttribute('rotation',`0 ${heading} 0`);updateHUD(heading);updateSimulation()})}
-function screenAngle(){return (screen.orientation&&typeof screen.orientation.angle==='number')?screen.orientation.angle:((window.orientation||0)+360)%360}
 
-function readHeading(e){
-  if(!tracking) return;
-  let raw=null;
-  if(typeof e.webkitCompassHeading==='number'&&isFinite(e.webkitCompassHeading)){raw=norm(e.webkitCompassHeading);sourceType='iOS compass'}
-  else if((e.absolute===true||event.type==='deviceorientationabsolute')&&typeof e.alpha==='number'&&isFinite(e.alpha)){raw=norm(360-e.alpha+screenAngle());sourceType='absolute alpha'}
-  else if(typeof e.alpha==='number'&&isFinite(e.alpha)){raw=norm(360-e.alpha+screenAngle());sourceType='relative alpha'}
-  if(raw==null)return;
-  latestRawHeading=raw;
-  if(rawHeading===null){rawHeading=raw;offset=signed(raw-heading)}
-  const calibrated=norm(raw-offset);circularLowPass(calibrated);updateDebug(raw,calibrated);requestRender();
+// カメラを通常（俯瞰）に戻す処理
+function resetCameraView(){
+  currentHumanViewIndex = -1;
+  cameraEl.setAttribute('position', '0 5 12');
+  cameraEl.setAttribute('orbit-controls', 'target: 0 1 0; minDistance: 0.5; maxDistance: 60');
+  $('viewBtn').textContent = '👤 人目線';
+  $('viewBtn').classList.remove('active');
 }
 
-async function startSensor(){
- try{if(typeof DeviceOrientationEvent==='undefined')throw Error('非対応端末');
-  if(typeof DeviceOrientationEvent.requestPermission==='function'){const r=await DeviceOrientationEvent.requestPermission();if(r!=='granted')throw Error('許可なし')}
-  rawHeading=null;latestRawHeading=null;resetCircularFilter(heading);tracking=true;
-  const evtName=('ondeviceorientationabsolute' in window)?'deviceorientationabsolute':'deviceorientation';
-  window.removeEventListener(evtName,readHeading,true);
-  window.addEventListener(evtName,readHeading,true);
-  $('sensorBtn').textContent='🧭 同期中';
-  $('mode').textContent='センサーモード稼働中';
- }catch(e){$('mode').textContent='開始失敗: '+e.message; tracking=false;}
-}
-
-function stopSensor(){
-  tracking=false;
-  rawHeading=null;
-  latestRawHeading=null;
-  const evtName=('ondeviceorientationabsolute' in window)?'deviceorientationabsolute':'deviceorientation';
-  window.removeEventListener(evtName,readHeading,true);
-  $('sensorBtn').textContent='🧭 センサーを開始';
-  $('mode').textContent='手動モード / スライダーで基準方位を調整';
-}
-
-$('sensorBtn').onclick=startSensor;
-$('stopBtn').onclick=stopSensor;
+// 複数人の目線切替・首振り視点設定
+$('viewBtn').onclick = () => {
+  if(humans.length === 0){
+    alert('人物が配置されていません。先に「人を追加」してください。');
+    return;
+  }
+  currentHumanViewIndex++;
+  if(currentHumanViewIndex >= humans.length){
+    resetCameraView();
+    return;
+  }
+  
+  const h = humans[currentHumanViewIndex];
+  const eyeHeight = h.h * 0.9;
+  // カメラを人の頭の位置にセット
+  cameraEl.setAttribute('position', `${h.x} ${eyeHeight} ${h.z}`);
+  // 注視点をすぐ直前に置き、minDistance/maxDistanceを極小化して「その場での首振り」にする
+  cameraEl.setAttribute('orbit-controls', `target: ${h.x} ${eyeHeight} ${+h.z - 0.1}; minDistance: 0.01; maxDistance: 0.1`);
+  
+  $('viewBtn').textContent = `👤 人${currentHumanViewIndex + 1}目線`;
+  $('viewBtn').classList.add('active');
+};
 
 let dragging=false, lastPointerX=0;
 sceneEl.addEventListener('pointerdown',e=>{
   if(placingType) return;
-  if(tracking) stopSensor();
-  dragging=true;
-  lastPointerX=e.clientX;
+  dragging=true; lastPointerX=e.clientX;
   sceneEl.setPointerCapture?.(e.pointerId);
 });
 sceneEl.addEventListener('pointermove',e=>{
   if(placingType || !dragging) return;
-  const dx=e.clientX-lastPointerX;
-  lastPointerX=e.clientX;
-  resetCircularFilter(heading-dx*.35);
-  requestRender();
+  const dx=e.clientX-lastPointerX; lastPointerX=e.clientX;
+  resetCircularFilter(heading-dx*.35); requestRender();
 });
 sceneEl.addEventListener('pointerup',()=>dragging=false);
-sceneEl.addEventListener('pointercancel',()=>dragging=false);
 
 document.querySelectorAll('.panel').forEach(panel => {
-  ['pointerdown', 'pointermove', 'click', 'touchstart', 'touchmove', 'touchend'].forEach(eventType => {
-    panel.addEventListener(eventType, e => e.stopPropagation());
-  });
+  ['pointerdown', 'pointermove', 'click', 'touchstart', 'touchmove', 'touchend'].forEach(eventType => panel.addEventListener(eventType, e => e.stopPropagation()));
 });
 
-const raycaster = new THREE.Raycaster();
-const mouse = new THREE.Vector2();
-const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-
-// 正確なキャンバス領域を元にしたマウス座標計算（ズレ防止）
+const raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2(), groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 function updateMouseCoords(e){
   const rect = sceneEl.getBoundingClientRect();
   mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -146,12 +126,10 @@ function updateMouseCoords(e){
 window.addEventListener('pointermove', e => {
   if(!placingType) return;
   updateMouseCoords(e);
-  
   if(!sceneEl.camera) return;
   raycaster.setFromCamera(mouse, sceneEl.camera);
   const targetPoint = new THREE.Vector3();
   raycaster.ray.intersectPlane(groundPlane, targetPoint);
-  
   if(targetPoint){
     lastIntersectPoint = targetPoint;
     const rotRad = -heading * Math.PI / 180;
@@ -162,13 +140,10 @@ window.addEventListener('pointermove', e => {
 });
 
 window.addEventListener('click', e => {
-  if(!placingType || !lastIntersectPoint) return;
-  if(e.target.closest('.panel')) return;
-  
+  if(!placingType || !lastIntersectPoint || e.target.closest('.panel')) return;
   const rotRad = -heading * Math.PI / 180;
   const localX = lastIntersectPoint.x * Math.cos(rotRad) - lastIntersectPoint.z * Math.sin(rotRad);
   const localZ = lastIntersectPoint.x * Math.sin(rotRad) + lastIntersectPoint.z * Math.cos(rotRad);
-  
   if(placingType === 'wall'){
     walls.push({x: localX.toFixed(1), z: localZ.toFixed(1), h: +$('wh').value, w: +$('ww').value, r: +$('wr').value});
     renderWalls();
@@ -176,101 +151,42 @@ window.addEventListener('click', e => {
     humans.push({x: localX.toFixed(1), z: localZ.toFixed(1), h: +$('hh').value/100});
     renderHumans();
   }
-  
-  placingType = null;
-  previewEl.setAttribute('visible', 'false');
+  placingType = null; previewEl.setAttribute('visible', 'false');
   $('mode').textContent = '手動モード / スライダーで基準方位を調整';
 });
 
-function updatePreviewShape(){
-  if(!placingType) return;
-  if(placingType === 'wall'){
-    const h = +$('wh').value, w = +$('ww').value, r = +$('wr').value;
-    const box = previewEl.querySelector('a-box');
-    if(box){
-      box.setAttribute('position', `0 ${h/2} 0`);
-      box.setAttribute('width', w);
-      box.setAttribute('height', h);
-      box.setAttribute('rotation', `0 ${r} 0`);
-    }
-  } else if(placingType === 'human'){
-    const h = +$('hh').value / 100;
-    previewEl.setAttribute('scale', `${h/1.6} ${h/1.6} ${h/1.6}`);
-  }
-}
-
 function startPlacement(type, e){
-  placingType = type;
-  previewEl.innerHTML = '';
-  previewEl.setAttribute('visible', 'true');
-
-  if(e){
-    updateMouseCoords(e);
-    if(sceneEl.camera){
-      raycaster.setFromCamera(mouse, sceneEl.camera);
-      const initialPoint = new THREE.Vector3();
-      raycaster.ray.intersectPlane(groundPlane, initialPoint);
-      lastIntersectPoint = initialPoint;
-      const rotRad = -heading * Math.PI / 180;
-      const localX = initialPoint.x * Math.cos(rotRad) - initialPoint.z * Math.sin(rotRad);
-      const localZ = initialPoint.x * Math.sin(rotRad) + initialPoint.z * Math.cos(rotRad);
-      previewEl.setAttribute('position', `${localX.toFixed(2)} 0 ${localZ.toFixed(2)}`);
-    }
-  }
+  // 配置モード開始時は操作性を担保するため自動で俯瞰に戻す
+  if(currentHumanViewIndex !== -1) resetCameraView();
   
+  placingType = type; previewEl.innerHTML = ''; previewEl.setAttribute('visible', 'true');
   if(type === 'wall'){
     const h = +$('wh').value, w = +$('ww').value, r = +$('wr').value;
     const obj = document.createElement('a-box');
-    obj.setAttribute('position', `0 ${h/2} 0`);
-    obj.setAttribute('width', w);
-    obj.setAttribute('height', h);
-    obj.setAttribute('depth', '.2');
-    obj.setAttribute('rotation', `0 ${r} 0`);
-    obj.setAttribute('material', 'color:#d35400;opacity:0.5;transparent:true');
+    obj.setAttribute('position', `0 ${h/2} 0`); obj.setAttribute('width', w); obj.setAttribute('height', h); obj.setAttribute('depth', '.2'); obj.setAttribute('rotation', `0 ${r} 0`); obj.setAttribute('material', 'color:#d35400;opacity:0.5;transparent:true');
     previewEl.appendChild(obj);
     $('mode').textContent = '設置モード: 地面をクリックして壁を配置';
   } else if(type === 'human'){
-    const h = +$('hh').value / 100;
-    const r = document.createElement('a-entity');
+    const h = +$('hh').value / 100; const r = document.createElement('a-entity');
     r.setAttribute('scale', `${h/1.6} ${h/1.6} ${h/1.6}`);
     [[.24,.24,.24,0,1.48],[.36,.5,.18,0,1.11],[.12,.76,.14,-.1,.38],[.12,.76,.14,.1,.38],[.1,.48,.1,-.24,1.1],[.1,.48,.1,.24,1.1]].forEach(p=>{
-      const obj = document.createElement('a-box');
-      obj.setAttribute('width', p[0]); obj.setAttribute('height', p[1]); obj.setAttribute('depth', p[2]);
-      obj.setAttribute('position', `${p[3]} ${p[4]} 0`);
-      obj.setAttribute('material', 'color:#8e44ad;opacity:0.5;transparent:true');
-      r.appendChild(obj);
+      const obj = document.createElement('a-box'); obj.setAttribute('width', p[0]); obj.setAttribute('height', p[1]); obj.setAttribute('depth', p[2]); obj.setAttribute('position', `${p[3]} ${p[4]} 0`); obj.setAttribute('material', 'color:#8e44ad;opacity:0.5;transparent:true'); r.appendChild(obj);
     });
     previewEl.appendChild(r);
     $('mode').textContent = '設置モード: 地面をクリックして人を配置';
   }
 }
 
-// --- 下部パネル内での設定/時刻モードのトグル切り替え ---
-function toggleSettings(){
+$('settingsBtn').onclick = () => {
   const isSetting = $('settingSection').style.display === 'none';
   $('settingSection').style.display = isSetting ? 'grid' : 'none';
   $('timeSection').style.display = isSetting ? 'none' : 'flex';
   $('settingsBtn').classList.toggle('active', isSetting);
   $('settingsBtn').textContent = isSetting ? '⏳ 時刻に戻る' : '⚙ 設定';
-}
-
-$('settingsBtn').onclick = toggleSettings;
+};
 $('wallBtn').onclick = (e) => startPlacement('wall', e);
 $('humanBtn').onclick = (e) => startPlacement('human', e);
-$('clearBtn').onclick = () => {walls=[]; humans=[]; renderWalls(); renderHumans();};
-
-function val(id,out,suffix,callback){
-  $(id).oninput=e=>{
-    $(out).textContent=e.target.value+suffix;
-    if(callback) callback();
-  }
-}
-val('wh','whOut','m',updatePreviewShape);
-val('ww','wwOut','m',updatePreviewShape);
-val('wr','wrOut','°',updatePreviewShape);
-val('hh','hhOut','cm',updatePreviewShape);
-
-$('time').oninput=updateSimulation;
+$('clearBtn').onclick = () => {walls=[]; humans=[]; renderWalls(); renderHumans(); resetCameraView();};
 
 function renderWalls(){wallsEl.innerHTML='';walls.forEach(w=>{const e=document.createElement('a-box');e.setAttribute('position',`${w.x} ${w.h/2} ${w.z}`);e.setAttribute('width',w.w);e.setAttribute('height',w.h);e.setAttribute('depth','.2');e.setAttribute('rotation',`0 ${w.r} 0`);e.setAttribute('material','color:#d35400;roughness:.6');e.setAttribute('shadow','cast:true;receive:true');wallsEl.appendChild(e)})}
 function renderHumans(){humansEl.innerHTML='';humans.forEach(h=>{const r=document.createElement('a-entity');r.setAttribute('position',`${h.x} 0 ${h.z}`);r.setAttribute('scale',`${h.h/1.6} ${h.h/1.6} ${h.h/1.6}`);[[.24,.24,.24,0,1.48],[.36,.5,.18,0,1.11],[.12,.76,.14,-.1,.38],[.12,.76,.14,.1,.38],[.1,.48,.1,-.24,1.1],[.1,.48,.1,.24,1.1]].forEach(p=>{const e=document.createElement('a-box');e.setAttribute('width',p[0]);e.setAttribute('height',p[1]);e.setAttribute('depth',p[2]);e.setAttribute('position',`${p[3]} ${p[4]} 0`);e.setAttribute('material','color:#8e44ad');e.setAttribute('shadow','cast:true;receive:true');r.appendChild(e)});humansEl.appendChild(r)})}
@@ -284,8 +200,7 @@ function updateSimulation(){
   light.setAttribute('position',`${x} ${y} ${z}`);
   $('sunInfo').textContent=`太陽高度 ${(alt*180/Math.PI).toFixed(1)}° / 方位 ${norm(az*180/Math.PI).toFixed(1)}°`;
 }
-
-resetCircularFilter(0);setHeading(0);updateDebug(null,null);updateSimulation();
+resetCircularFilter(0);setHeading(0);updateSimulation();
 </script>
 </body>
 </html>
