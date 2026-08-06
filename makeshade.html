@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>3D日陰シミュレーター - 視線連動版</title>
+    <title>3D日陰シミュレーター - 追従性高速化版</title>
     <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/aframe-orbit-controls@1.3.2/dist/aframe-orbit-controls.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/suncalc/1.9.0/suncalc.min.js"></script>
@@ -102,14 +102,16 @@
 <body>
 
     <a-scene id="main-scene" embedded vr-mode-ui="enabled: false" shadow="type: pcfsoft">
-        
+        <a-entity id="sun-light" light="type: directional; intensity: 1.3; castShadow: true; shadowCameraTop: 25; shadowCameraBottom: -25; shadowCameraLeft: -25; shadowCameraRight: 25; shadowMapWidth: 2048; shadowMapHeight: 2048;" position="10 20 10"></a-entity>
+        <a-light type="ambient" intensity="0.45"></a-light>
+
         <a-entity id="world-root" rotation="0 0 0">
             <a-entity id="camera" camera
                       position="0 1.6 5"
                       orbit-controls="
                           target: 0 1.5 0;
                           enableDamping: true;
-                          dampingFactor: 0.12;
+                          dampingFactor: 0.15;
                           rotateSpeed: 0.8;
                           zoomSpeed: 1.2;
                           panSpeed: 0.8;
@@ -137,9 +139,6 @@
             <a-box id="guide-box" material="color: #00FF66; opacity: 0.65; transparent: true;"></a-box>
             <a-ring rotation="-90 0 0" radius-inner="0.3" radius-outer="0.5" material="color: #00FF66; opacity: 0.85; transparent: true;"></a-ring>
         </a-entity>
-
-        <a-entity id="sun-light" light="type: directional; intensity: 1.3; castShadow: true; shadowCameraTop: 25; shadowCameraBottom: -25; shadowCameraLeft: -25; shadowCameraRight: 25; shadowMapWidth: 2048; shadowMapHeight: 2048;" position="10 20 10"></a-entity>
-        <a-light type="ambient" intensity="0.45"></a-light>
     </a-scene>
 
     <div class="top-bar">
@@ -264,6 +263,7 @@
         let isPlacingHuman = false;
         let compassActive = false;
         let baseHeadingOffset = null;
+        let currentWorldRotation = 0; // 現在のワールド角度を保持
         
         let walls = [];
         let humans = [];
@@ -343,16 +343,12 @@
             }
         }
 
-        // カメラが向いている方向（視線）を基準にしてオブジェクトの初期角度やワールドを合わせる
         function alignToCameraView(defaultObjectRot = 0) {
             const camObj = cameraEl.object3D;
             const dir = new THREE.Vector3();
             camObj.getWorldDirection(dir);
-            // カメラの向いている水平方向の角度を算出
             const angleRad = Math.atan2(dir.x, dir.z);
-            let angleDeg = angleRad * (180 / Math.PI) + 180; // ユーザーが向いている方向を正面にする
-            
-            // 壁の初期回転に反映
+            let angleDeg = angleRad * (180 / Math.PI) + 180;
             const finalRot = (defaultObjectRot + angleDeg) % 360;
             return Math.round(finalRot);
         }
@@ -366,7 +362,6 @@
             document.getElementById('p-depth').value = document.getElementById('wall-depth').value;
             document.getElementById('val-p-depth').textContent = document.getElementById('p-depth').value + 'm';
             
-            // 視線方向を反映した初期角度を設定
             const matchedRot = alignToCameraView(parseFloat(document.getElementById('wall-rot').value));
             document.getElementById('p-rot').value = matchedRot;
             document.getElementById('val-p-rot').textContent = matchedRot + '°';
@@ -457,11 +452,29 @@
             document.getElementById('val-wall-rot').textContent = e.target.value + '°';
         });
 
+        // 最短経路でスムーズかつキビキビと角度を更新するヘルパー関数
+        function setWorldRotationDirect(targetDeg) {
+            // 北跨ぎ（0°⇔360°）の急激なカクつきを防ぐための最短角度補間計算
+            let diff = (targetDeg - currentWorldRotation) % 360;
+            if (diff > 180) diff -= 360;
+            if (diff < -180) diff += 360;
+            
+            currentWorldRotation += diff * 0.4; // 追従性を高める高レスポンス係数
+            if (currentWorldRotation < 0) currentWorldRotation += 360;
+            if (currentWorldRotation >= 360) currentWorldRotation %= 360;
+
+            worldRoot.setAttribute('rotation', `0 ${currentWorldRotation} 0`);
+            document.getElementById('val-world-rot').textContent = Math.round(currentWorldRotation) + '°';
+            worldRotSlider.value = Math.round(currentWorldRotation);
+            updateSimulation();
+        }
+
         worldRotSlider.addEventListener('input', (e) => {
             compassActive = false;
-            const deg = parseFloat(e.target.value);
-            document.getElementById('val-world-rot').textContent = deg + '°';
-            worldRoot.setAttribute('rotation', `0 ${deg} 0`);
+            currentWorldRotation = parseFloat(e.target.value);
+            worldRoot.setAttribute('rotation', `0 ${currentWorldRotation} 0`);
+            document.getElementById('val-world-rot').textContent = Math.round(currentWorldRotation) + '°';
+            updateSimulation();
         });
 
         document.getElementById('human-height').addEventListener('input', (e) => {
@@ -562,9 +575,8 @@
             let relativeHeading = heading - baseHeadingOffset;
             if (relativeHeading < 0) relativeHeading += 360;
 
-            worldRoot.setAttribute('rotation', `0 ${-relativeHeading} 0`);
-            worldRotSlider.value = Math.round(relativeHeading);
-            document.getElementById('val-world-rot').textContent = Math.round(relativeHeading) + '°';
+            // 北の境界をまたぐ動きや方向転換をダイレクトに反映
+            setWorldRotationDirect(relativeHeading);
         }
 
         function updateSimulation() {
@@ -576,16 +588,21 @@
             date.setHours(h, m, 0, 0);
 
             const sun = SunCalc.getPosition(date, latitude, longitude);
+            const az = sun.azimuth + Math.PI; 
+            const alt = sun.altitude;
+
             const dist = 40;
-            const sunX = -dist * Math.cos(sun.altitude) * Math.sin(sun.azimuth);
-            const sunY = dist * Math.sin(sun.altitude);
-            const sunZ = dist * Math.cos(sun.altitude) * Math.cos(sun.azimuth);
+            const sunX = dist * Math.cos(alt) * Math.sin(az);
+            const sunY = dist * Math.sin(alt);
+            const sunZ = -dist * Math.cos(alt) * Math.cos(az);
 
             sunLight.setAttribute('position', `${sunX} ${sunY} ${sunZ}`);
             
-            const altDeg = (sun.altitude * 180 / Math.PI).toFixed(1);
-            const aziDeg = ((sun.azimuth * 180 / Math.PI + 180) % 360).toFixed(1);
-            document.getElementById('sun-info').innerHTML = `高度: ${altDeg}° / 方位: ${aziDeg}°`;
+            const altDeg = (alt * 180 / Math.PI).toFixed(1);
+            let dispAzi = (az * 180 / Math.PI) % 360;
+            if (dispAzi < 0) dispAzi += 360;
+
+            document.getElementById('sun-info').innerHTML = `高度: ${altDeg}° / 方位: ${dispAzi.toFixed(1)}°`;
         }
 
         timeSlider.addEventListener('input', updateSimulation);
