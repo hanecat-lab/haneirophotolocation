@@ -1,189 +1,42 @@
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ポートレート光・影シミュレーター</title>
-    <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/suncalc/1.9.0/suncalc.min.js"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body { width: 100%; height: 100%; font-family: 'Arial', sans-serif; background: #111; color: #fff; overflow: hidden; }
-        
-        /* 3Dシーンが確実に全画面を描画するようにサイズを固定 */
-        a-scene { width: 100%; height: 100%; position: absolute; top: 0; left: 0; z-index: 1; }
+// --- レベルアップ版の影生成・更新ロジックの概念 ---
+function updateShadowGeometry(wallDataList, sunDir, sunAlt, shadowMesh, geometry) {
+    if (sunAlt <= 0 || wallDataList.length === 0) {
+        shadowMesh.visible = false;
+        return;
+    }
+    shadowMesh.visible = true;
 
-        .ui-panel {
-            position: absolute; bottom: 15px; left: 50%; transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.9); padding: 12px 15px; border-radius: 12px;
-            width: 90%; max-width: 400px; z-index: 1000; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-            max-height: 80vh; overflow-y: auto; transition: all 0.3s ease;
-        }
-        .control-group { margin-bottom: 8px; }
-        label { display: block; font-size: 11px; margin-bottom: 2px; color: #ccc; }
-        input[type="time"], input[type="range"], button {
-            width: 100%; padding: 6px; border: none; border-radius: 6px; font-size: 13px;
-        }
-        input[type="time"] { background: #333; color: #fff; text-align: center; font-weight: bold; }
-        button { background: #4CAF50; color: white; font-weight: bold; cursor: pointer; margin-top: 4px; }
-        .val-text { float: right; color: #4CAF50; font-weight: bold; }
-        .top-info {
-            position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.8);
-            padding: 10px; border-radius: 8px; font-size: 12px; z-index: 1000; border-left: 4px solid #FFD700;
-        }
-        .panel-compact .hide-on-focus { display: none; }
-    </style>
-</head>
-<body>
+    // 太陽ベクトルから影の伸びる方向を計算
+    const lengthXZ = Math.sqrt(sunDir.x * sunDir.x + sunDir.z * sunDir.z);
+    const dirX = lengthXZ > 0 ? -sunDir.x / lengthXZ : 0;
+    const dirZ = lengthXZ > 0 ? -sunDir.z / lengthXZ : 0;
+    const shadowLenFactor = 1.0 / Math.tan(sunAlt);
 
-    <a-scene embedded shadow="type: pcfsoft" cursor="rayOrigin: mouse" raycaster="objects: .clickable">
+    let positions = [];
 
-        <!-- 背景（3Dグレー空間） -->
-        <a-sky color="#2c2c2c"></a-sky>
+    wallDataList.forEach(wall => {
+        // 壁の底面4隅の座標を基準に、上部頂点から地面(Y=0.01)への投影交点を正確に計算
+        const h = wall.height;
+        const w = wall.width / 2;
+        const d = wall.depth / 2;
+        const rotY = wall.rotation || 0; // 向きを考慮
 
-        <!-- カメラ（視点操作用） -->
-        <a-entity id="camera-rig" position="0 1.6 4">
-            <a-camera look-controls="enabled: true" rotation-reader></a-camera>
-        </a-entity>
+        // 簡易的な底面からトップへの投影頂点計算
+        // 壁の底面手前・奥の4点から、太陽方向へオフセットした地面上の4点を算出
+        const baseOffsetX = dirX * (h * shadowLenFactor);
+        const baseOffsetZ = dirZ * (h * shadowLenFactor);
 
-        <!-- 太陽光（影を生成） -->
-        <a-light id="sun" type="directional" intensity="1.0" position="0 20 0" 
-                 light="castShadow: true; shadowCameraLeft: -15; shadowCameraRight: 15; shadowCameraTop: 15; shadowCameraBottom: -15; shadowMapHeight: 2048; shadowMapWidth: 2048;"></a-light>
-        <a-light type="ambient" intensity="0.5"></a-light>
+        const p1 = [wall.x - w, 0.02, wall.z - d];
+        const p2 = [wall.x + w, 0.02, wall.z - d];
+        const p3 = [wall.x + w + baseOffsetX, 0.02, wall.z - d + baseOffsetZ];
+        const p4 = [wall.x - w + baseOffsetX, 0.02, wall.z - d + baseOffsetZ];
 
-        <!-- 地面 -->
-        <a-plane id="ground" position="0 0 0" rotation="-90 0 0" width="40" height="40" 
-                 material="color: #444; roughness: 0.9;" shadow="receive: true"></a-plane>
+        // 三角形ポリゴンとしてpositions配列に追加（フェンスや複数壁の統合描画に対応）
+        positions.push(...p1, ...p2, ...p3);
+        positions.push(...p1, ...p3, ...p4);
+    });
 
-        <!-- 被写体（人物ダミー：中央に配置） -->
-        <a-entity id="subject" position="0 0 0">
-            <!-- 胴体 -->
-            <a-cylinder position="0 0.9 0" radius="0.25" height="1.2" color="#e0e0e0" shadow="cast: true; receive: true;"></a-cylinder>
-            <!-- 頭部 -->
-            <a-sphere position="0 1.65 0" radius="0.18" color="#f5d0b1" shadow="cast: true; receive: true;"></a-sphere>
-            <!-- 向きを示す目印（北側を指す小さなキューブ） -->
-            <a-box position="0 1.65 -0.2" width="0.1" height="0.1" depth="0.1" color="#ff4444"></a-box>
-        </a-entity>
-
-        <!-- 障害物（壁・建物） -->
-        <a-entity id="wall" position="0 1.5 -3" geometry="primitive: box; width: 3; height: 3; depth: 0.3" material="color: #8B4513; roughness: 0.8;" shadow="cast: true; receive: true;"></a-entity>
-
-    </a-scene>
-
-    <div class="top-info">
-        <div id="sun-position" style="color:#FFD700; font-weight:bold;">太陽の位置を計算中...</div>
-        <div id="geo-info">位置: 紀の川市 (デフォルト)</div>
-        <div style="font-size: 10px; color: #aaa; margin-top: 4px;">※赤い目印が被写体の正面（北向き基準）です</div>
-    </div>
-
-    <div class="ui-panel" id="ui-panel">
-        <div class="control-group">
-            <label>撮影時刻を指定:</label>
-            <input type="time" id="time-input">
-        </div>
-
-        <div class="control-group hide-on-focus">
-            <label>障害物（壁）の距離: <span class="val-text" id="dist-display">3.0m</span></label>
-            <input type="range" id="wall-dist" min="1" max="10" value="3" step="0.5">
-        </div>
-
-        <div class="control-group hide-on-focus">
-            <label>障害物（壁）の高さ: <span class="val-text" id="wall-height-display">3.0m</span></label>
-            <input type="range" id="wall-height" min="1" max="8" value="3" step="0.5">
-        </div>
-
-        <div class="control-group hide-on-focus">
-            <label>障害物（壁）の左右位置: <span class="val-text" id="pos-display">0.0m</span></label>
-            <input type="range" id="wall-pos" min="-5" max="5" value="0" step="0.5">
-        </div>
-
-        <button id="reset-cam-btn" class="hide-on-focus" style="background: #555; margin-top: 6px;">視点を正面に戻す</button>
-    </div>
-
-    <script>
-        const now = new Date();
-        document.getElementById('time-input').value = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-
-        const sunLight = document.getElementById('sun');
-        const wallEl = document.getElementById('wall');
-        const timeInput = document.getElementById('time-input');
-        const uiPanel = document.getElementById('ui-panel');
-        const cameraRig = document.getElementById('camera-rig');
-
-        const wallDistInput = document.getElementById('wall-dist');
-        const wallHeightInput = document.getElementById('wall-height');
-        const wallPosInput = document.getElementById('wall-pos');
-
-        const distDisplay = document.getElementById('dist-display');
-        const wallHeightDisplay = document.getElementById('wall-height-display');
-        const posDisplay = document.getElementById('pos-display');
-
-        let latitude = 34.2709; 
-        let longitude = 135.3850;
-
-        timeInput.addEventListener('focus', () => { uiPanel.classList.add('panel-compact'); });
-        timeInput.addEventListener('blur', () => { setTimeout(() => { uiPanel.classList.remove('panel-compact'); }, 200); });
-
-        function updateWallTransform() {
-            const dist = parseFloat(wallDistInput.value);
-            const h = parseFloat(wallHeightInput.value);
-            const posX = parseFloat(wallPosInput.value);
-
-            distDisplay.textContent = dist.toFixed(1) + 'm';
-            wallHeightDisplay.textContent = h.toFixed(1) + 'm';
-            posDisplay.textContent = posX.toFixed(1) + 'm';
-
-            wallEl.setAttribute('position', `${posX} ${h/2} -${dist}`);
-            wallEl.setAttribute('geometry', `width: 3; height: ${h}; depth: 0.3`);
-        }
-
-        wallDistInput.addEventListener('input', updateWallTransform);
-        wallHeightInput.addEventListener('input', updateWallTransform);
-        wallPosInput.addEventListener('input', updateWallTransform);
-
-        document.getElementById('reset-cam-btn').addEventListener('click', () => {
-            cameraRig.setAttribute('position', '0 1.6 4');
-            cameraRig.querySelector('a-camera').setAttribute('rotation', '0 0 0');
-        });
-
-        function updateSun() {
-            try {
-                if (typeof SunCalc === 'undefined') return;
-
-                const timeStr = timeInput.value;
-                const [h, m] = timeStr.split(':').map(Number);
-                const date = new Date();
-                date.setHours(h, m, 0, 0);
-
-                const sun = SunCalc.getPosition(date, latitude, longitude);
-                const alt = sun.altitude; 
-
-                let sunAziDeg = (sun.azimuth * (180 / Math.PI)) + 180;
-                let sunAziRad = sunAziDeg * (Math.PI / 180);
-
-                const distance = 30;
-                const x = distance * Math.cos(alt) * Math.sin(sunAziRad);
-                const y = distance * Math.sin(alt);
-                const z = -distance * Math.cos(alt) * Math.cos(sunAziRad);
-
-                if (y < 0) {
-                    sunLight.setAttribute('intensity', 0);
-                } else {
-                    sunLight.setAttribute('intensity', 1.0);
-                }
-
-                sunLight.setAttribute('position', `${x} ${y} ${z}`);
-
-                const altDeg = alt * (180 / Math.PI);
-                document.getElementById('sun-position').textContent = 
-                    `太陽: 高度 ${altDeg.toFixed(1)}° / 方位 ${sunAziDeg.toFixed(1)}°`;
-            } catch (err) {
-                console.error(err);
-            }
-        }
-
-        timeInput.addEventListener('input', updateSun);
-        updateSun();
-    </script>
-</body>
-</html>
+    // BufferGeometryの頂点バッファを直接一括更新することで、DOM負荷とガベージコレクションをゼロに抑制
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.attributes.position.needsUpdate = true;
+}
