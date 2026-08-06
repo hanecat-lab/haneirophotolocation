@@ -1,42 +1,347 @@
-// --- レベルアップ版の影生成・更新ロジックの概念 ---
-function updateShadowGeometry(wallDataList, sunDir, sunAlt, shadowMesh, geometry) {
-    if (sunAlt <= 0 || wallDataList.length === 0) {
-        shadowMesh.visible = false;
-        return;
-    }
-    shadowMesh.visible = true;
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>影シミュレーター V3 - 統合完全版</title>
+    <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
+    <script src="https://raw.githack.com/AR-js-org/AR.js/master/aframe/build/aframe-ar.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/suncalc/1.9.0/suncalc.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Arial', sans-serif; background: #222; color: #fff; overflow: hidden; }
+        .ui-panel {
+            position: absolute; bottom: 15px; left: 50%; transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.9); padding: 10px 12px; border-radius: 12px;
+            width: 90%; max-width: 400px; z-index: 1000; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            max-height: 80vh; overflow-y: auto; transition: all 0.3s ease;
+        }
+        .control-group { margin-bottom: 6px; }
+        label { display: block; font-size: 11px; margin-bottom: 2px; color: #ccc; }
+        input[type="time"], input[type="range"], button {
+            width: 100%; padding: 6px; border: none; border-radius: 6px; font-size: 13px;
+        }
+        input[type="time"] { background: #333; color: #fff; text-align: center; font-weight: bold; }
+        button { background: #4CAF50; color: white; font-weight: bold; cursor: pointer; margin-top: 3px; }
+        #place-wall-btn.active { background: #f44336; }
+        #permission-btn { background: #2196F3; }
+        #mode-toggle-btn { background: #FF9800; }
+        .height-val { float: right; color: #4CAF50; font-weight: bold; }
+        .top-info {
+            position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.7);
+            padding: 8px; border-radius: 8px; font-size: 12px; z-index: 1000;
+        }
+        .panel-compact .hide-on-focus { display: none; }
+    </style>
+</head>
+<body style="margin : 0px; overflow: hidden;">
 
-    // 太陽ベクトルから影の伸びる方向を計算
-    const lengthXZ = Math.sqrt(sunDir.x * sunDir.x + sunDir.z * sunDir.z);
-    const dirX = lengthXZ > 0 ? -sunDir.x / lengthXZ : 0;
-    const dirZ = lengthXZ > 0 ? -sunDir.z / lengthXZ : 0;
-    const shadowLenFactor = 1.0 / Math.tan(sunAlt);
+    <a-scene id="main-scene" embedded cursor="rayOrigin: mouse" raycaster="objects: .clickable">
 
-    let positions = [];
+        <a-sky id="bg-sky" color="#444" visible="true"></a-sky>
 
-    wallDataList.forEach(wall => {
-        // 壁の底面4隅の座標を基準に、上部頂点から地面(Y=0.01)への投影交点を正確に計算
-        const h = wall.height;
-        const w = wall.width / 2;
-        const d = wall.depth / 2;
-        const rotY = wall.rotation || 0; // 向きを考慮
+        <a-entity id="camera-rig">
+            <a-camera look-controls="enabled: true" rotation-reader position="0 1.6 0"></a-camera>
+        </a-entity>
 
-        // 簡易的な底面からトップへの投影頂点計算
-        // 壁の底面手前・奥の4点から、太陽方向へオフセットした地面上の4点を算出
-        const baseOffsetX = dirX * (h * shadowLenFactor);
-        const baseOffsetZ = dirZ * (h * shadowLenFactor);
+        <a-light id="sun" type="directional" intensity="1.0" position="0 20 0"></a-light>
+        <a-light type="ambient" intensity="0.4"></a-light>
 
-        const p1 = [wall.x - w, 0.02, wall.z - d];
-        const p2 = [wall.x + w, 0.02, wall.z - d];
-        const p3 = [wall.x + w + baseOffsetX, 0.02, wall.z - d + baseOffsetZ];
-        const p4 = [wall.x - w + baseOffsetX, 0.02, wall.z - d + baseOffsetZ];
+        <!-- 固定のGroundPlane (Y=0) -->
+        <a-plane id="ground" position="0 0 0" rotation="-90 0 0" width="50" height="50" 
+                 class="clickable" material="color: #666; roughness: 1;"></a-plane>
 
-        // 三角形ポリゴンとしてpositions配列に追加（フェンスや複数壁の統合描画に対応）
-        positions.push(...p1, ...p2, ...p3);
-        positions.push(...p1, ...p3, ...p4);
-    });
+        <a-entity id="walls-container"></a-entity>
+        <a-entity id="shadows-container"></a-entity>
+    </a-scene>
 
-    // BufferGeometryの頂点バッファを直接一括更新することで、DOM負荷とガベージコレクションをゼロに抑制
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geometry.attributes.position.needsUpdate = true;
-}
+    <div class="top-info">
+        <div id="sun-position" style="color:#FFD700; font-weight:bold;">太陽の位置を計算中...</div>
+        <div id="geo-info">位置情報: 取得中...</div>
+    </div>
+
+    <div class="ui-panel" id="ui-panel">
+        <button id="mode-toggle-btn">モード: 3Dグレー空間 (タップしてAR切替)</button>
+        <button id="permission-btn">コンパス（自動方位）を有効化</button>
+        
+        <div class="control-group" style="margin-top: 4px;">
+            <label>時刻を指定:</label>
+            <input type="time" id="time-input">
+        </div>
+
+        <div class="control-group hide-on-focus">
+            <label>壁の高さ: <span class="height-val" id="height-display">3.0m</span></label>
+            <input type="range" id="wall-height" min="1" max="15" value="3" step="0.5">
+        </div>
+
+        <div class="control-group hide-on-focus">
+            <label>壁の幅: <span class="height-val" id="width-display">2.0m</span></label>
+            <input type="range" id="wall-width" min="0.5" max="10" value="2" step="0.5">
+        </div>
+
+        <div class="control-group hide-on-focus">
+            <label>壁の奥行き: <span class="height-val" id="depth-display">0.2m</span></label>
+            <input type="range" id="wall-depth" min="0.1" max="5" value="0.2" step="0.1">
+        </div>
+
+        <div class="control-group hide-on-focus" style="background: rgba(255,255,255,0.05); padding: 5px; border-radius: 6px;">
+            <label style="color: #4CAF50; font-weight: bold;">直近の壁の地面からの高さ(微調整): <span class="height-val" id="offset-display">0.0m</span></label>
+            <input type="range" id="wall-offset-y" min="-3" max="3" value="0" step="0.1">
+        </div>
+
+        <button id="place-wall-btn" class="hide-on-focus">壁を配置する (OFF)</button>
+        <button id="clear-walls-btn" class="hide-on-focus" style="background: #555;">すべて削除</button>
+    </div>
+
+    <script>
+        const now = new Date();
+        document.getElementById('time-input').value = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+        const sunLight = document.getElementById('sun');
+        const cameraRig = document.getElementById('camera-rig');
+        const wallsContainer = document.getElementById('walls-container');
+        const shadowsContainer = document.getElementById('shadows-container');
+        const heightDisplay = document.getElementById('height-display');
+        const widthDisplay = document.getElementById('width-display');
+        const depthDisplay = document.getElementById('depth-display');
+        const offsetDisplay = document.getElementById('offset-display');
+        const wallOffsetYInput = document.getElementById('wall-offset-y');
+        const placeBtn = document.getElementById('place-wall-btn');
+        const ground = document.getElementById('ground');
+        const permissionBtn = document.getElementById('permission-btn');
+        const modeToggleBtn = document.getElementById('mode-toggle-btn');
+        const uiPanel = document.getElementById('ui-panel');
+        const timeInput = document.getElementById('time-input');
+        const sceneEl = document.getElementById('main-scene');
+        const bgSky = document.getElementById('bg-sky');
+        
+        let isPlacing = false;
+        let currentHeight = 3.0;
+        let currentWidth = 2.0;
+        let currentDepth = 0.2;
+        let latitude = 34.2709; 
+        let longitude = 135.3850;
+        let smoothedHeading = 0;
+        let lastCreatedWall = null;
+        let wallDataList = [];
+
+        let savedMode = localStorage.getItem('sim_mode') || '3d';
+        if (savedMode === 'ar') {
+            sceneEl.setAttribute('arjs', 'sourceType: webcam; debugUIEnabled: false; sourceWidth: 1280; sourceHeight: 720; displayWidth: 1280; displayHeight: 720;');
+            bgSky.setAttribute('visible', 'false');
+            ground.setAttribute('material', 'opacity', '0.5');
+            modeToggleBtn.textContent = 'モード: ARカメラ中 (タップして3D切替)';
+        }
+
+        modeToggleBtn.addEventListener('click', () => {
+            localStorage.setItem('sim_mode', savedMode === 'ar' ? '3d' : 'ar');
+            window.location.reload();
+        });
+
+        timeInput.addEventListener('focus', () => uiPanel.classList.add('panel-compact'));
+        timeInput.addEventListener('blur', () => setTimeout(() => uiPanel.classList.remove('panel-compact'), 200));
+
+        permissionBtn.addEventListener('click', () => {
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                DeviceOrientationEvent.requestPermission().then(response => {
+                    if (response === 'granted') {
+                        window.addEventListener('deviceorientation', handleOrientation, true);
+                        permissionBtn.style.display = 'none';
+                    }
+                }).catch(console.error);
+            } else {
+                window.addEventListener('deviceorientation', handleOrientation, true);
+                permissionBtn.style.display = 'none';
+            }
+        });
+
+        function handleOrientation(e) {
+            let heading = e.webkitCompassHeading !== undefined ? e.webkitCompassHeading : (e.alpha !== null ? 360 - e.alpha : 0);
+            let diff = heading - smoothedHeading;
+            if (diff > 180) diff -= 360;
+            if (diff < -180) diff += 360;
+            smoothedHeading += diff * 0.1;
+            if (cameraRig) cameraRig.setAttribute('rotation', `0 ${-smoothedHeading} 0`);
+        }
+
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(pos => {
+                latitude = pos.coords.latitude;
+                longitude = pos.coords.longitude;
+                document.getElementById('geo-info').textContent = `位置: ${latitude.toFixed(2)}, ${longitude.toFixed(2)}`;
+                updateAllShadows();
+            }, () => {
+                document.getElementById('geo-info').textContent = "位置: 紀の川市(デフォルト)";
+                updateAllShadows();
+            });
+        } else {
+            updateAllShadows();
+        }
+
+        document.getElementById('wall-height').addEventListener('input', (e) => {
+            currentHeight = parseFloat(e.target.value);
+            heightDisplay.textContent = currentHeight.toFixed(1) + 'm';
+            if (lastCreatedWall) {
+                lastCreatedWall.height = currentHeight;
+                updateWallElement(lastCreatedWall);
+                updateAllShadows();
+            }
+        });
+
+        document.getElementById('wall-width').addEventListener('input', (e) => {
+            currentWidth = parseFloat(e.target.value);
+            widthDisplay.textContent = currentWidth.toFixed(1) + 'm';
+            if (lastCreatedWall) {
+                lastCreatedWall.width = currentWidth;
+                updateWallElement(lastCreatedWall);
+                updateAllShadows();
+            }
+        });
+
+        document.getElementById('wall-depth').addEventListener('input', (e) => {
+            currentDepth = parseFloat(e.target.value);
+            depthDisplay.textContent = currentDepth.toFixed(1) + 'm';
+            if (lastCreatedWall) {
+                lastCreatedWall.depth = currentDepth;
+                updateWallElement(lastCreatedWall);
+                updateAllShadows();
+            }
+        });
+
+        wallOffsetYInput.addEventListener('input', (e) => {
+            const offsetVal = parseFloat(e.target.value);
+            offsetDisplay.textContent = offsetVal.toFixed(1) + 'm';
+            if (lastCreatedWall) {
+                lastCreatedWall.yOffset = offsetVal;
+                updateWallElement(lastCreatedWall);
+                updateAllShadows();
+            }
+        });
+
+        placeBtn.addEventListener('click', () => {
+            isPlacing = !isPlacing;
+            placeBtn.textContent = isPlacing ? '地面をタップして配置' : '壁を配置する (OFF)';
+            placeBtn.className = isPlacing ? 'active' : '';
+        });
+
+        ground.addEventListener('click', (evt) => {
+            if (!isPlacing) return;
+            const point = evt.detail.intersection.point;
+            createWall(point.x, point.z);
+            isPlacing = false;
+            placeBtn.textContent = '壁を配置する (OFF)';
+            placeBtn.className = '';
+        });
+
+        function createWall(x, z) {
+            const wallItem = {
+                x: x,
+                z: z,
+                width: currentWidth,
+                height: currentHeight,
+                depth: currentDepth,
+                yOffset: parseFloat(wallOffsetYInput.value),
+                el: null,
+                shadowEl: null
+            };
+
+            const wallEl = document.createElement('a-box');
+            wallEl.setAttribute('material', 'color: #8B4513; roughness: 0.8;');
+            wallItem.el = wallEl;
+
+            const shadowEl = document.createElement('a-plane');
+            shadowEl.setAttribute('material', 'color: #000000; opacity: 0.4; transparent: true; shader: flat;');
+            shadowEl.setAttribute('rotation', '-90 0 0');
+            wallItem.shadowEl = shadowEl;
+
+            wallsContainer.appendChild(wallEl);
+            shadowsContainer.appendChild(shadowEl);
+
+            updateWallElement(wallItem);
+            wallDataList.push(wallItem);
+            lastCreatedWall = wallItem;
+
+            updateAllShadows();
+        }
+
+        function updateWallElement(item) {
+            item.el.setAttribute('position', `${item.x} ${(item.height / 2) + item.yOffset} ${item.z}`);
+            item.el.setAttribute('width', item.width);
+            item.el.setAttribute('height', item.height);
+            item.el.setAttribute('depth', item.depth);
+        }
+
+        document.getElementById('clear-walls-btn').addEventListener('click', () => {
+            wallsContainer.innerHTML = '';
+            shadowsContainer.innerHTML = '';
+            wallDataList = [];
+            lastCreatedWall = null;
+        });
+
+        function updateShadow(wallData, sunDir, sunAlt) {
+            if (sunAlt <= 0) {
+                wallData.shadowEl.setAttribute('visible', 'false');
+                return;
+            }
+            wallData.shadowEl.setAttribute('visible', 'true');
+
+            const shadowLen = wallData.height / Math.tan(sunAlt);
+            const lengthXZ = Math.sqrt(sunDir.x * sunDir.x + sunDir.z * sunDir.z);
+            const dirX = lengthXZ > 0 ? -sunDir.x / lengthXZ : 0;
+            const dirZ = lengthXZ > 0 ? -sunDir.z / lengthXZ : 0;
+
+            const shadowCenterX = wallData.x + dirX * (shadowLen / 2);
+            const shadowCenterZ = wallData.z + dirZ * (shadowLen / 2);
+            const shadowWidth = wallData.width;
+            const shadowDepth = wallData.depth + shadowLen;
+            const angle = Math.atan2(sunDir.x, sunDir.z) * (180 / Math.PI);
+
+            wallData.shadowEl.setAttribute('position', `${shadowCenterX} 0.01 ${shadowCenterZ}`);
+            wallData.shadowEl.setAttribute('width', shadowWidth);
+            wallData.shadowEl.setAttribute('height', shadowDepth);
+            wallData.shadowEl.setAttribute('rotation', `-90 ${angle} 0`);
+        }
+
+        function updateAllShadows() {
+            try {
+                if (typeof SunCalc === 'undefined') return;
+                const timeStr = timeInput.value;
+                const [h, m] = timeStr.split(':').map(Number);
+                const date = new Date();
+                date.setHours(h, m, 0, 0);
+
+                const sun = SunCalc.getPosition(date, latitude, longitude);
+                const alt = sun.altitude; 
+
+                let sunAziDeg = (sun.azimuth * (180 / Math.PI)) + 180;
+                let sunAziRad = sunAziDeg * (Math.PI / 180);
+
+                const distance = 30;
+                const x = distance * Math.cos(alt) * Math.sin(sunAziRad);
+                const y = distance * Math.sin(alt);
+                const z = -distance * Math.cos(alt) * Math.cos(sunAziRad);
+
+                if (y < 0) {
+                    sunLight.setAttribute('intensity', 0);
+                } else {
+                    sunLight.setAttribute('intensity', 1.0);
+                }
+                sunLight.setAttribute('position', `${x} ${y} ${z}`);
+
+                const altDeg = alt * (180 / Math.PI);
+                document.getElementById('sun-position').textContent = 
+                    `太陽: 高度 ${altDeg.toFixed(1)}° / 方位 ${sunAziDeg.toFixed(1)}°`;
+
+                wallDataList.forEach(wall => {
+                    updateShadow(wall, {x, y, z}, alt);
+                });
+            } catch (err) {
+                console.error(err);
+            }
+        }
+
+        timeInput.addEventListener('input', updateAllShadows);
+        updateAllShadows();
+    </script>
+</body>
+</html>
