@@ -3,11 +3,96 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>日陰シミュレーター / Mobile Master v5.2</title>
+  <title>日陰シミュレーター / Mobile Master v5.4</title>
   
   <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
   <script src="https://unpkg.com/aframe-orbit-controls@1.3.2/dist/aframe-orbit-controls.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/suncalc/1.9.0/suncalc.min.js"></script>
+
+  <script>
+    // ─── 影の品質設定 ────────────────────────────────────────────────
+    // シェーダー側の #define と JS 側のシャドウカメラ設定は必ず同じ値から作る。
+    // ズレると半影の幅が距離に対して合わなくなる。
+    const SHADOW_CFG = (function () {
+      const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+      return {
+        halfExtent: 30,              // 正射影シャドウカメラの半幅[m]（この外の物は影を落とさない）
+        near: 0.5,
+        far: 120,                    // 光源は原点から半径40なので余裕を見た値
+        mapSize: coarse ? 2048 : 4096,
+        bias: -0.0004,               // シャドウアクネ対策（負値で受光面を手前に寄せる）
+        normalBias: 0.03,            // 法線方向のずらし。斜面のアクネとピーターパン現象の両対策
+        sunTan: 0.00925,             // tan(太陽の視直径 0.53°)。半影 = 遮蔽物までの距離 × これ
+        maxPenumbra: 0.4             // 半影幅の上限[m]。ブロッカー探索半径もこれに一致させる
+      };
+    })();
+
+    // ─── ソフトシャドウ（PCSS）──────────────────────────────────────
+    // three r147 の SHADOWMAP_TYPE_PCF_SOFT は shadow.radius を参照しない固定 9 タップで、
+    // 遮蔽物からの距離によらず常に同じ太さにしかぼけない（PCF も UV 空間で一定幅）。
+    // 「離れるほど輪郭がぼやける」を出すには半影幅を距離から計算する必要があるので、
+    // getShadow を PCSS（ブロッカー探索 → 可変半径 PCF）に差し替える。
+    // 平行光源のシャドウカメラは正射影なので、深度差はそのまま実距離に比例する。
+    (function installPCSS() {
+      const c = SHADOW_CFG;
+      const frustumW = c.halfExtent * 2;
+      const depthRange = c.far - c.near;
+      const maxRadiusUV = c.maxPenumbra / frustumW;
+
+      const PCSS_GLSL = `
+      #define PCSS_BLOCKER_SAMPLES 12
+      #define PCSS_PCF_SAMPLES 16
+      #define PCSS_DEPTH_RANGE ${depthRange.toFixed(4)}
+      #define PCSS_FRUSTUM_W ${frustumW.toFixed(4)}
+      #define PCSS_SUN_TAN ${c.sunTan.toFixed(6)}
+      #define PCSS_MAX_RADIUS_UV ${maxRadiusUV.toFixed(8)}
+      vec2 pcssOffset( const in float i, const in float total, const in float startAngle ) {
+        float angle = startAngle + i * ( PI2 * 5.0 / total );
+        float r = pow( ( i + 0.5 ) / total, 0.75 );
+        return vec2( cos( angle ), sin( angle ) ) * r;
+      }
+      float pcssFindBlocker( sampler2D shadowMap, const in vec2 uv, const in float zReceiver, const in float startAngle ) {
+        float sum = 0.0;
+        float count = 0.0;
+        for ( int i = 0; i < PCSS_BLOCKER_SAMPLES; i ++ ) {
+          vec2 o = pcssOffset( float( i ), float( PCSS_BLOCKER_SAMPLES ), startAngle ) * PCSS_MAX_RADIUS_UV;
+          float d = unpackRGBAToDepth( texture2D( shadowMap, uv + o ) );
+          if ( d < zReceiver ) { sum += d; count += 1.0; }
+        }
+        if ( count < 0.5 ) return -1.0;
+        return sum / count;
+      }
+      float PCSS( sampler2D shadowMap, vec2 shadowMapSize, vec4 coords ) {
+        vec2 uv = coords.xy;
+        float z = coords.z;
+        float startAngle = rand( uv ) * PI2;
+        float zBlocker = pcssFindBlocker( shadowMap, uv, z, startAngle );
+        if ( zBlocker < 0.0 ) return 1.0;
+        float occluderDist = ( z - zBlocker ) * PCSS_DEPTH_RANGE;
+        float radius = clamp( occluderDist * PCSS_SUN_TAN / PCSS_FRUSTUM_W, 1.0 / shadowMapSize.x, PCSS_MAX_RADIUS_UV );
+        float shadow = 0.0;
+        for ( int i = 0; i < PCSS_PCF_SAMPLES; i ++ ) {
+          vec2 o = pcssOffset( float( i ), float( PCSS_PCF_SAMPLES ), startAngle ) * radius;
+          shadow += texture2DCompare( shadowMap, uv + o, z );
+        }
+        return shadow / float( PCSS_PCF_SAMPLES );
+      }
+      `;
+
+      // 差し込み位置は three のバージョンに依存する。見つからないまま素通りすると
+      // 「パッチが当たっていないのに動いて見える」状態になるので、その場で失敗させる。
+      const anchorFn = 'float getShadow( sampler2D shadowMap,';
+      const anchorBranch = '#if defined( SHADOWMAP_TYPE_PCF )\n';
+      let src = THREE.ShaderChunk.shadowmap_pars_fragment;
+      if (src.indexOf(anchorFn) === -1 || src.indexOf(anchorBranch) === -1) {
+        console.error('[shadow] PCSS パッチの差し込み位置が見つかりません (three r' + THREE.REVISION + ')。ソフトシャドウは無効です。');
+        return;
+      }
+      src = src.replace(anchorFn, PCSS_GLSL + anchorFn);
+      src = src.replace(anchorBranch, 'return PCSS( shadowMap, shadowMapSize, shadowCoord );\n' + anchorBranch);
+      THREE.ShaderChunk.shadowmap_pars_fragment = src;
+    })();
+  </script>
 
   <style>
     :root {
@@ -71,7 +156,7 @@
     .dp-left { grid-column: 1; grid-row: 2; }
     .dp-right { grid-column: 3; grid-row: 2; }
     .dp-down { grid-column: 2; grid-row: 3; }
-    #selected-notice { display: none; background: #e67e22; color: #fff; padding: 4px 8px; border-radius: 6px; font-size: 11px; text-align: center; font-weight: bold; margin-bottom: 8px; }
+    .notice { display: none; background: #e67e22; color: #fff; padding: 4px 8px; border-radius: 6px; font-size: 11px; text-align: center; font-weight: bold; margin-bottom: 8px; }
     @media (orientation: landscape) and (max-height: 500px) {
       .top-panel { width: 220px; right: auto; }
       .bottom-panel { left: 240px; }
@@ -84,7 +169,7 @@
   <div class="panel top-panel">
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
-      <span id="version-display">v5.2</span>
+      <span id="version-display">v5.4</span>
     </div>
     <div class="hud-box">
       <div class="hud-main"><span>向き</span><strong id="heading-text">N (0°)</strong></div>
@@ -98,7 +183,8 @@
       <button id="compass-btn" class="btn compass-toggle" onclick="toggleCompass()">🧭 磁気連動 OFF</button>
     </div>
     <div id="mode-text" class="mode-text">手動モード / タップで配置</div>
-    <div id="selected-notice">選択中: スライダーで調整 / 地面タップで解除</div>
+    <div id="selected-notice" class="notice">選択中: スライダーで調整 / 地面タップで解除</div>
+    <div id="placing-notice" class="notice">配置中: スライダーで調整 / 地面タップで確定</div>
   </div>
 
   <div id="dpad">
@@ -121,16 +207,18 @@
       <div class="geo-info" id="geo-info">位置: 東京 (35.6895, 139.6917)</div>
     </div>
     <div id="settings-section" class="settings-grid" style="display:none;">
-      <div class="ctrl-item"><label>壁高 <output id="wh-out">3.0m</output></label><input id="wh-range" class="slider" type="range" min="1" max="15" step="0.5" value="3"></div>
-      <div class="ctrl-item"><label>壁幅 <output id="ww-out">4.0m</output></label><input id="ww-range" class="slider" type="range" min="0.5" max="20" step="0.5" value="4"></div>
-      <div class="ctrl-item"><label>壁回転 <output id="wr-out">0°</output></label><input id="wr-range" class="slider" type="range" min="0" max="359" value="0"></div>
-      <div class="ctrl-item"><label>身長 <output id="hh-out">160cm</output></label><input id="hh-range" class="slider" type="range" min="120" max="200" value="160"></div>
+      <div class="ctrl-item ctrl-wall"><label>壁高 <output id="wh-out">3.0m</output></label><input id="wh-range" class="slider" type="range" min="1" max="15" step="0.5" value="3"></div>
+      <div class="ctrl-item ctrl-wall"><label>壁幅 <output id="ww-out">4.0m</output></label><input id="ww-range" class="slider" type="range" min="0.5" max="20" step="0.5" value="4"></div>
+      <div class="ctrl-item ctrl-wall"><label>奥行 <output id="wd-out">0.2m</output></label><input id="wd-range" class="slider" type="range" min="0.1" max="5" step="0.1" value="0.2"></div>
+      <div class="ctrl-item ctrl-wall"><label>壁回転 <output id="wr-out">0°</output></label><input id="wr-range" class="slider" type="range" min="0" max="359" value="0"></div>
+      <div class="ctrl-item ctrl-human"><label>身長 <output id="hh-out">160cm</output></label><input id="hh-range" class="slider" type="range" min="120" max="200" value="160"></div>
     </div>
     <div class="btn-group">
       <button id="toggle-settings-btn" class="btn btn-dark">⚙ 設定</button>
       <button id="toggle-fps-btn" class="btn btn-purple">🎮 FPS視点</button>
       <button id="add-wall-btn" class="btn btn-primary">壁を追加</button>
       <button id="add-human-btn" class="btn btn-purple">人を追加</button>
+      <button id="cancel-place-btn" class="btn btn-dark" style="grid-column: span 4; margin-top: 4px; display: none;">✕ 配置をキャンセル</button>
       <button id="delete-btn" class="btn btn-danger" style="grid-column: span 2; margin-top: 4px;">選択削除</button>
       <button id="clear-all-btn" class="btn btn-danger" style="grid-column: span 2; margin-top: 4px; background: #880000;">全削除</button>
     </div>
@@ -144,7 +232,8 @@
     </a-entity>
     <a-sky color="#111"></a-sky>
     <a-entity id="world-root" rotation="0 0 0">
-      <a-entity id="sun-light" light="type: directional; intensity: 1.3; castShadow: true; shadowCameraTop: 40; shadowCameraBottom: -40; shadowCameraLeft: -40; shadowCameraRight: 40; shadowMapWidth: 2048; shadowMapHeight: 2048" position="10 20 10"></a-entity>
+      <!-- シャドウの解像度・範囲・バイアスは SHADOW_CFG から initShadowQuality() で設定する -->
+      <a-entity id="sun-light" light="type: directional; intensity: 1.3; castShadow: true" position="10 20 10"></a-entity>
       <a-light type="ambient" intensity="0.5"></a-light>
       <a-plane id="ground" class="clickable" position="0 0 0" rotation="-90 0 0" width="100" height="100" material="color: #222; roughness: 0.9" shadow="receive: true"></a-plane>
       <a-entity id="guide-markers">
@@ -157,11 +246,12 @@
       </a-entity>
       <a-entity id="walls-container"></a-entity>
       <a-entity id="humans-container"></a-entity>
-      <a-box id="preview-wall" material="color: #00ff88; transparent: true; opacity: 0.5" depth="0.2" visible="false"></a-box>
-      <a-entity id="preview-human" visible="false">
-        <a-sphere position="0 1.5 0" radius="0.15" material="color: #00ff88; transparent: true; opacity: 0.5"></a-sphere>
-        <a-box position="0 0.9 0" width="0.4" height="0.8" depth="0.2" material="color: #00ff88; transparent: true; opacity: 0.5"></a-box>
-      </a-entity>
+      <!-- 接地部のオクルージョン。オブジェクトの子にすると .clickable の当たり判定が
+           足元まで広がって地面タップを塞ぐので、独立したコンテナで管理する -->
+      <a-entity id="contact-shadows"></a-entity>
+      <a-box id="preview-wall" material="color: #ff9800; transparent: true; opacity: 0.5" depth="0.2" visible="false"></a-box>
+      <!-- 中身は buildHumanParts() で実体と同じ形を組む -->
+      <a-entity id="preview-human" visible="false"></a-entity>
     </a-entity>
   </a-scene>
 
@@ -187,6 +277,105 @@
       $('compass-strip').innerHTML = dirs.map(d => d === getDirName(deg) ? `<b>${d}</b>` : d).join(' ');
     }
 
+    // ─── シャドウ品質の適用 ─────────────────────────────────────────
+    function initShadowQuality() {
+      const c = SHADOW_CFG;
+      sunLight.setAttribute('light', {
+        shadowMapWidth: c.mapSize, shadowMapHeight: c.mapSize,
+        shadowCameraLeft: -c.halfExtent, shadowCameraRight: c.halfExtent,
+        shadowCameraTop: c.halfExtent, shadowCameraBottom: -c.halfExtent,
+        shadowCameraNear: c.near, shadowCameraFar: c.far,
+        shadowBias: c.bias
+      });
+      // normalBias は A-Frame の light スキーマにないので three 側へ直接入れる。
+      // updateShadow() は normalBias を触らないので上書きされない。
+      const l = sunLight.components.light && sunLight.components.light.light;
+      if (l && l.shadow) l.shadow.normalBias = c.normalBias;
+    }
+
+    // ─── コンタクトシャドウ（接地部のオクルージョン）─────────────────
+    // 太陽の落とす影とは別物で、環境光が接地部で遮られる分の落ち込みを表す。
+    // 乗算ブレンドの板を接地面に敷き、太陽方向に依らず常に接地感を出す。
+    const SELECT_COLOR = '#ff9800';   // 選択中の色。プレビューも同じ色を使う
+    const CONTACT_Y = 0.012;        // 地面(0)とガイドリング(0.02)の間に置く
+    const CONTACT_DARKEST = 60;     // 最も濃い部分のグレー値(0-255)
+    const CONTACT_WALL_SPREAD = 0.35; // 壁の両端に広げる量[m]
+    const CONTACT_HUMAN_SIZE = 0.7;   // 身長160cm時の足元の広がり[m]
+
+    function makeAOTexture(build) {
+      const s = 128, cv = document.createElement('canvas');
+      cv.width = cv.height = s;
+      const ctx = cv.getContext('2d'), img = ctx.createImageData(s, s);
+      for (let y = 0; y < s; y++) {
+        for (let x = 0; x < s; x++) {
+          const a = build((x + 0.5) / s, (y + 0.5) / s);   // 0(遮蔽なし)〜1(最も濃い)
+          const g = Math.round(255 - a * (255 - CONTACT_DARKEST));
+          const i = (y * s + x) * 4;
+          img.data[i] = img.data[i + 1] = img.data[i + 2] = g;
+          img.data[i + 3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+      const tex = new THREE.CanvasTexture(cv);
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+      return tex;
+    }
+
+    // 壁: 壁に垂直な方向へ減衰させる。長い壁でも根元が均一に濃くなるよう、
+    // 長手方向は端の 15% だけで抜く。
+    const wallAOTex = makeAOTexture((u, v) => {
+      const across = Math.pow(1 - Math.abs(v - 0.5) * 2, 2.2);
+      const along = Math.min(1, (1 - Math.abs(u - 0.5) * 2) / 0.25);
+      return across * along;
+    });
+    // 人: 足元の等方な落ち込み
+    const humanAOTex = makeAOTexture((u, v) => {
+      const r = Math.min(1, Math.hypot(u - 0.5, v - 0.5) * 2);
+      return Math.pow(1 - r, 2.2);
+    });
+
+    const contactGeo = new THREE.PlaneGeometry(1, 1);
+    function contactMaterial(tex) {
+      return new THREE.MeshBasicMaterial({
+        map: tex, blending: THREE.MultiplyBlending,
+        transparent: true, depthWrite: false, toneMapped: false
+      });
+    }
+    const wallAOMat = contactMaterial(wallAOTex), humanAOMat = contactMaterial(humanAOTex);
+
+    function attachContact(el, mat) {
+      const m = new THREE.Mesh(contactGeo, mat);
+      m.castShadow = false; m.receiveShadow = false;
+      m.renderOrder = 2;
+      m.rotation.order = 'YXZ';   // 寝かせた板を世界のY軸まわりに回すため
+      el.__contact = m;
+      $('contact-shadows').object3D.add(m);
+      // 生成直後のエンティティはまだ初期化されておらず getAttribute が既定値を返すので待つ
+      if (el.hasLoaded) syncContact(el);
+      else el.addEventListener('loaded', () => syncContact(el), { once: true });
+    }
+
+    function syncContact(el) {
+      const m = el.__contact;
+      if (!m) return;
+      const p = el.getAttribute('position');
+      m.position.set(p.x, CONTACT_Y, p.z);
+      if (el.dataset.type === 'human') {
+        const s = el.getAttribute('scale').x;
+        m.scale.set(CONTACT_HUMAN_SIZE * s, CONTACT_HUMAN_SIZE * s, 1);
+        m.rotation.set(-Math.PI / 2, 0, 0);
+      } else {
+        m.scale.set(+el.getAttribute('width') + CONTACT_WALL_SPREAD * 2, +el.getAttribute('depth') + CONTACT_WALL_SPREAD * 2, 1);
+        m.rotation.set(-Math.PI / 2, THREE.MathUtils.degToRad(el.getAttribute('rotation').y), 0);
+      }
+    }
+
+    function removeContact(el) {
+      if (!el.__contact) return;
+      $('contact-shadows').object3D.remove(el.__contact);
+      el.__contact = null;
+    }
+
     function updateSimulation() {
       const minutes = +$('time-range').value, h = Math.floor(minutes / 60), m = minutes % 60;
       $('time-display').textContent = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
@@ -202,35 +391,32 @@
       // 地平線下では光源が地面より下に来て下から照らしてしまうので、消灯して影も止める
       const aboveHorizon = alt > 0;
       sunLight.setAttribute('light', 'intensity', aboveHorizon ? 1.3 : 0);
-      sunLight.setAttribute('light', 'castShadow', aboveHorizon);
+      // castShadow を setAttribute で変えるとスライダー操作のたびにシャドウマップが
+      // 再構成されるので、three のライトへ直接入れる
+      const l = sunLight.components.light && sunLight.components.light.light;
+      if (l) l.castShadow = aboveHorizon;
       $('sun-info').textContent = aboveHorizon
         ? `太陽高度 ${(alt * 180 / Math.PI).toFixed(1)}° / 方位 ${(norm(az * 180 / Math.PI)).toFixed(1)}°`
         : `太陽: 地平線下 (${(alt * 180 / Math.PI).toFixed(1)}°)`;
     }
 
     function createWall(x, z) {
-      const w = +$('ww-range').value, h = +$('wh-range').value, r = +$('wr-range').value;
+      const w = +$('ww-range').value, h = +$('wh-range').value, d = +$('wd-range').value, r = +$('wr-range').value;
       const wall = document.createElement('a-box');
       wall.classList.add('clickable');
       wall.dataset.originalColor = '#7f8c8d';
       wall.setAttribute('position', `${x} ${h/2} ${z}`);
-      wall.setAttribute('width', w); wall.setAttribute('height', h); wall.setAttribute('depth', 0.2);
+      wall.setAttribute('width', w); wall.setAttribute('height', h); wall.setAttribute('depth', d);
       wall.setAttribute('rotation', `0 ${r} 0`);
       wall.setAttribute('material', 'color: #7f8c8d; roughness: 0.6');
       wall.setAttribute('shadow', 'cast: true; receive: true');
       wall.addEventListener('click', e => { e.stopPropagation(); selectObject(wall); });
       wallsContainer.appendChild(wall);
       wallObjects.push({ el: wall, x: x, z: z });
+      attachContact(wall, wallAOMat);
     }
 
-    function createHuman(x, z) {
-      const hh = +$('hh-range').value / 100;
-      const human = document.createElement('a-entity');
-      human.classList.add('clickable');
-      human.dataset.type = 'human';
-      human.setAttribute('position', `${x} 0 ${z}`);
-      human.setAttribute('scale', `${hh/1.6} ${hh/1.6} ${hh/1.6}`);
-const parts = [
+const HUMAN_PARTS = [
 
   // 黒い外形
   { tag:'a-sphere', pos:'0 1.5 0', rad:0.16, col:'#111111' },
@@ -289,44 +475,57 @@ const parts = [
   { tag:'a-cylinder', pos:'0.13 0.32 0.03', rad:0.055, h:0.58, col:'#ffffff' }
 
 ];
-      parts.forEach(p => {
+
+    // ghostColor を渡すとプレビュー用の半透明ゴーストになる（影は落とさない）
+    function buildHumanParts(container, ghostColor) {
+      HUMAN_PARTS.forEach(p => {
         const el = document.createElement(p.tag);
         el.setAttribute('position', p.pos);
         if (p.rad) el.setAttribute('radius', p.rad);
         if (p.w) { el.setAttribute('width', p.w); el.setAttribute('height', p.h); el.setAttribute('depth', p.d); }
         if (p.tag === 'a-cylinder') { el.setAttribute('radius', p.rad); el.setAttribute('height', p.h); }
-        if(p.rot){
-        el.setAttribute('rotation', p.rot);
-}          
-        // 白黒アウトライン用
-  el.setAttribute(
-    'material',
-    `shader: flat; color: ${p.col}`
-  );
-        el.setAttribute('material', `color: ${p.col}`);
-        el.dataset.originalColor = p.col;
-        el.setAttribute('shadow', 'cast: true');
-        human.appendChild(el);
+        if (p.rot) el.setAttribute('rotation', p.rot);
+        if (ghostColor) {
+          el.setAttribute('material', `color: ${ghostColor}; transparent: true; opacity: 0.5`);
+        } else {
+          // 陰影を優先するため flat シェーダーは使わず標準シェーダーのままにする
+          el.setAttribute('material', `color: ${p.col}`);
+          el.dataset.originalColor = p.col;
+          el.setAttribute('shadow', 'cast: true');
+        }
+        container.appendChild(el);
       });
+    }
+
+    function createHuman(x, z) {
+      const hh = +$('hh-range').value / 100;
+      const human = document.createElement('a-entity');
+      human.classList.add('clickable');
+      human.dataset.type = 'human';
+      human.setAttribute('position', `${x} 0 ${z}`);
+      human.setAttribute('scale', `${hh/1.6} ${hh/1.6} ${hh/1.6}`);
+      buildHumanParts(human);
       human.addEventListener('click', e => { e.stopPropagation(); selectObject(human); });
       humansContainer.appendChild(human);
       humanObjects.push({ el: human, x: x, z: z });
+      attachContact(human, humanAOMat);
     }
 
     function selectObject(el) {
       if (selectedEl) deselectObject();
+      if (pendingType) endPlacement();
       selectedEl = el;
-      const highlight = '#ff9800';
-      if (el.tagName.toLowerCase() === 'a-box') el.setAttribute('material', 'color', highlight);
-      else el.querySelectorAll('*').forEach(c => c.setAttribute('material', 'color', highlight));
-      $('settings-section').style.display = 'grid';
-      $('time-section').style.display = 'none';
+      const isWall = el.tagName.toLowerCase() === 'a-box';
+      if (isWall) el.setAttribute('material', 'color', SELECT_COLOR);
+      else el.querySelectorAll('*').forEach(c => c.setAttribute('material', 'color', SELECT_COLOR));
+      setSettingsTarget(isWall ? 'wall' : 'human');
+      showSettings(true);
       $('selected-notice').style.display = 'block';
-      $('toggle-settings-btn').textContent = '⏳ 時刻に戻る';
-      if (el.tagName.toLowerCase() === 'a-box') {
-        const w = el.getAttribute('width'), h = el.getAttribute('height'), rot = el.getAttribute('rotation');
+      if (isWall) {
+        const w = el.getAttribute('width'), h = el.getAttribute('height'), d = el.getAttribute('depth'), rot = el.getAttribute('rotation');
         $('ww-range').value = w; $('ww-out').textContent = w + 'm';
         $('wh-range').value = h; $('wh-out').textContent = h + 'm';
+        $('wd-range').value = d; $('wd-out').textContent = d + 'm';
         $('wr-range').value = rot.y; $('wr-out').textContent = rot.y + '°';
       } else {
         const scale = el.getAttribute('scale').x;
@@ -341,6 +540,7 @@ const parts = [
       else selectedEl.querySelectorAll('*').forEach(c => c.setAttribute('material', 'color', c.dataset.originalColor));
       selectedEl = null;
       $('selected-notice').style.display = 'none';
+      setSettingsTarget(null);
     }
 
     const raycaster = new THREE.Raycaster();
@@ -352,6 +552,70 @@ const parts = [
     function toWorldRootLocal(pt) {
       worldRoot.object3D.updateMatrixWorld();
       return worldRoot.object3D.worldToLocal(_tmpVec.copy(pt));
+    }
+
+    // ─── 配置フロー ──────────────────────────────────────────────────
+    // 追加ボタンを押した時点で選択中と同じオレンジのプレビューを画面中央に出し、
+    // スライダーで調整してから地面をタップして確定する。
+    function showSettings(on) {
+      $('settings-section').style.display = on ? 'grid' : 'none';
+      $('time-section').style.display = on ? 'none' : 'flex';
+      $('toggle-settings-btn').textContent = on ? '⏳ 時刻に戻る' : '⚙ 設定';
+    }
+
+    // 対象に関係のないスライダーは隠す。null なら全部出す
+    function setSettingsTarget(type) {
+      document.querySelectorAll('.ctrl-wall').forEach(e => e.style.display = (!type || type === 'wall') ? 'block' : 'none');
+      document.querySelectorAll('.ctrl-human').forEach(e => e.style.display = (!type || type === 'human') ? 'block' : 'none');
+    }
+
+    function updatePreview() {
+      if (pendingType === 'wall') {
+        const h = +$('wh-range').value, p = previewWall.getAttribute('position');
+        previewWall.setAttribute('width', +$('ww-range').value);
+        previewWall.setAttribute('height', h);
+        previewWall.setAttribute('depth', +$('wd-range').value);
+        previewWall.setAttribute('rotation', `0 ${+$('wr-range').value} 0`);
+        previewWall.setAttribute('position', `${p.x} ${h / 2} ${p.z}`);
+      } else if (pendingType === 'human') {
+        const s = +$('hh-range').value / 160;
+        previewHuman.setAttribute('scale', `${s} ${s} ${s}`);
+      }
+    }
+
+    // プレビューの初期位置。ドラッグしなくても見えるよう画面中央の地面に出す
+    function screenCenterGroundPoint() {
+      mouse.set(0, 0);
+      raycaster.setFromCamera(mouse, sceneEl.camera);
+      const hits = raycaster.intersectObject($('ground').object3D, true);
+      return hits.length ? toWorldRootLocal(hits[0].point) : new THREE.Vector3(0, 0, 0);
+    }
+
+    function startPlacement(type) {
+      if (isFps) return;
+      if (selectedEl) deselectObject();
+      pendingType = type;
+      const pt = screenCenterGroundPoint();
+      previewWall.setAttribute('visible', type === 'wall');
+      previewHuman.setAttribute('visible', type === 'human');
+      (type === 'wall' ? previewWall : previewHuman).setAttribute('position', `${pt.x} 0 ${pt.z}`);
+      updatePreview();
+      setSettingsTarget(type);
+      showSettings(true);
+      $('placing-notice').style.display = 'block';
+      $('cancel-place-btn').style.display = 'flex';
+      $('mode-text').textContent = (type === 'wall' ? '壁' : '人') + 'を配置中 / 調整して地面をタップ';
+    }
+
+    function endPlacement() {
+      pendingType = null;
+      previewWall.setAttribute('visible', false);
+      previewHuman.setAttribute('visible', false);
+      $('placing-notice').style.display = 'none';
+      $('cancel-place-btn').style.display = 'none';
+      $('mode-text').textContent = '手動モード / タップで配置';
+      setSettingsTarget(null);
+      showSettings(false);
     }
 
     function getGroundPoint(e) {
@@ -391,9 +655,7 @@ const parts = [
         const pt = toWorldRootLocal(hit);
         if (pendingType === 'wall') createWall(pt.x, pt.z);
         else createHuman(pt.x, pt.z);
-        pendingType = null;
-        previewWall.setAttribute('visible', false); previewHuman.setAttribute('visible', false);
-        $('mode-text').textContent = '手動モード / タップで配置';
+        endPlacement();
       }
     });
 
@@ -484,19 +746,26 @@ rig.setAttribute('position', `${newX} ${pos.y} ${newZ}`);
     }
     step();
 
-    $('add-wall-btn').onclick = () => { pendingType = 'wall'; $('mode-text').textContent = '配置場所をタップしてください'; };
-    $('add-human-btn').onclick = () => { pendingType = 'human'; $('mode-text').textContent = '配置場所をタップしてください'; };
+    $('add-wall-btn').onclick = () => startPlacement('wall');
+    $('add-human-btn').onclick = () => startPlacement('human');
+    $('cancel-place-btn').onclick = () => endPlacement();
+    window.addEventListener('keydown', e => {
+      if (e.key !== 'Escape') return;
+      if (pendingType) endPlacement();
+      else if (selectedEl) deselectObject();
+    });
     $('delete-btn').onclick = () => { if (selectedEl) { 
       wallObjects = wallObjects.filter(o => o.el !== selectedEl);
       humanObjects = humanObjects.filter(o => o.el !== selectedEl);
+      removeContact(selectedEl);
       selectedEl.remove(); deselectObject(); 
     } };
-    $('clear-all-btn').onclick = () => { if (confirm('すべてのオブジェクトを削除しますか？')) { wallsContainer.innerHTML = ''; humansContainer.innerHTML = ''; wallObjects = []; humanObjects = []; deselectObject(); } };
+    $('clear-all-btn').onclick = () => { if (confirm('すべてのオブジェクトを削除しますか？')) { wallsContainer.innerHTML = ''; humansContainer.innerHTML = ''; $('contact-shadows').object3D.clear(); wallObjects = []; humanObjects = []; deselectObject(); } };
     $('toggle-settings-btn').onclick = () => {
-      const isH = $('settings-section').style.display === 'none';
-      $('settings-section').style.display = isH ? 'grid' : 'none';
-      $('time-section').style.display = isH ? 'none' : 'flex';
-      $('toggle-settings-btn').textContent = isH ? '⏳ 時刻に戻る' : '⚙ 設定';
+      if (pendingType) return;   // 配置中はキャンセルボタンで抜ける
+      const willShow = $('settings-section').style.display === 'none';
+      if (willShow && !selectedEl) setSettingsTarget(null);
+      showSettings(willShow);
     };
 
     $('time-range').oninput = updateSimulation;
@@ -519,14 +788,18 @@ rig.setAttribute('position', `${newX} ${pos.y} ${newZ}`);
         { enableHighAccuracy: true, timeout: 12000 }
       );
     };
-    $('wh-range').oninput = e => { $('wh-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('height', e.target.value); let p = selectedEl.getAttribute('position'); selectedEl.setAttribute('position', `${p.x} ${e.target.value/2} ${p.z}`); } };
-    $('ww-range').oninput = e => { $('ww-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') selectedEl.setAttribute('width', e.target.value); };
-    $('wr-range').oninput = e => { $('wr-out').textContent = e.target.value + '°'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') selectedEl.setAttribute('rotation', `0 ${e.target.value} 0`); };
-    $('hh-range').oninput = e => { $('hh-out').textContent = e.target.value + 'cm'; if (selectedEl && selectedEl.dataset.type === 'human') { let s = e.target.value / 160; selectedEl.setAttribute('scale', `${s} ${s} ${s}`); } };
+    $('wh-range').oninput = e => { $('wh-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('height', e.target.value); let p = selectedEl.getAttribute('position'); selectedEl.setAttribute('position', `${p.x} ${e.target.value/2} ${p.z}`); } updatePreview(); };
+    $('wd-range').oninput = e => { $('wd-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('depth', e.target.value); syncContact(selectedEl); } updatePreview(); };
+    $('ww-range').oninput = e => { $('ww-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('width', e.target.value); syncContact(selectedEl); } updatePreview(); };
+    $('wr-range').oninput = e => { $('wr-out').textContent = e.target.value + '°'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('rotation', `0 ${e.target.value} 0`); syncContact(selectedEl); } updatePreview(); };
+    $('hh-range').oninput = e => { $('hh-out').textContent = e.target.value + 'cm'; if (selectedEl && selectedEl.dataset.type === 'human') { let s = e.target.value / 160; selectedEl.setAttribute('scale', `${s} ${s} ${s}`); syncContact(selectedEl); } updatePreview(); };
+
+    buildHumanParts(previewHuman, SELECT_COLOR);
 
     window.addEventListener('load', () => {
       const t = new Date();
       $('date-input').value = `${t.getFullYear()}-${String(t.getMonth()+1).padStart(2,'0')}-${String(t.getDate()).padStart(2,'0')}`;
+      initShadowQuality();
       updateSimulation(); updateHUD(0);
     });
     document.querySelectorAll('.panel, #dpad').forEach(p => { ['pointerdown', 'touchstart', 'click'].forEach(e => p.addEventListener(e, ev => ev.stopPropagation())); });
