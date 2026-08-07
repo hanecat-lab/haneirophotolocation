@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>日陰シミュレーター / Mobile Master v5.5</title>
+  <title>日陰シミュレーター / Mobile Master v5.6</title>
   
   <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
   <script src="https://unpkg.com/aframe-orbit-controls@1.3.2/dist/aframe-orbit-controls.min.js"></script>
@@ -175,7 +175,7 @@
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
       <button id="ui-toggle-btn" class="mini-toggle-btn">▴ 簡易表示</button>
-      <span id="version-display">v5.5</span>
+      <span id="version-display">v5.6</span>
     </div>
     <div class="hud-box">
       <div class="hud-main"><span>向き</span><strong id="heading-text">N (0°)</strong></div>
@@ -227,6 +227,7 @@
       <button id="cancel-place-btn" class="btn btn-dark" style="grid-column: span 4; margin-top: 4px; display: none;">✕ 配置をキャンセル</button>
       <button id="delete-btn" class="btn btn-danger compact-hide" style="grid-column: span 2; margin-top: 4px;">選択削除</button>
       <button id="clear-all-btn" class="btn btn-danger compact-hide" style="grid-column: span 2; margin-top: 4px; background: #880000;">全削除</button>
+      <button id="save-scene-btn" class="btn btn-dark compact-hide" style="grid-column: span 4; margin-top: 4px;">💾 配置を保存</button>
     </div>
   </div>
 
@@ -270,7 +271,7 @@
     const sunLight = $('sun-light');
     const previewWall = $('preview-wall');
     const previewHuman = $('preview-human');
-    let wallObjects = [], humanObjects = [], isFps = false, isCompassActive = false, selectedEl = null, pendingType = null, moveState = { fwd: 0, bwd: 0, left: 0, right: 0 };
+    let humanObjects = [], isFps = false, isCompassActive = false, selectedEl = null, pendingType = null, moveState = { fwd: 0, bwd: 0, left: 0, right: 0 };
     let compassHandler = null, compassEventName = null, targetHeading = null, smoothHeading = null;
     let LAT = 35.6895, LON = 139.6917;
     const norm = v => (v % 360 + 360) % 360;
@@ -406,11 +407,15 @@
         : `太陽: 地平線下 (${(alt * 180 / Math.PI).toFixed(1)}°)`;
     }
 
-    function createWall(x, z) {
-      const w = +$('ww-range').value, h = +$('wh-range').value, d = +$('wd-range').value, r = +$('wr-range').value;
+    function createWall(x, z, dims) {
+      const w = dims ? dims.w : +$('ww-range').value;
+      const h = dims ? dims.h : +$('wh-range').value;
+      const d = dims ? dims.d : +$('wd-range').value;
+      const r = dims ? dims.r : +$('wr-range').value;
       const wall = document.createElement('a-box');
       wall.classList.add('clickable');
       wall.dataset.originalColor = '#7f8c8d';
+      wall.dataset.type = 'wall';
       wall.setAttribute('position', `${x} ${h/2} ${z}`);
       wall.setAttribute('width', w); wall.setAttribute('height', h); wall.setAttribute('depth', d);
       wall.setAttribute('rotation', `0 ${r} 0`);
@@ -418,7 +423,6 @@
       wall.setAttribute('shadow', 'cast: true; receive: true');
       wall.addEventListener('click', e => { e.stopPropagation(); selectObject(wall); });
       wallsContainer.appendChild(wall);
-      wallObjects.push({ el: wall, x: x, z: z });
       attachContact(wall, wallAOMat);
     }
 
@@ -503,8 +507,8 @@ const HUMAN_PARTS = [
       });
     }
 
-    function createHuman(x, z) {
-      const hh = +$('hh-range').value / 100;
+    function createHuman(x, z, heightCm) {
+      const hh = (heightCm !== undefined ? heightCm : +$('hh-range').value) / 100;
       const human = document.createElement('a-entity');
       human.classList.add('clickable');
       human.dataset.type = 'human';
@@ -521,7 +525,7 @@ const HUMAN_PARTS = [
       if (selectedEl) deselectObject();
       if (pendingType) endPlacement();
       selectedEl = el;
-      const isWall = el.tagName.toLowerCase() === 'a-box';
+      const isWall = el.dataset.type === 'wall';
       if (isWall) el.setAttribute('material', 'color', SELECT_COLOR);
       else el.querySelectorAll('*').forEach(c => c.setAttribute('material', 'color', SELECT_COLOR));
       setSettingsTarget(isWall ? 'wall' : 'human');
@@ -542,7 +546,7 @@ const HUMAN_PARTS = [
 
     function deselectObject() {
       if (!selectedEl) return;
-      if (selectedEl.tagName.toLowerCase() === 'a-box') selectedEl.setAttribute('material', 'color', selectedEl.dataset.originalColor);
+      if (selectedEl.dataset.type === 'wall') selectedEl.setAttribute('material', 'color', selectedEl.dataset.originalColor);
       else selectedEl.querySelectorAll('*').forEach(c => c.setAttribute('material', 'color', c.dataset.originalColor));
       selectedEl = null;
       $('selected-notice').style.display = 'none';
@@ -746,29 +750,34 @@ const HUMAN_PARTS = [
     }
     bindMove('btn-fwd', 'fwd'); bindMove('btn-bwd', 'bwd'); bindMove('btn-left', 'left'); bindMove('btn-right', 'right');
 
+    const FPS_MOVE_SPEED = 7.2;   // units/秒。60fps時の従来の体感速度に合わせた値
+    let lastStepTime = null;
     function step() {
-      // 磁気センサーの生値は毎フレーム跳ねるので、最短回り方向へ補間して反映する
+      const now = performance.now();
+      // dt の上限を 0.05s に丸め、タブ非アクティブから復帰した直後などに一気に動くのを防ぐ。
+      // 初回フレームは dt=0 にして移動・追従をスキップする。
+      const dt = lastStepTime === null ? 0 : Math.min((now - lastStepTime) / 1000, 0.05);
+      lastStepTime = now;
+
+      // 磁気センサーの生値は毎フレーム跳ねるので、最短回り方向へ補間して反映する。
+      // 60fps基準で従来と同じ追従速度になるよう、フレームレートに依らない指数減衰にする。
       if (isCompassActive && targetHeading !== null) {
         if (smoothHeading === null) smoothHeading = targetHeading;
         const diff = ((targetHeading - smoothHeading + 540) % 360) - 180;
-        smoothHeading = norm(smoothHeading + diff * 0.15);
+        const factor = 1 - Math.pow(0.85, dt * 60);
+        smoothHeading = norm(smoothHeading + diff * factor);
         setWorldDirection(smoothHeading);
       }
       if (isFps) {
         const rig = $('fps-rig'), cam = $('fps-camera'), pos = rig.getAttribute('position'), rot = cam.getAttribute('rotation');
         if (moveState.fwd || moveState.bwd || moveState.left || moveState.right) {
-          const s = 0.15, y = (rot ? rot.y : 0) * Math.PI / 180;
+          const move = FPS_MOVE_SPEED * dt, y = (rot ? rot.y : 0) * Math.PI / 180;
           let dx = 0, dz = 0;
-          if (moveState.fwd) { dx -= Math.sin(y)*s; dz -= Math.cos(y)*s; }
-          if (moveState.bwd) { dx += Math.sin(y)*s; dz += Math.cos(y)*s; }
-          if (moveState.left) { dx -= Math.cos(y)*s; dz += Math.sin(y)*s; }
-          if (moveState.right) { dx += Math.cos(y)*s; dz -= Math.sin(y)*s; }
-         const smooth = 0.8;
-
-const newX = pos.x + dx * smooth;
-const newZ = pos.z + dz * smooth;
-
-rig.setAttribute('position', `${newX} ${pos.y} ${newZ}`);
+          if (moveState.fwd) { dx -= Math.sin(y)*move; dz -= Math.cos(y)*move; }
+          if (moveState.bwd) { dx += Math.sin(y)*move; dz += Math.cos(y)*move; }
+          if (moveState.left) { dx -= Math.cos(y)*move; dz += Math.sin(y)*move; }
+          if (moveState.right) { dx += Math.cos(y)*move; dz -= Math.sin(y)*move; }
+          rig.setAttribute('position', `${pos.x + dx} ${pos.y} ${pos.z + dz}`);
         }
       }
       requestAnimationFrame(step);
@@ -784,12 +793,48 @@ rig.setAttribute('position', `${newX} ${pos.y} ${newZ}`);
       else if (selectedEl) deselectObject();
     });
     $('delete-btn').onclick = () => { if (selectedEl) { 
-      wallObjects = wallObjects.filter(o => o.el !== selectedEl);
       humanObjects = humanObjects.filter(o => o.el !== selectedEl);
       removeContact(selectedEl);
       selectedEl.remove(); deselectObject(); 
     } };
-    $('clear-all-btn').onclick = () => { if (confirm('すべてのオブジェクトを削除しますか？')) { wallsContainer.innerHTML = ''; humansContainer.innerHTML = ''; $('contact-shadows').object3D.clear(); wallObjects = []; humanObjects = []; deselectObject(); } };
+    $('clear-all-btn').onclick = () => { if (confirm('すべてのオブジェクトを削除しますか？')) { wallsContainer.innerHTML = ''; humansContainer.innerHTML = ''; $('contact-shadows').object3D.clear(); humanObjects = []; deselectObject(); } };
+
+    // ─── 配置の保存/復元 ────────────────────────────────────────────
+    // 保存対象は配置物（壁・人）のみ。時刻/日付/現在地/世界の向きは対象外。
+    // 明示的な保存ボタンでのみ保存し、リロード時は自動で復元する。
+    const SCENE_STORAGE_KEY = 'shadow-sim-scene';
+
+    function saveScene() {
+      const walls = [...wallsContainer.children].map(el => {
+        const p = el.getAttribute('position'), rot = el.getAttribute('rotation');
+        return { x: p.x, z: p.z, w: +el.getAttribute('width'), h: +el.getAttribute('height'),
+                 d: +el.getAttribute('depth'), r: rot.y };
+      });
+      const humans = [...humansContainer.children].map(el => {
+        const p = el.getAttribute('position'), s = el.getAttribute('scale');
+        return { x: p.x, z: p.z, heightCm: Math.round(s.x * 160) };
+      });
+      localStorage.setItem(SCENE_STORAGE_KEY, JSON.stringify({ walls, humans }));
+    }
+
+    function loadScene() {
+      const raw = localStorage.getItem(SCENE_STORAGE_KEY);
+      if (!raw) return;
+      try {
+        const data = JSON.parse(raw);
+        (data.walls || []).forEach(w => createWall(w.x, w.z, w));
+        (data.humans || []).forEach(h => createHuman(h.x, h.z, h.heightCm));
+      } catch (e) {
+        console.error('[scene] 保存データの読み込みに失敗しました', e);
+      }
+    }
+
+    $('save-scene-btn').onclick = () => {
+      saveScene();
+      const btn = $('save-scene-btn'), original = '💾 配置を保存';
+      btn.textContent = '✓ 保存しました';
+      setTimeout(() => { btn.textContent = original; }, 1200);
+    };
     $('toggle-settings-btn').onclick = () => {
       if (pendingType) return;   // 配置中はキャンセルボタンで抜ける
       const willShow = $('settings-section').style.display === 'none';
@@ -817,10 +862,10 @@ rig.setAttribute('position', `${newX} ${pos.y} ${newZ}`);
         { enableHighAccuracy: true, timeout: 12000 }
       );
     };
-    $('wh-range').oninput = e => { $('wh-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('height', e.target.value); let p = selectedEl.getAttribute('position'); selectedEl.setAttribute('position', `${p.x} ${e.target.value/2} ${p.z}`); } updatePreview(); };
-    $('wd-range').oninput = e => { $('wd-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('depth', e.target.value); syncContact(selectedEl); } updatePreview(); };
-    $('ww-range').oninput = e => { $('ww-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('width', e.target.value); syncContact(selectedEl); } updatePreview(); };
-    $('wr-range').oninput = e => { $('wr-out').textContent = e.target.value + '°'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('rotation', `0 ${e.target.value} 0`); syncContact(selectedEl); } updatePreview(); };
+    $('wh-range').oninput = e => { $('wh-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.dataset.type === 'wall') { selectedEl.setAttribute('height', e.target.value); let p = selectedEl.getAttribute('position'); selectedEl.setAttribute('position', `${p.x} ${e.target.value/2} ${p.z}`); } updatePreview(); };
+    $('wd-range').oninput = e => { $('wd-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.dataset.type === 'wall') { selectedEl.setAttribute('depth', e.target.value); syncContact(selectedEl); } updatePreview(); };
+    $('ww-range').oninput = e => { $('ww-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.dataset.type === 'wall') { selectedEl.setAttribute('width', e.target.value); syncContact(selectedEl); } updatePreview(); };
+    $('wr-range').oninput = e => { $('wr-out').textContent = e.target.value + '°'; if (selectedEl && selectedEl.dataset.type === 'wall') { selectedEl.setAttribute('rotation', `0 ${e.target.value} 0`); syncContact(selectedEl); } updatePreview(); };
     $('hh-range').oninput = e => { $('hh-out').textContent = e.target.value + 'cm'; if (selectedEl && selectedEl.dataset.type === 'human') { let s = e.target.value / 160; selectedEl.setAttribute('scale', `${s} ${s} ${s}`); syncContact(selectedEl); } updatePreview(); };
 
     buildHumanParts(previewHuman, SELECT_COLOR);
@@ -830,6 +875,7 @@ rig.setAttribute('position', `${newX} ${pos.y} ${newZ}`);
       $('date-input').value = `${t.getFullYear()}-${String(t.getMonth()+1).padStart(2,'0')}-${String(t.getDate()).padStart(2,'0')}`;
       initShadowQuality();
       updateSimulation(); updateHUD(0);
+      loadScene();
       positionDpad();
     });
     document.querySelectorAll('.panel, #dpad').forEach(p => { ['pointerdown', 'touchstart', 'click'].forEach(e => p.addEventListener(e, ev => ev.stopPropagation())); });
