@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>日陰シミュレーター / Mobile Master v5.1</title>
+  <title>日陰シミュレーター / Mobile Master v5.2</title>
   
   <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
   <script src="https://unpkg.com/aframe-orbit-controls@1.3.2/dist/aframe-orbit-controls.min.js"></script>
@@ -54,13 +54,17 @@
     .compass-toggle { grid-column: span 4; background: #e74c3c; margin-top: 4px; }
     .compass-toggle.active { background: #2ecc71; }
     .mode-text { font-size: 10px; color: var(--accent-color); text-align: center; margin-top: 4px; }
-    .time-section { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+    .time-section { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+    .time-row { display: flex; align-items: center; gap: 12px; width: 100%; }
+    .date-input { flex: 1; min-width: 0; height: 32px; background: rgba(0,0,0,0.4); color: var(--accent-color); border: 1px solid #444; border-radius: 8px; padding: 0 8px; font-size: 13px; font-family: monospace; }
+    .geo-btn { flex: 0 0 96px; height: 32px; }
+    .geo-info { font-size: 10px; color: #888; text-align: right; }
     .time-label { font-size: 14px; font-weight: bold; color: var(--accent-color); min-width: 45px; }
     .slider { flex: 1; height: 30px; accent-color: var(--accent-color); }
     .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
     .ctrl-item label { display: flex; justify-content: space-between; font-size: 11px; color: #ccc; margin-bottom: 4px; }
     .ctrl-item output { color: var(--accent-color); font-weight: bold; }
-    #dpad { position: fixed; bottom: 200px; left: calc(20px + var(--safe-left)); z-index: 20; display: none; grid-template-columns: repeat(3, 48px); grid-template-rows: repeat(3, 48px); gap: 6px; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 16px; backdrop-filter: blur(8px); }
+    #dpad { position: fixed; bottom: 265px; left: calc(20px + var(--safe-left)); z-index: 20; display: none; grid-template-columns: repeat(3, 48px); grid-template-rows: repeat(3, 48px); gap: 6px; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 16px; backdrop-filter: blur(8px); }
     #dpad button { background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: #fff; font-size: 18px; border-radius: 8px; touch-action: manipulation; }
     #dpad button:active { background: var(--accent-color); color: #000; }
     .dp-up { grid-column: 2; grid-row: 1; }
@@ -80,7 +84,7 @@
   <div class="panel top-panel">
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
-      <span id="version-display">v5.1</span>
+      <span id="version-display">v5.2</span>
     </div>
     <div class="hud-box">
       <div class="hud-main"><span>向き</span><strong id="heading-text">N (0°)</strong></div>
@@ -106,8 +110,15 @@
 
   <div class="panel bottom-panel">
     <div id="time-section" class="time-section">
-      <span class="time-label" id="time-display">12:00</span>
-      <input id="time-range" class="slider" type="range" min="300" max="1140" value="720">
+      <div class="time-row">
+        <span class="time-label" id="time-display">12:00</span>
+        <input id="time-range" class="slider" type="range" min="180" max="1320" value="720">
+      </div>
+      <div class="time-row">
+        <input id="date-input" class="date-input" type="date">
+        <button id="geo-btn" class="btn btn-dark geo-btn">📍 現在地</button>
+      </div>
+      <div class="geo-info" id="geo-info">位置: 東京 (35.6895, 139.6917)</div>
     </div>
     <div id="settings-section" class="settings-grid" style="display:none;">
       <div class="ctrl-item"><label>壁高 <output id="wh-out">3.0m</output></label><input id="wh-range" class="slider" type="range" min="1" max="15" step="0.5" value="3"></div>
@@ -164,7 +175,8 @@
     const previewWall = $('preview-wall');
     const previewHuman = $('preview-human');
     let wallObjects = [], humanObjects = [], isFps = false, isCompassActive = false, selectedEl = null, pendingType = null, moveState = { fwd: 0, bwd: 0, left: 0, right: 0 };
-    const LAT = 35.6895, LON = 139.6917;
+    let compassHandler = null, compassEventName = null, targetHeading = null, smoothHeading = null;
+    let LAT = 35.6895, LON = 139.6917;
     const norm = v => (v % 360 + 360) % 360;
     const getDirName = v => ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.floor((norm(v) + 22.5) / 45) % 8];
 
@@ -178,12 +190,22 @@
     function updateSimulation() {
       const minutes = +$('time-range').value, h = Math.floor(minutes / 60), m = minutes % 60;
       $('time-display').textContent = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+      // 端末のローカルタイムゾーンで解釈する（JST 固定をやめ、現在地取得と整合させる）
       const now = new Date();
-      const d = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0) - (9 * 60 * 60 * 1000));
+      const ymd = ($('date-input').value || '').split('-').map(Number);
+      const d = (ymd.length === 3 && ymd.every(Number.isFinite))
+        ? new Date(ymd[0], ymd[1] - 1, ymd[2], h, m, 0)
+        : new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0);
       const sunPos = SunCalc.getPosition(d, LAT, LON);
       const az = sunPos.azimuth + Math.PI, alt = sunPos.altitude, dist = 40;
       sunLight.setAttribute('position', `${dist * Math.cos(alt) * Math.sin(az)} ${dist * Math.sin(alt)} ${-dist * Math.cos(alt) * Math.cos(az)}`);
-      $('sun-info').textContent = `太陽高度 ${(alt * 180 / Math.PI).toFixed(1)}° / 方位 ${(norm(az * 180 / Math.PI)).toFixed(1)}°`;
+      // 地平線下では光源が地面より下に来て下から照らしてしまうので、消灯して影も止める
+      const aboveHorizon = alt > 0;
+      sunLight.setAttribute('light', 'intensity', aboveHorizon ? 1.3 : 0);
+      sunLight.setAttribute('light', 'castShadow', aboveHorizon);
+      $('sun-info').textContent = aboveHorizon
+        ? `太陽高度 ${(alt * 180 / Math.PI).toFixed(1)}° / 方位 ${(norm(az * 180 / Math.PI)).toFixed(1)}°`
+        : `太陽: 地平線下 (${(alt * 180 / Math.PI).toFixed(1)}°)`;
     }
 
     function createWall(x, z) {
@@ -323,6 +345,14 @@ const parts = [
 
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
+    const _tmpVec = new THREE.Vector3();
+
+    // レイキャストの交点はワールド座標だが、壁・人・プレビューは回転する #world-root の子なので
+    // ローカル座標へ変換してから position に入れる（変換しないと世界回転ぶんズレる）
+    function toWorldRootLocal(pt) {
+      worldRoot.object3D.updateMatrixWorld();
+      return worldRoot.object3D.worldToLocal(_tmpVec.copy(pt));
+    }
 
     function getGroundPoint(e) {
       const clientX = e.touches ? e.touches[0].clientX : e.clientX;
@@ -337,8 +367,9 @@ const parts = [
 
     function handlePointer(e) {
       if (!pendingType || isFps) return;
-      const pt = getGroundPoint(e);
-      if (pt) {
+      const hit = getGroundPoint(e);
+      if (hit) {
+        const pt = toWorldRootLocal(hit);
         if (pendingType === 'wall') {
           previewWall.setAttribute('position', `${pt.x} ${+$('wh-range').value/2} ${pt.z}`);
           previewWall.setAttribute('visible', true); previewHuman.setAttribute('visible', false);
@@ -355,8 +386,9 @@ const parts = [
     $('ground').addEventListener('click', e => {
       if (selectedEl) { deselectObject(); return; }
       if (!pendingType || isFps) return;
-      const pt = e.detail.intersection ? e.detail.intersection.point : null;
-      if (pt) {
+      const hit = e.detail.intersection ? e.detail.intersection.point : null;
+      if (hit) {
+        const pt = toWorldRootLocal(hit);
         if (pendingType === 'wall') createWall(pt.x, pt.z);
         else createHuman(pt.x, pt.z);
         pendingType = null;
@@ -373,18 +405,39 @@ const parts = [
       } else startCompass();
     }
     function startCompass() {
-      const h = e => { let hd = e.webkitCompassHeading || (360 - e.alpha); if (hd) setWorldDirection(hd); };
-      window.addEventListener('deviceorientationabsolute', h, true);
-      window.addEventListener('deviceorientation', h, true);
+      if (compassHandler) return;
+      compassHandler = e => {
+        // 0（真北）を捨てないよう Number.isFinite で判定する
+        let hd = Number.isFinite(e.webkitCompassHeading) ? e.webkitCompassHeading
+               : (Number.isFinite(e.alpha) ? 360 - e.alpha : NaN);
+        if (!Number.isFinite(hd)) return;
+        targetHeading = norm(hd);
+      };
+      // 両方に登録すると二重発火して競合するので、絶対方位が使える場合はそちらだけを使う
+      compassEventName = ('ondeviceorientationabsolute' in window) ? 'deviceorientationabsolute' : 'deviceorientation';
+      window.addEventListener(compassEventName, compassHandler, true);
       isCompassActive = true; $('compass-btn').textContent = '🧭 磁気連動 ON'; $('compass-btn').classList.add('active');
     }
-    function stopCompass() { isCompassActive = false; $('compass-btn').textContent = '🧭 磁気連動 OFF'; $('compass-btn').classList.remove('active'); }
+    function stopCompass() {
+      if (compassHandler) {
+        window.removeEventListener(compassEventName, compassHandler, true);
+        compassHandler = null;
+      }
+      targetHeading = null; smoothHeading = null;
+      isCompassActive = false; $('compass-btn').textContent = '🧭 磁気連動 OFF'; $('compass-btn').classList.remove('active');
+    }
 
     $('toggle-fps-btn').onclick = () => {
       isFps = !isFps;
       const orbit = $('orbit-camera'), fps = $('fps-camera'), rig = $('fps-rig'), dpad = $('dpad');
       if (isFps) {
-        if (humanObjects.length > 0) rig.setAttribute('position', `${humanObjects[humanObjects.length-1].el.getAttribute('position').x} 1.6 ${humanObjects[humanObjects.length-1].el.getAttribute('position').z}`);
+        // #fps-rig は #world-root の外なので、人のローカル座標をワールド座標へ変換して渡す
+        if (humanObjects.length > 0) {
+          const lastHuman = humanObjects[humanObjects.length - 1].el;
+          lastHuman.object3D.updateMatrixWorld();
+          const wp = lastHuman.object3D.getWorldPosition(new THREE.Vector3());
+          rig.setAttribute('position', `${wp.x} 1.6 ${wp.z}`);
+        }
         orbit.setAttribute('camera', 'active', false); fps.setAttribute('camera', 'active', true); dpad.style.display = 'grid';
         $('toggle-fps-btn').textContent = '🚁 俯瞰視点'; $('toggle-fps-btn').classList.add('btn-active');
       } else {
@@ -403,6 +456,13 @@ const parts = [
     bindMove('btn-fwd', 'fwd'); bindMove('btn-bwd', 'bwd'); bindMove('btn-left', 'left'); bindMove('btn-right', 'right');
 
     function step() {
+      // 磁気センサーの生値は毎フレーム跳ねるので、最短回り方向へ補間して反映する
+      if (isCompassActive && targetHeading !== null) {
+        if (smoothHeading === null) smoothHeading = targetHeading;
+        const diff = ((targetHeading - smoothHeading + 540) % 360) - 180;
+        smoothHeading = norm(smoothHeading + diff * 0.15);
+        setWorldDirection(smoothHeading);
+      }
       if (isFps) {
         const rig = $('fps-rig'), cam = $('fps-camera'), pos = rig.getAttribute('position'), rot = cam.getAttribute('rotation');
         if (moveState.fwd || moveState.bwd || moveState.left || moveState.right) {
@@ -440,12 +500,35 @@ rig.setAttribute('position', `${newX} ${pos.y} ${newZ}`);
     };
 
     $('time-range').oninput = updateSimulation;
+    $('date-input').onchange = updateSimulation;
+
+    // 取得方式は photo-location.html と同じ（高精度・12秒タイムアウト・エラーコード分岐）
+    $('geo-btn').onclick = () => {
+      if (!navigator.geolocation) { $('geo-info').textContent = '位置: このブラウザは位置情報に対応していません'; return; }
+      $('geo-info').textContent = '位置: 取得中...';
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          LAT = pos.coords.latitude; LON = pos.coords.longitude;
+          $('geo-info').textContent = `位置: ${LAT.toFixed(4)}, ${LON.toFixed(4)} (±${Math.round(pos.coords.accuracy)}m)`;
+          updateSimulation();
+        },
+        err => {
+          const msg = { 1: '位置情報の許可が必要です', 2: '位置情報を取得できませんでした', 3: 'タイムアウトしました' };
+          $('geo-info').textContent = '位置: ' + (msg[err.code] || 'エラーが発生しました');
+        },
+        { enableHighAccuracy: true, timeout: 12000 }
+      );
+    };
     $('wh-range').oninput = e => { $('wh-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') { selectedEl.setAttribute('height', e.target.value); let p = selectedEl.getAttribute('position'); selectedEl.setAttribute('position', `${p.x} ${e.target.value/2} ${p.z}`); } };
     $('ww-range').oninput = e => { $('ww-out').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') selectedEl.setAttribute('width', e.target.value); };
     $('wr-range').oninput = e => { $('wr-out').textContent = e.target.value + '°'; if (selectedEl && selectedEl.tagName.toLowerCase() === 'a-box') selectedEl.setAttribute('rotation', `0 ${e.target.value} 0`); };
     $('hh-range').oninput = e => { $('hh-out').textContent = e.target.value + 'cm'; if (selectedEl && selectedEl.dataset.type === 'human') { let s = e.target.value / 160; selectedEl.setAttribute('scale', `${s} ${s} ${s}`); } };
 
-    window.addEventListener('load', () => { updateSimulation(); updateHUD(0); });
+    window.addEventListener('load', () => {
+      const t = new Date();
+      $('date-input').value = `${t.getFullYear()}-${String(t.getMonth()+1).padStart(2,'0')}-${String(t.getDate()).padStart(2,'0')}`;
+      updateSimulation(); updateHUD(0);
+    });
     document.querySelectorAll('.panel, #dpad').forEach(p => { ['pointerdown', 'touchstart', 'click'].forEach(e => p.addEventListener(e, ev => ev.stopPropagation())); });
   </script>
 </body>
