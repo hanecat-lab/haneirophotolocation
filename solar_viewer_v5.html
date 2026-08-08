@@ -274,7 +274,7 @@
   <div class="panel top-panel">
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
-      <span id="version-display">v5.45</span>
+      <span id="version-display">v5.46</span>
     </div>
     <div class="sun-times" id="sun-times">日の出 --:-- ・ 日の入り --:--</div>
     <div class="hud-box">
@@ -436,7 +436,16 @@
 
   <a-scene id="main-scene" vr-mode-ui="enabled: false" shadow="type: pcfsoft" cursor="rayOrigin: mouse" raycaster="objects: .clickable">
     <a-assets></a-assets>
-    <a-entity id="orbit-camera" camera position="0 10 20" orbit-controls="target: 0 0 0; enableDamping: true; dampingFactor: 0.15; rotateSpeed: 0.6; minDistance: 1; maxDistance: 80; maxPolarAngle: 1.5" active="true"></a-entity>
+    <!-- maxPolarAngle は aframe-orbit-controls が度数として受け取り内部でラジアンに変換する。
+         85.9(≈ラジアン1.5相当、水平よりわずかに上で止める)を指定する。1.5をそのまま
+         渡すと「1.5°」という極端な制限になる。
+         initialPosition も明示する。orbit-controls の init() は
+         `camera.position.copy(data.initialPosition)` を無条件に実行し、未指定だと
+         既定値 (0,0,0) で position="0 10 20" を上書きしてしまう。target(0 0 0)と
+         一致するため長さ0のベクトルになり、次の update() で minDistance まで
+         強制的に収束する(カメラが注視点の真上・距離1に張り付き、1本指ドラッグの
+         回転が特異点でほぼ効かなくなる) -->
+    <a-entity id="orbit-camera" camera position="0 10 20" orbit-controls="target: 0 0 0; initialPosition: 0 10 20; enableDamping: true; dampingFactor: 0.15; rotateSpeed: 0.6; minDistance: 1; maxDistance: 80; maxPolarAngle: 85.9" active="true"></a-entity>
     <a-entity id="fps-rig" position="0 1.6 0">
       <!-- look-controls は使わない。タッチだと onTouchMove が yaw しか動かさず、
            検証したい足元の影を見下ろせないため、見回しは自前で yaw+pitch を扱う（bindLook）。
@@ -1453,6 +1462,57 @@ const HUMAN_PARTS = [
     window.addEventListener('pointermove', handlePointer);
     window.addEventListener('touchstart', handlePointer);
     window.addEventListener('touchmove', handlePointer);
+
+    // ─── 俯瞰視点のピンチズーム ──────────────────────────────────────
+    // three.js OrbitControls の2本指タッチは既定で DOLLY_PAN(ズームとパンを同時処理)
+    // で、aframe-orbit-controls 側にこの割り当てを変更する手段が無い。ピンチ操作は
+    // 指の中心点も動きがちなので、ズームのつもりがパンと混ざって「効いていない」ように
+    // 感じられやすい。ライブラリの2本指処理には頼らず、距離の変化だけを見る
+    // 純粋なズームを自前で実装する。2本指の間は orbit-controls 自体を止めて
+    // 二重に反応しないようにする。
+    const orbitCam = $('orbit-camera');
+    let pinchStartDist = null, pinchStartCamDist = null;
+
+    function pinchDistance(touches) {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      return Math.hypot(dx, dy);
+    }
+
+    function handlePinch(e) {
+      if (isFps) return;
+      if (e.target.closest('.panel, #dpad')) return;
+      const oc = orbitCam.components['orbit-controls'];
+      if (!oc || !oc.controls) return;
+      if (e.touches.length === 2) {
+        // ページの拡大縮小・スクロールと競合させないよう、既定ジェスチャーも止める
+        e.preventDefault();
+        const cam = orbitCam.getObject3D('camera');
+        if (pinchStartDist === null) {
+          pinchStartDist = pinchDistance(e.touches);
+          pinchStartCamDist = cam.position.distanceTo(oc.controls.target);
+          oc.controls.enabled = false;
+          return;
+        }
+        const scale = pinchStartDist / pinchDistance(e.touches);
+        const dist = Math.min(oc.data.maxDistance, Math.max(oc.data.minDistance, pinchStartCamDist * scale));
+        const dir = cam.position.clone().sub(oc.controls.target).normalize();
+        cam.position.copy(oc.controls.target).add(dir.multiplyScalar(dist));
+      } else {
+        pinchStartDist = null;
+        oc.controls.enabled = true;
+      }
+    }
+    // この <script> はシーンの canvas 生成より前に評価されるため、sceneEl.canvas は
+    // まだ存在しない。'loaded' を待ってから登録する
+    function bindPinchZoom() {
+      sceneEl.canvas.addEventListener('touchstart', handlePinch, { passive: false });
+      sceneEl.canvas.addEventListener('touchmove', handlePinch, { passive: false });
+      sceneEl.canvas.addEventListener('touchend', handlePinch);
+      sceneEl.canvas.addEventListener('touchcancel', handlePinch);
+    }
+    if (sceneEl.canvas) bindPinchZoom();
+    else sceneEl.addEventListener('loaded', bindPinchZoom, { once: true });
 
     $('ground').addEventListener('click', e => {
       // プレビュー追従(handlePointer)で直前に計算した地面座標を優先して使う。
