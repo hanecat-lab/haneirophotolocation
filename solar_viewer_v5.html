@@ -273,7 +273,7 @@
   <div class="panel top-panel">
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
-      <span id="version-display">v5.41</span>
+      <span id="version-display">v5.42</span>
     </div>
     <div class="hud-box">
       <div class="hud-main"><span>向き</span><strong id="heading-text">N (0°)</strong></div>
@@ -465,6 +465,8 @@
       <a-entity id="shadow-tip" visible="false"></a-entity>
       <!-- 検証タブで日陰時間帯を調べた地点。先端マーカー(黄)と区別するため水色 -->
       <a-entity id="shade-probe" visible="false"></a-entity>
+      <!-- 配置/移動中、地面のどの点が設置基準点かを示す目印（緑、他のリングと被らない色） -->
+      <a-entity id="place-marker" visible="false"></a-entity>
       <a-entity id="walls-container"></a-entity>
       <a-entity id="humans-container"></a-entity>
       <!-- 接地部のオクルージョン。オブジェクトの子にすると .clickable の当たり判定が
@@ -698,6 +700,25 @@
       shadeProbeRing.setAttribute('radius-outer', '0.45');
       shadeProbeRing.setAttribute('material', 'color: #4fc3f7; opacity: 0.9; transparent: true');
       $('shade-probe').appendChild(shadeProbeRing);
+    }
+
+    // 配置/移動中、地面のどの点が設置基準点かを示す目印。
+    // 人・壁のゴースト本体は形が複雑で基準点(x,z)が読み取りにくいので、専用の印を別に置く。
+    let placeMarkerRing = null;
+    function initPlaceMarker() {
+      placeMarkerRing = document.createElement('a-ring');
+      placeMarkerRing.setAttribute('rotation', '-90 0 0');
+      placeMarkerRing.setAttribute('radius-inner', '0.12');
+      placeMarkerRing.setAttribute('radius-outer', '0.2');
+      placeMarkerRing.setAttribute('material', 'color: #7cff4f; opacity: 0.9; transparent: true');
+      $('place-marker').appendChild(placeMarkerRing);
+    }
+    function setPlaceMarker(x, z) {
+      $('place-marker').setAttribute('position', `${x} ${GRID_Y} ${z}`);
+      $('place-marker').setAttribute('visible', true);
+    }
+    function hidePlaceMarker() {
+      $('place-marker').setAttribute('visible', false);
     }
 
     // localPt は #world-root ローカル座標。太陽方向へレイを飛ばし、壁/人に当たれば日陰。
@@ -1178,6 +1199,10 @@ const HUMAN_PARTS = [
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
     const _tmpVec = new THREE.Vector3();
+    // handlePointer が最後に計算した地面座標（#world-root ローカル）。地面タップでの
+    // 設置確定は、これとは別に再計算するとプレビューの表示位置とズレうるので、
+    // 確定時もこの値をそのまま使う（プレビューと設置を同じ計算結果で揃える）。
+    let lastGroundPt = null;
 
     // レイキャストの交点はワールド座標だが、壁・人・プレビューは回転する #world-root の子なので
     // ローカル座標へ変換してから position に入れる（変換しないと世界回転ぶんズレる）
@@ -1317,6 +1342,8 @@ const HUMAN_PARTS = [
       previewHuman.setAttribute('visible', type === 'human');
       (type === 'wall' ? previewWall : previewHuman).setAttribute('position', `${pt.x} 0 ${pt.z}`);
       updatePreview();
+      setPlaceMarker(pt.x, pt.z);
+      lastGroundPt = { x: pt.x, z: pt.z };
       setSettingsTarget(type);
       setActiveTask('place');
       $('placing-status').textContent = '配置中';
@@ -1328,6 +1355,7 @@ const HUMAN_PARTS = [
       pendingType = null;
       previewWall.setAttribute('visible', false);
       previewHuman.setAttribute('visible', false);
+      hidePlaceMarker();
       setSettingsTarget(null);
       setActiveTask(null);
       updatePlaceView();
@@ -1340,11 +1368,14 @@ const HUMAN_PARTS = [
       movingEl = selectedEl;
       movingEl.setAttribute('visible', false);
       const isWall = movingEl.dataset.type === 'wall';
-      const pt = screenCenterGroundPoint();
+      // 画面中央ではなく、今その物が置いてある場所から動かし始める
+      const pt = movingEl.getAttribute('position');
       (isWall ? previewWall : previewHuman).setAttribute('position', `${pt.x} 0 ${pt.z}`);
       previewWall.setAttribute('visible', isWall);
       previewHuman.setAttribute('visible', !isWall);
       updatePreview();
+      setPlaceMarker(pt.x, pt.z);
+      lastGroundPt = { x: +pt.x, z: +pt.z };
       $('placing-status').textContent = '移動中';
       $('placing-repeat').style.display = 'none';
       setActiveTask('place');
@@ -1358,6 +1389,7 @@ const HUMAN_PARTS = [
       movingEl = null;
       previewWall.setAttribute('visible', false);
       previewHuman.setAttribute('visible', false);
+      hidePlaceMarker();
       updatePlaceView();
       updateShadowTip();
     }
@@ -1382,6 +1414,8 @@ const HUMAN_PARTS = [
       const hit = getGroundPoint(e);
       if (hit) {
         const pt = toWorldRootLocal(hit);
+        lastGroundPt = { x: pt.x, z: pt.z };
+        setPlaceMarker(pt.x, pt.z);
         const type = currentPlacementType();
         if (type === 'wall') {
           previewWall.setAttribute('position', `${pt.x} ${+$('wh-range').value/2} ${pt.z}`);
@@ -1393,14 +1427,24 @@ const HUMAN_PARTS = [
       }
     }
 
+    // pointermove/touchmove(動いた時)だけでなく pointerdown/touchstart(触れた瞬間)でも
+    // 追従させる。動かないと何も表示されない仕様だと、動かさず一度だけ触れる操作では
+    // プレビューが古い位置のまま設置だけが実行され、「指示した場所からずれる」体感になる。
+    window.addEventListener('pointerdown', handlePointer);
     window.addEventListener('pointermove', handlePointer);
+    window.addEventListener('touchstart', handlePointer);
     window.addEventListener('touchmove', handlePointer);
 
     $('ground').addEventListener('click', e => {
-      const hit = e.detail.intersection ? e.detail.intersection.point : null;
+      // プレビュー追従(handlePointer)で直前に計算した地面座標を優先して使う。
+      // e.detail.intersection は A-Frame のカーソル機構が別系統で計算した値なので、
+      // そちらを都度使うと「見えていたプレビューの位置」と「実際の設置位置」が
+      // 一致しない場合がある(特にドラッグ無しの単純タップ)。取得できていない時のみ
+      // フォールバックする。
+      const hit = lastGroundPt || (e.detail.intersection ? toWorldRootLocal(e.detail.intersection.point) : null);
       if (movingEl) {
         if (hit) {
-          const pt = toWorldRootLocal(hit);
+          const pt = hit;
           const y = movingEl.dataset.type === 'wall' ? +movingEl.getAttribute('height') / 2 : 0;
           movingEl.setAttribute('position', `${pt.x} ${y} ${pt.z}`);
           syncContact(movingEl);
@@ -1411,13 +1455,13 @@ const HUMAN_PARTS = [
       // 検証タブを開いている間の地面タップは、その地点の日陰時間帯を調べる操作。
       // selectObject は setActiveTask('place') を呼ぶので、ここで選択中になることはない
       if (activeTask === 'verify' && !isFps) {
-        if (hit) queryShadeAt(toWorldRootLocal(hit));
+        if (e.detail.intersection) queryShadeAt(toWorldRootLocal(e.detail.intersection.point));
         return;
       }
       if (selectedEl) { deselectObject(); return; }
       if (!pendingType || isFps) return;
       if (hit) {
-        const pt = toWorldRootLocal(hit);
+        const pt = hit;
         const type = pendingType;
         if (type === 'wall') createWall(pt.x, pt.z);
         else createHuman(pt.x, pt.z);
@@ -1974,6 +2018,7 @@ const HUMAN_PARTS = [
       initGrid();
       initShadowTip();
       initShadeProbe();
+      initPlaceMarker();
       loadCalibration();
       loadStride();
       applyVfUnit();
