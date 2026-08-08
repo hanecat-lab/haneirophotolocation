@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>日陰シミュレーター / Mobile Master v5.32</title>
+  <title>日陰シミュレーター / Mobile Master v5.33</title>
   
   <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
   <script src="https://unpkg.com/aframe-orbit-controls@1.3.2/dist/aframe-orbit-controls.min.js"></script>
@@ -149,6 +149,13 @@
     /* 使い方と、目測・歩測でも構わない旨を先頭に明示する */
     .verify-howto { font-size: 11px; color: #ccc; line-height: 1.4; margin-bottom: 6px; }
     .verify-hint { font-size: 10px; color: #999; line-height: 1.4; margin-bottom: 8px; }
+    /* 地点の一日。数字を何行も並べるより、1本の帯のほうが読み取りが速い */
+    #shade-result { background: rgba(0,0,0,0.35); border-radius: 6px; padding: 5px 8px; margin-bottom: 8px; }
+    .shade-head { display: flex; align-items: center; font-size: 11px; color: #ccc; margin-bottom: 4px; }
+    .shade-head .unit-toggle { height: 18px; font-size: 10px; margin-left: auto; padding: 0 6px; }
+    #shade-bar { display: flex; height: 12px; border-radius: 3px; overflow: hidden; }
+    #shade-bar > div { height: 100%; }
+    #shade-text { font-size: 11px; color: #ccc; line-height: 1.4; margin-top: 4px; }
     .verify-row { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: #ccc; padding: 3px 0; }
     .verify-row strong { color: var(--accent-color); font-family: monospace; font-size: 13px; }
     /* 「身長〇〇cmの人の影」は自分の実測値ではなく参考目安なので、実測入力より弱いトーンにする */
@@ -253,7 +260,7 @@
   <div class="panel top-panel">
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
-      <span id="version-display">v5.32</span>
+      <span id="version-display">v5.33</span>
     </div>
     <div class="hud-box">
       <div class="hud-main"><span>向き</span><strong id="heading-text">N (0°)</strong></div>
@@ -367,8 +374,17 @@
           ④高さが分からない対象は、影の長さだけ入れると高さのおよその値が出る。
           ⑤検証に使った物体を配置タブで壁／人として置いておくと、時刻を変えた後も
           その影の動きを3D上で確認できる。
+          ⑥このタブを開いたまま地面をタップすると、その地点が一日のうち
+          いつ日陰になるかが帯で出る（壁／人を置いてある必要がある）。
         </div>
       </details>
+      <!-- 検証タブを開いている間の地面タップ = その地点の日陰時間帯を調べる。
+           新しい入力欄は増やさず、結果の表示だけが増える -->
+      <div id="shade-result" style="display:none;">
+        <div class="shade-head"><span>この地点の一日</span><button id="shade-clear" type="button" class="unit-toggle">消す</button></div>
+        <div id="shade-bar"></div>
+        <div id="shade-text"></div>
+      </div>
       <div class="verify-measure">
         <label>物体の高さ<input id="vf-height" type="number" step="0.5" min="0" placeholder="1.6" inputmode="decimal">m</label>
         <!-- 単位は m → 歩 → 倍 の3値巡回。倍は「影は高さの何倍か」で、時刻の逆算は
@@ -433,6 +449,8 @@
       </a-entity>
       <!-- 選択中のオブジェクトの影がどこまで届くかを示す（中身は initShadowTip() で作る） -->
       <a-entity id="shadow-tip" visible="false"></a-entity>
+      <!-- 検証タブで日陰時間帯を調べた地点。先端マーカー(黄)と区別するため水色 -->
+      <a-entity id="shade-probe" visible="false"></a-entity>
       <a-entity id="walls-container"></a-entity>
       <a-entity id="humans-container"></a-entity>
       <!-- 接地部のオクルージョン。オブジェクトの子にすると .clickable の当たり判定が
@@ -646,6 +664,110 @@
         $('tip-dist').textContent = `${L.toFixed(1)}m（≈${Math.round(L / strideM)}歩）`;
         row.style.display = 'flex';
       }
+    }
+
+    // ─── 地点の一日（日陰になる時間帯）─────────────────────────────────
+    // ロケハンの中核的な問い「この場所は何時から何時まで日陰か」に答える。
+    // 影の長さは 1/tan(高度) で低い太陽ほど誤差が暴れるが、日陰かどうかは幾何なので
+    // 主に方位が効く。方位は高度より頑健なので、この判定は影長の検証より信頼度が高い。
+    const SHADE_STEP_MIN = 2;     // 2分刻み。720回の走査なら壁が何枚あっても一瞬で終わる
+    const SHADE_COLOR = { night: '#1b2330', sun: '#f0c419', shade: '#4a5a72' };
+    // 共有の raycaster は setFromCamera でカメラの near/far を書き込まれるので、
+    // 太陽方向へ無限遠まで飛ばすこちらは専用インスタンスを持つ
+    const shadeRay = new THREE.Raycaster();
+    let shadeProbeRing = null, shadeProbePt = null;
+
+    function initShadeProbe() {
+      shadeProbeRing = document.createElement('a-ring');
+      shadeProbeRing.setAttribute('rotation', '-90 0 0');
+      shadeProbeRing.setAttribute('radius-inner', '0.3');
+      shadeProbeRing.setAttribute('radius-outer', '0.45');
+      shadeProbeRing.setAttribute('material', 'color: #4fc3f7; opacity: 0.9; transparent: true');
+      $('shade-probe').appendChild(shadeProbeRing);
+    }
+
+    // localPt は #world-root ローカル座標。太陽方向へレイを飛ばし、壁/人に当たれば日陰。
+    // 回転した壁も three.js 側が matrixWorld で扱うので、自前の ray-box は書かない。
+    function computeShadeDay(localPt) {
+      const targets = [...wallsContainer.children, ...humansContainer.children]
+        // 描画上 halfExtent の外は影を落とさないので、判定対象からも外して表示と揃える
+        .filter(el => Math.hypot(+el.getAttribute('position').x, +el.getAttribute('position').z) <= SHADOW_CFG.halfExtent)
+        .map(el => el.object3D);
+      worldRoot.object3D.updateMatrixWorld(true);
+      const originWorld = worldRoot.object3D.localToWorld(new THREE.Vector3(localPt.x, 0.01, localPt.z));
+      const q = worldRoot.object3D.quaternion;
+      const dir = new THREE.Vector3();
+      const states = [];
+      for (let t = 0; t < 1440; t += SHADE_STEP_MIN) {
+        const s = sunAt(t);
+        if (s.altDeg <= 0) { states.push('night'); continue; }
+        if (!targets.length) { states.push('sun'); continue; }
+        // #sun-light の position と同じ式（ローカル）→ 世界回転を掛けてワールド方向へ
+        const az = s.azDeg * Math.PI / 180, alt = s.altDeg * Math.PI / 180;
+        dir.set(Math.cos(alt) * Math.sin(az), Math.sin(alt), -Math.cos(alt) * Math.cos(az))
+          .applyQuaternion(q).normalize();
+        shadeRay.set(originWorld, dir);
+        states.push(shadeRay.intersectObjects(targets, true).length ? 'shade' : 'sun');
+      }
+      // 同じ状態が続く区間へまとめる
+      const segs = [];
+      states.forEach((st, i) => {
+        const at = i * SHADE_STEP_MIN;
+        if (segs.length && segs[segs.length - 1].state === st) segs[segs.length - 1].end = at + SHADE_STEP_MIN;
+        else segs.push({ state: st, start: at, end: at + SHADE_STEP_MIN });
+      });
+      return { segs, hasBlocker: targets.length > 0 };
+    }
+
+    // 1440分ちょうどは翌0時ではなく「24:00」と出す（%24 だと 00:00 になり区間が潰れる）
+    const hhmm = m => m >= 1440 ? '24:00'
+      : `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+
+    function queryShadeAt(localPt) {
+      shadeProbePt = { x: localPt.x, z: localPt.z };
+      shadeProbeRing.setAttribute('position', `${localPt.x} ${GRID_Y} ${localPt.z}`);
+      $('shade-probe').setAttribute('visible', true);
+      renderShadeResult();
+    }
+
+    function renderShadeResult() {
+      const box = $('shade-result');
+      if (!shadeProbePt) { box.style.display = 'none'; return; }
+      const { segs, hasBlocker } = computeShadeDay(shadeProbePt);
+      const bar = $('shade-bar');
+      bar.innerHTML = '';
+      segs.forEach(s => {
+        const d = document.createElement('div');
+        d.style.flex = String(s.end - s.start);
+        d.style.background = SHADE_COLOR[s.state];
+        d.title = `${hhmm(s.start)}〜${hhmm(s.end)}`;
+        bar.appendChild(d);
+      });
+      const shades = segs.filter(s => s.state === 'shade');
+      // 昼の区間は日なた/日陰に分かれているので繋ぎ直す。端末TZと現地の経度が離れると
+      // 昼が0時をまたいで2区間に割れるため、単純な最初〜最後では潰れる
+      const dayline = [];
+      segs.forEach(s => {
+        if (s.state === 'night') return;
+        const last = dayline[dayline.length - 1];
+        if (last && last.end === s.start) last.end = s.end;
+        else dayline.push({ start: s.start, end: s.end });
+      });
+      const dayRange = dayline.map(d => `${hhmm(d.start)}〜${hhmm(d.end)}`).join('、');
+      let msg;
+      if (!dayline.length) msg = 'この日は太陽が昇りません';
+      else if (!hasBlocker) msg = `遮るものがありません（${dayRange} は終日 日なた）`;
+      else if (!shades.length) msg = `終日 日なた（${dayRange}）`;
+      else msg = `日陰 ${shades.map(s => `${hhmm(s.start)}〜${hhmm(s.end)}`).join('、')}`
+        + `／それ以外は日なた（${dayRange}）`;
+      $('shade-text').textContent = msg;
+      box.style.display = 'block';
+    }
+
+    function clearShadeProbe() {
+      shadeProbePt = null;
+      $('shade-probe').setAttribute('visible', false);
+      $('shade-result').style.display = 'none';
     }
 
     // ─── 太陽の状態 ─────────────────────────────────────────────────
@@ -873,6 +995,8 @@ const HUMAN_PARTS = [
       $('task-verify-btn').classList.toggle('active', activeTask === 'verify');
       if (activeTask !== 'place') { repeatPlacement = false; $('repeat-place-btn').classList.remove('active'); }
       if (activeTask === 'verify') updateVerifyCard();
+      // 検証タブを離れたら調査結果と地点マーカーを消す（別タブに残っていても意味がない）
+      if (activeTask !== 'verify' && shadeProbePt) clearShadeProbe();
       if (activeTask === 'place') updatePlaceView();
       requestAnimationFrame(positionDpad);
     }
@@ -1069,6 +1193,12 @@ const HUMAN_PARTS = [
           syncContact(movingEl);
           endMove();
         }
+        return;
+      }
+      // 検証タブを開いている間の地面タップは、その地点の日陰時間帯を調べる操作。
+      // selectObject は setActiveTask('place') を呼ぶので、ここで選択中になることはない
+      if (activeTask === 'verify' && !isFps) {
+        if (hit) queryShadeAt(toWorldRootLocal(hit));
         return;
       }
       if (selectedEl) { deselectObject(); return; }
@@ -1393,6 +1523,8 @@ const HUMAN_PARTS = [
       $('vf-height').placeholder = vfLengthUnit === 'ratio' ? '不要' : '1.6';
     }
 
+    $('shade-clear').onclick = () => clearShadeProbe();
+
     $('vf-length-unit').onclick = () => {
       const cur = parseFloat($('vf-length').value);
       const prev = vfLengthUnit;
@@ -1626,6 +1758,7 @@ const HUMAN_PARTS = [
       initShadowQuality();
       initGrid();
       initShadowTip();
+      initShadeProbe();
       loadCalibration();
       loadStride();
       applyVfUnit();
