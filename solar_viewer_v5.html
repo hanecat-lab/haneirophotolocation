@@ -40,12 +40,22 @@
       const maxRadiusUV = c.maxPenumbra / frustumW;
 
       const PCSS_GLSL = `
-      #define PCSS_BLOCKER_SAMPLES 12
+      // ブロッカー探索は最大半影幅(0.4m)ぶんの広い円を張るので、頭が肩を隠すような近接の
+      // 遮蔽ではサンプルが当たるか外れるかが画素ごとに入れ替わり、count<0.5 の「完全に光」
+      // 分岐と相まって白黒の斑点になる。本数を増やして判定を安定させる。
+      // 24本まで増やすと寄ったときはさらに綺麗になるが、実機は毎フレーム走るので 16 に留める
+      // （通常の表示倍率では 16 と 24 の差は見えない）。
+      #define PCSS_BLOCKER_SAMPLES 16
       #define PCSS_PCF_SAMPLES 16
       #define PCSS_DEPTH_RANGE ${depthRange.toFixed(4)}
       #define PCSS_FRUSTUM_W ${frustumW.toFixed(4)}
       #define PCSS_SUN_TAN ${c.sunTan.toFixed(6)}
       #define PCSS_MAX_RADIUS_UV ${maxRadiusUV.toFixed(8)}
+      // 遮蔽物がすぐ近くにあると半影が1テクセル未満に潰れ、16サンプルがほぼ同じ点を叩く。
+      // 画素ごとに startAngle を乱数で回しているため、結果が白黒に振れて斑点として見える。
+      // 最小半径を数テクセルに広げてサンプルを散らし、階調で出す。半影が少しぼけるだけで
+      // 影の位置は動かないので、影の長さ（このアプリの本題）の正確さは損なわない。
+      #define PCSS_MIN_RADIUS_TEXELS 3.0
       vec2 pcssOffset( const in float i, const in float total, const in float startAngle ) {
         float angle = startAngle + i * ( PI2 * 5.0 / total );
         float r = pow( ( i + 0.5 ) / total, 0.75 );
@@ -69,7 +79,7 @@
         float zBlocker = pcssFindBlocker( shadowMap, uv, z, startAngle );
         if ( zBlocker < 0.0 ) return 1.0;
         float occluderDist = ( z - zBlocker ) * PCSS_DEPTH_RANGE;
-        float radius = clamp( occluderDist * PCSS_SUN_TAN / PCSS_FRUSTUM_W, 1.0 / shadowMapSize.x, PCSS_MAX_RADIUS_UV );
+        float radius = clamp( occluderDist * PCSS_SUN_TAN / PCSS_FRUSTUM_W, PCSS_MIN_RADIUS_TEXELS / shadowMapSize.x, PCSS_MAX_RADIUS_UV );
         float shadow = 0.0;
         for ( int i = 0; i < PCSS_PCF_SAMPLES; i ++ ) {
           vec2 o = pcssOffset( float( i ), float( PCSS_PCF_SAMPLES ), startAngle ) * radius;
@@ -260,7 +270,7 @@
   <div class="panel top-panel">
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
-      <span id="version-display">v5.39</span>
+      <span id="version-display">v5.40</span>
     </div>
     <div class="hud-box">
       <div class="hud-main"><span>向き</span><strong id="heading-text">N (0°)</strong></div>
@@ -1035,6 +1045,38 @@ const HUMAN_PARTS = [
 
 ];
 
+    // 人体は単一の閉じたメッシュだが、首と肩の境目のように光に対して浅い角度で自分を隠す
+    // 面では、シャドウマップの解像度（60m を 2048〜4096 で割るので 1テクセル 1.5〜3cm）が
+    // 足りず、自己遮蔽が白黒の斑点として出る。
+    // これを光源の bias / normalBias で潰すと影が物体の根元から剥がれ、影の長さが実際より
+    // 短く描かれる（実測で 4m の壁の影が 0.22m 短くなった）。影の長さはこのアプリの本題
+    // なので、そちらを犠牲にはできない。
+    // そこで「影を書き込むときだけ」人体を法線方向に少し痩せさせる。表面は常に自分の影の
+    // 手前に来るので斑点が原理的に出ず、壁からの受影も、壁が地面に落とす影も一切変わらない
+    // （痩せるのは人自身のシルエットだけで、身長1.7mに対して数cm）。
+    const HUMAN_SHADOW_SHRINK = 0.03;
+    AFRAME.registerComponent('shadow-shrink', {
+      init: function () {
+        const mat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+        mat.onBeforeCompile = shader => {
+          const anchor = '#include <begin_vertex>';
+          if (shader.vertexShader.indexOf(anchor) === -1) {
+            console.error('[shadow] 影用の痩せ処理の差し込み位置が見つかりません (three r' + THREE.REVISION + ')');
+            return;
+          }
+          shader.vertexShader = shader.vertexShader.replace(anchor,
+            anchor + `\n\ttransformed -= normalize( normal ) * ${HUMAN_SHADOW_SHRINK.toFixed(4)};`);
+        };
+        this.depthMaterial = mat;
+        this.apply();
+      },
+      apply: function () {
+        const mesh = this.el.getObject3D('mesh');
+        if (mesh) mesh.customDepthMaterial = this.depthMaterial;
+      },
+      events: { object3dset: function () { this.apply(); } }
+    });
+
     // ghostColor を渡すとプレビュー用の半透明ゴーストになる（影は落とさない）
     function buildHumanParts(container, ghostColor) {
       HUMAN_PARTS.forEach(p => {
@@ -1052,9 +1094,11 @@ const HUMAN_PARTS = [
           // マネキン風の艶を出すため roughness を低めにする
           el.setAttribute('material', `color: ${p.col}; roughness: 0.25; metalness: 0.15`);
           el.dataset.originalColor = p.col;
-          // 頭・首・胴体など隣接パーツ同士が互いの影を受けるとセルフシャドウの
-          // アクネ(継ぎ目の黒い斑点)が出るため、自分では影を受けないようにする
-          el.setAttribute('shadow', 'cast: true; receive: false');
+          // 壁の影が人に落ちることは日陰シミュレータの本題なので必ず受ける。
+          // v5.37 で受影を切ったのは自己遮蔽の斑点への過剰な対処だった。斑点のほうは
+          // shadow-shrink（影を書き込むときだけ痩せさせる）で個別に潰す。
+          el.setAttribute('shadow', 'cast: true; receive: true');
+          el.setAttribute('shadow-shrink', '');
           // raycaster は要素自身の object3DMap(=自分のメッシュ)しか拾わないため、
           // コンテナ(human)だけに .clickable を付けても人はクリック判定されない。
           // パーツ自身にも付けてクリックを拾い、DOMバブリングでコンテナの
