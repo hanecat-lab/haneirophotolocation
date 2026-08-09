@@ -135,6 +135,19 @@
     .top-panel { top: calc(10px + var(--safe-top)); }
     .bottom-panel { bottom: calc(10px + var(--safe-bottom)); }
     .info-row { font-size: 12px; color: #ffd700; font-weight: bold; margin-bottom: 6px; display: flex; justify-content: space-between; }
+    .info-row-right { display: flex; align-items: center; gap: 8px; }
+    /* 電子水準器のON/OFF。常時見える場所に置くのでタスクの状態に依存しない info-row に置く */
+    #vf-level-toggle-btn { border: 0; background: none; color: #888; font-size: 15px; line-height: 1; padding: 0; cursor: pointer; }
+    #vf-level-toggle-btn.active { color: var(--accent-color); text-shadow: 0 0 4px var(--accent-color); }
+    /* 常時表示の電子水準器本体。スマホをカメラのように立てて構えた姿勢が前提（傾斜計測用の
+       水準器とは別物。あちらは画面を上にして地面へ置く姿勢が前提）。俯瞰・FPSどちらでも
+       同じ位置に出る小さな隅の表示なので、3Dビューの操作を邪魔しないよう pointer-events は
+       切っておく */
+    #vf-level { position: fixed; right: calc(10px + var(--safe-right)); z-index: 20; width: 84px; height: 64px;
+      background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.15); border-radius: 10px;
+      display: none; pointer-events: none; overflow: hidden; }
+    #vf-level.on { display: block; }
+    #vf-level svg { width: 100%; height: 100%; display: block; }
     .hud-box { background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(0, 255, 136, 0.2); border-radius: 8px; padding: 6px 10px; margin-bottom: 10px; }
     .hud-main { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
     .hud-main strong { font-size: 16px; color: var(--accent-color); font-family: monospace; }
@@ -292,7 +305,10 @@
   <div class="panel top-panel">
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
-      <span id="version-display">v5.55</span>
+      <span class="info-row-right">
+        <button id="vf-level-toggle-btn" type="button" title="電子水準器（構えた姿勢の傾き表示）">📐</button>
+        <span id="version-display">v5.56</span>
+      </span>
     </div>
     <div class="sun-times" id="sun-times">日の出 --:-- ・ 日の入り --:--</div>
     <div class="hud-box">
@@ -305,6 +321,18 @@
       <button id="task-verify-btn" class="task-btn" data-task="verify"><span class="ico">📏</span>検証</button>
       <button id="toggle-fps-btn" class="task-btn"><span class="ico">🎮</span>FPS視点</button>
     </div>
+  </div>
+
+  <!-- 常時表示の電子水準器。スマホを立てて構えた姿勢（カメラのファインダー同様）が前提 -->
+  <div id="vf-level">
+    <svg viewBox="0 0 84 64">
+      <line x1="8" y1="32" x2="20" y2="32" stroke="rgba(255,255,255,0.5)" stroke-width="1.5"/>
+      <line x1="64" y1="32" x2="76" y2="32" stroke="rgba(255,255,255,0.5)" stroke-width="1.5"/>
+      <g id="vf-level-group">
+        <line x1="12" y1="32" x2="72" y2="32" stroke="#fff" stroke-width="2"/>
+        <line id="vf-level-pitch-mark" x1="42" y1="26" x2="42" y2="38" stroke="#fff" stroke-width="2" stroke-dasharray="3,2"/>
+      </g>
+    </svg>
   </div>
 
   <div id="dpad">
@@ -2166,6 +2194,81 @@ const HUMAN_PARTS = [
       updateSlopeAngUI();
     }
 
+    // ─── 常時表示の電子水準器（俯瞰・FPS共通）───────────────────────────
+    // 上の水準器は「画面を上にして地面へ置く」姿勢が前提だったが、こちらは
+    // 「スマホをカメラのように立てて構える」姿勢が前提。デバイスのZ軸（画面外向き
+    // 法線）の仰角をピッチ、法線まわりの上端方向の回転をロールとして常時表示する。
+    // 別の姿勢・別の用途なので levelHandler 等とは変数を分けて独立させる。
+    let vfLevelOn = false, vfLevelHandler = null, vfLevelEventName = null;
+
+    function vfLevelReadingFrom(e) {
+      const beta = e.beta, gamma = e.gamma;
+      if (!Number.isFinite(beta) || !Number.isFinite(gamma)) return null;
+      const R = Math.PI / 180;
+      const eul = new THREE.Euler(beta * R, gamma * R, (e.alpha || 0) * R, 'ZXY');
+      const n = new THREE.Vector3(0, 0, 1).applyEuler(eul);   // 画面の外向き法線
+      const up = new THREE.Vector3(0, 1, 0).applyEuler(eul);  // デバイスの上端方向
+      const pitch = Math.asin(Math.min(1, Math.max(-1, n.z))) * 180 / Math.PI;
+      // ロールは「法線まわりに、真上方向を screen 平面へ投影した基準」からの回転角。
+      // ほぼ真上/真下を向いている（法線が鉛直に近い）とこの基準が定まらないので 0 とする
+      const worldUp = new THREE.Vector3(0, 0, 1);
+      const refUp = worldUp.clone().sub(n.clone().multiplyScalar(worldUp.dot(n)));
+      const refLen = refUp.length();
+      if (refLen < 1e-4) return { pitch, roll: 0 };
+      refUp.divideScalar(refLen);
+      const refRight = new THREE.Vector3().crossVectors(refUp, n).normalize();
+      const roll = Math.atan2(up.dot(refRight), up.dot(refUp)) * 180 / Math.PI;
+      return { pitch, roll };
+    }
+
+    const VF_LEVEL_MAX_PITCH_DEG = 20, VF_LEVEL_MAX_PITCH_PX = 14;
+    function updateVfLevelSvg(roll, pitch) {
+      $('vf-level-group').setAttribute('transform', `rotate(${(-roll).toFixed(2)} 42 32)`);
+      const px = Math.max(-VF_LEVEL_MAX_PITCH_PX, Math.min(VF_LEVEL_MAX_PITCH_PX,
+        (pitch / VF_LEVEL_MAX_PITCH_DEG) * VF_LEVEL_MAX_PITCH_PX));
+      $('vf-level-pitch-mark').setAttribute('y1', (26 - px).toFixed(1));
+      $('vf-level-pitch-mark').setAttribute('y2', (38 - px).toFixed(1));
+    }
+
+    function startVfLevel() {
+      vfLevelEventName = ('ondeviceorientationabsolute' in window) ? 'deviceorientationabsolute' : 'deviceorientation';
+      vfLevelHandler = e => {
+        const r = vfLevelReadingFrom(e);
+        if (r) updateVfLevelSvg(r.roll, r.pitch);
+      };
+      window.addEventListener(vfLevelEventName, vfLevelHandler, true);
+      vfLevelOn = true;
+      $('vf-level').classList.add('on');
+      $('vf-level-toggle-btn').classList.add('active');
+    }
+
+    function stopVfLevel() {
+      if (vfLevelHandler) {
+        window.removeEventListener(vfLevelEventName, vfLevelHandler, true);
+        vfLevelHandler = null;
+      }
+      vfLevelOn = false;
+      $('vf-level').classList.remove('on');
+      $('vf-level-toggle-btn').classList.remove('active');
+    }
+
+    function toggleVfLevel() {
+      if (vfLevelOn) { stopVfLevel(); return; }
+      if (typeof DeviceOrientationEvent === 'undefined') return;
+      if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission().then(res => { if (res === 'granted') startVfLevel(); }).catch(() => {});
+      } else startVfLevel();
+    }
+    $('vf-level-toggle-btn').onclick = toggleVfLevel;
+
+    // .top-panel の高さはタスクの状態に関わらず一定だが、極端に狭い画面での折り返し等に
+    // 備えて実測して配置する（dpad の positionDpad() と同じ考え方）
+    function positionVfLevel() {
+      const rect = document.querySelector('.top-panel').getBoundingClientRect();
+      $('vf-level').style.top = Math.round(rect.bottom + 8) + 'px';
+    }
+    window.addEventListener('resize', positionVfLevel);
+
     // ボトムパネルの高さは開いているタスクによって大きく変わるので、dpad はその都度
     // パネル直上に位置し直す（縦画面のみ。横画面はパネルが左右に分かれるので CSS に任せる）。
     const landscapeMQ = window.matchMedia('(orientation: landscape) and (max-height: 500px)');
@@ -2725,6 +2828,7 @@ const HUMAN_PARTS = [
       loadScene();
       applyActiveTask();
       positionDpad();
+      positionVfLevel();
     });
     document.querySelectorAll('.panel, #dpad').forEach(p => { ['pointerdown', 'touchstart', 'click'].forEach(e => p.addEventListener(e, ev => ev.stopPropagation())); });
   </script>
