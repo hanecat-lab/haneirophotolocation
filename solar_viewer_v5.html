@@ -292,7 +292,7 @@
   <div class="panel top-panel">
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
-      <span id="version-display">v5.54</span>
+      <span id="version-display">v5.55</span>
     </div>
     <div class="sun-times" id="sun-times">日の出 --:-- ・ 日の入り --:--</div>
     <div class="hud-box">
@@ -488,6 +488,8 @@
         <button id="vf-stride-height-apply" type="button" class="unit-toggle">反映</button>
       </div>
       <div class="verify-result" id="vf-result">高さと影の長さを入れると、その影になる時刻を逆算します</div>
+      <!-- 高さを逆算できた時だけ出る。壁が未選択／傾斜面中は理由付きで disabled にする -->
+      <button id="vf-apply-height-btn" type="button" class="unit-toggle" style="display:none; width:100%; margin-top:6px;"></button>
       <div class="verify-lowsun" id="vf-lowsun" style="display:none;">太陽高度が低いため、影の長さは小さな誤差でも大きく変わります</div>
       <div class="verify-lowsun" id="vf-slope-note" style="display:none;">傾斜面を設定中です。ここの逆算と影の長さ比は水平な地面を前提にしているため、傾斜面上の実測とは一致しません</div>
       <div class="verify-row"><span>影の方位</span><strong id="vf-shadow-az">--</strong></div>
@@ -1574,6 +1576,7 @@ const HUMAN_PARTS = [
       }
       updatePlaceView();
       updateShadowTip();
+      updateVfApplyBtn();
     }
 
     function deselectObject() {
@@ -1583,6 +1586,7 @@ const HUMAN_PARTS = [
       else selectedEl.querySelectorAll('*').forEach(c => c.setAttribute('material', 'color', c.dataset.originalColor));
       selectedEl = null;
       setSettingsTarget(null);
+      updateVfApplyBtn();
       updatePlaceView();
       updateShadowTip();
     }
@@ -2357,6 +2361,7 @@ const HUMAN_PARTS = [
     const VF_UNITS = ['m', 'steps', 'ratio'];
     const VF_UNIT_LABEL = { m: 'm', steps: '歩', ratio: '倍' };
     let vfLengthUnit = 'm';
+    let vfDerivedHeight = null;   // 「高さを逆算した」時だけ数値を持つ。他の分岐・早期returnではnull
     function vfStrideM() { return strideCm / 100; }
     function vfLengthMeters() {
       const v = parseFloat($('vf-length').value);
@@ -2425,6 +2430,9 @@ const HUMAN_PARTS = [
     function updateVerifyResult() {
       const out = $('vf-result');
       if (!out) return;
+      // 「高さを逆算した」分岐以外はここで null に戻す。以降、その分岐でだけ上書きする
+      vfDerivedHeight = null;
+      updateVfApplyBtn();
       const setMsg = (text, mismatch) => {
         out.textContent = text;
         out.classList.toggle('mismatch', !!mismatch);
@@ -2458,8 +2466,13 @@ const HUMAN_PARTS = [
         if (hOk !== LOk) {
           // 現在の日時/現在地/方位の設定を前提に、片方だけから残りを見積もる
           const ratio = 1 / Math.tan(sunState.altDeg * Math.PI / 180);
-          if (hOk) setMsg(`現在の設定なら、影の長さは約 ${(ratio * h).toFixed(1)}m のはずです`, false);
-          else setMsg(`現在の設定なら、高さは約 ${(L / ratio).toFixed(1)}m のはずです`, false);
+          if (hOk) {
+            setMsg(`現在の設定なら、影の長さは約 ${(ratio * h).toFixed(1)}m のはずです`, false);
+          } else {
+            vfDerivedHeight = L / ratio;
+            setMsg(`現在の設定なら、高さは約 ${vfDerivedHeight.toFixed(1)}m のはずです`, false);
+            updateVfApplyBtn();
+          }
           return;
         }
         measuredAlt = Math.atan(h / L) * 180 / Math.PI;
@@ -2503,6 +2516,38 @@ const HUMAN_PARTS = [
         setMsg(base + ` ${Math.abs(delta)}分${delta > 0 ? '進めると' : '戻すと'}一致します。`, true);
       }
     }
+
+    // 検証タブで逆算した高さを、選択中の壁へ反映するボタンの表示状態
+    function updateVfApplyBtn() {
+      const btn = $('vf-apply-height-btn');
+      if (!btn) return;
+      if (vfDerivedHeight === null) { btn.style.display = 'none'; return; }
+      btn.style.display = 'block';
+      const isWall = selectedEl && selectedEl.dataset.type === 'wall';
+      if (!isWall) {
+        btn.disabled = true;
+        btn.title = '壁を選択すると反映できます';
+        btn.textContent = '壁の高さへ反映';
+      } else if (groundPlane.type === 'slope') {
+        btn.disabled = true;
+        btn.title = '傾斜面では反映できません（この計算は水平地面が前提です）';
+        btn.textContent = '壁の高さへ反映';
+      } else {
+        const rounded = Math.min(15, Math.max(1, Math.round(vfDerivedHeight / 0.5) * 0.5));
+        btn.disabled = false;
+        btn.title = '';
+        btn.textContent = `壁の高さへ反映（${rounded.toFixed(1)}m）`;
+      }
+    }
+
+    $('vf-apply-height-btn').onclick = () => {
+      if (vfDerivedHeight === null || !selectedEl || selectedEl.dataset.type !== 'wall') return;
+      if (groundPlane.type === 'slope') return;
+      const rounded = Math.min(15, Math.max(1, Math.round(vfDerivedHeight / 0.5) * 0.5));
+      // wh-range の既存の oninput に、高さ属性・Y再配置・接地AO同期・影先端更新を任せる
+      $('wh-range').value = rounded;
+      $('wh-range').dispatchEvent(new Event('input'));
+    };
 
     // ─── 配置の保存/復元 ────────────────────────────────────────────
     // 保存対象は配置物（壁・人）のみ。時刻/日付/現在地/世界の向きは対象外。
