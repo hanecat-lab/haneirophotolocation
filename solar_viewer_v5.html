@@ -281,7 +281,7 @@
   <div class="panel top-panel">
     <div class="info-row">
       <span id="sun-info">太陽: --</span>
-      <span id="version-display">v5.49</span>
+      <span id="version-display">v5.50</span>
     </div>
     <div class="sun-times" id="sun-times">日の出 --:-- ・ 日の入り --:--</div>
     <div class="hud-box">
@@ -508,6 +508,9 @@
       <a-entity id="shade-probe" visible="false"></a-entity>
       <!-- 配置/移動中、地面のどの点が設置基準点かを示す目印（緑、他のリングと被らない色） -->
       <a-entity id="place-marker" visible="false"></a-entity>
+      <!-- 傾斜面の受光面。シャドウマッピングは受け手の形状を問わないので、この面を
+           置くだけで壁も人も傾斜面へ3Dで正しく影を落とす（投影ポリゴンの計算は不要） -->
+      <a-plane id="slope-ground" visible="false" width="100" height="100" material="color: #222; roughness: 0.9" shadow="receive: true"></a-plane>
       <!-- 傾斜面の3点と、それを結ぶ半透明の補助面（中身は initSlopeHelper() で作る） -->
       <a-entity id="slope-helper" visible="false"></a-entity>
       <a-entity id="walls-container"></a-entity>
@@ -625,7 +628,8 @@
       const m = el.__contact;
       if (!m) return;
       const p = el.getAttribute('position');
-      m.position.set(p.x, CONTACT_Y, p.z);
+      // 傾斜面では接地位置のYも面に沿って動く（板の傾き合わせは今回のスコープ外）
+      m.position.set(p.x, slopeHeightAt(p.x, p.z) + CONTACT_Y, p.z);
       if (el.dataset.type === 'human') {
         const s = el.getAttribute('scale').x;
         m.scale.set(CONTACT_HUMAN_SIZE * s, CONTACT_HUMAN_SIZE * s, 1);
@@ -711,16 +715,26 @@
       const h = selectedEl.dataset.type === 'wall'
         ? +selectedEl.getAttribute('height')
         : selectedEl.getAttribute('scale').x * 1.6;
-      const L = h / Math.tan(sunState.altDeg * Math.PI / 180);
-      // #sun-light と同じローカル座標系。太陽へ向かう水平方向が (sin(az), -cos(az)) なので影はその逆
-      const az = sunState.azDeg * Math.PI / 180;
-      const tx = p.x - L * Math.sin(az), tz = p.z + L * Math.cos(az);
+      // 足元と頂点は地面（水平面 or 傾斜面）の上に取り、頂点から影の方向へ飛ばした
+      // レイと地面の交点を先端とする。水平面も同じ経路を通す（分岐を増やさない）
+      const baseY = slopeHeightAt(p.x, p.z);
+      const hit = shadowHitOnGround(p.x, baseY + h, p.z);
+      if (!hit) {
+        // 光線が地面と平行、または影が上り側へ発散して交点を持たない。
+        // 低い太陽や急斜面では普通に起こるので、数値を出さずに消す
+        host.setAttribute('visible', false);
+        if (row) row.style.display = 'none';
+        return;
+      }
+      const tx = hit.x, tz = hit.z;
+      // 影長は3D距離。斜面では XZ 平面上の距離と一致しない
+      const L = Math.hypot(tx - p.x, hit.y - baseY, tz - p.z);
       const pos = tipLine.geometry.attributes.position;
-      pos.setXYZ(0, p.x, GRID_Y, p.z);
-      pos.setXYZ(1, tx, GRID_Y, tz);
+      pos.setXYZ(0, p.x, baseY + GRID_Y, p.z);
+      pos.setXYZ(1, tx, hit.y + GRID_Y, tz);
       pos.needsUpdate = true;
       tipLine.geometry.computeBoundingSphere();
-      tipRing.setAttribute('position', `${tx} ${GRID_Y} ${tz}`);
+      tipRing.setAttribute('position', `${tx} ${hit.y + GRID_Y} ${tz}`);
       host.setAttribute('visible', true);
       if (row) {
         // 入力側が歩測精度なので 0.1m 刻みまで。cm は出さない
@@ -785,6 +799,23 @@
       if (g.type === 'horizontal') return 0;
       const n = g.normal, A = g.point;
       return A.y - (n.x * (x - A.x) + n.z * (z - A.z)) / n.y;
+    }
+
+    // 点(ox,oy,oz)から影の方向へレイを飛ばし、地面（水平 or 傾斜）との交点を返す。
+    // 交点を持たない場合は null。傾斜角から影長を割り増しするのではなく、
+    // 実際に3D空間で平面と交差させるので、太陽側へ下る斜面と反対側へ下る斜面で
+    // 自然に違う答えになる。
+    function shadowHitOnGround(ox, oy, oz) {
+      if (!sunState.aboveHorizon) return null;
+      // #sun-light と同じローカル系。太陽へ向かう方向の逆が影の方向
+      const az = sunState.azDeg * Math.PI / 180, alt = sunState.altDeg * Math.PI / 180;
+      const dx = -Math.cos(alt) * Math.sin(az), dy = -Math.sin(alt), dz = Math.cos(alt) * Math.cos(az);
+      const g = groundPlane, n = g.normal, A = g.point;
+      const denom = n.x * dx + n.y * dy + n.z * dz;
+      if (Math.abs(denom) < 1e-9) return null;               // 光線が面と平行
+      const t = (n.x * (A.x - ox) + n.y * (A.y - oy) + n.z * (A.z - oz)) / denom;
+      if (t <= 0) return null;                               // 面の裏側／上り側へ発散
+      return { x: ox + dx * t, y: oy + dy * t, z: oz + dz * t };
     }
 
     // 3点から平面を作る。作れない組み合わせは error を返して確定させない
@@ -875,6 +906,7 @@
       slopePts = [];
       slopePendingXZ = null;
       groundPlane = { type: 'horizontal', point: { x: 0, y: 0, z: 0 }, normal: { x: 0, y: 1, z: 0 } };
+      applyGroundPlane();
       updateSlopeUI();
     }
 
@@ -909,7 +941,71 @@
       const plane = planeFromPoints(slopePts);
       if (plane.error) return;
       groundPlane = { type: 'slope', point: plane.point, normal: plane.normal, points: slopePts.slice() };
+      applyGroundPlane();
       updateSlopeUI();
+    }
+
+    // 地面の定義が変わったときに、見た目（受光面）と全オブジェクトの接地Yを合わせ直す。
+    // 傾斜/水平のどちらへ切り替えた時も同じ関数を通す
+    function applyGroundPlane() {
+      const isSlope = groundPlane.type === 'slope';
+      const slopeEl = $('slope-ground');
+      // 水平の #ground はタップ判定に使い続けるので消さない。傾斜中は影を受けないように
+      // し、マテリアルを透明にして二重に影が出るのを防ぐ（レイキャストは形状ベースなので
+      // 透明でも従来通り当たる）
+      $('ground').setAttribute('shadow', `receive: ${!isSlope}`);
+      $('ground').setAttribute('material', isSlope
+        ? 'color: #222; roughness: 0.9; transparent: true; opacity: 0'
+        : 'color: #222; roughness: 0.9');
+      slopeEl.setAttribute('visible', isSlope);
+      // 地面に「描かれている」ものはまとめて面に貼り直す。マス目や方位マーカーが
+      // 水平のまま残ると、斜面を突き抜けて宙に浮いて見える
+      const painted = [slopeEl, $('ground-grid'), $('guide-markers')];
+      if (isSlope) {
+        const n = groundPlane.normal;
+        // 平面の法線に合わせて向きを決める。a-plane は既定で +Z を向くので、
+        // +Z を法線へ回すクォータニオンをそのまま姿勢にする
+        const q = new THREE.Quaternion().setFromUnitVectors(
+          new THREE.Vector3(0, 0, 1), new THREE.Vector3(n.x, n.y, n.z).normalize());
+        // A-Frame のエンティティ回転は YXZ 順。THREE 既定の XYZ で分解して渡すと
+        // 別の姿勢に解釈され、面が水平のままになる
+        const e = new THREE.Euler().setFromQuaternion(q, 'YXZ');
+        const d = 180 / Math.PI;
+        const rot = `${e.x * d} ${e.y * d} ${e.z * d}`;
+        // 面上の1点（XZ原点の真上）を基準にする
+        const pos = `0 ${slopeHeightAt(0, 0)} 0`;
+        // マス目と方位マーカーは -90 の寝かせを自前で持っているので、
+        // 受光面(+Z向き)との差分ぶんだけ余計に回す必要がある。
+        // 素直に「+Y を法線へ回す」回転を別に作って当てる
+        const qUp = new THREE.Quaternion().setFromUnitVectors(
+          new THREE.Vector3(0, 1, 0), new THREE.Vector3(n.x, n.y, n.z).normalize());
+        const eUp = new THREE.Euler().setFromQuaternion(qUp, 'YXZ');
+        const rotUp = `${eUp.x * d} ${eUp.y * d} ${eUp.z * d}`;
+        slopeEl.setAttribute('rotation', rot);
+        slopeEl.setAttribute('position', pos);
+        [$('ground-grid'), $('guide-markers')].forEach(el => {
+          el.setAttribute('rotation', rotUp);
+          el.setAttribute('position', pos);
+        });
+      } else {
+        painted.forEach(el => {
+          el.setAttribute('rotation', '0 0 0');
+          el.setAttribute('position', '0 0 0');
+        });
+      }
+      // 既存のオブジェクトを地面の上へ載せ直す。向き・回転・寸法は触らない
+      [...wallsContainer.children, ...humansContainer.children].forEach(el => {
+        const p = el.getAttribute('position');
+        el.setAttribute('position', `${p.x} ${groundYFor(el, p.x, p.z)} ${p.z}`);
+        syncContact(el);
+      });
+      updateShadowTip();
+    }
+
+    // オブジェクトの position.y。壁は中心が原点なので高さの半分だけ持ち上げる
+    function groundYFor(el, x, z) {
+      const base = slopeHeightAt(x, z);
+      return el.dataset.type === 'wall' ? base + (+el.getAttribute('height')) / 2 : base;
     }
 
     // localPt は #world-root ローカル座標。太陽方向へレイを飛ばし、壁/人に当たれば日陰。
@@ -1054,7 +1150,7 @@
       wall.classList.add('clickable');
       wall.dataset.originalColor = '#7f8c8d';
       wall.dataset.type = 'wall';
-      wall.setAttribute('position', `${x} ${h/2} ${z}`);
+      wall.setAttribute('position', `${x} ${slopeHeightAt(x, z) + h/2} ${z}`);
       wall.setAttribute('width', w); wall.setAttribute('height', h); wall.setAttribute('depth', d);
       wall.setAttribute('rotation', `0 ${r} 0`);
       wall.setAttribute('material', 'color: #7f8c8d; roughness: 0.6');
@@ -1343,7 +1439,7 @@ const HUMAN_PARTS = [
       const human = document.createElement('a-entity');
       human.classList.add('clickable');
       human.dataset.type = 'human';
-      human.setAttribute('position', `${x} 0 ${z}`);
+      human.setAttribute('position', `${x} ${slopeHeightAt(x, z)} ${z}`);
       human.setAttribute('rotation', `0 ${r} 0`);
       human.setAttribute('scale', `${hh/1.6} ${hh/1.6} ${hh/1.6}`);
       buildHumanParts(human);
@@ -1716,7 +1812,7 @@ const HUMAN_PARTS = [
       if (movingEl) {
         if (hit) {
           const pt = hit;
-          const y = movingEl.dataset.type === 'wall' ? +movingEl.getAttribute('height') / 2 : 0;
+          const y = groundYFor(movingEl, pt.x, pt.z);
           movingEl.setAttribute('position', `${pt.x} ${y} ${pt.z}`);
           syncContact(movingEl);
           endMove();
@@ -2296,7 +2392,7 @@ const HUMAN_PARTS = [
         { enableHighAccuracy: true, timeout: 12000 }
       );
     };
-    $('wh-range').oninput = e => { $('wh-out').textContent = $('dim-wh-val').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.dataset.type === 'wall') { selectedEl.setAttribute('height', e.target.value); let p = selectedEl.getAttribute('position'); selectedEl.setAttribute('position', `${p.x} ${e.target.value/2} ${p.z}`); updateShadowTip(); } updatePreview(); };
+    $('wh-range').oninput = e => { $('wh-out').textContent = $('dim-wh-val').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.dataset.type === 'wall') { selectedEl.setAttribute('height', e.target.value); let p = selectedEl.getAttribute('position'); selectedEl.setAttribute('position', `${p.x} ${slopeHeightAt(p.x, p.z) + e.target.value/2} ${p.z}`); syncContact(selectedEl); updateShadowTip(); } updatePreview(); };
     $('wd-range').oninput = e => { $('wd-out').textContent = $('dim-wd-val').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.dataset.type === 'wall') { selectedEl.setAttribute('depth', e.target.value); syncContact(selectedEl); } updatePreview(); };
     $('ww-range').oninput = e => { $('ww-out').textContent = $('dim-ww-val').textContent = e.target.value + 'm'; if (selectedEl && selectedEl.dataset.type === 'wall') { selectedEl.setAttribute('width', e.target.value); syncContact(selectedEl); } updatePreview(); };
     // 壁・人の向きは直角に揃えたい場面が多いので、0/90/180/270°の近くではその値に
