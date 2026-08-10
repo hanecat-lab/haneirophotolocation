@@ -350,7 +350,7 @@
       <span id="sun-info">太陽: --</span>
       <span class="info-row-right">
         <button id="vf-level-toggle-btn" type="button" title="電子水準器（構えた姿勢の傾き表示）">📐</button>
-        <span id="version-display">v5.65</span>
+        <span id="version-display">v5.66</span>
       </span>
     </div>
     <div class="sun-times" id="sun-times">日の出 --:-- ・ 日の入り --:--</div>
@@ -831,6 +831,9 @@
     // カメラ角度で暴れない(画面ピクセル基準のオフセットだと、地面へ浅い角度で
     // 当たる場所ほど現実の距離換算が激変してしまう)。設置座標そのものには使わない。
     const PLACE_MARKER_LIFT = 0.35;
+    // 人物・カメラの移動時、指の実座標より上をレイキャストして確定するためのpxオフセット。
+    // 画面ピクセル基準なのでズーム倍率に依存せず、指の接触サイズに対して一定になる
+    const MOVE_TOUCH_LIFT_PX = 56;
     function initGrid() {
       // 目線視点では遠くのマス目が地平線に潰れて縞ノイズになるので、細かい線ほど狭く敷く。
       // 範囲は既存の目印に合わせる: 1mは内側のガイドリング(10m)まで、
@@ -2056,9 +2059,11 @@ const HUMAN_PARTS = [
       updateShadowTip();
     }
 
-    function getGroundPoint(e) {
+    // liftPx: 指が対象を隠してしまう問題への対策。人物・カメラの移動中(タッチ時)だけ、
+    // 指の実座標より一定px上をレイキャストする。壁は対象が大きく問題にならないので使わない
+    function getGroundPoint(e, liftPx) {
       const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+      const clientY = (e.touches ? e.touches[0].clientY : e.clientY) - (liftPx || 0);
       const rect = sceneEl.getBoundingClientRect();
       mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
       mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
@@ -2073,14 +2078,18 @@ const HUMAN_PARTS = [
       // その指の画面座標をそのまま地面の交点として拾ってプレビューが暴れる。
       // パネル上で発生したイベントは無視する。
       if (e.target.closest('.panel, #dpad')) return;
-      const hit = getGroundPoint(e);
+      // touchstart/touchmove は e.touches を持つ。ブラウザが合成する pointerdown/
+      // pointermove では touches が無い代わりに pointerType で判別できる
+      const isTouch = !!e.touches || e.pointerType === 'touch';
+      // 人物・カメラの移動中は、指が対象そのものを隠して微調整しづらいという指摘への対応。
+      // タッチ時だけ指の実座標より上をレイキャストし、見えている位置(プレビュー)と
+      // 確定される位置(lastGroundPt→confirmMoveOnRelease)を常に一致させたまま浮かせる
+      const liftPx = (movingEl && isTouch && movingEl.dataset.type !== 'wall') ? MOVE_TOUCH_LIFT_PX : 0;
+      const hit = getGroundPoint(e, liftPx);
       if (hit) {
         const pt = toWorldRootLocal(hit);
         lastGroundPt = { x: pt.x, z: pt.z };
         // 指が設置点そのものを隠すタッチ操作の時だけ、マーカーの見た目を持ち上げる。
-        // touchstart/touchmove は e.touches を持つ。ブラウザが合成する pointerdown/
-        // pointermove では touches が無い代わりに pointerType で判別できる
-        const isTouch = !!e.touches || e.pointerType === 'touch';
         setPlaceMarker(pt.x, pt.z, isTouch);
         const type = currentPlacementType();
         previewWall.setAttribute('visible', type === 'wall');
@@ -2128,6 +2137,60 @@ const HUMAN_PARTS = [
     // キャプチャで先に確定させ、この競合の影響を受けないようにする
     window.addEventListener('pointerup', confirmMoveOnRelease, { capture: true });
     window.addEventListener('touchend', confirmMoveOnRelease, { capture: true });
+
+    // 壁の近くに人物・カメラを置くと選択しづらいという指摘への対応。壁は大きく素の
+    // 最近接レイキャストで十分選びやすいので対象にしない。人物・カメラだけ、タップ座標
+    // から画面上一定px以内なら(素のレイキャストが壁やgroundを拾っていても)優先して選ぶ。
+    // 実寸(メートル)で当たり判定を広げるとズーム倍率で有効性が変わってしまうため、
+    // 画面ピクセル基準の許容範囲にする
+    const TAP_SELECT_TOLERANCE_PX = 22;
+    // 引きで見ている(ズームアウトした)時は22pxが実寸で数m相当まで広がってしまい、
+    // 遠くの人物まで拾ってしまう。pxの許容範囲に加えて、実寸でもこの距離未満のものだけを
+    // 候補にする(人物の足元footprint半径+指の誤差ぶんの余裕)
+    const TAP_SELECT_MAX_WORLD_M = 1.2;
+    let suppressNextClickForSelect = false;
+    function screenPointFor(el) {
+      const wp = new THREE.Vector3();
+      el.object3D.getWorldPosition(wp);
+      wp.project(sceneEl.camera);
+      const rect = sceneEl.canvas.getBoundingClientRect();
+      return { x: (wp.x * 0.5 + 0.5) * rect.width + rect.left, y: (-wp.y * 0.5 + 0.5) * rect.height + rect.top };
+    }
+    function nearestSmallCandidate(clientX, clientY, worldPt) {
+      let best = null, bestDist = TAP_SELECT_TOLERANCE_PX;
+      const candidates = humanObjects.map(h => ({ el: h.el, x: h.x, z: h.z }));
+      if (scoutCamEl) { const p = scoutCamEl.getAttribute('position'); candidates.push({ el: scoutCamEl, x: p.x, z: p.z }); }
+      candidates.forEach(c => {
+        if (worldPt && Math.hypot(c.x - worldPt.x, c.z - worldPt.z) > TAP_SELECT_MAX_WORLD_M) return;
+        const sp = screenPointFor(c.el);
+        const d = Math.hypot(sp.x - clientX, sp.y - clientY);
+        if (d < bestDist) { bestDist = d; best = c.el; }
+      });
+      return best;
+    }
+    function onTapSelectCapture(e) {
+      // 配置・移動・目線/カメラ視点中は既存フローに一切干渉しない
+      if (viewLocked() || pendingType || movingEl) return;
+      // e.target がElement以外(windowへ直接dispatchされた合成イベント等)の場合に備える
+      if (e.target && e.target.closest && e.target.closest('.panel, #dpad')) return;
+      const t = e.changedTouches ? e.changedTouches[0] : e;
+      const groundHit = getGroundPoint(t);
+      const worldPt = groundHit ? toWorldRootLocal(groundHit) : null;
+      const candidate = nearestSmallCandidate(t.clientX, t.clientY, worldPt);
+      if (candidate && candidate !== selectedEl) {
+        selectObject(candidate);
+        // 1回の指離しでA-Frameの合成clickとブラウザの合成clickが両方発火することがあるため、
+        // 1回消費したら終わりのフラグではなく、この同期処理が終わった直後(次のtick)まで
+        // まとめて打ち消す
+        suppressNextClickForSelect = true;
+        setTimeout(() => { suppressNextClickForSelect = false; }, 0);
+      }
+    }
+    window.addEventListener('pointerup', onTapSelectCapture, { capture: true });
+    window.addEventListener('touchend', onTapSelectCapture, { capture: true });
+    window.addEventListener('click', e => {
+      if (suppressNextClickForSelect) e.stopPropagation();
+    }, { capture: true });
 
     // ─── 俯瞰視点のピンチズーム ──────────────────────────────────────
     // three.js OrbitControls の2本指タッチは既定で DOLLY_PAN(ズームとパンを同時処理)
