@@ -220,6 +220,10 @@
     /* ドラッグ回転の存在に気づけるよう、視点中だけ一言添える */
     #scout-drag-hint { position: fixed; left: 0; right: 0; bottom: calc(16px + var(--safe-bottom)); text-align: center; z-index: 30; display: none; color: #fff; font-size: 13px; text-shadow: 0 1px 3px rgba(0,0,0,0.8); pointer-events: none; }
     #scout-drag-hint.on { display: block; }
+    #scout-height-control { position: fixed; right: calc(16px + var(--safe-right)); bottom: 265px; z-index: 30; display: none; flex-direction: column; gap: 4px; background: rgba(0,0,0,0.3); padding: 6px; border-radius: 14px; backdrop-filter: blur(8px); }
+    #scout-height-control.on { display: flex; }
+    #scout-height-control button { width: 40px; height: 40px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: #fff; font-size: 16px; border-radius: 7px; touch-action: manipulation; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+    #scout-height-control button:active { background: var(--accent-color); color: #000; }
     #scout-letterbox.on { display: block; }
     #scout-letterbox::before, #scout-letterbox::after { content: ''; position: absolute; background: #000; }
     #scout-letterbox.horizontal::before { top: 0; left: 0; right: 0; height: var(--bar-size); }
@@ -331,6 +335,7 @@
       .top-panel { width: 220px; right: auto; }
       .bottom-panel { left: 240px; }
       #dpad { bottom: 20px; left: auto; right: calc(20px + var(--safe-right)); }
+      #scout-height-control { bottom: 20px; }
     }
   </style>
 </head>
@@ -341,7 +346,7 @@
       <span id="sun-info">太陽: --</span>
       <span class="info-row-right">
         <button id="vf-level-toggle-btn" type="button" title="電子水準器（構えた姿勢の傾き表示）">📐</button>
-        <span id="version-display">v5.61</span>
+        <span id="version-display">v5.62</span>
       </span>
     </div>
     <div class="sun-times" id="sun-times">日の出 --:-- ・ 日の入り --:--</div>
@@ -397,6 +402,11 @@
   <button id="scout-exit-btn" class="btn btn-primary" type="button">🔙 通常視点へ戻る</button>
   <!-- 数値スライダーしか向きを合わせる手段がないという指摘への対応。ドラッグでも回せることを示す -->
   <div id="scout-drag-hint">ドラッグで向きを調整できます</div>
+  <!-- カメラ視点中の高さ調整。dpad(徒歩移動)と同じ「押している間動く」ボタン方式 -->
+  <div id="scout-height-control">
+    <button id="scout-height-up" type="button">⬆</button>
+    <button id="scout-height-down" type="button">⬇</button>
+  </div>
 
   <div class="panel bottom-panel">
     <div class="time-row">
@@ -677,10 +687,15 @@
     const previewWall = $('preview-wall');
     const previewHuman = $('preview-human');
     const previewCamera = $('preview-camera');
-    let humanObjects = [], isFps = false, isCompassActive = false, selectedEl = null, pendingType = null, moveState = { fwd: 0, bwd: 0, left: 0, right: 0 };
+    let humanObjects = [], isFps = false, isCompassActive = false, selectedEl = null, pendingType = null, moveState = { fwd: 0, bwd: 0, left: 0, right: 0, camUp: 0, camDown: 0 };
     // ─── ロケハンモードの簡易カメラ ────────────────────────────────────
     // 撮影位置の確認だけが目的。実カメラの精密再現(F値/被写界深度/センサーサイズ等)は行わない
-    const SCOUT_CAM_HEIGHT = 1.5;   // 初期高さ150cm。専用のY入力は作らず固定値のまま移動する
+    const SCOUT_CAM_HEIGHT = 1.5;   // 初期高さ150cm(設置直後の既定値)
+    // カメラ視点中の上下ボタンで変えた「地面からの高さ」。位置移動・傾斜面変更の後も
+    // この値を保ち続ける(固定値には戻さない)。カメラが存在しない間は既定値のまま
+    let scoutCamHeightOffset = SCOUT_CAM_HEIGHT;
+    const SCOUT_CAM_HEIGHT_MIN = 0.3, SCOUT_CAM_HEIGHT_MAX = 3.0;
+    const SCOUT_HEIGHT_SPEED = 1.0;   // m/秒。ボタン長押しでの上下速度
     const FOCAL_PRESETS = [24, 35, 50, 85, 135];
     let scoutCamEl = null, scoutFocalMM = 50, scoutAspect = '16:9', scoutViewOn = false;
     // 35mm判(縦24mm)換算の垂直画角。実レンズの厳密な再現はしない、単調に狭くなればよい目安の式
@@ -1207,7 +1222,7 @@
       // ロケハンモードの簡易カメラも同じ理由でYだけ追従させる（壁/人のロジックは無変更）
       if (scoutCamEl) {
         const p = scoutCamEl.getAttribute('position');
-        scoutCamEl.setAttribute('position', `${p.x} ${slopeHeightAt(p.x, p.z) + SCOUT_CAM_HEIGHT} ${p.z}`);
+        scoutCamEl.setAttribute('position', `${p.x} ${slopeHeightAt(p.x, p.z) + scoutCamHeightOffset} ${p.z}`);
       }
       updateShadowTip();
     }
@@ -1671,7 +1686,17 @@ const HUMAN_PARTS = [
       lens.setAttribute('position', '0 0 -0.09');
       lens.setAttribute('rotation', '-90 0 0');
       lens.setAttribute('radius-bottom', 0.05); lens.setAttribute('radius-top', 0.03); lens.setAttribute('height', 0.08);
-      [[body, '#222'], [lens, '#444']].forEach(([el, col]) => {
+      // 本体・レンズだけだと俯瞰視点で向きの変化に気づきにくいという指摘への対応。
+      // レンズの先から明るい色の矢印(軸+矢じり)を伸ばし、向きを一目で追えるようにする
+      const arrowShaft = document.createElement('a-cylinder');
+      arrowShaft.setAttribute('position', '0 0 -0.255');
+      arrowShaft.setAttribute('rotation', '-90 0 0');
+      arrowShaft.setAttribute('radius', 0.012); arrowShaft.setAttribute('height', 0.25);
+      const arrowHead = document.createElement('a-cone');
+      arrowHead.setAttribute('position', '0 0 -0.44');
+      arrowHead.setAttribute('rotation', '-90 0 0');
+      arrowHead.setAttribute('radius-bottom', 0.05); arrowHead.setAttribute('radius-top', 0); arrowHead.setAttribute('height', 0.12);
+      [[body, '#222'], [lens, '#444'], [arrowShaft, '#00e5ff'], [arrowHead, '#00e5ff']].forEach(([el, col]) => {
         if (ghostColor) el.setAttribute('material', `color: ${ghostColor}; transparent: true; opacity: 0.5`);
         else { el.setAttribute('material', `color: ${col}`); el.dataset.originalColor = col; }
         container.appendChild(el);
@@ -1682,6 +1707,7 @@ const HUMAN_PARTS = [
     // 位置(x,z)はslopeHeightAtで既存の壁/人と同じ流儀で地面に合わせるだけ
     let scoutLensEl = null;   // 実際に camera コンポーネントを持つ子entity(下記の理由で本体とは分離)
     function createScoutCamera(x, z) {
+      scoutCamHeightOffset = SCOUT_CAM_HEIGHT;   // 新規設置のたびに既定の高さへ戻す
       const cam = document.createElement('a-entity');
       cam.classList.add('clickable');
       cam.dataset.type = 'camera';
@@ -1725,7 +1751,9 @@ const HUMAN_PARTS = [
       selectedEl = el;
       const type = el.dataset.type, isWall = type === 'wall';
       if (isWall) el.setAttribute('material', 'color', SELECT_COLOR);
-      else el.querySelectorAll('*').forEach(c => c.setAttribute('material', 'color', SELECT_COLOR));
+      // カメラは実カメラのcameraコンポーネントを持つ子entity(見た目のないlens)も
+      // 子孫に含む。マーカーの見た目パーツ(dataset.originalColorを持つもの)だけ塗り替える
+      else el.querySelectorAll('*').forEach(c => { if (c.dataset.originalColor !== undefined) c.setAttribute('material', 'color', SELECT_COLOR); });
       setSettingsTarget(type);
       setActiveTask('place');
       if (isWall) {
@@ -1753,7 +1781,7 @@ const HUMAN_PARTS = [
       if (!selectedEl) return;
       if (movingEl === selectedEl) endMove();
       if (selectedEl.dataset.type === 'wall') selectedEl.setAttribute('material', 'color', selectedEl.dataset.originalColor);
-      else selectedEl.querySelectorAll('*').forEach(c => c.setAttribute('material', 'color', c.dataset.originalColor));
+      else selectedEl.querySelectorAll('*').forEach(c => { if (c.dataset.originalColor !== undefined) c.setAttribute('material', 'color', c.dataset.originalColor); });
       selectedEl = null;
       setSettingsTarget(null);
       updateVfApplyBtn();
@@ -2131,7 +2159,7 @@ const HUMAN_PARTS = [
           const pt = hit;
           // groundYFor は壁/人専用(変更しない)なので、カメラだけこの場で高さを決める
           const y = movingEl.dataset.type === 'camera'
-            ? slopeHeightAt(pt.x, pt.z) + SCOUT_CAM_HEIGHT
+            ? slopeHeightAt(pt.x, pt.z) + scoutCamHeightOffset
             : groundYFor(movingEl, pt.x, pt.z);
           movingEl.setAttribute('position', `${pt.x} ${y} ${pt.z}`);
           syncContact(movingEl);
@@ -2515,10 +2543,14 @@ const HUMAN_PARTS = [
     // ボトムパネルの高さは開いているタスクによって大きく変わるので、dpad はその都度
     // パネル直上に位置し直す（縦画面のみ。横画面はパネルが左右に分かれるので CSS に任せる）。
     const landscapeMQ = window.matchMedia('(orientation: landscape) and (max-height: 500px)');
+    // scout-height-control(カメラ視点の上下ボタン)もdpadと同じく「ボトムパネル直上」に
+    // 位置させたいので、同じ計算をここで一緒に行う(dpadとscoutViewは同時に出ないので競合しない)
     function positionDpad() {
-      if (landscapeMQ.matches) { $('dpad').style.bottom = ''; return; }
+      if (landscapeMQ.matches) { $('dpad').style.bottom = ''; $('scout-height-control').style.bottom = ''; return; }
       const rect = document.querySelector('.bottom-panel').getBoundingClientRect();
-      $('dpad').style.bottom = Math.round(window.innerHeight - rect.top + 16) + 'px';
+      const bottom = Math.round(window.innerHeight - rect.top + 16) + 'px';
+      $('dpad').style.bottom = bottom;
+      $('scout-height-control').style.bottom = bottom;
     }
     window.addEventListener('resize', positionDpad);
 
@@ -2624,7 +2656,7 @@ const HUMAN_PARTS = [
     const SCOUT_LOOK_SPEED = 0.2;
     let scoutLookDrag = null;
     function onScoutLookDown(e) {
-      if (e.target.closest('.panel, #scout-exit-btn')) return;
+      if (e.target.closest('.panel, #scout-exit-btn, #scout-height-control')) return;
       scoutLookDrag = { x: e.clientX, y: e.clientY };
     }
     function onScoutLookMove(e) {
@@ -2657,6 +2689,7 @@ const HUMAN_PARTS = [
       $('scout-view-btn').textContent = on ? '🔙 通常視点へ戻る' : '📷 カメラ視点';
       $('scout-exit-btn').classList.toggle('on', on);
       $('scout-drag-hint').classList.toggle('on', on);
+      $('scout-height-control').classList.toggle('on', on);
       updateTaskBtnDisabled();
       applyScoutAspect();
     }
@@ -2695,6 +2728,7 @@ const HUMAN_PARTS = [
       el.addEventListener('mousedown', p); el.addEventListener('mouseup', r); el.addEventListener('mouseleave', r);
     }
     bindMove('btn-fwd', 'fwd'); bindMove('btn-bwd', 'bwd'); bindMove('btn-left', 'left'); bindMove('btn-right', 'right');
+    bindMove('scout-height-up', 'camUp'); bindMove('scout-height-down', 'camDown');
 
     const FPS_MOVE_SPEED = 7.2;   // units/秒。60fps時の従来の体感速度に合わせた値
     let lastStepTime = null;
@@ -2728,6 +2762,15 @@ const HUMAN_PARTS = [
           // 斜面を歩くと足元の高さが変わるので、移動先のXZで測り直す
           rig.setAttribute('position', `${pos.x + dx} ${fpsEyeY(pos.x + dx, pos.z + dz)} ${pos.z + dz}`);
         }
+      }
+      // カメラ視点中の上下ボタン。dpadの歩行(moveState/bindMove)と同じ「押している間動く」方式を流用
+      if (scoutViewOn && scoutCamEl && (moveState.camUp || moveState.camDown)) {
+        const pos = scoutCamEl.getAttribute('position');
+        const dy = (moveState.camUp ? 1 : 0) - (moveState.camDown ? 1 : 0);
+        const groundY = slopeHeightAt(pos.x, pos.z);
+        const newY = Math.max(groundY + SCOUT_CAM_HEIGHT_MIN, Math.min(groundY + SCOUT_CAM_HEIGHT_MAX, pos.y + dy * SCOUT_HEIGHT_SPEED * dt));
+        scoutCamEl.setAttribute('position', `${pos.x} ${newY} ${pos.z}`);
+        scoutCamHeightOffset = newY - groundY;
       }
       requestAnimationFrame(step);
     }
