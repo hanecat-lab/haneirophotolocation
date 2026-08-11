@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<title>黒衣モード Pro（AR & 軽量AI版）</title>
+<title>黒衣モード Pro（安定化・フォールバック版）</title>
 <style>
 *{box-sizing:border-box}
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#050505;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif}
@@ -15,7 +15,7 @@ html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#050505;col
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#00e887;margin-right:6px;box-shadow:0 0 10px #00e887}
 #reticle{position:fixed;left:50%;top:45%;transform:translate(-50%,-50%);width:38px;height:38px;border:1px solid rgba(255,255,255,.28);border-radius:50%;z-index:3;pointer-events:none}
 #reticle:after{content:"";position:absolute;left:50%;top:50%;width:3px;height:3px;background:#fff;border-radius:50%;transform:translate(-50%,-50%)}
-#insight{position:fixed;left:18px;right:18px;bottom:max(24px,calc(env(safe-area-inset-bottom) + 16px));z-index:6;transition:.45s ease;transform:translateY(0)}
+#insight{position:fixed;left:18px;right:18px;bottom:max(24px,calc(env(safe-area-inset-bottom) + 16px));z-index:6}
 .card{background:rgba(10,10,10,.76);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border:1px solid rgba(255,255,255,.14);border-radius:22px;padding:18px 18px 15px;box-shadow:0 14px 40px rgba(0,0,0,.35)}
 .type{font-size:24px;font-weight:700;letter-spacing:.02em}
 .sub{margin-top:5px;font-size:13px;color:rgba(255,255,255,.7)}
@@ -44,19 +44,19 @@ button{font:inherit}
 <video id="camera" autoplay playsinline muted></video>
 <canvas id="arCanvas"></canvas>
 <div id="shade"></div>
-<div id="status"><span><i class="dot"></i><span id="state">待機中</span></span><span id="clock">--:--</span></div>
+<div id="status"><span><i class="dot"></i><span id="state">解析中</span></span><span id="clock">--:--</span></div>
 <div id="reticle"></div>
 
 <div id="insight">
   <div class="card">
     <div class="type" id="type">周囲を見ています</div>
-    <div class="sub" id="sub">カメラを向けて、少し静止してください[cite: 1]</div>
-    <div class="subject" id="subject">被写体：認識準備中</div>
-    <div class="light-reading" id="lightReading">光解析：カメラの準備中</div>
-    <div class="reason" id="reason">太陽位置・時間・スマホの向きを組み合わせて、撮影条件の変化を探します[cite: 1]。</div>
+    <div class="sub" id="sub">カメラを向けて撮影条件を解析中</div>
+    <div class="subject" id="subject">被写体：光と方角を優先解析中</div>
+    <div class="light-reading" id="lightReading">光解析：準備完了</div>
+    <div class="reason" id="reason">太陽位置・時間・スマホの向きから最適な撮影条件を導き出します。</div>
     <div class="meta" id="meta">
       <span class="tag">黒衣モード</span>
-      <span class="tag">ARガイド対応</span>
+      <span class="tag">ARガイド稼働中</span>
     </div>
   </div>
 </div>
@@ -74,8 +74,6 @@ button{font:inherit}
     <div class="row"><span>光の状態</span><b id="lightScene">--</b></div>
     <div class="row"><span>推奨露出補正</span><b id="exposureAdvice">--</b></div>
     <div class="row"><span>明るい方向</span><b id="lightDirection">--</b></div>
-    <div class="row"><span>色かぶり</span><b id="colorCast">--</b></div>
-    <div class="row"><span>白飛び / 黒つぶれ</span><b id="clipping">--</b></div>
     <div class="row"><span>おすすめレンズ</span><b id="lens">--</b></div>
     <div class="row"><span>構図</span><b id="composition">--</b></div>
   </div>
@@ -97,44 +95,42 @@ button{font:inherit}
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
 <script>
 const $=id=>document.getElementById(id);
-let lat=34.69, lon=135.50, heading=null, stream=null, lastMotion=Date.now(), stable=false;
-let previousAcceleration=null;
+let lat=34.69, lon=135.50, heading=null, stream=null;
 let lastType="周囲を見ています", lastSubject="", lastLightAdvice="";
-let detector=null, detected=[], detecting=false;
+let detector=null, detected=[], detecting=false, aiReady=false;
 let lightCanvas=null, lightContext=null, lightStats={
   ready:false, scene:"解析待ち", exposureEv:0, direction:"解析待ち",
-  colorCast:"解析待ち", highlight:0, shadow:0, average:0, contrast:0
+  colorCast:"ニュートラル", highlight:0, shadow:0, average:0, contrast:0
 };
 let step = 1;
 
-const labels = {
-  person:"人物", bicycle:"自転車", car:"車", motorcycle:"バイク", bus:"バス",
-  train:"電車", truck:"トラック", boat:"ボート", bird:"鳥", cat:"猫", dog:"犬",
-  horse:"馬", backpack:"リュック", umbrella:"傘", handbag:"バッグ", suitcase:"スーツケース",
-  chair:"椅子", couch:"ソファ", potted_plant:"観葉植物", bed:"ベッド", dining_table:"テーブル",
-  tv:"テレビ", laptop:"ノートPC", cell_phone:"スマホ", book:"本", clock:"時計",
-  bottle:"ボトル", cup:"カップ", bowl:"ボウル", banana:"バナナ", apple:"りんご",
-  orange:"オレンジ", pizza:"ピザ", cake:"ケーキ", keyboard:"キーボード", mouse:"マウス",
-  vase:"花瓶", scissors:"はさみ", teddy_bear:"ぬいぐるみ"
-};
-
+// AIの読み込みにタイムアウト（6秒）を設け、失敗時は自動的に軽量モードへフォールバックする
 async function loadRecognitionModel(){
-  if(!window.cocoSsd) return false;
-  try{
-    $("subject").textContent="被写体：軽量AIモデルを読み込んでいます…";
-    await tf.setBackend('webgl');
-    detector=await window.cocoSsd.load({base:"mobilenet_v2"});
+  if(!window.cocoSsd) {
+    aiReady = false;
+    return;
+  }
+  try {
+    $("subject").textContent="被写体：AIモデルを読み込んでいます…";
+    
+    const loadPromise = window.cocoSsd.load({base:"mobilenet_v2"});
+    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 6000));
+    
+    detector = await Promise.race([loadPromise, timeoutPromise]);
+    aiReady = true;
     $("subject").textContent="被写体：カメラを向けてください";
-    return true;
-  }catch(e){
-    $("subject").textContent="被写体：認識モデルを読み込めませんでした";
-    return false;
+  } catch(e) {
+    // タイムアウトまたは失敗時はAIをバイパスし、光解析と方角・ARに専念してフリーズを防ぐ
+    aiReady = false;
+    detector = null;
+    $("subject").textContent="被写体：光と方角の解析モードで稼働中";
   }
 }
 
 async function recognizeFrame(){
+  if(!aiReady || !detector || detecting) return;
   const video=$("camera");
-  if(!detector || detecting || !video.videoWidth || $("permission").style.display!=="none") return;
+  if(!video.videoWidth || $("permission").style.display!=="none") return;
   detecting=true;
   try{
     const results=await detector.detect(video,20,0.5);
@@ -147,17 +143,9 @@ async function recognizeFrame(){
 }
 
 function subjectText(){
-  if(!detector) return "認識準備中";
+  if(!aiReady) return "光・方角解析モード";
   if(!detected.length) return "検出なし";
-  return detected.map(x=>(labels[x.class]||x.class)+" "+Math.round(x.score*100)+"%").join(" / ");
-}
-
-function subjectAdvice(objects){
-  if(!objects.length) return null;
-  const names=objects.map(x=>x.class);
-  if(names.includes("person")) return "人物を認識しました。顔に光が当たりすぎないよう、少し横を向いて撮ると自然な立体感になります[cite: 1]。";
-  if(names.includes("dog")||names.includes("cat")) return "動物を認識しました。目にピントを合わせ、少し低い目線から撮るのがおすすめです[cite: 1]。";
-  return "被写体を認識しました。画面の中央に寄せすぎず、周囲の光と余白も構図に入れてください[cite: 1]。";
+  return detected.map(x=>(x.class)+" "+Math.round(x.score*100)+"%").join(" / ");
 }
 
 function setupLightAnalysis(){
@@ -203,17 +191,11 @@ function analyzeFrameLight(){
   values.sort((a,b)=>a-b);
   const p10=percentile(values,.1), p50=percentile(values,.5), p90=percentile(values,.9);
   const average=values.reduce((sum,value)=>sum+value,0)/values.length;
-  const raw={average,p10,p50,p90,contrast:p90-p10,highlight:highlights/count*100,shadow:shadows/count*100};
-  const previous=lightStats.ready?lightStats:null;
-  const smooth=(key)=>previous ? previous[key]*.7+raw[key]*.3 : raw[key];
-  const smoothed={...raw};
-  ["average","contrast","highlight","shadow"].forEach(key=>smoothed[key]=smooth(key));
-  const brightness=smoothed.p50;
+  const brightness=p50;
   let scene="標準光";
-  if(brightness<38 || smoothed.shadow>28) scene="低照度";
-  else if(brightness>205 || smoothed.highlight>20) scene="高照度";
-  else if(smoothed.contrast>145 && smoothed.highlight>5 && smoothed.shadow>8) scene="高コントラスト";
-  else if(smoothed.contrast<58) scene="フラットな光";
+  if(brightness<38) scene="低照度";
+  else if(brightness>205) scene="高照度";
+  else if(p90-p10>145) scene="高コントラスト";
 
   const averageRegion=(list)=>list.reduce((sum,value)=>sum+value,0)/Math.max(1,list.length);
   const regionValues={
@@ -222,32 +204,24 @@ function analyzeFrameLight(){
   };
   const sortedRegions=Object.entries(regionValues).sort((a,b)=>b[1]-a[1]);
   const directionLabels={left:"左側から",right:"右側から",top:"上側から",bottom:"下側から"};
-  const direction=sortedRegions[0][1]-sortedRegions[3][1]>16
-    ? directionLabels[sortedRegions[0][0]]
-    : "全体に回っています";
-  const colorRatio=(red/count+1)/(blue/count+1);
-  const colorCast=colorRatio>1.16?"暖色寄り":colorRatio<.86?"青色寄り":"ニュートラル";
+  const direction=sortedRegions[0][1]-sortedRegions[3][1]>16 ? directionLabels[sortedRegions[0][0]] : "全体に回っています";
   const exposureEv=Math.max(-2,Math.min(2,Math.log2(118/Math.max(18,brightness))));
+
   lightStats={
-    ready:true, scene, exposureEv, direction, colorCast,
-    highlight:smoothed.highlight, shadow:smoothed.shadow,
-    average:smoothed.average, contrast:smoothed.contrast
+    ready:true, scene, exposureEv, direction,
+    highlight:highlights/count*100, shadow:shadows/count*100
   };
   update();
 }
 
 function lightAdvice(){
   if(!lightStats.ready) return null;
-  if(lightStats.scene==="高コントラスト"){
-    return `明暗差が大きい映像です。白飛びを守るため ${formatEv(lightStats.exposureEv)}[cite: 1]。`;
-  }
-  if(lightStats.scene==="低照度"){
-    return `光量が少ない映像です。${formatEv(lightStats.exposureEv)}を目安に固定してください[cite: 1]。`;
-  }
-  return `光は安定しています。${lightStats.direction}の光を活かせます[cite: 1]。`;
+  if(lightStats.scene==="高コントラスト") return `明暗差が大きい映像です。白飛びを守るため ${formatEv(lightStats.exposureEv)}`;
+  if(lightStats.scene==="低照度") return `光量が少ない映像です。${formatEv(lightStats.exposureEv)}を目安に固定してください`;
+  return `光は安定しています。${lightStats.direction}の光を活かせます`;
 }
 
-// ARオーバーレイ描画（3D風の光の矢印・ガイド）
+// ARガイド描画
 function drawARGuide(){
   const canvas = $("arCanvas");
   const ctx = canvas.getContext("2d");
@@ -256,13 +230,11 @@ function drawARGuide(){
     canvas.height = window.innerHeight;
   }
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-
   if(heading == null) return;
 
   const now = new Date();
   const s = solar(now, lat, lon);
   const angleDiff = ((s.az - heading + 540) % 360) - 180;
-
   const centerX = canvas.width / 2;
   const xOffset = centerX + (angleDiff / 30) * centerX;
 
@@ -285,8 +257,7 @@ function drawARGuide(){
     ctx.fillStyle = "#00e887";
     ctx.font = "12px sans-serif";
     ctx.textAlign = "center";
-    ctx.fillText("☀️ 太陽の方向 (光の差し込む向き)", xOffset, 75);
-
+    ctx.fillText("☀️ 太陽の方向 (光の向き)", xOffset, 75);
     ctx.restore();
   }
 }
@@ -304,7 +275,7 @@ async function handleAction(){
       $("camera").srcObject=stream;
       $("fallback").style.display="none";
     }catch(e){
-      $("permError").textContent="カメラを起動できませんでした。HTTPS環境をご確認ください[cite: 1]。";
+      $("permError").textContent="カメラを起動できませんでした。HTTPS環境をご確認ください。";
       return;
     }
 
@@ -319,10 +290,12 @@ async function handleAction(){
     }
 
     setupLightAnalysis();
-    await loadRecognitionModel();
+    
+    // 非同期でAI読み込みを開始（失敗しても止まらないように分離）
+    loadRecognitionModel();
 
     step = 2;
-    $("permDesc").textContent = "次に、コンパス・モーションセンサーを有効にします[cite: 1]。";
+    $("permDesc").textContent = "次に、コンパス・センサーを有効にします。";
     $("permStatus").textContent = "準備完了";
     $("startBtn").textContent = "2. センサーを許可して完了";
 
@@ -335,10 +308,8 @@ async function handleAction(){
 
     window.addEventListener("deviceorientationabsolute",orientation,true);
     window.addEventListener("deviceorientation",orientation,true);
-    window.addEventListener("devicemotion",motion,true);
 
     $("permission").style.display="none";
-    $("state").textContent="解析開始";
     update();
   }
 }
@@ -351,12 +322,7 @@ function orientation(e){
   update();
 }
 
-
-function motion(e){
-  // 重力ノイズによる誤作動を防ぐため、モーション判定をシンプルにし、常に「解析中」へ進めるようにします
-  lastMotion = Date.now();
-}
-  function dayOfYear(d){return Math.floor((Date.UTC(d.getFullYear(),d.getMonth(),d.getDate())-Date.UTC(d.getFullYear(),0,0))/86400000)}
+function dayOfYear(d){return Math.floor((Date.UTC(d.getFullYear(),d.getMonth(),d.getDate())-Date.UTC(d.getFullYear(),0,0))/86400000)}
 function solar(d,lat,lon){
   const N=dayOfYear(d), hour=d.getHours()+d.getMinutes()/60+d.getSeconds()/3600;
   const g=2*Math.PI/365*(N-1+(hour-12)/24);
@@ -375,15 +341,13 @@ function solar(d,lat,lon){
 function diff(a,b){return Math.abs((a-b+540)%360-180)}
 function classify(sun){
   const h=heading==null?null:diff(heading,sun.az);
-  let type="周囲を見ています", reason="大きな撮影条件の変化は検出していません[cite: 1]。数歩動いてみてください。", lens="35–50mm", comp="自由";
-  const detectedAdvice=subjectAdvice(detected);
+  let type="周囲を見ています", reason="太陽と光の状態から撮影条件を解析しています。", lens="35–50mm", comp="自由";
   const currentLightAdvice=lightAdvice();
-  if(sun.alt<2){type="ブルーアワー候補";reason="太陽が地平線下です。空の色と街明かりを組み合わせます[cite: 1]。";lens="24–50mm";comp="空を広めに"}
-  else if(sun.alt>=2 && sun.alt<10){type="🌅 低い光が狙えます";reason="斜光や長い影が発生しやすい絶好のタイミングです[cite: 1]。";lens="35–85mm";comp="影を入れる"}
-  else if(h!=null && h<18 && sun.alt<35){type="👤 シルエット向き";reason="半逆光・逆光状態で被写体の輪郭を強調できます[cite: 1]。";lens="50–135mm";comp="縦構図"}
-  else if(h!=null && h>55 && h<125 && sun.alt<45){type="☀️ サイドライト向き";reason="横からの光で凹凸を立体的に表現できます[cite: 1]。";lens="35–85mm";comp="光と影の分離"}
+  if(sun.alt<2){type="ブルーアワー候補";reason="太陽が地平線下です。空の色と街明かりを組み合わせます。";lens="24–50mm";comp="空を広めに"}
+  else if(sun.alt>=2 && sun.alt<10){type="🌅 低い光が狙えます";reason="斜光や長い影が発生しやすい絶好のタイミングです。";lens="35–85mm";comp="影を入れる"}
+  else if(h!=null && h<18 && sun.alt<35){type="👤 シルエット向き";reason="半逆光・逆光状態で被写体の輪郭を強調できます。";lens="50–135mm";comp="縦構図"}
+  else if(h!=null && h>55 && h<125 && sun.alt<45){type="☀️ サイドライト向き";reason="横からの光で凹凸を立体的に表現できます。";lens="35–85mm";comp="光と影の分離"}
   if(currentLightAdvice && type==="周囲を見ています") reason=currentLightAdvice;
-  if(detectedAdvice && type==="周囲を見ています") reason=detectedAdvice;
   return {type,reason,lens,comp,angle:h};
 }
 function update(){
@@ -399,7 +363,6 @@ function update(){
   $("lightScene").textContent=lightStats.ready?lightStats.scene:"解析待ち";
   $("exposureAdvice").textContent=lightStats.ready?formatEv(lightStats.exposureEv):"解析待ち";
   $("lightDirection").textContent=lightStats.ready?lightStats.direction:"解析待ち";
-  $("colorCast").textContent=lightStats.ready?lightStats.colorCast:"解析待ち";
   $("lens").textContent=c.lens;
   $("composition").textContent=c.comp;
   $("subject").textContent="被写体："+currentSubject;
@@ -410,16 +373,12 @@ function update(){
     lastType=c.type;
     lastSubject=currentSubject;
   }
-// 常に解析中としてスムーズに動作させる
-  stable = true;
-  $("state").textContent = "解析中";
-
   drawARGuide();
 }
 $("more").onclick=()=>{$("panel").style.display=$("panel").style.display==="block"?"none":"block"};
 $("startBtn").onclick=handleAction;
 setInterval(update,1000);
-setInterval(recognizeFrame,1400);
+setInterval(recognizeFrame,2000);
 setInterval(analyzeFrameLight,500);
 </script>
 </body>
