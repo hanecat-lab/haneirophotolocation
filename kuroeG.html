@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<title>プロ・ライティング・ナビ v42 (露出精度改善版)</title>
+<title>プロ・ライティング・ナビ v41 (スタジオモード搭載)</title>
 <style>
 *{box-sizing:border-box;user-select:none;-webkit-user-select:none;touch-action:none}
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP",monospace}
@@ -208,630 +208,406 @@ button.primary{background:#00e887;color:#000;border:none;font-weight:800}
 
 <div id="permission">
   <div class="permission-card">
-    <div style="font-size:18px;font-weight:700;margin-bottom:8px">プロ・ライティング・ナビ v42</div>
-    <div style="font-size:12px;color:#aaa;margin-bottom:20px">高精度逆ガンマ算出＆自動露出同期モード搭載</div>
+    <div style="font-size:18px;font-weight:700;margin-bottom:8px">プロ・ライティング・ナビ v41</div>
+    <div style="font-size:12px;color:#aaa;margin-bottom:20px">スタジオモード（太陽OFF＆純ストロボ計算）搭載</div>
     <button id="startBtn" class="primary" style="width:100%;padding:14px;border-radius:14px;font-weight:bold">利用を開始</button>
   </div>
 </div>
+
 <script>
-// ==========================================
-// 1. 変数定義・アプリケーション状態管理
-// ==========================================
 const video = document.getElementById('camera');
-const canvas = document.getElementById('overlayCanvas');
-const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const overlay = document.getElementById('overlayCanvas');
+const oCtx = overlay.getContext('2d', {willReadFrequently: true});
 
-// 解析用オフスクリーンCanvas
-const offCanvas = document.createElement('canvas');
-const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
+const GW = 32, GH = 24;
+const refCanvas = document.createElement('canvas'); refCanvas.width = GW; refCanvas.height = GH;
+const rCtx = refCanvas.getContext('2d', {willReadFrequently: true});
+const curCanvas = document.createElement('canvas'); curCanvas.width = GW; curCanvas.height = GH;
+const cCtx = curCanvas.getContext('2d', {willReadFrequently: true});
 
-// トラッキング用W（ハイライト/シャドー）データ
-let hlPoint = { x: 0, y: 0, val: 0, targetX: 0, targetY: 0 };
-let sdPoint = { x: 0, y: 0, val: 0, targetX: 0, targetY: 0 };
-let isTrackingActive = true;
+const freezeCanvas = document.createElement('canvas'); freezeCanvas.width = GW; freezeCanvas.height = GH;
+const fCtx = freezeCanvas.getContext('2d', {willReadFrequently: true});
 
-// 画面制御・状態パラメータ
+let loadedImg = null;
+let isPressing = false;
+let currentMode = 'exp';
+let panelOpen = false;
+let uiVisible = true;
+
+let isLocked = false;
+let isGhost = false;
+let isTracking = true;
 let currentFacingMode = 'environment';
-let isPinned = false;
-let pinnedImageData = null;
-let isGhostActive = false;
-let ghostImage = null;
-let displayMode = 'exp'; // 'exp' (EV差分) | 'col' (WB色温度)
-let envMode = 'studio';  // 'studio' | 'sun'
+let currentZoom = 'std';
+
+let roi = { x: 0.35, y: 0.3, w: 0.3, h: 0.3 };
+let targetHL = { x: 0.5, y: 0.4 };
+let targetSD = { x: 0.5, y: 0.5 };
+let smoothedRatio = 1.0;
+
+const PRESETS = {
+  flat:     { name: 'EC・カタログ', targetRatio: 1.5 },
+  portrait: { name: 'ポートレート', targetRatio: 3.0 },
+  dramatic: { name: 'ドラマチック', targetRatio: 5.0 }
+};
+let currentPreset = 'dramatic';
+
+/* 環境モード ('studio' または 'sun') */
+let envMode = 'studio'; 
 let sunHour = 12;
 
-// ライト（A灯・B灯）設定状態
-let activeTargetLight = 'A'; // 'A' or 'B'
 let flashA = '1/1';
 let flashB = 'OFF';
-let lightPosA = 'back-right'; // 初期値: 右後 (135°)
-let lightPosB = 'right';      // 初期値: 右 (90°)
 
-// ターゲット目標プリセット
-let currentPreset = 'dramatic'; // 'flat' | 'portrait' | 'dramatic'
-const presetRatioMap = {
-  flat: 1.5,
-  portrait: 3.0,
-  dramatic: 5.0
+const POS_LABELS = {
+  'front': { name: '正面 (0°)', dx: 0, dy: -1 },
+  'front-right': { name: '右前 (45°)', dx: 0.7, dy: -0.7 },
+  'right': { name: '右 (90°)', dx: 1, dy: 0 },
+  'back-right': { name: '右後 (135°)', dx: 0.7, dy: 0.7 },
+  'back': { name: '真後 (180°)', dx: 0, dy: 1 },
+  'back-left': { name: '左後 (225°)', dx: -0.7, dy: 0.7 },
+  'left': { name: '左 (270°)', dx: -1, dy: 0 },
+  'front-left': { name: '左前 (315°)', dx: -0.7, dy: -0.7 }
 };
 
-// 光量値換算テーブル（1/1 = 1.0 〜 1/128 = 0.0078, OFF = 0.0）
+let posA = 'back-right';
+let posB = 'right';
+let activeLightSelect = 'A';
+
 const flashValueMap = {
-  'OFF': 0.0,
-  '1/1': 1.0,
-  '1/2': 0.5,
-  '1/4': 0.25,
-  '1/8': 0.125,
-  '1/16': 0.0625,
-  '1/32': 0.03125,
-  '1/64': 0.015625,
-  '1/128': 0.0078125
+  'OFF': 0, '1/1': 1.0, '1/2': 0.5, '1/4': 0.25, '1/8': 0.125,
+  '1/16': 0.0625, '1/32': 0.03125, '1/64': 0.015625, '1/128': 0.0078125
 };
 
-// 位置方向マップ（度数表記およびラベル）
-const posAngleMap = {
-  'front': { deg: 0, label: '正面 (0°)' },
-  'front-right': { deg: 45, label: '右前 (45°)' },
-  'right': { deg: 90, label: '右 (90°)' },
-  'back-right': { deg: 135, label: '右後 (135°)' },
-  'back': { deg: 180, label: '真後 (180°)' },
-  'back-left': { deg: 225, label: '左後 (225°)' },
-  'left': { deg: 270, label: '左 (270°)' },
-  'front-left': { deg: 315, label: '左前 (315°)' }
-};
-
-// 長押し・マルチタップ検出用変数
-let isLongPressing = false;
-let longPressTimer = null;
-let lastTapTime = 0;
-let isUiHidden = false;
-
-// ==========================================
-// 2. 初期化 ＆ カメラ起動処理
-// ==========================================
-document.getElementById('startBtn').addEventListener('click', async () => {
-  document.getElementById('permission').style.display = 'none';
-  await startCamera();
-  resizeCanvas();
-  window.addEventListener('resize', resizeCanvas);
-  requestAnimationFrame(loop);
-});
-
-// 自動露出（AE）調整制御を試みるカメラ起動
-async function startCamera() {
-  try {
-    const constraints = {
-      video: {
-        facingMode: currentFacingMode,
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        // 利用可能デバイスで自動露出の補正振れ幅を制御する拡張プロパティ
-        advanced: [{ exposureMode: 'continuous' }]
-      }
-    };
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    video.srcObject = stream;
-    await video.play();
-  } catch (e) {
-    console.warn("標準カメラ起動失敗。フォールバックで再試行:", e);
-    try {
-      const fallbackStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: currentFacingMode }
-      });
-      video.srcObject = fallbackStream;
-      await video.play();
-    } catch (err) {
-      alert("カメラの起動に失敗しました: " + err.message);
-    }
-  }
-}
-
-function resizeCanvas() {
-  canvas.width = window.innerWidth;
-  canvas.height = window.innerHeight;
-  offCanvas.width = 160; // 高速ピクセル解析用（軽量化）
-  offCanvas.height = Math.round(160 * (window.innerHeight / window.innerWidth));
-}
-
-// カメラ前後反転
-async function switchCamera() {
-  currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
-  if (video.srcObject) {
-    video.srcObject.getTracks().forEach(track => track.stop());
-  }
-  await startCamera();
-}
-
-// ==========================================
-// 3. UIインタラクション・イベントハンドラ
-// ==========================================
-
-// コントロールパネル開閉
-function toggleControlPanel() {
-  const panel = document.getElementById('controlPanel');
-  const arrow = document.getElementById('panelArrow');
-  if (panel.style.display === 'none') {
-    panel.style.display = 'block';
-    arrow.textContent = '▲ 隠す';
-  } else {
-    panel.style.display = 'none';
-    arrow.textContent = '⚙️ 設定';
-  }
-}
-
-// 操作対象ライト設定（A灯/B灯）
-function setActiveTarget(target) {
-  activeTargetLight = target;
-  document.getElementById('tabLightA').className = 'tab-btn' + (target === 'A' ? ' selected-a' : '');
-  document.getElementById('tabLightB').className = 'tab-btn' + (target === 'B' ? ' selected-b' : '');
-  updatePosDialUI();
-}
-
-// 8方向ダイアルUI更新
-function updatePosDialUI() {
-  const currentPos = (activeTargetLight === 'A') ? lightPosA : lightPosB;
-  const activeClass = (activeTargetLight === 'A') ? 'active-a' : 'active-b';
-
-  Object.keys(posAngleMap).forEach(key => {
-    const btn = document.getElementById('p-' + key);
-    if (btn) {
-      btn.className = 'pos-btn' + (key === currentPos ? ' ' + activeClass : '');
-    }
-  });
-}
-
-// ライト配置設定
-function setLightPos(posKey) {
-  if (activeTargetLight === 'A') {
-    lightPosA = posKey;
-    document.getElementById('posLabelA').textContent = posAngleMap[posKey].label;
-  } else {
-    lightPosB = posKey;
-    document.getElementById('posLabelB').textContent = posAngleMap[posKey].label;
-  }
-  updatePosDialUI();
-}
-
-// 光量ドロップダウン選択変更
-function onSettingChanged(light, val) {
-  if (light === 'A') flashA = val;
-  if (light === 'B') flashB = val;
-}
-
-// 撮影環境設定（スタジオ / 屋外）
+/* --- スタジオ / 太陽環境切り替え --- */
 function setEnvironmentMode(mode) {
   envMode = mode;
-  document.getElementById('btnEnvSun').className = 'env-btn' + (mode === 'sun' ? ' selected-sun' : '');
-  document.getElementById('btnEnvStudio').className = 'env-btn' + (mode === 'studio' ? ' selected-studio' : '');
+  document.getElementById('btnEnvSun').className = `env-btn ${mode === 'sun' ? 'selected-sun' : ''}`;
+  document.getElementById('btnEnvStudio').className = `env-btn ${mode === 'studio' ? 'selected-studio' : ''}`;
   document.getElementById('sunContainer').style.display = (mode === 'sun') ? 'block' : 'none';
+  triggerActionFeedback();
+}
+
+/* --- 灯具選択 ＆ 位置指定コントロール --- */
+function setActiveTarget(target) {
+  activeLightSelect = target;
+  document.getElementById('tabLightA').className = `tab-btn ${target === 'A' ? 'selected-a' : ''}`;
+  document.getElementById('tabLightB').className = `tab-btn ${target === 'B' ? 'selected-b' : ''}`;
+}
+
+function setLightPos(pos) {
+  if (activeLightSelect === 'A') {
+    posA = pos;
+    document.getElementById('posLabelA').textContent = POS_LABELS[pos].name;
+  } else {
+    posB = pos;
+    document.getElementById('posLabelB').textContent = POS_LABELS[pos].name;
+  }
+  updatePosMapUI();
+  triggerActionFeedback();
+}
+
+function updatePosMapUI() {
+  document.querySelectorAll('.pos-btn').forEach(btn => btn.classList.remove('active-a', 'active-b'));
+  if (flashA !== 'OFF') {
+    const btnA = document.getElementById(`p-${posA}`);
+    if (btnA) btnA.classList.add('active-a');
+  }
+  if (flashB !== 'OFF') {
+    const btnB = document.getElementById(`p-${posB}`);
+    if (btnB) btnB.classList.add('active-b');
+  }
+}
+
+function triggerActionFeedback() {
+  const card = document.getElementById('actionCard');
+  card.classList.remove('flash');
+  void card.offsetWidth;
+  card.classList.add('flash');
+}
+
+function onSettingChanged(lightType, val) {
+  if (lightType === 'A') {
+    flashA = val;
+  } else if (lightType === 'B') {
+    flashB = val;
+  }
+  updatePosMapUI();
+  triggerActionFeedback();
+}
+
+function setPreset(pKey) {
+  currentPreset = pKey;
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(`p-${pKey}`).classList.add('active');
+  triggerActionFeedback();
 }
 
 function updateSun(val) {
-  sunHour = parseFloat(val);
-  document.getElementById('sunVal').textContent = `${val}:00 (太陽高度換算)`;
+  sunHour = parseInt(val);
+  const alt = sunHour <= 12 ? (sunHour - 6) * 15 : (18 - sunHour) * 15;
+  document.getElementById('sunVal').textContent = `${sunHour}:00 (太陽高度: 約${alt}°)`;
+  triggerActionFeedback();
 }
 
-// ターゲットプリセット切替
-function setPreset(presetKey) {
-  currentPreset = presetKey;
-  ['flat', 'portrait', 'dramatic'].forEach(p => {
-    const btn = document.getElementById('p-' + p);
-    if (btn) btn.className = 'preset-btn' + (p === presetKey ? ' active' : '');
-  });
+/* --- 基本UI ＆ モード制御 --- */
+function toggleControlPanel() {
+  panelOpen = !panelOpen;
+  document.getElementById('controlPanel').style.display = panelOpen ? 'block' : 'none';
+  document.getElementById('panelArrow').textContent = panelOpen ? '▲ 隠す' : '▼ 展開';
 }
 
-// モード切替（EV / WB）
-function setMode(m) {
-  displayMode = m;
-  document.getElementById('btnModeExp').className = (m === 'exp') ? 'active' : '';
-  document.getElementById('btnModeCol').className = (m === 'col') ? 'active' : '';
-}
-
-// W追尾ON/OFF
-function toggleTracking() {
-  isTrackingActive = !isTrackingActive;
-  const btn = document.getElementById('btnTracking');
-  btn.className = isTrackingActive ? 'active' : '';
-}
-
-// 固定（ピン留め）処理
 function togglePin() {
-  isPinned = !isPinned;
+  isLocked = !isLocked;
   const btn = document.getElementById('btnPin');
-  if (isPinned) {
-    btn.className = 'active';
-    btn.textContent = '🔒 固定: ON';
-    // 現在のCanvas描画結果をキャッシュ
-    pinnedImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  if (isLocked) {
+    fCtx.drawImage(video, 0, 0, GW, GH);
+    btn.textContent = '🔒 固定: ON'; btn.classList.add('active');
   } else {
-    btn.className = '';
-    btn.textContent = '🔒 固定: OFF';
-    pinnedImageData = null;
+    btn.textContent = '🔒 固定: OFF'; btn.classList.remove('active');
   }
 }
 
-// ゴーストオーバーレイ
 function toggleGhost() {
-  isGhostActive = !isGhostActive;
-  const btn = document.getElementById('btnGhost');
-  if (isGhostActive) {
-    btn.className = 'active';
-    // 現在の画面をゴースト画像として一時キャプチャ
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = video.videoWidth || 640;
-    tempCanvas.height = video.videoHeight || 480;
-    const tCtx = tempCanvas.getContext('2d');
-    tCtx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
-    ghostImage = new Image();
-    ghostImage.src = tempCanvas.toDataURL('image/png');
-  } else {
-    btn.className = '';
-    ghostImage = null;
-  }
+  isGhost = !isGhost;
+  document.getElementById('btnGhost').classList.toggle('active', isGhost);
 }
 
-// クロップ・ズーム切替
-function setZoom(level) {
-  ['Close', 'Std', 'Wide'].forEach(l => {
-    const btn = document.getElementById('btnZoom' + l);
-    if (btn) btn.className = '';
-  });
-  if (level === 'close') {
-    document.getElementById('btnZoomClose').className = 'active';
-    video.style.transform = 'scale(1.4)';
-  } else if (level === 'std') {
-    document.getElementById('btnZoomStd').className = 'active';
-    video.style.transform = 'scale(1.0)';
-  } else if (level === 'wide') {
-    document.getElementById('btnZoomWide').className = 'active';
-    video.style.transform = 'scale(0.85)';
-  }
+function toggleTracking() {
+  isTracking = !isTracking;
+  document.getElementById('btnTracking').classList.toggle('active', isTracking);
 }
 
-// 画像ファイルの読み込み処理
-function loadImage(event) {
-  const file = event.target.files[0];
+async function switchCamera() {
+  currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
+  if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+  await startCamera();
+}
+
+function setZoom(mode) {
+  currentZoom = mode;
+  document.getElementById('btnZoomClose').classList.toggle('active', mode === 'close');
+  document.getElementById('btnZoomStd').classList.toggle('active', mode === 'std');
+  document.getElementById('btnZoomWide').classList.toggle('active', mode === 'wide');
+
+  const cx = roi.x + roi.w / 2, cy = roi.y + roi.h / 2;
+  if (mode === 'close') { roi.w = 0.5; roi.h = 0.5; }
+  else if (mode === 'std') { roi.w = 0.3; roi.h = 0.3; }
+  else if (mode === 'wide') { roi.w = 0.18; roi.h = 0.18; }
+  roi.x = Math.max(0, Math.min(1 - roi.w, cx - roi.w / 2));
+  roi.y = Math.max(0, Math.min(1 - roi.h, cy - roi.h / 2));
+}
+
+function setMode(mode) {
+  currentMode = mode;
+  document.getElementById('btnModeExp').classList.toggle('active', mode === 'exp');
+  document.getElementById('btnModeCol').classList.toggle('active', mode === 'col');
+}
+
+window.addEventListener('dblclick', () => {
+  uiVisible = !uiVisible;
+  document.getElementById('uiLayer').style.opacity = uiVisible ? '1' : '0';
+});
+
+let isDraggingRoi = false;
+window.addEventListener('pointerdown', (e) => {
+  if (e.target.closest('.interactive')) return;
+  const rect = overlay.getBoundingClientRect();
+  const touchX = (e.clientX - rect.left) / rect.width, touchY = (e.clientY - rect.top) / rect.height;
+  if (touchX >= roi.x && touchX <= roi.x + roi.w && touchY >= roi.y && touchY <= roi.y + roi.h) {
+    isDraggingRoi = true;
+  } else { isPressing = true; }
+});
+
+window.addEventListener('pointermove', (e) => {
+  if (isDraggingRoi) {
+    const rect = overlay.getBoundingClientRect();
+    const touchX = (e.clientX - rect.left) / rect.width, touchY = (e.clientY - rect.top) / rect.height;
+    roi.x = Math.max(0, Math.min(1 - roi.w, touchX - roi.w / 2));
+    roi.y = Math.max(0, Math.min(1 - roi.h, touchY - roi.h / 2));
+  }
+});
+
+window.addEventListener('pointerup', () => { isPressing = false; isDraggingRoi = false; });
+
+function loadImage(e) {
+  const file = e.target.files[0];
   if (!file) return;
-
   const reader = new FileReader();
-  reader.onload = function(e) {
+  reader.onload = (evt) => {
     const img = new Image();
-    img.onload = function() {
-      // サムネイルにセット
-      const thumb = document.getElementById('thumbImg');
-      thumb.src = e.target.result;
-      thumb.style.display = 'block';
-
-      // ゴースト用画像として同時に読み込み設定
-      ghostImage = img;
-      isGhostActive = true;
-      document.getElementById('btnGhost').className = 'active';
+    img.onload = () => {
+      loadedImg = img;
+      document.getElementById('thumbImg').src = evt.target.result;
+      document.getElementById('thumbImg').style.display = 'block';
+      rCtx.drawImage(loadedImg, 0, 0, GW, GH);
+      document.getElementById('navBadge').textContent = "長押し中：光・色のズレをヒートマップ表示";
     };
-    img.src = e.target.result;
+    img.src = evt.target.result;
   };
   reader.readAsDataURL(file);
 }
 
-// 長押し・タップによるUI隠し処理のセットアップ
-window.addEventListener('pointerdown', (e) => {
-  if (e.target.closest('.interactive')) return;
-  isLongPressing = true;
-  longPressTimer = setTimeout(() => {
-    if (isLongPressing) {
-      // 長押しで差分ヒートマップを強調表示
-      document.body.classList.add('diff-boost');
-    }
-  }, 400);
-});
-
-window.addEventListener('pointerup', () => {
-  isLongPressing = false;
-  clearTimeout(longPressTimer);
-  document.body.classList.remove('diff-boost');
-});
-
-// 画面ダブルタップでUI一括トグル
-window.addEventListener('click', (e) => {
-  if (e.target.closest('.interactive')) return;
-  const now = Date.now();
-  if (now - lastTapTime < 300) {
-    isUiHidden = !isUiHidden;
-    document.getElementById('uiLayer').style.opacity = isUiHidden ? '0' : '1';
-    document.getElementById('uiLayer').style.pointerEvents = isUiHidden ? 'none' : 'auto';
-  }
-  lastTapTime = now;
-});
-</script>
-<script>
-// ==========================================
-// 4. 解析計算エンジン (逆ガンマ物理換算 & 比率計算)
-// ==========================================
-
-/**
- * 8bit sRGB輝度 (0〜255) を物理光量 (Linear RGB) に変換
- * 逆ガンマ処理: L_linear = (L_sRGB / 255) ^ 2.2
- */
-function byteToLinear(byteVal) {
-  const norm = Math.max(byteVal, 1.0) / 255.0;
-  return Math.pow(norm, 2.2);
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: currentFacingMode, width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) { alert("カメラエラー: " + e.message); }
 }
 
-/**
- * トラッキング位置の決定と逆ガンマ物理光量に基づく明暗比の算出
- */
-function analyzeFrame() {
-  if (!video.videoWidth || !video.videoHeight) return { ratio: 1.0, maxL: 255, minL: 0 };
-
-  // オフスクリーンCanvasに描画して高速ピクセル解析
-  offCtx.drawImage(video, 0, 0, offCanvas.width, offCanvas.height);
-  const frameData = offCtx.getImageData(0, 0, offCanvas.width, offCanvas.height);
-  const data = frameData.data;
-  const w = offCanvas.width;
-  const h = offCanvas.height;
-
-  let maxLuma = -1;
-  let minLuma = 256;
-  let maxPos = { x: w / 2, y: h / 3 };
-  let minPos = { x: w / 2, y: (h / 3) * 2 };
-
-  // ピクセル走査（輝度計算: Rec.709）
-  for (let y = 0; y < h; y += 2) {
-    for (let x = 0; x < w; x += 2) {
-      const idx = (y * w + x) * 4;
-      const r = data[idx];
-      const g = data[idx + 1];
-      const b = data[idx + 2];
-      
-      // 輝度（Luma）算出
-      const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-
-      if (luma > maxLuma) {
-        maxLuma = luma;
-        maxPos = { x, y };
-      }
-      if (luma < minLuma) {
-        minLuma = luma;
-        minPos = { x, y };
-      }
-    }
-  }
-
-  // スクリーン座標系へのスケーリング
-  const scaleX = canvas.width / w;
-  const scaleY = canvas.height / h;
-
-  // 慣性追尾（スムージングフィルタ: 補間率 0.25）
-  hlPoint.targetX = maxPos.x * scaleX;
-  hlPoint.targetY = maxPos.y * scaleY;
-  sdPoint.targetX = minPos.x * scaleX;
-  sdPoint.targetY = minPos.y * scaleY;
-
-  hlPoint.x += (hlPoint.targetX - hlPoint.x) * 0.25;
-  hlPoint.y += (hlPoint.targetY - hlPoint.y) * 0.25;
-  sdPoint.x += (sdPoint.targetX - sdPoint.x) * 0.25;
-  sdPoint.y += (sdPoint.targetY - sdPoint.y) * 0.25;
-
-  hlPoint.val = maxLuma;
-  sdPoint.val = minLuma;
-
-  // --------------------------------------------------
-  // 【重要修正】逆ガンマ（リニア化）による実測明暗比の算定
-  // --------------------------------------------------
-  const linHL = byteToLinear(maxLuma);
-  const linSD = byteToLinear(minLuma);
-
-  // カメラ映像から直接取得された物理光量比（実測値）
-  const measuredRatio = linHL / Math.max(linSD, 0.0001);
-
-  // UI上の設定（A灯・B灯）から算出される理論補正
-  const pA = flashValueMap[flashA] || 0.0;
-  const pB = flashValueMap[flashB] || 0.0;
-
-  // スタジオモード時は映像の実測値をダイレクト採用、屋外モードでは太陽光モデルを加味
-  let calculatedRatio = measuredRatio;
-
-  if (envMode === 'sun') {
-    // 太陽高度に基づく補正（12時が最大光量）
-    const sunFactor = Math.sin(((sunHour - 6) / 12) * Math.PI);
-    const envEffect = Math.max(0.2, sunFactor * 1.5);
-    calculatedRatio = measuredRatio * (1.0 + (pA + pB) * 0.5) * envEffect;
-  }
-
-  return {
-    ratio: Math.max(1.0, calculatedRatio),
-    maxL: maxLuma,
-    minL: minLuma
-  };
-}
-
-// ==========================================
-// 5. アクション誘導 ＆ 評価ロジック
-// ==========================================
-function updateActionUI(ratio) {
-  const targetRatio = presetRatioMap[currentPreset];
-  const diff = ratio - targetRatio;
-
-  const ratioElem = document.getElementById('ratioVal');
-  const evalElem = document.getElementById('evalVal');
-  const actionElem = document.getElementById('actionCard');
-
-  ratioElem.textContent = `1 : ${ratio.toFixed(1)}`;
-
-  // 許容誤差 ±0.5 以内
-  if (Math.abs(diff) <= 0.5) {
-    evalElem.textContent = '適正 (TARGET MATCH)';
-    evalElem.style.background = 'rgba(0,232,135,0.2)';
-    evalElem.style.color = '#00e887';
-    evalElem.style.borderColor = 'rgba(0,232,135,0.4)';
-
-    actionElem.textContent = `✨ 理想的なライティングです！ (${currentPreset.toUpperCase()} 達成)`;
-    actionElem.style.borderColor = '#00e887';
-    actionElem.style.color = '#00e887';
-  } else if (diff < -0.5) {
-    // コントラスト不足（フラットすぎる）
-    evalElem.textContent = 'フラット (LOW CONTRAST)';
-    evalElem.style.background = 'rgba(0,191,255,0.2)';
-    evalElem.style.color = '#00bfff';
-    evalElem.style.borderColor = 'rgba(0,191,255,0.4)';
-
-    const recAction = (activeTargetLight === 'A') 
-      ? `💡 ACTION: A灯(メイン)の光量を上げるか、被写体へ近づけてください。`
-      : `💡 ACTION: B灯(サブ)を弱めるか、A灯との距離差を広げてください。`;
-    
-    actionElem.textContent = recAction;
-    actionElem.style.borderColor = '#00bfff';
-    actionElem.style.color = '#00bfff';
-  } else {
-    // コントラスト過多（影が濃すぎる）
-    evalElem.textContent = 'ハイコントラスト (HARD SHADOW)';
-    evalElem.style.background = 'rgba(255,180,0,0.2)';
-    evalElem.style.color = '#ffb400';
-    evalElem.style.borderColor = 'rgba(255,180,0,0.4)';
-
-    const recAction = (activeTargetLight === 'B')
-      ? `💡 ACTION: B灯(サブ)を起こしてシャドー部(影)を補光してください。`
-      : `💡 ACTION: A灯(メイン)を弱めるか、アンブレラ/ソフトボックスで拡散してください。`;
-
-    actionElem.textContent = recAction;
-    actionElem.style.borderColor = '#ffb400';
-    actionElem.style.color = '#ffb400';
-  }
-}
-
-// ==========================================
-// 6. メインフレーム描画ループ
-// ==========================================
-function loop() {
-  // ピン留めモード時はキャッシュ画像を優先描画
-  if (isPinned && pinnedImageData) {
-    ctx.putImageData(pinnedImageData, 0, 0);
-    requestAnimationFrame(loop);
-    return;
-  }
-
-  // 1. 画面クリア ＆ カメラ映像描画
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-  // 2. ゴースト重畳表示
-  if (isGhostActive && ghostImage) {
-    ctx.save();
-    ctx.globalAlpha = 0.45;
-    ctx.drawImage(ghostImage, 0, 0, canvas.width, canvas.height);
-    ctx.restore();
-  }
-
-  // 3. フレーム解析
-  const analysis = analyzeFrame();
-  updateActionUI(analysis.ratio);
-
-  // 4. EV差分ヒートマップ / WBモード オーバーレイ描画
-  if (displayMode === 'exp') {
-    drawExposureHeatmap(analysis);
-  } else if (displayMode === 'col') {
-    drawColorBalanceOverlay();
-  }
-
-  // 5. W追尾（HL/SD）マーカー描画
-  if (isTrackingActive) {
-    drawTrackingMarkers();
-  }
-
-  // 6. 長押し差分ブーストモード
-  if (document.body.classList.contains('diff-boost')) {
-    drawDiffBoostOverlay();
-  }
-
+async function startApp() {
+  await startCamera();
+  document.getElementById('permission').style.display = 'none';
+  overlay.width = window.innerWidth;
+  overlay.height = window.innerHeight;
+  window.addEventListener('resize', () => { overlay.width = window.innerWidth; overlay.height = window.innerHeight; });
+  updatePosMapUI();
   requestAnimationFrame(loop);
 }
 
-// ==========================================
-// 7. オーバーレイ描画サブ関数
-// ==========================================
+/* --- 擬似ライティング・ビジュアルオーバーレイ --- */
+function drawVirtualLightingOverlay(W, H) {
+  const drawLightGrad = (posKey, power, color) => {
+    if (!POS_LABELS[posKey] || power <= 0) return;
+    const info = POS_LABELS[posKey];
+    const cx = W / 2 + info.dx * (W * 0.38);
+    const cy = H / 2 + info.dy * (H * 0.38);
+    const radius = Math.max(W, H) * (0.25 + power * 0.45);
 
-// EV差分ヒートマップ描画
-function drawExposureHeatmap(analysis) {
-  ctx.save();
-  // ハイライト領域強調（レッド・シアンのグラデーション風）
-  ctx.lineWidth = 3;
-  ctx.strokeStyle = 'rgba(255, 60, 60, 0.6)';
-  ctx.beginPath();
-  ctx.arc(hlPoint.x, hlPoint.y, 24, 0, Math.PI * 2);
-  ctx.stroke();
+    const grad = oCtx.createRadialGradient(cx, cy, 10, cx, cy, radius);
+    grad.addColorStop(0, color);
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
 
-  ctx.strokeStyle = 'rgba(0, 200, 255, 0.6)';
-  ctx.beginPath();
-  ctx.arc(sdPoint.x, sdPoint.y, 24, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.restore();
+    oCtx.save();
+    oCtx.globalCompositeOperation = 'screen';
+    oCtx.fillStyle = grad;
+    oCtx.beginPath(); oCtx.arc(cx, cy, radius, 0, Math.PI * 2); oCtx.fill();
+    oCtx.restore();
+  };
+
+  if (flashA !== 'OFF') drawLightGrad(posA, flashValueMap[flashA], 'rgba(0, 232, 135, 0.3)');
+  if (flashB !== 'OFF') drawLightGrad(posB, flashValueMap[flashB], 'rgba(0, 191, 255, 0.25)');
 }
 
-// WBカラーバランス（疑似色温度）描画
-function drawColorBalanceOverlay() {
-  ctx.save();
-  ctx.font = 'bold 10px monospace';
-  ctx.fillStyle = 'rgba(0, 232, 135, 0.8)';
-  ctx.fillText('WB: 5600K (DAYLIGHT TARGET)', 14, canvas.height - 120);
-  ctx.restore();
+/* --- 動的フィードバック ＆ アクション計算 --- */
+function updateActionUI(rawRatio) {
+  smoothedRatio = smoothedRatio * 0.75 + rawRatio * 0.25;
+  const target = PRESETS[currentPreset].targetRatio;
+  const diff = smoothedRatio - target;
+
+  const ratioEl = document.getElementById('ratioVal');
+  ratioEl.textContent = `1 : ${smoothedRatio.toFixed(1)} (目標 1:${target.toFixed(1)})`;
+
+  const actionEl = document.getElementById('actionCard');
+  const badgeEl = document.getElementById('evalVal');
+
+  if (flashA === 'OFF' && flashB === 'OFF') {
+    actionEl.textContent = "💡 全灯OFF：ストロボ（A灯またはB灯）を点灯してください";
+    actionEl.style.borderColor = "#888"; actionEl.style.color = "#ccc";
+    badgeEl.textContent = envMode === 'studio' ? "スタジオ(完全暗転)" : "地光のみ";
+    badgeEl.style.background = "rgba(255,255,255,0.1)"; badgeEl.style.color = "#ccc"; badgeEl.style.borderColor = "#888";
+    ratioEl.style.color = "#fff";
+    return;
+  }
+
+  if (Math.abs(diff) <= 0.6) {
+    actionEl.textContent = `✨ 【適正】バランス良好です (${envMode === 'studio' ? '🎬スタジオ' : '☀️屋外'})`;
+    actionEl.style.borderColor = "#00e887"; actionEl.style.color = "#00e887";
+    badgeEl.textContent = "適正"; badgeEl.style.background = "rgba(0,232,135,0.2)";
+    badgeEl.style.color = "#00e887"; badgeEl.style.borderColor = "#00e887";
+    ratioEl.style.color = "#00e887";
+  } else if (diff < -0.6) {
+    actionEl.textContent = `💡 【コントラスト不足】メイン光量を「+1〜2Stop」上げるか近づけてください`;
+    actionEl.style.borderColor = "#ffb400"; actionEl.style.color = "#ffb400";
+    badgeEl.textContent = "フラット"; badgeEl.style.background = "rgba(255,180,0,0.2)";
+    badgeEl.style.color = "#ffb400"; badgeEl.style.borderColor = "#ffb400";
+    ratioEl.style.color = "#ffb400";
+  } else {
+    actionEl.textContent = `💡 【影潰れ対策】サブ灯(B灯)を追加/増光するか、レフ板を設置してください`;
+    actionEl.style.borderColor = "#ff3366"; actionEl.style.color = "#ff3366";
+    badgeEl.textContent = "シャドー潰れ"; badgeEl.style.background = "rgba(255,51,102,0.2)";
+    badgeEl.style.color = "#ff3366"; badgeEl.style.borderColor = "#ff3366";
+    ratioEl.style.color = "#ff3366";
+  }
 }
 
-// W追尾（HL:ハイライト / SD:シャドー）マーカーの描画
-function drawTrackingMarkers() {
-  ctx.save();
+/* --- 解析メインループ --- */
+function loop() {
+  const W = overlay.width, H = overlay.height;
+  oCtx.clearRect(0, 0, W, H);
 
-  // --- HL (ハイライト) マーカー ---
-  ctx.strokeStyle = '#00e887';
-  ctx.fillStyle = '#00e887';
-  ctx.lineWidth = 2;
+  if (video.videoWidth) {
+    drawVirtualLightingOverlay(W, H);
 
-  // ターゲット照準
-  ctx.beginPath();
-  ctx.arc(hlPoint.x, hlPoint.y, 14, 0, Math.PI * 2);
-  ctx.stroke();
+    if (isGhost && loadedImg) { oCtx.save(); oCtx.globalAlpha = 0.35; oCtx.drawImage(loadedImg, 0, 0, W, H); oCtx.restore(); }
 
-  ctx.beginPath();
-  ctx.arc(hlPoint.x, hlPoint.y, 3, 0, Math.PI * 2);
-  ctx.fill();
+    if (isLocked) cCtx.drawImage(freezeCanvas, 0, 0, GW, GH);
+    else cCtx.drawImage(video, 0, 0, GW, GH);
+    const curData = cCtx.getImageData(0, 0, GW, GH).data;
 
-  // ラベルテキスト
-  ctx.font = 'bold 10px monospace';
-  ctx.fillText(`HL [${Math.round(hlPoint.val)}]`, hlPoint.x + 18, hlPoint.y + 4);
+    let rxPx = roi.x * W, ryPx = roi.y * H, rwPx = roi.w * W, rhPx = roi.h * H;
+    oCtx.strokeStyle = isLocked ? '#ff0055' : '#00e887';
+    oCtx.lineWidth = 2; oCtx.setLineDash([4, 4]); oCtx.strokeRect(rxPx, ryPx, rwPx, rhPx); oCtx.setLineDash([]);
 
-  // --- SD (シャドー) マーカー ---
-  ctx.strokeStyle = '#00bfff';
-  ctx.fillStyle = '#00bfff';
+    let rx = Math.floor(roi.x * GW), ry = Math.floor(roi.y * GH), rw = Math.floor(roi.w * GW), rh = Math.floor(roi.h * GH);
+    let maxL = -1, minL = 999, rawHL = { x: targetHL.x, y: targetHL.y }, rawSD = { x: targetSD.x, y: targetSD.y };
 
-  ctx.beginPath();
-  ctx.arc(sdPoint.x, sdPoint.y, 14, 0, Math.PI * 2);
-  ctx.stroke();
+    for (let y = ry; y < ry + rh && y < GH; y++) {
+      for (let x = rx; x < rx + rw && x < GW; x++) {
+        let idx = (y * GW + x) * 4;
+        let lum = curData[idx] * 0.2126 + curData[idx+1] * 0.7152 + curData[idx+2] * 0.0722;
+        if (lum > maxL) { maxL = lum; rawHL = { x: (x + 0.5) / GW, y: (y + 0.5) / GH }; }
+        if (lum < minL) { minL = lum; rawSD = { x: (x + 0.5) / GW, y: (y + 0.5) / GH }; }
+      }
+    }
+    if (maxL < 0) maxL = 1; if (minL > 255) minL = 1;
 
-  ctx.beginPath();
-  ctx.arc(sdPoint.x, sdPoint.y, 3, 0, Math.PI * 2);
-  ctx.fill();
+    if (isTracking && !isLocked) {
+      targetHL.x += (rawHL.x - targetHL.x) * 0.2; targetHL.y += (rawHL.y - targetHL.y) * 0.2;
+      targetSD.x += (rawSD.x - targetSD.x) * 0.2; targetSD.y += (rawSD.y - targetSD.y) * 0.2;
+    }
 
-  ctx.fillText(`SD [${Math.round(sdPoint.val)}]`, sdPoint.x + 18, sdPoint.y + 4);
+    const drawPoint = (pos, color, label) => {
+      let px = pos.x * W, py = pos.y * H;
+      oCtx.fillStyle = color; oCtx.strokeStyle = '#ffffff'; oCtx.lineWidth = 1.5;
+      oCtx.beginPath(); oCtx.arc(px, py, 7, 0, Math.PI * 2); oCtx.stroke();
+      oCtx.beginPath(); oCtx.arc(px, py, 3, 0, Math.PI * 2); oCtx.fill();
+      oCtx.font = 'bold 10px monospace'; oCtx.fillText(label, px + 10, py + 4);
+    };
 
-  // --- 2点をつなぐベクターライン ---
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath();
-  ctx.moveTo(hlPoint.x, hlPoint.y);
-  ctx.lineTo(sdPoint.x, sdPoint.y);
-  ctx.stroke();
+    drawPoint(targetHL, '#ff3366', '☀️ HL');
+    drawPoint(targetSD, '#00bfff', '🌙 SD');
 
-  ctx.restore();
+    // 計算式の切替（スタジオモード時は環境光/太陽効果を完全カット）
+    let totalFlashEffect = 1.0 + (flashValueMap[flashA] * 3.5) + (flashValueMap[flashB] * 2.0);
+    let envEffect = (envMode === 'sun') ? Math.max(0.2, Math.sin(((sunHour - 6) / 12) * Math.PI)) : 1.0;
+    
+    let rawRatio = (maxL / Math.max(1, minL)) * totalFlashEffect * envEffect;
+    
+    updateActionUI(rawRatio);
+
+    if (isPressing && loadedImg) {
+      const refData = rCtx.getImageData(0, 0, GW, GH).data, diffImg = oCtx.createImageData(GW, GH), d = diffImg.data;
+      for (let i = 0; i < refData.length; i += 4) {
+        const rL = refData[i] * 0.2126 + refData[i+1] * 0.7152 + refData[i+2] * 0.0722, cL = curData[i] * 0.2126 + curData[i+1] * 0.7152 + curData[i+2] * 0.0722;
+        const lumDiff = cL - rL, colorDiff = (curData[i] - curData[i+2]) - (refData[i] - refData[i+2]);
+        if (currentMode === 'exp') {
+          if (lumDiff > 25) { d[i]=255; d[i+1]=120; d[i+2]=0; d[i+3]=180; } else if (lumDiff < -25) { d[i]=0; d[i+1]=100; d[i+2]=255; d[i+3]=180; } else { d[i]=0; d[i+1]=232; d[i+2]=135; d[i+3]=15; }
+        } else {
+          if (colorDiff > 20) { d[i]=255; d[i+1]=180; d[i+2]=0; d[i+3]=180; } else if (colorDiff < -20) { d[i]=0; d[i+1]=220; d[i+2]=255; d[i+3]=180; } else { d[i]=0; d[i+1]=232; d[i+2]=135; d[i+3]=15; }
+        }
+      }
+      const tempCanvas = document.createElement('canvas'); tempCanvas.width = GW; tempCanvas.height = GH; tempCanvas.getContext('2d').putImageData(diffImg, 0, 0);
+      oCtx.save(); oCtx.globalCompositeOperation = 'source-over'; oCtx.drawImage(tempCanvas, 0, 0, W, H); oCtx.restore();
+    }
+  }
+  requestAnimationFrame(loop);
 }
 
-// 長押し時の差分強調描画
-function drawDiffBoostOverlay() {
-  ctx.save();
-  ctx.fillStyle = 'rgba(255, 0, 0, 0.15)';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.font = 'bold 14px monospace';
-  ctx.fillStyle = '#fff';
-  ctx.fillText('🔥 差分ハイコントラスト強調モード', 20, 40);
-  ctx.restore();
-}
+document.getElementById('startBtn').onclick = startApp;
 </script>
 </body>
 </html>
