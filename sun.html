@@ -34,6 +34,44 @@
       position: relative;
     }
 
+    /* 初回起動オーバーレイ（カメラ＆コンパスの連続許可用） */
+    #start-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.85);
+      backdrop-filter: blur(15px);
+      -webkit-backdrop-filter: blur(15px);
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      gap: 20px;
+      padding: 24px;
+      text-align: center;
+      transition: opacity 0.4s ease;
+    }
+
+    #start-overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .start-btn {
+      background: var(--accent-color);
+      color: #fff;
+      border: none;
+      padding: 16px 32px;
+      border-radius: 30px;
+      font-size: 16px;
+      font-weight: 700;
+      box-shadow: 0 4px 20px rgba(0, 122, 255, 0.5);
+      cursor: pointer;
+    }
+
     /* カメラ＆ARオーバーレイ表示エリア */
     #viewfinder {
       position: absolute;
@@ -380,6 +418,16 @@
   </style>
 </head>
 <body>
+  <!-- 初回起動時オーバーレイ (カメラ＋コンパスの順次許可トリガー) -->
+  <div id="start-overlay">
+    <div style="font-size: 40px;">📷 🧭</div>
+    <h2>LuminaCam Pro</h2>
+    <p style="font-size: 13px; color: rgba(255,255,255,0.7); line-height: 1.5;">
+      カメラ映像とコンパス（太陽位置追従）を使用します。<br>タップして順次許可してください。
+    </p>
+    <button class="start-btn" id="btn-start">撮影・AR追従を開始</button>
+  </div>
+
   <!-- カメラ映像 & AR描画エリア -->
   <video id="viewfinder" autoplay playsinline muted></video>
   <canvas id="ar-canvas"></canvas>
@@ -393,7 +441,6 @@
       <span>📷</span> LuminaCam Pro
     </div>
     <div class="header-actions">
-      <button class="btn-chip" id="btn-sensor-perm" style="padding: 4px 8px; font-size: 10px; background: rgba(0, 122, 255, 0.4);">🧭 センサー許可</button>
       <div class="mode-switch">
         <button class="mode-btn active" id="btn-mode-phone">📱 スマホ</button>
         <button class="mode-btn" id="btn-mode-camera">📷 一眼カメラ</button>
@@ -577,7 +624,7 @@
       const toast = document.getElementById('toast');
       toast.innerText = message;
       toast.classList.add('show');
-      setTimeout(() => toast.classList.remove('show'), 2000);
+      setTimeout(() => toast.classList.remove('show'), 2200);
     }
 
     // 1. APEX 露出演算エンジン
@@ -708,7 +755,7 @@
     }
     /**
      * LuminaCam Pro Canvas Processing & AR Engine
-     * 画像解析(5fps)、スポット測光、60fps AR描画、DOMバインディング
+     * カメラ許可＋順次コンパス許可リクエスト、画像解析(5fps)、60fps AR描画、DOMバインディング
      */
 
     const video = document.getElementById('viewfinder');
@@ -719,7 +766,7 @@
     const procCanvas = document.createElement('canvas');
     const procCtx = procCanvas.getContext('2d');
 
-    // カメラ起動
+    // ① カメラ起動処理
     async function initCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -727,9 +774,63 @@
           audio: false
         });
         video.srcObject = stream;
-        video.play();
+        await video.play();
+        return true;
       } catch (err) {
         console.warn('カメラアクセス不可 - デモモードで起動します', err);
+        showToast('⚠️ カメラへのアクセスが拒否されました');
+        return false;
+      }
+    }
+
+    // ② コンパス・方位センサー許可要求（iOS対応）
+    async function requestOrientationPermission() {
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        try {
+          const response = await DeviceOrientationEvent.requestPermission();
+          if (response === 'granted') {
+            state.sensorGranted = true;
+            window.addEventListener('deviceorientation', handleOrientation, true);
+            showToast('🧭 コンパス・太陽追従を有効化しました');
+          } else {
+            showToast('⚠️ コンパスアクセスが拒否されました');
+          }
+        } catch (err) {
+          console.error('コンパス許可エラー:', err);
+        }
+      } else {
+        // Android / PC等 (明示的リクエスト不要環境)
+        window.addEventListener('deviceorientation', handleOrientation, true);
+        state.sensorGranted = true;
+        showToast('🧭 コンパス・太陽追従を有効化しました');
+      }
+    }
+
+    // ③ 順次許可シーケンス (カメラ許可 ➔ コンパス許可)
+    async function startAppSequence() {
+      document.getElementById('start-overlay').classList.add('hidden');
+      
+      // 1. カメラ許可・起動
+      await initCamera();
+      
+      // 2. 順次コンパスの許可ダイアログを自動要求
+      await requestOrientationPermission();
+    }
+
+    // コンパス方位（Heading）のリアルタイム処理ハンドラ
+    function handleOrientation(event) {
+      let heading = null;
+
+      if (event.webkitCompassHeading) {
+        // iOS Safari のコンパス真方位
+        heading = event.webkitCompassHeading;
+      } else if (event.alpha !== null) {
+        // Android / 標準方位
+        heading = 360 - event.alpha;
+      }
+
+      if (heading !== null) {
+        state.compassHeading = heading;
       }
     }
 
@@ -741,7 +842,7 @@
       procCanvas.height = 120;
     }
 
-    // 1. 5fps Canvas 画像解析 & 測光処理
+    // 5fps Canvas 画像解析 & 測光処理
     function processImage() {
       if (video.readyState >= 2) {
         procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
@@ -792,47 +893,7 @@
       updateUI();
     }
 
-    // iOS/Android コンパス・ジャイロセンサー許可要求関数
-    async function requestOrientationPermission() {
-      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-        try {
-          const response = await DeviceOrientationEvent.requestPermission();
-          if (response === 'granted') {
-            state.sensorGranted = true;
-            window.addEventListener('deviceorientation', handleOrientation, true);
-            showToast('🧭 コンパス・センサーを有効化しました');
-            document.getElementById('btn-sensor-perm').style.display = 'none';
-          } else {
-            showToast('⚠️ センサーアクセスが拒否されました');
-          }
-        } catch (err) {
-          console.error(err);
-          showToast('⚠️ センサー許可エラーが発生しました');
-        }
-      } else {
-        window.addEventListener('deviceorientation', handleOrientation, true);
-        state.sensorGranted = true;
-        showToast('🧭 コンパス・センサーを有効化しました');
-        document.getElementById('btn-sensor-perm').style.display = 'none';
-      }
-    }
-
-    // コンパス方位（Heading）のリアルタイム処理ハンドラ
-    function handleOrientation(event) {
-      let heading = null;
-
-      if (event.webkitCompassHeading) {
-        heading = event.webkitCompassHeading;
-      } else if (event.alpha !== null) {
-        heading = 360 - event.alpha;
-      }
-
-      if (heading !== null) {
-        state.compassHeading = heading;
-      }
-    }
-
-    // 2. 60fps AR 太陽オーバーレイ描画
+    // 60fps AR 太陽オーバーレイ描画 (コンパスリアルタイム連動)
     function drawAR() {
       ctx.clearRect(0, 0, arCanvas.width, arCanvas.height);
 
@@ -886,7 +947,7 @@
       requestAnimationFrame(drawAR);
     }
 
-    // 3. UI リアルタイム更新
+    // UI リアルタイム更新
     function updateUI() {
       const apex = calculateAPEX();
 
@@ -924,11 +985,11 @@
       generateAdvice(apex);
     }
 
-    // 4. イベントハンドラ & UI結合
+    // イベントハンドラ & UI結合
     function bindEvents() {
-      // センサー許可ボタン
-      document.getElementById('btn-sensor-perm').addEventListener('click', () => {
-        requestOrientationPermission();
+      // アプリ起動ボタン（カメラ許可 ➔ コンパス許可の連続リクエストを実行）
+      document.getElementById('btn-start').addEventListener('click', () => {
+        startAppSequence();
       });
 
       // モード切り替え
@@ -1027,7 +1088,6 @@
     window.addEventListener('DOMContentLoaded', () => {
       resizeCanvas();
       window.addEventListener('resize', resizeCanvas);
-      initCamera();
       bindEvents();
       updateSunPosition();
 
