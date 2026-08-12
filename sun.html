@@ -7,7 +7,7 @@
   <style>
     :root {
       --primary-color: #0a84ff;
-      --bg-glass: rgba(18, 18, 20, 0.85); /* 屋外視認性を高めるため背景濃度を強化 */
+      --bg-glass: rgba(18, 18, 20, 0.85);
       --border-glass: rgba(255, 255, 255, 0.25);
       --text-main: #ffffff;
       --text-sub: rgba(255, 255, 255, 0.75);
@@ -406,7 +406,7 @@
 <script>
 /**
  * LuminaCam Pro - Core Logic Engine
- * 太陽演算・配光アドバイスエンジン・コンパス自動タップ校正
+ * 太陽演算・夜間街灯/人工光対応アドバイスエンジン・コンパス校正
  */
 const AppState = {
   lat: 35.6812,
@@ -426,7 +426,7 @@ const AppState = {
   shadowRatio: 0.33,
   midRatio: 0.34,
   highlightRatio: 0.33,
-  contrastRatio: 1.0 // 明暗乖離度
+  contrastRatio: 1.0
 };
 
 // UI Element Referencing
@@ -521,67 +521,93 @@ function calculateSunPosition(lat, lng, date = new Date()) {
 }
 
 /* ==========================================================================
-   2. 撮影現場向け 具体的なアドバイス出力ロジック
+   2. カメラ分析・実測輝度（EV）優先型 アドバイス出力ロジック
    ========================================================================== */
 function generateLightingAdvice() {
-  // カメラの現在方位と太陽方位の相対落差角
-  let angleDiff = Math.abs(AppState.heading - AppState.sunAzimuth) % 360;
-  if (angleDiff > 180) angleDiff = 360 - angleDiff;
-
   const alt = AppState.sunAltitude;
+  const ev = AppState.luminanceEV;
   const highRatio = AppState.highlightRatio;
   const shadowRatio = AppState.shadowRatio;
+  const midRatio = AppState.midRatio;
+
+  // 相対落差角（太陽・カメラ向き）
+  let angleDiff = Math.abs(AppState.heading - AppState.sunAzimuth) % 360;
+  if (angleDiff > 180) angleDiff = 360 - angleDiff;
 
   let lightingType = "";
   let tagText = "";
   let tagColor = "var(--accent-yellow)";
   let actionAdvice = "";
 
+  // -------------------------------------------------------------
+  // Branch 1: 夜間 / 日没後（太陽高度 < -2°）のカメラ実測値ベース判定
+  // -------------------------------------------------------------
   if (alt < -2) {
-    lightingType = "夜間 / 光量不足";
-    tagText = "ローライト";
-    tagColor = "var(--primary-color)";
-    actionAdvice = "自然光が得られません。定常光LEDまたは高感度（ISOアップ）撮影を推奨します。";
-  } else if (alt > 65) {
-    lightingType = "トップ光（太陽直上）";
-    tagText = "強い影注意";
-    tagColor = "var(--accent-red)";
-    actionAdvice = "被写体の目元や首元に落ち影が発生します。頭上にディフューザー天幕を張るか、下部から白レフ板で起こしてください。";
-  } else if (angleDiff >= 130) {
-    // 逆光条件
-    lightingType = "配光：逆光 (Backlight)";
-    if (highRatio - shadowRatio > 0.35 || AppState.contrastRatio > 2.0) {
-      tagText = "輝度差：極大";
+    if (ev >= 7.0 && (midRatio + highRatio) >= 0.50) {
+      // パターンB：全体的に明るい人工光（明るい室内・ナイター・ネオン街）
+      lightingType = "人工光環境（光量十分）";
+      tagText = "環境光良好";
+      tagColor = "var(--accent-green)";
+      actionAdvice = "街灯や店舗照明で光量は十分です。ミックス光による色被りに注意し、被写体の肌色基準で露出を固定（AEロック）してください。";
+    } else if (ev >= 4.0 && highRatio >= 0.18 && shadowRatio >= 0.35) {
+      // パターンA：街灯・スポットライトなどの強い点光源（高コントラスト夜景）
+      lightingType = "夜間点光源（街灯・スポット光）";
+      tagText = "強明暗差";
+      tagColor = "var(--accent-orange)";
+      actionAdvice = "街灯等の強いスポット光を検知。目元や首元に強い影が出やすいため、被写体を街灯に対し斜め前方に配置するか、白レフで陰影を和らげてください。";
+    } else {
+      // パターンC：街灯もない完全な暗闇
+      lightingType = "夜間 / 極低照度";
+      tagText = "光量不足";
       tagColor = "var(--accent-red)";
-      actionAdvice = "背景白飛び・被写体黒つぶれリスク高。『被写体正面やや下から白レフ補正』または『ストロボ +1.5EV Fill-in』が必須です。";
-    } else {
-      tagText = "輝度差：中";
-      tagColor = "var(--accent-yellow)";
-      actionAdvice = "髪や輪郭のフレア演出に最適。顔のトーンを保つため『銀レフで薄く起こす』と立体感が増します。";
+      actionAdvice = "自然光・環境光ともに不十分です。三脚等で固定して長秒露光を行うか、定常光LED・ストロボの補光、ISO感度アップを推奨します。";
     }
-  } else if (angleDiff >= 50 && angleDiff < 130) {
-    // サイド光 / 斜光条件
-    lightingType = "配光：サイド光・斜光 (Side Light)";
-    if (shadowRatio > 0.45) {
-      tagText = "影かぶり大";
-      tagColor = "var(--accent-orange)";
-      actionAdvice = "シャドウ側のコントラストが強すぎます。『陰影側に黒レフで締める』か『ディフューザーで光を和らげる』調整が効果的です。";
+  } 
+  // -------------------------------------------------------------
+  // Branch 2: 日中 / 太陽光環境（太陽高度 >= -2°）の太陽方位連携判定
+  // -------------------------------------------------------------
+  else {
+    if (alt > 65) {
+      lightingType = "トップ光（太陽直上）";
+      tagText = "強い影注意";
+      tagColor = "var(--accent-red)";
+      actionAdvice = "頭上からの強い直射光です。目元や首元に落ち影が発生するため、ディフューザー天幕を張るか下部から白レフ板で起こしてください。";
+    } else if (angleDiff >= 130) {
+      // 逆光
+      lightingType = "配光：逆光 (Backlight)";
+      if (highRatio - shadowRatio > 0.35 || AppState.contrastRatio > 2.0) {
+        tagText = "輝度差：極大";
+        tagColor = "var(--accent-red)";
+        actionAdvice = "背景白飛び・被写体黒つぶれリスク高。『被写体正面やや下から白レフ補正』または『ストロボ +1.5EV Fill-in』が必須です。";
+      } else {
+        tagText = "輝度差：中";
+        tagColor = "var(--accent-yellow)";
+        actionAdvice = "髪や輪郭のフレア演出に最適。顔のトーンを保つため『銀レフで薄く起こす』と立体感が増します。";
+      }
+    } else if (angleDiff >= 50 && angleDiff < 130) {
+      // サイド光
+      lightingType = "配光：サイド光・斜光 (Side Light)";
+      if (shadowRatio > 0.45) {
+        tagText = "影かぶり大";
+        tagColor = "var(--accent-orange)";
+        actionAdvice = "シャドウ側のコントラストが強すぎます。『陰影側に黒レフで締める』か『ディフューザーで光を和らげる』調整が効果的です。";
+      } else {
+        tagText = "質感良好";
+        tagColor = "var(--accent-green)";
+        actionAdvice = "被写体の立体感・テクスチャが綺麗に出る良好な配光状態です。そのままでドラマチックな描写が可能です。";
+      }
     } else {
-      tagText = "質感良好";
-      tagColor = "var(--accent-green)";
-      actionAdvice = "被写体の立体感・テクスチャが綺麗に出る良好な配光状態です。そのままでドラマチックな描写が可能です。";
-    }
-  } else {
-    // 順光条件
-    lightingType = "配光：順光 (Front Light)";
-    if (highRatio > 0.5) {
-      tagText = "フラット / 白飛び";
-      tagColor = "var(--accent-orange)";
-      actionAdvice = "全体が平坦でまぶしい状態です。『ハーフNDフィルター使用』または被写体に少し角度をつけて斜光気味に構えてください。";
-    } else {
-      tagText = "標準順光";
-      tagColor = "var(--accent-green)";
-      actionAdvice = "色再現性が最も高い配置です。まぶしさによる白飛びに注意し、EV調整でハイライトを保護してください。";
+      // 順光
+      lightingType = "配光：順光 (Front Light)";
+      if (highRatio > 0.5) {
+        tagText = "フラット / 白飛び";
+        tagColor = "var(--accent-orange)";
+        actionAdvice = "全体が平坦でまぶしい状態です。『ハーフNDフィルター使用』または被写体に少し角度をつけて斜光気味に構えてください。";
+      } else {
+        tagText = "標準順光";
+        tagColor = "var(--accent-green)";
+        actionAdvice = "色再現性が最も高い配置です。まぶしさによる白飛びに注意し、EV調整でハイライトを保護してください。";
+      }
     }
   }
 
@@ -593,21 +619,16 @@ function generateLightingAdvice() {
 }
 
 /* ==========================================================================
-   3. タップ位置によるコンパス自動方位角再補正 (画面上の太陽を直接校正)
+   3. タップ位置によるコンパス自動方位角再補正
    ========================================================================== */
 function calibrateCompassBySunTap(tapX, tapY, canvasWidth, canvasHeight) {
-  // 画面中央からのX軸オフセット（画面水平画角 約60度と仮定）
   const centerX = canvasWidth / 2;
   const deltaX = tapX - centerX;
   const fovH = 60; // deg
   const angleOffsetFromCenter = (deltaX / centerX) * (fovH / 2);
 
-  // タップされた位置の真の方位 = 現在のカメラ視線方位 + タップオフセット角
-  // これが計算上の「太陽方位 (sunAzimuth)」と一致すべき
-  // 推定カメラ方位 = sunAzimuth - angleOffsetFromCenter
   const estimatedCameraHeading = AppState.sunAzimuth - angleOffsetFromCenter;
   
-  // 新しいオフセット = 推定カメラ方位 - rawHeading
   let newOffset = (estimatedCameraHeading - AppState.rawHeading) % 360;
   if (newOffset > 180) newOffset -= 360;
   if (newOffset < -180) newOffset += 360;
@@ -616,7 +637,6 @@ function calibrateCompassBySunTap(tapX, tapY, canvasWidth, canvasHeight) {
   sliderOffset.value = AppState.headingOffset;
   elStOffset.textContent = `${AppState.headingOffset}°`;
 
-  // 即時適用
   let corrected = (AppState.rawHeading + AppState.headingOffset) % 360;
   if (corrected < 0) corrected += 360;
   AppState.heading = corrected;
@@ -735,7 +755,7 @@ async function initCamera() {
 <script>
 /**
  * LuminaCam Pro - Rendering & Light-Analysis Engine
- * 熱対策インターバル処理・ヒストグラム解析・ARプロジェクション
+ * 5fps間引き処理・ヒストグラム解析・ARプロジェクション
  */
 const canvas = document.getElementById('ar-canvas');
 const ctx = canvas.getContext('2d');
@@ -755,7 +775,7 @@ window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
 
 /* ==========================================================================
-   1. 熱対策タイマー処理（5fpsの間引き重労働処理）& ヒストグラム解析
+   1. 熱対策タイマー処理（5fpsの間引き処理）& ヒストグラム解析
    ========================================================================== */
 function performLightAnalysisAndAdvice() {
   if (video.readyState !== video.HAVE_ENOUGH_DATA) return;
@@ -815,7 +835,7 @@ function performLightAnalysisAndAdvice() {
 
   elStLux.textContent = `${calculatedEV.toFixed(1)} EV`;
 
-  // 撮影アドバイスの自動更新
+  // カメラ分析結果に基づくアドバイスの自動更新
   generateLightingAdvice();
 }
 
@@ -895,7 +915,6 @@ function drawAROverlay() {
 /* ==========================================================================
    3. イベントハンドラー & モード切り替え
    ========================================================================== */
-// 画面タップで「画面上の実際の太陽」を指定してコンパス再校正
 canvas.addEventListener('click', (e) => {
   if (!AppState.manualTapCalibrateMode) return;
 
@@ -903,7 +922,6 @@ canvas.addEventListener('click', (e) => {
   const tapX = e.clientX - rect.left;
   const tapY = e.clientY - rect.top;
 
-  // タップ位置に基づいてコンパス方位角を逆算・自動補正
   calibrateCompassBySunTap(tapX, tapY, canvas.width, canvas.height);
 });
 
