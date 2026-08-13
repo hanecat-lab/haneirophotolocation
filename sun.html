@@ -970,33 +970,44 @@ function calculateSunPosition(lat, lng, date = new Date()) {
 }
 
 /* ==========================================================================
-   2. APEX 露出演算式 ＆ 限界可変ガード
+   修正版：APEX 露出演算 ＆ ピンポイントアドバイスエンジン
    ========================================================================== */
+
+/**
+ * APEX露出演算式
+ * EV_setting = log2(N^2 / t) - log2(S / 100)
+ * 露出誤差 deltaEV = EV_setting - EV_env
+ *  - deltaEV > +0.6  : 設定が明るい場所用（絞りすぎ/SS速すぎ/ISO低すぎ） ➔ アンダー（暗い）
+ *  - deltaEV < -0.6  : 設定が暗い場所用（開放すぎ/SS遅すぎ/ISO高すぎ） ➔ オーバー（明るい）
+ */
 function calculateAPEXExposure() {
   const N = APERTURE_VALUES[AppState.cameraParams.apertureIndex];
   const t = SS_VALUES[AppState.cameraParams.ssIndex];
   const S = ISO_VALUES[AppState.cameraParams.isoIndex];
 
-  // APEX 式: EV_setting = log2(N^2 / t) - log2(S / 100)
+  // 設定露出の計算
   const evSetting = Math.log2((N * N) / t) - Math.log2(S / 100);
+  
+  // 露出誤差（+なら暗い/アンダー、-なら明るい/オーバー）
   const deltaEV = evSetting - AppState.luminanceEV;
 
   // 露出メーター表示位置の更新 (-3EV ~ +3EV ➔ 0% ~ 100%)
-  let meterPosPct = 50 + (deltaEV / 3.0) * 50;
+  // deltaEV > 0 (アンダー) の時はメーターを左(-方向)へ、deltaEV < 0 (オーバー) は右(+方向)へ
+  let meterPosPct = 50 - (deltaEV / 3.0) * 50;
   meterPosPct = Math.max(0, Math.min(100, meterPosPct));
   meterPointer.style.left = `${meterPosPct}%`;
 
   meterEvVal.textContent = `EV_set: ${evSetting.toFixed(1)} / Env: ${AppState.luminanceEV.toFixed(1)}`;
 
   if (Math.abs(deltaEV) <= 0.6) {
-    meterStatusText.textContent = `適正露出 (${deltaEV >= 0 ? '+' : ''}${deltaEV.toFixed(1)} EV)`;
+    meterStatusText.textContent = `適正露出 (${deltaEV >= 0 ? '-' : '+'}${Math.abs(deltaEV).toFixed(1)} EV)`;
     meterStatusText.style.color = "var(--accent-green)";
   } else if (deltaEV > 0.6) {
-    meterStatusText.textContent = `露出オーバー (+${deltaEV.toFixed(1)} EV 明るすぎ)`;
-    meterStatusText.style.color = "var(--accent-red)";
-  } else {
-    meterStatusText.textContent = `露出アンダー (${deltaEV.toFixed(1)} EV 暗すぎ)`;
+    meterStatusText.textContent = `露出アンダー (-${deltaEV.toFixed(1)} EV 暗すぎ)`;
     meterStatusText.style.color = "var(--accent-orange)";
+  } else {
+    meterStatusText.textContent = `露出オーバー (+${Math.abs(deltaEV).toFixed(1)} EV 明るすぎ)`;
+    meterStatusText.style.color = "var(--accent-red)";
   }
 
   return { evSetting, deltaEV, N, t, S };
@@ -1093,6 +1104,9 @@ function generatePhoneAdvice() {
   elAdviceTool.textContent = toolTxt;
 }
 
+/**
+ * 一眼カメラ用アドバイス生成（不足EVから最適パラメータをダイレクト計算）
+ */
 function generateCameraAdvice() {
   const { deltaEV, N, t, S } = calculateAPEXExposure();
 
@@ -1101,44 +1115,75 @@ function generateCameraAdvice() {
   let badgeBg = "var(--accent-green)";
   let moveTxt = "", adjustTxt = "", toolTxt = "";
 
-  // 手ブレ警告判定 (手持ちモード時)
-  let blurWarning = false;
-  if (AppState.shootingStyle === 'HANDHELD' && t > 0.02) { // 1/50s より遅い
-    blurWarning = true;
-  }
+  // 手ブレ警告判定 (手持ちモード時に 1/50s より遅い場合)
+  const isBlurRisk = (AppState.shootingStyle === 'HANDHELD' && t > 0.02);
 
   if (deltaEV > 0.6) {
-    badge = "オーバー";
-    badgeBg = "var(--accent-red)";
-    moveTxt = "被写体を日陰や直射日光の当たらない場所へ1歩移動させます。";
-    adjustTxt = `SSを速くするか、F値を F${APERTURE_VALUES[Math.min(APERTURE_VALUES.length - 1, AppState.cameraParams.apertureIndex + 2)]} に絞り込みます。`;
-    
-    if (N <= AppState.cameraLimits.minF && t <= AppState.cameraLimits.maxSS) {
-      toolTxt = "⚠️ 機材の最速限界です。ND4〜ND16フィルターを装着して減光してください。";
-    } else {
-      toolTxt = "NDフィルターを使用するか、レンズの絞りを活用します。";
-    }
-  } else if (deltaEV < -0.6) {
+    // 【露出アンダー（暗すぎる）】➔ 光量を増やす必要がある
     badge = "アンダー";
     badgeBg = "var(--accent-orange)";
-    moveTxt = "街灯や照明など光源に被写体を近づけます。";
-    
-    if (S < AppState.cameraLimits.maxISO) {
-      adjustTxt = `ISO感度を ISO ${ISO_VALUES[Math.min(ISO_VALUES.length - 1, AppState.cameraParams.isoIndex + 2)]} へ引き上げます。`;
+    moveTxt = "被写体を明るい場所や光源の近くへ移動させます。";
+
+    // 不足しているEV段数分（deltaEV）、ISOを引き上げた場合の最適ISO値を計算
+    const targetISO = S * Math.pow(2, deltaEV);
+    const maxISO = AppState.cameraLimits.maxISO;
+
+    // ISO配列の中から targetISO に最も近い（または上回る）設定値を探す
+    let recISOIdx = ISO_VALUES.findIndex(v => v >= targetISO);
+    if (recISOIdx === -1) recISOIdx = ISO_VALUES.length - 1;
+    const recommendedISO = ISO_VALUES[recISOIdx];
+
+    if (recommendedISO <= maxISO && recISOIdx > AppState.cameraParams.isoIndex) {
+      adjustTxt = `適正露出にするため、ISO感を **ISO ${recommendedISO}** に引き上げてください。`;
     } else {
-      adjustTxt = `ISOは上限(${AppState.cameraLimits.maxISO})です。SSを少し遅くします。`;
+      // ISO上限に達する場合はSS（シャッタースピード）またはF値を緩める提案
+      const targetSS = t * Math.pow(2, deltaEV);
+      let recSSIdx = SS_VALUES.findIndex(v => v >= targetSS);
+      if (recSSIdx === -1) recSSIdx = SS_VALUES.length - 1;
+
+      adjustTxt = `ISO上限(${maxISO})に達するため、SSを **${SS_LABELS[recSSIdx]}** に低速化するかF値をひらいてください。`;
     }
 
-    if (blurWarning) {
+    if (isBlurRisk) {
       toolTxt = "⚠️ 手ブレの危険があります。三脚に固定するかクリップオンストロボを使用してください。";
     } else {
-      toolTxt = "白反射板やクリップオンストロボでキャッチライトを補光します。";
+      toolTxt = "白反射板やLEDライトで被写体にキャッチライトを補光します。";
     }
+
+  } else if (deltaEV < -0.6) {
+    // 【露出オーバー（明るすぎる）】➔ 光量を減らす必要がある
+    const excessEV = Math.abs(deltaEV);
+    badge = "オーバー";
+    badgeBg = "var(--accent-red)";
+    moveTxt = "被写体を日陰や直射日光の当たらない場所へ移動させます。";
+
+    // 過剰なEV段数分、ISOを下げるかSSを速くする
+    if (AppState.cameraParams.isoIndex > 0) {
+      const targetISO = S / Math.pow(2, excessEV);
+      let recISOIdx = ISO_VALUES.findLastIndex(v => v <= targetISO);
+      if (recISOIdx === -1) recISOIdx = 0;
+      adjustTxt = `明るすぎるため、ISO感を **ISO ${ISO_VALUES[recISOIdx]}** に下げてください。`;
+    } else {
+      const targetSS = t / Math.pow(2, excessEV);
+      let recSSIdx = SS_VALUES.findIndex(v => v <= targetSS);
+      if (recSSIdx === -1) recSSIdx = 0;
+      adjustTxt = `ISOは最小です。SSを **${SS_LABELS[recSSIdx]}** に高速化するか、F値を絞り込んでください。`;
+    }
+
+    if (N <= AppState.cameraLimits.minF && t <= AppState.cameraLimits.maxSS) {
+      toolTxt = "⚠️ 機材の最速限界です。NDフィルターを装着して減光してください。";
+    } else {
+      toolTxt = "レンズの絞り(F値)を大きくして光量をカットします。";
+    }
+
   } else {
+    // 【適正露出】
     badge = "適正 (0EV)";
     badgeBg = "var(--accent-green)";
     moveTxt = "被写体の影の向きと背景のボケ味を確認します。";
-    adjustTxt = blurWarning ? "⚠️ 露出は適正ですが手ブレ注意。SSを1/125s以上に上げてISOで調整してください。" : "設定バランスは良好です。シャッターを切ります。";
+    adjustTxt = isBlurRisk 
+      ? "⚠️ 露出は適正ですが手ブレ注意。SSを速くしてISOを上げるか三脚を使用してください。" 
+      : "露出バランスは完璧です。そのままシャッターを切れます。";
     toolTxt = "必要に応じて白紙やレフ板でキャッチ光を追加します。";
   }
 
