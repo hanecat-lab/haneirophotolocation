@@ -218,6 +218,10 @@
               <option value="右前">右前</option>
             </select>
           </div>
+          <div class="field wide">
+            <label>光源を動かせる範囲（壁までなど） <output id="room-max-out">5.0m</output></label>
+            <input id="room-max-distance" type="range" min="1" max="8" step="0.1" value="5">
+          </div>
         </div>
         <div class="row wrap" style="margin-top:10px">
           <button id="set-reference-btn" class="btn ghost grow" type="button">この写真を基準に登録</button>
@@ -280,8 +284,16 @@
       <summary>6. 撮影設定<span class="card-sub">絞り・ISO・シャッター</span></summary>
       <div class="card-body">
         <div class="form-grid">
-          <div class="field"><label>絞り F</label><input id="nw-aperture" type="number" min="1" max="22" step="0.1" value="4"></div>
-          <div class="field"><label>ISO</label><input id="nw-iso" type="number" min="50" max="12800" step="50" value="400"></div>
+          <div class="field">
+            <label>絞り F</label>
+            <input id="nw-aperture" type="number" min="1" max="22" step="0.1" value="4">
+            <div class="row" style="margin-top:6px;gap:6px"><input type="checkbox" id="nw-aperture-lock"><span class="small">固定する（動かさない。ボケの演出を守りたい時）</span></div>
+          </div>
+          <div class="field">
+            <label>ISO</label>
+            <input id="nw-iso" type="number" min="50" max="12800" step="50" value="400">
+            <div class="row" style="margin-top:6px;gap:6px"><input type="checkbox" id="nw-iso-lock"><span class="small">固定する（動かさない）</span></div>
+          </div>
           <div class="field wide"><label>シャッター速度（分の1秒）</label><input id="nw-shutter" type="number" min="1" max="8000" step="1" value="125" disabled></div>
         </div>
       </div>
@@ -300,6 +312,7 @@
           <div id="nowindow-next-stage" class="stage-tag hidden">--</div>
           <div id="nowindow-next-text" class="next-text">写真を読み込むと表示します。</div>
           <div id="nowindow-next-side" class="small" style="margin-top:6px"></div>
+          <div id="nowindow-stale-note" class="status warn hidden" style="margin-top:8px">設定を変更しました。この助言は直前の写真のままです。もう一枚撮って確認してください。</div>
         </div>
         <details class="why-details nowindow-only">
           <summary>なぜ？</summary>
@@ -419,9 +432,12 @@
       photoReady: false, photoSource: null, pixelCtx: null,
       tapPoints: { face: null, background: null }, tapTurn: 'face', measurement: null,
       // 窓なしモード専用。光源1つを前提に、設定値と申告位置を持つ。
+      // apertureLocked/isoLocked/roomMaxDistanceはユーザーの現在の選好・制約であり、
+      // 「この写真を撮った時の設定」ではないため measurementSettings には含めない。
       nowindow: {
         lightType: 'strobe', powerStops: -3, distanceSubject: 1.2, distanceBg: 1.8,
-        aperture: 4, iso: 400, shutterSeconds: 1 / 125, positionClaim: ''
+        aperture: 4, iso: 400, shutterSeconds: 1 / 125, positionClaim: '',
+        apertureLocked: false, isoLocked: false, roomMaxDistance: 5
       },
       // 2灯目（窓なしモード専用）。役割は使わない/フィル/背景灯の3択で、既定は「使わない」
       // ＝v03と同じ1灯挙動になる。出力・距離は「一手」でΔF/ΔB段を実際の出力表示へ
@@ -430,7 +446,10 @@
         role: 'none', powerStops: -3, distance: 1.2, targetRatioStops: 1, targetBgStops: -1
       },
       reference: null, // { faceLuminance, settings, isStrobe } … γ_eff校正の基準写真
-      target: { luminance: 0.18 } // 顔の目標リニア輝度。ボタンで実測値に置き換えられる
+      target: { luminance: 0.18 }, // 顔の目標リニア輝度。ボタンで実測値に置き換えられる
+      // measure()の瞬間にnowindow/nowindow2から複製する「その写真を撮った時の設定」。
+      // 助言はこれを基準に計算し、撮り直す前に入力欄だけ変えても指示が発散しないようにする。
+      measurementSettings: null, measurementSettings2: null
     };
 
     function toLocalInputValue(date) {
@@ -878,6 +897,14 @@
       const faceVerticalSplit = Math.log2(lumTop / lumBottom); // 正なら上が明るい＝光源が上
       const faceVsBackground = Math.log2(Math.max(face.luminance, 1e-4) / Math.max(background.luminance, 1e-4));
       state.measurement = { face, background, faceLeft, faceRight, faceSplit, brightSide, faceVerticalSplit, faceVsBackground };
+      // 窓なしモードでは、この瞬間の入力欄を「この写真を撮った時の設定」として複製する。
+      // 助言はこのスナップショットを基準に計算し、撮り直す前に入力欄だけ動かしても
+      // 古いneededがそのまま再適用されて指示が発散する（例：距離を離す→また離す）のを防ぐ。
+      if (state.mode === 'nowindow') {
+        readNowindowInputs(); readNowindow2Inputs();
+        state.measurementSettings = { ...state.nowindow };
+        state.measurementSettings2 = { powerStops: state.nowindow2.powerStops, distance: state.nowindow2.distance };
+      }
       setMeasurementReady(true);
     }
     function addTap(x, y) {
@@ -1017,9 +1044,30 @@
       const shutterDenom = Number($('nw-shutter').value);
       n.shutterSeconds = shutterDenom > 0 ? 1 / shutterDenom : 1 / 125;
       n.positionClaim = $('light-position').value;
+      n.apertureLocked = $('nw-aperture-lock').checked;
+      n.isoLocked = $('nw-iso-lock').checked;
+      n.roomMaxDistance = Math.max(0.5, Number($('room-max-distance').value) || 5);
     }
-    function getNowindowSettings() {
-      const n = state.nowindow;
+    // 入力欄が、いま解析している写真を撮った時から動いていないかを調べる。動いていれば
+    // 助言はまだその古い写真のままなので、新しい写真を撮って確認するよう促す。
+    function nowindowSettingsDrifted() {
+      if (!state.measurementSettings) return false;
+      const b = state.measurementSettings, n = state.nowindow, eps = 0.02;
+      if (b.lightType !== n.lightType) return true;
+      if (Math.abs(b.powerStops - n.powerStops) > eps) return true;
+      if (Math.abs(b.distanceSubject - n.distanceSubject) > eps) return true;
+      if (Math.abs(b.aperture - n.aperture) > eps) return true;
+      if (Math.abs(b.iso - n.iso) > 0.5) return true;
+      if (Math.abs(b.shutterSeconds - n.shutterSeconds) > 1e-6) return true;
+      if (state.nowindow2.role !== 'none' && state.measurementSettings2) {
+        const b2 = state.measurementSettings2, n2 = state.nowindow2;
+        if (Math.abs(b2.powerStops - n2.powerStops) > eps) return true;
+        if (Math.abs(b2.distance - n2.distance) > eps) return true;
+      }
+      return false;
+    }
+    function getNowindowSettings(source) {
+      const n = source || state.nowindow;
       return { powerStops: n.powerStops, distance: n.distanceSubject, aperture: n.aperture, iso: n.iso, shutter: n.shutterSeconds };
     }
     // 2灯目の入力欄を読む。露出計算（exposureStops/computeGammaEff）はキー灯だけを
@@ -1039,8 +1087,11 @@
     // 0.3段未満は計算しない。
     function computeGammaEff() {
       if (!state.reference || !state.measurement) return { gamma: 1, note: '2枚目を撮ると精度が上がります。', ready: false };
-      const current = getNowindowSettings();
-      const isStrobeNow = state.nowindow.lightType === 'strobe';
+      // ライブの入力欄ではなく、この写真を撮った時の設定を使う（入力欄はまだ次の
+      // 撮影に向けて動かしている途中かもしれないため）。
+      const base = state.measurementSettings || state.nowindow;
+      const current = getNowindowSettings(base);
+      const isStrobeNow = base.lightType === 'strobe';
       const dE = exposureStops(current, isStrobeNow) - exposureStops(state.reference.settings, state.reference.isStrobe);
       if (Math.abs(dE) < 0.3) return { gamma: 1, note: '設定を1段以上変えた2枚目を撮ってください。', ready: false };
       const dY = Math.log2(Math.max(state.measurement.face.luminance, 1e-4) / Math.max(state.reference.faceLuminance, 1e-4));
@@ -1103,8 +1154,9 @@
       if (newPower >= -7 && newPower <= 0) {
         return `${label}の出力を ${powerLabel(Math.pow(2, currentPowerStops))} → ${powerLabel(Math.pow(2, newPower))} へ`;
       }
+      // roomMaxDistanceはキー灯・2灯目で共有するスタジオの制約（部屋の奥行き）。
       const d2 = currentDistance / Math.pow(2, deltaStops / 2);
-      if (d2 >= 0.3 && d2 <= 5) {
+      if (d2 >= 0.3 && d2 <= state.nowindow.roomMaxDistance) {
         return `${label}との距離を ${currentDistance.toFixed(1)}m → ${d2.toFixed(1)}m へ`;
       }
       return `${label}を ${deltaStops >= 0 ? '+' : ''}${deltaStops.toFixed(1)}段動かしてください（出力・距離の調整範囲を超えています）`;
@@ -1144,29 +1196,41 @@
       else text = '背景が光を吸っています（黒い壁、または背景が遠すぎます）。';
       return { predicted, diff, text };
     }
-    // キー灯の軸選択（v03のdecideNowindowMoveの中身そのまま）。出力→距離→絞り→ISOの
-    // 順で、範囲内に収まる最初の軸を1つだけ返す。
+    // キー灯の軸選択。出力→距離→絞り→ISOの順で、範囲内に収まる最初の軸を1つだけ返す。
+    // 「距離」「絞り」「ISO」の基準値(base)は、この写真を撮った時の設定
+    // (measurementSettings)を使う。ライブのstate.nowindowを使うと、助言に従って
+    // 数値だけ書き換えた（まだ撮り直していない）状態で同じneededがもう一度乗り、
+    // 「離してください」が繰り返されるように見える。
+    // 一方、絞り・ISOの固定チェックとroomMaxDistance(動かせる範囲)は今この瞬間の
+    // ユーザーの選好・制約なので、常にライブのstate.nowindowを見る。
     function decideKeyAxisMove(needed) {
-      const n = state.nowindow;
-      const newPower = n.powerStops + needed;
+      const base = state.measurementSettings || state.nowindow;
+      const live = state.nowindow;
+      const newPower = base.powerStops + needed;
       if (newPower >= -7 && newPower <= 0) {
-        return { text: `キーの出力を ${powerLabel(Math.pow(2, n.powerStops))} → ${powerLabel(Math.pow(2, newPower))} へ`, side: '（なし。最も安全です）' };
+        return { text: `キーの出力を ${powerLabel(Math.pow(2, base.powerStops))} → ${powerLabel(Math.pow(2, newPower))} へ`, side: '（なし。最も安全です）' };
       }
       if (needed > 0) {
         // 明るくしたいが出力が上限：距離を縮める（逆二乗則）
-        const d2 = n.distanceSubject / Math.pow(2, needed / 2);
-        if (d2 >= 0.3) return { text: `キーとの距離を ${n.distanceSubject.toFixed(1)}m → ${d2.toFixed(1)}m へ近づけてください`, side: '光が柔らかくなり、背景はさらに暗くなります' };
+        const d2 = base.distanceSubject / Math.pow(2, needed / 2);
+        if (d2 >= 0.3) return { text: `キーとの距離を ${base.distanceSubject.toFixed(1)}m → ${d2.toFixed(1)}m へ近づけてください`, side: '光が柔らかくなり、背景はさらに暗くなります' };
       } else {
-        // 暗くしたいが出力が下限：距離を離す
-        const d2 = n.distanceSubject / Math.pow(2, needed / 2);
-        if (d2 <= 5) return { text: `キーとの距離を ${n.distanceSubject.toFixed(1)}m → ${d2.toFixed(1)}m へ離してください`, side: '光が硬くなります' };
+        // 暗くしたいが出力が下限：距離を離す。壁までの距離など、動かせる範囲を超えない。
+        const d2 = base.distanceSubject / Math.pow(2, needed / 2);
+        if (d2 <= live.roomMaxDistance) return { text: `キーとの距離を ${base.distanceSubject.toFixed(1)}m → ${d2.toFixed(1)}m へ離してください`, side: '光が硬くなります' };
       }
-      // 距離も動かせない範囲：絞り
-      const f2 = n.aperture / Math.pow(2, needed / 2);
-      if (f2 >= 1.4 && f2 <= 16) return { text: `絞りを F${n.aperture.toFixed(1)} → F${f2.toFixed(1)} へ`, side: 'ボケの量が変わります' };
-      // 最後の手段：ISO
-      const s2 = clamp(Math.round(n.iso * Math.pow(2, needed) / 50) * 50, 50, 25600);
-      return { text: `ISOを ${n.iso} → ${s2} へ`, side: 'ノイズが増えます' };
+      // 距離も動かせない範囲：絞り（固定されていなければ）
+      if (!live.apertureLocked) {
+        const f2 = base.aperture / Math.pow(2, needed / 2);
+        if (f2 >= 1.4 && f2 <= 16) return { text: `絞りを F${base.aperture.toFixed(1)} → F${f2.toFixed(1)} へ`, side: 'ボケの量が変わります' };
+      }
+      // 最後の手段：ISO（固定されていなければ）
+      if (!live.isoLocked) {
+        const s2 = clamp(Math.round(base.iso * Math.pow(2, needed) / 50) * 50, 50, 25600);
+        return { text: `ISOを ${base.iso} → ${s2} へ`, side: 'ノイズが増えます' };
+      }
+      // 絞り・ISOとも固定され、距離もこれ以上動かせない：自動では出せる手がない
+      return { text: '出力・距離ではこれ以上調整できません。絞りかISOの固定を外すか、光源の強さを見直してください。', side: '' };
     }
     // 「次の一手」の判定（窓なしモード）。上から順に見て最初に該当した1件だけを返す。
     // 1:白飛び → 2:顔の明るさ(キー) → 3:光の比(フィル。役割がfillの時だけ)
@@ -1193,7 +1257,8 @@
         if (Math.abs(s - t) >= 0.3) {
           const deltaF = fillAdjustStops(s, t);
           const sideEffect = fillSideEffectStops(s, deltaF);
-          const n2 = state.nowindow2;
+          // 2灯目もキー灯と同じ理由で、この写真を撮った時の設定を基準にする。
+          const n2 = state.measurementSettings2 || state.nowindow2;
           const text = nw2PowerOrDistanceAdvice('フィル', n2.powerStops, n2.distance, deltaF);
           const side = Number.isFinite(sideEffect)
             ? `顔全体の明るさも ${sideEffect >= 0 ? '+' : ''}${sideEffect.toFixed(1)}段変わります（フィルは明るい側にも足されるため）`
@@ -1206,7 +1271,7 @@
         const actual = m.faceVsBackground, target = state.nowindow2.targetBgStops;
         if (Math.abs(actual - target) >= 0.3) {
           const deltaB = backgroundLightAdjustStops(actual, target, gamma);
-          const n2 = state.nowindow2;
+          const n2 = state.measurementSettings2 || state.nowindow2;
           const text = nw2PowerOrDistanceAdvice('背景灯', n2.powerStops, n2.distance, deltaB);
           return { text, side: '', calc, stage: '最後に背景' };
         }
@@ -1215,8 +1280,10 @@
     }
     function renderNowindowWhy(move) {
       const m = state.measurement;
+      const b = state.measurementSettings;
+      const baseLine = b ? `<div>この助言は、出力${powerLabel(Math.pow(2, b.powerStops))}・距離${b.distanceSubject.toFixed(1)}mで撮った写真をもとにしています。</div>` : '';
       if (!move || !move.calc) {
-        return m ? `<div>顔の白飛び率：${Math.round(m.face.clipHigh * 100)}%（5%を超えると白飛びとして警告します）</div>` : '';
+        return m ? baseLine + `<div>顔の白飛び率：${Math.round(m.face.clipHigh * 100)}%（5%を超えると白飛びとして警告します）</div>` : '';
       }
       const calc = move.calc;
       const lines = [
@@ -1226,13 +1293,13 @@
         `ΔEV(JPEG) = log2(目標 / 実測) = ${calc.dEVjpeg.toFixed(2)}段`,
         `ΔE_needed = ΔEV / γ_eff = ${calc.needed.toFixed(2)}段`
       ];
-      return lines.map(line => `<div>${line}</div>`).join('');
+      return baseLine + lines.map(line => `<div>${line}</div>`).join('');
     }
     function setNowindowStatus(message, kind) { const el = $('nowindow-status'); el.textContent = message; el.className = `status ${kind || ''}`; }
     function setReference() {
       if (!state.measurement) { setNowindowStatus('先に写真を読み込み、顔をタップしてください。', 'warn'); return; }
-      readNowindowInputs();
-      state.reference = { faceLuminance: state.measurement.face.luminance, settings: getNowindowSettings(), isStrobe: state.nowindow.lightType === 'strobe' };
+      const base = state.measurementSettings || state.nowindow;
+      state.reference = { faceLuminance: state.measurement.face.luminance, settings: getNowindowSettings(base), isStrobe: base.lightType === 'strobe' };
       setNowindowStatus('この写真を基準に登録しました。設定を変えて次の1枚を撮ってください。', 'good');
       renderAll();
     }
@@ -1261,6 +1328,7 @@
       const n = state.nowindow;
       const isStrobe = n.lightType === 'strobe';
       $('power-stops-out').textContent = powerLabel(Math.pow(2, n.powerStops));
+      $('room-max-out').textContent = `${n.roomMaxDistance.toFixed(1)}m`;
       $('nw-shutter').disabled = isStrobe;
       $('light-type-note').textContent = isStrobe
         ? 'シャッター速度は明るさに関係しません。1/125のままで大丈夫です。明るさは出力・距離・絞り・ISOの4つで決まります。'
@@ -1273,6 +1341,7 @@
         $('nowindow-next-side').textContent = '';
         $('nowindow-next-stage').classList.add('hidden');
         $('nowindow-why-body').innerHTML = '';
+        $('nowindow-stale-note').classList.add('hidden');
         return;
       }
       const m = state.measurement;
@@ -1306,6 +1375,9 @@
       $('nowindow-next-stage').classList.toggle('hidden', !move.stage);
       if (move.stage) $('nowindow-next-stage').textContent = move.stage;
       $('nowindow-why-body').innerHTML = renderNowindowWhy(move);
+      // 入力欄が、この助言のもとになった写真を撮った時から動いているなら、
+      // 数値を書き換えただけでまだ撮り直していないと分かるようにする。
+      $('nowindow-stale-note').classList.toggle('hidden', !nowindowSettingsDrifted());
     }
 
     function renderAll() {
@@ -1349,8 +1421,9 @@
     // 窓なしモードの入力欄。変更のたびに再計算するだけで、モードが nowindow で
     // ない間は renderAll 内の分岐でスキップされるため副作用はない。
     ['light-type-strobe','light-type-led'].forEach(id => $(id).addEventListener('change', renderAll));
-    ['power-stops','distance-subject','distance-bg','nw-aperture','nw-iso','nw-shutter'].forEach(id => $(id).addEventListener('input', renderAll));
+    ['power-stops','distance-subject','distance-bg','nw-aperture','nw-iso','nw-shutter','room-max-distance'].forEach(id => $(id).addEventListener('input', renderAll));
     $('light-position').addEventListener('change', renderAll);
+    ['nw-aperture-lock','nw-iso-lock'].forEach(id => $(id).addEventListener('change', renderAll));
     $('distance-subject-preset').addEventListener('change', () => { $('distance-subject').value = $('distance-subject-preset').value; renderAll(); });
     $('distance-bg-preset').addEventListener('change', () => { $('distance-bg').value = $('distance-bg-preset').value; renderAll(); });
     $('set-reference-btn').addEventListener('click', setReference);
