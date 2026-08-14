@@ -714,6 +714,18 @@
     :root[data-theme="light"] .pf-shadow-time-result strong { color: #125c5a; }
     :root[data-theme="light"] .pf-status-chip.shadow-time { background: #ddf5f1; border-color: #65bdb4; color: #146963; }
 
+
+
+    /* 「ここへ影」の方位測定・到達性表示。測定中は3Dを覆わず軽量バーだけで進める。 */
+    .pf-direction-quality { display: inline-flex; align-items: center; min-height: 22px; padding: 3px 7px; border: 1px solid rgba(100,218,205,.45); border-radius: 999px; background: rgba(15,77,74,.46); color: #cffdf7; font-size: 10px; font-weight: 800; }
+    .pf-direction-quality.warn { border-color: rgba(220,169,75,.6); background: rgba(101,70,20,.38); color: #ffe5a6; }
+    .pf-shadow-reach-warning { width: 100%; padding: 8px 9px; border-left: 3px solid #e4ad55; border-radius: 7px; background: rgba(122,83,23,.22); color: #ffedc5; font-size: 11px; line-height: 1.45; }
+    .pf-shadow-reach-warning strong { display: block; color: #fff4db; font-size: 13px; }
+    :root[data-theme="light"] .pf-direction-quality { border-color: #59b6aa; background: #e0f6f1; color: #17675f; }
+    :root[data-theme="light"] .pf-direction-quality.warn { border-color: #c59137; background: #fff3d9; color: #8a5a10; }
+    :root[data-theme="light"] .pf-shadow-reach-warning { border-left-color: #c68b2e; background: #fff1d6; color: #77531a; }
+    :root[data-theme="light"] .pf-shadow-reach-warning strong { color: #70490d; }
+
   </style>
 </head>
 <body>
@@ -724,7 +736,7 @@
       <span class="info-row-right">
         <button id="vf-level-toggle-btn" type="button" title="壁や構図の傾きが気になる時だけ使う構えガイド" aria-pressed="false">構えガイド OFF</button>
         <button id="theme-toggle-btn" type="button" title="表示テーマを切り替える" aria-label="ライトモードに切り替える">☼ ライト</button>
-        <span id="version-display">v5.79 影時間</span>
+        <span id="version-display">v5.81 ここへ影</span>
       </span>
     </div>
     <div class="sun-times" id="sun-times">日の出 --:-- ・ 日の入り --:--</div>
@@ -4253,7 +4265,7 @@ const HUMAN_PARTS = [
       shadowTime: null
     };
 
-    const PF_PHASE_IDS = ['placing', 'select', 'align', 'compare', 'steps', 'shadow-time-check', 'shadow-time-target', 'shadow-time-result', 'mismatch', 'compass-check', 'other', 'paused', 'complete', 'details'];
+    const PF_PHASE_IDS = ['placing', 'select', 'align', 'compare', 'steps', 'shadow-time-check', 'shadow-target-intro', 'shadow-time-target', 'shadow-target-direction', 'shadow-time-result', 'mismatch', 'compass-check', 'other', 'paused', 'complete', 'details'];
 
     function getScoutWalls() { return [...wallsContainer.children].filter(el => el.dataset.type === 'wall'); }
     function progressiveWallLabel(wall) {
@@ -4316,8 +4328,21 @@ const HUMAN_PARTS = [
     const SHADOW_TIME_SEARCH_MINUTES = 45;
     const SHADOW_TIME_INTERVAL_MINUTES = 5;
     const SHADOW_TIME_TOLERANCE_STEPS = 0.5;
+    const SHADOW_TARGET_DIRECTION_TOLERANCE_DEG = 15;
+    const SHADOW_TARGET_DIRECTION_HARD_MISS_DEG = 30;
+    const SHADOW_TARGET_DIRECTION_CAPTURE_MS = 1500;
+    const SHADOW_TARGET_DIRECTION_MIN_SAMPLES = 8;
+    let shadowTargetDirectionHandler = null, shadowTargetDirectionEventName = null, shadowTargetDirectionTimer = null;
 
-    function progressiveInvalidateShadowTime() { fieldFlow.shadowTime = null; }
+    function stopShadowTargetDirectionCapture() {
+      if (shadowTargetDirectionTimer) { window.clearTimeout(shadowTargetDirectionTimer); shadowTargetDirectionTimer = null; }
+      if (shadowTargetDirectionHandler) {
+        window.removeEventListener(shadowTargetDirectionEventName, shadowTargetDirectionHandler, true);
+        shadowTargetDirectionHandler = null;
+      }
+      shadowTargetDirectionEventName = null;
+    }
+    function progressiveInvalidateShadowTime() { stopShadowTargetDirectionCapture(); fieldFlow.shadowTime = null; }
     function progressiveShadowTimeContextValid(state = fieldFlow.shadowTime) {
       if (!state || !fieldFlow.referenceWall || !fieldFlow.referenceWall.isConnected) return false;
       if (!progressiveSameWall(state.wall, progressiveWallSnapshot(fieldFlow.referenceWall))) return false;
@@ -4329,32 +4354,112 @@ const HUMAN_PARTS = [
       const start = fieldVerifyTimeText(result.startMinute), end = fieldVerifyTimeText(result.endMinute);
       return result.startMinute === result.endMinute ? `${start}ごろ` : `${start}–${end}ごろ`;
     }
-    function progressiveStartShadowTime() {
+    // 目標歩数に入らない場合も、45分内で最も近づく時刻を候補として扱う。
+    // 「なりません」で止めず、現場で許容できる影かを判断できるようにする。
+    function progressiveShadowTimeCandidateLabel(state = fieldFlow.shadowTime) {
+      if (!state) return '';
+      if (state.result) return progressiveShadowTimeWindowLabel(state.result);
+      return state.closest ? `${fieldVerifyTimeText(state.closest.minute)}ごろ` : '';
+    }
+    function progressiveStartShadowTime(source = 'current') {
       const baseMinute = +$('time-range').value;
       const current = progressiveShadowAt(baseMinute);
       if (!current.ok || !fieldFlow.referenceWall) return { ok:false, reason:current.reason };
+      const defaultTarget = source === 'target-first' ? 3 : fieldVerifyRoundedSteps(current.steps);
       fieldFlow.shadowTime = {
         wall: progressiveWallSnapshot(fieldFlow.referenceWall), date: fieldVerifyDateKey(), lat: LAT, lon: LON,
         groundType: groundPlane.type, baseMinute,
         observedSteps: fieldVerifyRoundedSteps(current.steps),
-        targetSteps: fieldVerifyRoundedSteps(current.steps),
+        targetSteps: defaultTarget,
         toleranceSteps: SHADOW_TIME_TOLERANCE_STEPS,
+        source,
+        direction: null,
+        reachability: null,
         result: null,
         saved: false
       };
       return { ok:true, current };
     }
+
+    function circularMeanHeading(samples) {
+      let x = 0, y = 0;
+      samples.forEach(sample => { const r = sample.heading * Math.PI / 180; x += Math.cos(r); y += Math.sin(r); });
+      if (Math.hypot(x, y) < 1e-7) return NaN;
+      return norm(Math.atan2(y, x) * 180 / Math.PI);
+    }
+    function progressiveDirectionLabel(direction) {
+      if (!direction) return '';
+      if (direction.status === 'stable') return '方向：安定';
+      if (direction.status === 'measuring') return '方向を確認中';
+      return '方向：未取得';
+    }
+    function progressiveBeginShadowTargetDirection() {
+      const state = fieldFlow.shadowTime;
+      if (!state) return;
+      const unavailable = reason => {
+        if (fieldFlow.shadowTime !== state) return;
+        state.direction = { status:'unavailable', reason };
+        if (!fieldFlow.detailOpen) renderProgressiveFlow();
+      };
+      const begin = () => {
+        if (fieldFlow.shadowTime !== state) return;
+        stopShadowTargetDirectionCapture();
+        state.direction = { status:'measuring', samples:[], startedAt:Date.now() };
+        shadowTargetDirectionEventName = ('ondeviceorientationabsolute' in window) ? 'deviceorientationabsolute' : 'deviceorientation';
+        shadowTargetDirectionHandler = e => {
+          const rawHeading = deviceHeadingFromOrientation(e);
+          if (!Number.isFinite(rawHeading) || fieldFlow.shadowTime !== state) return;
+          // 利用者は理想地点から壁Aへスマホ上端を向ける。180°反転して壁A→理想地点にする。
+          const correction = applyShadowCalibrationToCompass ? headingOffset : 0;
+          const targetAz = norm(rawHeading + correction + 180);
+          state.direction.samples.push({ targetAz, accuracy:Number(e.webkitCompassAccuracy), at:Date.now() });
+        };
+        window.addEventListener(shadowTargetDirectionEventName, shadowTargetDirectionHandler, true);
+        shadowTargetDirectionTimer = window.setTimeout(() => progressiveFinishShadowTargetDirection(state), SHADOW_TARGET_DIRECTION_CAPTURE_MS);
+        if (!fieldFlow.detailOpen) renderProgressiveFlow();
+      };
+      if (typeof DeviceOrientationEvent === 'undefined') { unavailable('この端末では方向センサーが使えません'); return; }
+      if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission().then(result => result === 'granted' ? begin() : unavailable('センサーの使用が許可されませんでした')).catch(() => unavailable('センサーを開始できませんでした'));
+      } else begin();
+    }
+    function progressiveFinishShadowTargetDirection(state) {
+      stopShadowTargetDirectionCapture();
+      if (fieldFlow.shadowTime !== state) return;
+      const samples = state.direction && state.direction.samples ? state.direction.samples : [];
+      if (samples.length < SHADOW_TARGET_DIRECTION_MIN_SAMPLES) {
+        state.direction = { status:'unavailable', reason:'方向の値が十分に取れませんでした' };
+      } else {
+        const mean = circularMeanHeading(samples.map(sample => ({ heading:sample.targetAz })));
+        const spread = Math.max(...samples.map(sample => compassAngularDelta(sample.targetAz, mean)));
+        const accuracies = samples.map(sample => sample.accuracy).filter(Number.isFinite);
+        const maxAccuracy = accuracies.length ? Math.max(...accuracies) : null;
+        if (!Number.isFinite(mean) || spread > SHADOW_TARGET_DIRECTION_TOLERANCE_DEG || (maxAccuracy !== null && maxAccuracy > 25)) {
+          state.direction = { status:'unstable', reason:'磁気が安定しません。金属や機器から離れて、もう一度測ってください', spread, maxAccuracy };
+        } else {
+          state.direction = { status:'stable', targetAz:mean, spread, maxAccuracy, sampleCount:samples.length };
+        }
+      }
+      if (!fieldFlow.detailOpen) renderProgressiveFlow();
+    }
     function progressiveSearchShadowTime() {
       const state = fieldFlow.shadowTime;
       if (!progressiveShadowTimeContextValid(state)) return { ok:false, reason:'壁または時刻が変わりました。もう一度影を確認します' };
+      const targetAz = state.direction && state.direction.status === 'stable' ? state.direction.targetAz : null;
       const samples = [];
       for (let offset = 0; offset <= SHADOW_TIME_SEARCH_MINUTES; offset += SHADOW_TIME_INTERVAL_MINUTES) {
         const minute = Math.min(1439, state.baseMinute + offset);
         const data = progressiveShadowAt(minute);
-        if (data.ok) samples.push({ offset, minute, steps:data.steps, delta:Math.abs(data.steps - state.targetSteps), inside:Math.abs(data.steps - state.targetSteps) <= state.toleranceSteps });
+        if (!data.ok) continue;
+        const shadowAz = norm(sunAt(minute).azDeg + 180);
+        const directionDelta = targetAz === null ? null : compassAngularDelta(shadowAz, targetAz);
+        const distanceInside = Math.abs(data.steps - state.targetSteps) <= state.toleranceSteps;
+        const directionInside = directionDelta === null || directionDelta <= SHADOW_TARGET_DIRECTION_TOLERANCE_DEG;
+        samples.push({ offset, minute, steps:data.steps, shadowAz, directionDelta, delta:Math.abs(data.steps - state.targetSteps), inside:distanceInside && directionInside });
       }
       if (!samples.length) return { ok:false, reason:'次の45分は影の歩数を確認できません' };
       const closest = samples.reduce((best, sample) => sample.delta < best.delta ? sample : best, samples[0]);
+      const directionClosest = targetAz === null ? null : samples.reduce((best, sample) => sample.directionDelta < best.directionDelta ? sample : best, samples[0]);
       const windows = [];
       let start = null, previous = null;
       samples.forEach(sample => {
@@ -4370,7 +4475,11 @@ const HUMAN_PARTS = [
       const result = windows.length ? { ...windows[0], closestMinute:closest.minute, closestSteps:closest.steps, closestDelta:closest.delta, samples } : null;
       state.result = result;
       state.closest = closest;
-      return { ok:true, result, closest, samples };
+      state.reachability = targetAz === null ? null : {
+        targetAz, directionClosest,
+        hardMiss: directionClosest && directionClosest.directionDelta >= SHADOW_TARGET_DIRECTION_HARD_MISS_DEG
+      };
+      return { ok:true, result, closest, samples, reachability:state.reachability };
     }
 
     function progressiveClearReference() {
@@ -4474,14 +4583,14 @@ const HUMAN_PARTS = [
       const timeClass = progressiveIsNow() ? '' : ' pending';
       const checkLabel = progressiveCheckStatusLabel();
       const checkClass = checkLabel === '確認済み' || checkLabel === '向き確認済み' ? ' good' : (checkLabel === '未確認' ? ' pending' : ' warn');
-      const shadowTimeChip = progressiveShadowTimeContextValid() && fieldFlow.shadowTime.result && fieldFlow.shadowTime.saved
-        ? `<button type="button" class="pf-status-chip shadow-time" data-q-context="shadow-time">影：${fieldFlow.shadowTime.targetSteps.toFixed(1)}歩 / ${progressiveShadowTimeWindowLabel(fieldFlow.shadowTime.result)}</button>`
+      const shadowTimeChip = progressiveShadowTimeContextValid() && fieldFlow.shadowTime.saved && (fieldFlow.shadowTime.result || fieldFlow.shadowTime.closest)
+        ? `<button type="button" class="pf-status-chip shadow-time" data-q-context="shadow-time">影：${fieldFlow.shadowTime.targetSteps.toFixed(1)}歩 / ${progressiveShadowTimeCandidateLabel(fieldFlow.shadowTime)}</button>`
         : '';
       $('field-flow-context').innerHTML = `<span class="pf-context-chips">${wallChip}<span class="pf-status-chip time${timeClass}">${progressiveTimeModeLabel()}</span><span class="pf-status-chip${checkClass}">${checkLabel}</span>${shadowTimeChip}</span>`;
       updateProgressiveTimeModeChip();
       $('field-flow-main-btn').textContent = action.label;
       $('field-flow-main-btn').dataset.action = action.action;
-      $('field-flow-main-btn').style.display = ['align','compare','steps','shadow-time-check','shadow-time-target','shadow-time-result','mismatch','complete','details','placing','select'].includes(fieldFlow.phase) ? 'none' : 'block';
+      $('field-flow-main-btn').style.display = ['align','compare','steps','shadow-time-check','shadow-target-intro','shadow-time-target','shadow-target-direction','shadow-time-result','mismatch','complete','details','placing','select'].includes(fieldFlow.phase) ? 'none' : 'block';
       $('field-flow-advanced-btn').style.display = fieldFlow.phase === 'placing' ? 'none' : 'block';
       progressiveShowOnly(fieldFlow.phase);
 
@@ -4675,29 +4784,52 @@ const HUMAN_PARTS = [
           : `<button type="button" class="pf-quick-btn" disabled title="影比較を始めた後に使えます">戻す</button>`;
         markup = `${moveLine}<div class="pf-quick-row"><span class="pf-quick-label"><strong>${wallName}を回す</strong></span>${quickActionButton('move','移動')}</div><div class="pf-quick-row"><span class="pf-quick-label">回転</span><input id="pf-quick-rotate" class="pf-quick-rotate" type="range" min="0" max="359" value="${rot}" aria-label="壁の回転"><span id="pf-quick-rotate-out" class="pf-quick-label" style="flex:0 0 auto;">${rot}°</span>${restore}${quickActionButton('aligned','影を見る','primary')}</div>`;
       } else if (phase === 'compare') {
-        markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>3Dの影と実際の影を見比べる</strong></span></div><div class="pf-quick-grid">${quickActionButton('match','同じ','good')}${quickActionButton('mismatch','違う','warn')}${quickActionButton('unclear','見えない')}</div><div class="pf-quick-row"><span class="pf-quick-label">長さを測らない時</span>${quickActionButton('direction-only','影の向きだけ確認')}</div>`;
+        markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>3Dの影と実際の影を見比べる</strong></span></div><div class="pf-quick-grid">${quickActionButton('match','同じ','good')}${quickActionButton('mismatch','違う','warn')}${quickActionButton('unclear','見えない')}</div><div class="pf-quick-row"><span class="pf-quick-label">構図を先に見つけた時</span>${quickActionButton('shadow-target','ここへ影','primary')}</div><div class="pf-quick-row"><span class="pf-quick-label">長さを測らない時</span>${quickActionButton('direction-only','影の向きだけ確認')}</div>`;
       } else if (phase === 'steps') {
         const d = progressiveShadowAt(+$('time-range').value);
         const note = d.ok ? `壁から影先端まで　約 ${progressiveStepText(d.steps)}` : d.reason;
-        markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>${note}</strong></span>${quickActionButton('done','完了','primary')}</div><div class="pf-quick-row">${quickActionButton('shadow-time','影の時間を探す','primary')}${quickActionButton('compare-again','影を再確認')}</div><div class="pf-quick-row">${quickActionButton('verify','歩数を詳しく比べる')}</div>`;
+        markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>${note}</strong></span>${quickActionButton('done','完了','primary')}</div><div class="pf-quick-row">${quickActionButton('shadow-target','ここへ影','primary')}${quickActionButton('shadow-time','影の時間を探す')}</div><div class="pf-quick-row">${quickActionButton('compare-again','影を再確認')}${quickActionButton('verify','歩数を詳しく比べる')}</div>`;
       } else if (phase === 'shadow-time-check') {
         const d = progressiveShadowAt(+$('time-range').value);
         const message = d.ok ? `3Dでは約 ${progressiveStepText(d.steps)}です。壁から影先端まで歩いて、だいたい同じか確認します。` : d.reason;
         markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>いまの影を歩数で確認</strong></span></div><div class="pf-shadow-time-note">${message}</div><div class="pf-quick-row">${quickActionButton('shadow-time-confirm','合っている','good')}${quickActionButton('shadow-time-adjust','壁を調整')}</div><div class="pf-quick-row">${quickActionButton('shadow-time-back','戻る')}</div>`;
+      } else if (phase === 'shadow-target-intro') {
+        markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>ここへ影</strong></span></div><div class="pf-shadow-time-note">壁Aの根元から、影を置きたい位置まで歩きます。歩いた数だけを次に入れます。</div><div class="pf-quick-row">${quickActionButton('shadow-target-measured','歩いた → 歩数を入れる','primary')}${quickActionButton('shadow-time-back','戻る')}</div>`;
       } else if (phase === 'shadow-time-target') {
         const state = fieldFlow.shadowTime;
         const target = state ? state.targetSteps : 0;
-        markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>影が何歩なら撮りやすい？</strong></span></div><div class="pf-quick-stepper">${quickActionButton('shadow-time-minus','−')}<span class="pf-stepper-value">${target.toFixed(1)}歩</span>${quickActionButton('shadow-time-plus','＋')}</div><div class="pf-shadow-time-note">目安：${target.toFixed(1)}歩の前後 約${SHADOW_TIME_TOLERANCE_STEPS.toFixed(1)}歩　選択時刻から45分を探します</div><div class="pf-quick-row">${quickActionButton('shadow-time-search','次の45分を探す','primary')}${quickActionButton('shadow-time-back','戻る')}</div>`;
+        const targetFirst = state && state.source === 'target-first';
+        const title = targetFirst ? '壁Aから何歩の位置に影？' : '影が何歩なら撮りやすい？';
+        const direction = state && state.direction;
+        const directionRow = targetFirst ? `<div class="pf-quick-row"><span class="pf-shadow-time-note">方向も測ると、届きにくい場所を確認できます</span>${quickActionButton('shadow-target-direction','届くかも確認')}</div>` : '';
+        markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>${title}</strong></span></div><div class="pf-quick-stepper">${quickActionButton('shadow-time-minus','−')}<span class="pf-stepper-value">${target.toFixed(1)}歩</span>${quickActionButton('shadow-time-plus','＋')}</div><div class="pf-shadow-time-note">目安：${target.toFixed(1)}歩の前後 約${SHADOW_TIME_TOLERANCE_STEPS.toFixed(1)}歩　選択時刻から45分を探します</div>${direction && direction.status === 'stable' ? `<div class="pf-quick-row"><span class="pf-direction-quality">${progressiveDirectionLabel(direction)}</span></div>` : ''}${directionRow}<div class="pf-quick-row">${quickActionButton('shadow-time-search','次の45分を探す','primary')}${quickActionButton('shadow-time-back','戻る')}</div>`;
+      } else if (phase === 'shadow-target-direction') {
+        const state = fieldFlow.shadowTime, direction = state && state.direction;
+        if (direction && direction.status === 'measuring') {
+          markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>方向を確認中</strong></span><span class="pf-direction-quality">約1.5秒</span></div><div class="pf-shadow-time-note">理想位置に立ち、スマホを縦に持って上端を壁Aへ向けたまま静止してください。</div>${quickActionButton('shadow-target-cancel-direction','中止')}`;
+        } else if (direction && direction.status === 'stable') {
+          markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>方向を記録しました</strong></span><span class="pf-direction-quality">${progressiveDirectionLabel(direction)}</span></div><div class="pf-shadow-time-note">距離と方向の両方で、次の45分を探します。</div><div class="pf-quick-row">${quickActionButton('shadow-target-search-direction','この方向で探す','primary')}${quickActionButton('shadow-target-direction','測り直す')}</div><div class="pf-quick-row">${quickActionButton('shadow-target-distance','方向を使わない')}</div>`;
+        } else {
+          const reason = direction && direction.reason ? direction.reason : '方向センサーを使って到達可能性を確認します。';
+          markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>届くかも確認</strong></span><span class="pf-direction-quality warn">${progressiveDirectionLabel(direction) || '任意'}</span></div><div class="pf-shadow-time-note">${reason}<br>理想位置に立ち、スマホを縦に持って上端を壁Aへ向けます。</div><div class="pf-quick-row">${quickActionButton('shadow-target-direction','方向を記録','primary')}${quickActionButton('shadow-target-distance','方向を使わない')}</div><div class="pf-quick-row">${quickActionButton('shadow-time-back','戻る')}</div>`;
+        }
       } else if (phase === 'shadow-time-result') {
         const state = fieldFlow.shadowTime;
         const result = state && state.result;
-        if (result) {
+        const reachability = state && state.reachability;
+        if (reachability && reachability.hardMiss) {
+          const nearest = reachability.directionClosest;
+          markup = `<div class="pf-shadow-reach-warning"><strong>この45分では影がこの位置を通りにくい</strong>方向が最も近い：${fieldVerifyTimeText(nearest.minute)}ごろ／目安から約${Math.round(nearest.directionDelta)}°ずれます。距離は約${nearest.steps.toFixed(1)}歩です。</div><div class="pf-shadow-time-note">待つより、壁の向きか影を置く位置を変える方が早い可能性があります。</div><div class="pf-quick-row">${quickActionButton('shadow-target-wall-adjust','壁を調整','primary')}${quickActionButton('shadow-target-remeasure','別の位置を測る')}</div><div class="pf-quick-row">${quickActionButton('shadow-time-check-real','最接近を実影で見る')}${quickActionButton('shadow-time-back','戻る')}</div>`;
+        } else if (result) {
           const until = Math.max(0, result.startMinute - +$('time-range').value);
-          markup = `<div class="pf-shadow-time-result"><strong>${progressiveShadowTimeWindowLabel(result)} に ${state.targetSteps.toFixed(1)}歩前後</strong>最も近い：${fieldVerifyTimeText(result.closestMinute)}ごろ（約${result.closestSteps.toFixed(1)}歩）${progressiveIsNow() ? `　いまから約${until}分` : ''}</div><div class="pf-shadow-time-note">壁Aの予測です。建物・樹木・雲の影は候補時刻に実際に確認します。</div><div class="pf-quick-row">${quickActionButton('shadow-time-save','この時間を留める','good')}${quickActionButton('shadow-time-check-real','実影を確認','primary')}</div><div class="pf-quick-row">${quickActionButton('shadow-time-retarget','目標歩数を変える')}${quickActionButton('shadow-time-back','戻る')}</div>`;
+          const directionNote = reachability && reachability.directionClosest ? ` / 方向も合っています` : '';
+          markup = `<div class="pf-shadow-time-result"><strong>${progressiveShadowTimeWindowLabel(result)} に ${state.targetSteps.toFixed(1)}歩前後</strong>最も近い：${fieldVerifyTimeText(result.closestMinute)}ごろ（約${result.closestSteps.toFixed(1)}歩）${directionNote}${progressiveIsNow() ? `　いまから約${until}分` : ''}</div><div class="pf-shadow-time-note">壁Aの予測です。建物・樹木・雲の影は候補時刻に実際に確認します。</div><div class="pf-quick-row">${quickActionButton('shadow-time-save','この時間を留める','good')}${quickActionButton('shadow-time-check-real','実影を確認','primary')}</div><div class="pf-quick-row">${quickActionButton('shadow-time-retarget','目標歩数を変える')}${quickActionButton('shadow-time-back','戻る')}</div>`;
         } else {
           const closest = state && state.closest;
-          const detail = closest ? `最も近いのは${fieldVerifyTimeText(closest.minute)}ごろ（約${closest.steps.toFixed(1)}歩）です。` : '';
-          markup = `<div class="pf-shadow-time-result"><strong>次の45分では目標歩数になりません</strong>${detail}</div><div class="pf-quick-row">${quickActionButton('shadow-time-retarget','目標歩数を変える','primary')}${quickActionButton('shadow-time-back','戻る')}</div>`;
+          const until = closest ? Math.max(0, closest.minute - +$('time-range').value) : 0;
+          const dirText = reachability && reachability.directionClosest && reachability.directionClosest.directionDelta > SHADOW_TARGET_DIRECTION_TOLERANCE_DEG ? ` / 方向は目安から約${Math.round(reachability.directionClosest.directionDelta)}°ずれます` : '';
+          const detail = closest ? `約${closest.steps.toFixed(1)}歩（目標まであと約${closest.delta.toFixed(1)}歩）${dirText}` : '候補を計算できませんでした';
+          markup = `<div class="pf-shadow-time-result"><strong>最も近い：${closest ? fieldVerifyTimeText(closest.minute) + 'ごろ' : '--'}</strong>${detail}${closest && progressiveIsNow() ? `　いまから約${until}分` : ''}</div><div class="pf-shadow-time-note">目標歩数には入らなくても、候補時刻の実影が構図に使えるか確認できます。</div><div class="pf-quick-row">${quickActionButton('shadow-time-save','この時間を留める','good')}${quickActionButton('shadow-time-check-real','実影を確認','primary')}</div><div class="pf-quick-row">${quickActionButton('shadow-time-retarget','目標歩数を変える')}${quickActionButton('shadow-time-back','戻る')}</div>`;
         }
       } else if (phase === 'mismatch') {
         markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>見え方が違う</strong>　順に一つだけ確認します</span></div><div class="pf-quick-grid">${quickActionButton('realign','壁を回す','primary')}${quickActionButton('compass-check','磁気を確認')}${quickActionButton('other','その他')}</div><div class="pf-quick-row"><span class="pf-quick-label">調整後</span>${quickActionButton('compare-again','影をもう一度見る')}</div>`;
@@ -4759,6 +4891,12 @@ const HUMAN_PARTS = [
         if (started.ok) fieldFlow.phase = 'shadow-time-check';
         else { fieldFlow.completion = { title:'影の時間を探せません', copy:started.reason }; fieldFlow.phase = 'complete'; }
       }
+      else if (action === 'shadow-target') {
+        const started = progressiveStartShadowTime('target-first');
+        if (started.ok) fieldFlow.phase = 'shadow-target-intro';
+        else { fieldFlow.completion = { title:'ここへ影を探せません', copy:started.reason }; fieldFlow.phase = 'complete'; }
+      }
+      else if (action === 'shadow-target-measured') { if (fieldFlow.shadowTime) fieldFlow.phase = 'shadow-time-target'; }
       else if (action === 'shadow-time-confirm') { if (fieldFlow.shadowTime) fieldFlow.phase = 'shadow-time-target'; }
       else if (action === 'shadow-time-adjust') { progressiveInvalidateShadowTime(); fieldFlow.referenceStamp = null; fieldFlow.compareResult = 'none'; fieldFlow.quickTool = 'none'; fieldFlow.phase = 'align'; }
       else if (action === 'shadow-time-minus' && fieldFlow.shadowTime) { fieldFlow.shadowTime.targetSteps = Math.max(0.5, +(fieldFlow.shadowTime.targetSteps - 0.5).toFixed(1)); fieldFlow.shadowTime.result = null; fieldFlow.shadowTime.saved = false; }
@@ -4768,8 +4906,14 @@ const HUMAN_PARTS = [
         if (searched.ok) fieldFlow.phase = 'shadow-time-result';
         else { fieldFlow.completion = { title:'影の時間を探せません', copy:searched.reason }; fieldFlow.phase = 'complete'; }
       }
+      else if (action === 'shadow-target-direction') { progressiveBeginShadowTargetDirection(); fieldFlow.phase = 'shadow-target-direction'; }
+      else if (action === 'shadow-target-cancel-direction') { stopShadowTargetDirectionCapture(); if (fieldFlow.shadowTime) fieldFlow.shadowTime.direction = null; fieldFlow.phase = 'shadow-time-target'; }
+      else if (action === 'shadow-target-distance') { if (fieldFlow.shadowTime) fieldFlow.shadowTime.direction = null; const searched = progressiveSearchShadowTime(); if (searched.ok) fieldFlow.phase = 'shadow-time-result'; else { fieldFlow.completion = { title:'影の時間を探せません', copy:searched.reason }; fieldFlow.phase = 'complete'; } }
+      else if (action === 'shadow-target-search-direction') { const searched = progressiveSearchShadowTime(); if (searched.ok) fieldFlow.phase = 'shadow-time-result'; else { fieldFlow.completion = { title:'影の時間を探せません', copy:searched.reason }; fieldFlow.phase = 'complete'; } }
+      else if (action === 'shadow-target-wall-adjust') { progressiveInvalidateShadowTime(); fieldFlow.referenceStamp = null; fieldFlow.compareResult = 'none'; fieldFlow.phase = 'align'; }
+      else if (action === 'shadow-target-remeasure') { const started = progressiveStartShadowTime('target-first'); if (started.ok) fieldFlow.phase = 'shadow-target-intro'; }
       else if (action === 'shadow-time-retarget') { if (fieldFlow.shadowTime) { fieldFlow.shadowTime.result = null; fieldFlow.shadowTime.saved = false; fieldFlow.phase = 'shadow-time-target'; } }
-      else if (action === 'shadow-time-save') { if (fieldFlow.shadowTime && fieldFlow.shadowTime.result) { fieldFlow.shadowTime.saved = true; progressiveComplete('影の候補を留めました', `${progressiveShadowTimeWindowLabel(fieldFlow.shadowTime.result)}に${fieldFlow.shadowTime.targetSteps.toFixed(1)}歩前後です。候補時刻に実影を確認してください。`); } }
+      else if (action === 'shadow-time-save') { if (fieldFlow.shadowTime && (fieldFlow.shadowTime.result || fieldFlow.shadowTime.closest)) { const state = fieldFlow.shadowTime; state.saved = true; const label = progressiveShadowTimeCandidateLabel(state); const detail = state.result ? `${state.targetSteps.toFixed(1)}歩前後` : `約${state.closest.steps.toFixed(1)}歩（目標まで約${state.closest.delta.toFixed(1)}歩）`; progressiveComplete('影の候補を留めました', `${label}に${detail}です。候補時刻に実影を確認してください。`); } }
       else if (action === 'shadow-time-check-real') { fieldFlow.compareResult = 'none'; fieldFlow.phase = 'compare'; }
       else if (action === 'shadow-time-back') { fieldFlow.phase = 'steps'; }
       else if (action === 'verify') $('pf-steps-detail-btn').click();
@@ -4845,7 +4989,7 @@ const HUMAN_PARTS = [
         return;
       }
       if (e.target.closest('[data-q-context="shadow-time"]')) {
-        if (progressiveShadowTimeContextValid() && fieldFlow.shadowTime.result) {
+        if (progressiveShadowTimeContextValid() && (fieldFlow.shadowTime.result || fieldFlow.shadowTime.closest)) {
           fieldFlow.phase = 'shadow-time-result';
           renderProgressiveFlow();
         }
