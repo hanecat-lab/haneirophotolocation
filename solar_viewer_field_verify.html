@@ -502,7 +502,7 @@
       <span id="sun-info">太陽: --</span>
       <span class="info-row-right">
         <button id="vf-level-toggle-btn" type="button" title="画面を水平に保つためのガイド" aria-pressed="false">水平ガイド OFF</button>
-        <span id="version-display">v5.73 最終改善</span>
+        <span id="version-display">v5.74 方位補正</span>
       </span>
     </div>
     <div class="sun-times" id="sun-times">日の出 --:-- ・ 日の入り --:--</div>
@@ -2650,10 +2650,13 @@ const HUMAN_PARTS = [
     // 局所的な磁気擾乱（鉄筋・車・磁石）も同時に打ち消せる。
     const CALIB_STORAGE_KEY = 'shadow-sim-calib';
     let headingOffset = 0, calibratedAt = null;
+    // 影を使った校正は、その場で明示的に実行した時だけ磁気連動へ使う。
+    // 以前の現場で保存した補正を次の現場へ自動適用すると、北が90°など大きくずれる原因になる。
+    let applyShadowCalibrationToCompass = false;
 
     function saveCalibration() {
       localStorage.setItem(CALIB_STORAGE_KEY, JSON.stringify({
-        headingOffset, at: calibratedAt, lat: LAT, lon: LON
+        headingOffset, at: calibratedAt, lat: LAT, lon: LON, version: 2
       }));
     }
 
@@ -2663,13 +2666,15 @@ const HUMAN_PARTS = [
       try {
         const d = JSON.parse(raw);
         if (Number.isFinite(d.headingOffset)) { headingOffset = d.headingOffset; calibratedAt = d.at || null; }
+        // 保存済み校正は参考情報として残すが、新しい現場の磁気連動には自動で足さない。
+        applyShadowCalibrationToCompass = false;
       } catch (e) {
         console.error('[calib] 校正データの読み込みに失敗しました', e);
       }
     }
 
     function clearCalibration() {
-      headingOffset = 0; calibratedAt = null;
+      headingOffset = 0; calibratedAt = null; applyShadowCalibrationToCompass = false;
       localStorage.removeItem(CALIB_STORAGE_KEY);
       updateCalibUI();
     }
@@ -2683,8 +2688,9 @@ const HUMAN_PARTS = [
       btn.textContent = sunState.aboveHorizon ? '☀ 実際の影に合わせる' : '☀ 校正不可（太陽が地平線下）';
       if (calibratedAt) {
         const t = new Date(calibratedAt);
-        info.innerHTML = `校正済み ${t.getMonth() + 1}/${t.getDate()} ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`
-          + ` (${headingOffset >= 0 ? '+' : ''}${headingOffset.toFixed(1)}°)`
+        const useLabel = applyShadowCalibrationToCompass ? 'この現場で磁気連動へ適用中' : '保存済み（磁気連動へは未適用）';
+        info.innerHTML = `影校正 ${t.getMonth() + 1}/${t.getDate()} ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`
+          + ` (${headingOffset >= 0 ? '+' : ''}${headingOffset.toFixed(1)}°／${useLabel})`
           + `<button onclick="clearCalibration()">破棄</button>`;
         info.classList.add('calibrated');
       } else {
@@ -2703,6 +2709,8 @@ const HUMAN_PARTS = [
       if (targetHeading !== null) {
         headingOffset = ((shadowAz - targetHeading + 540) % 360) - 180;
         calibratedAt = new Date().toISOString();
+        // 現在地・現在姿勢で実行した場合だけ、影校正を磁気連動に反映する。
+        applyShadowCalibrationToCompass = true;
         smoothHeading = null;   // 補間を新しい基準へ引き直す
         saveCalibration();
       }
@@ -2716,6 +2724,29 @@ const HUMAN_PARTS = [
         DeviceOrientationEvent.requestPermission().then(res => { if (res === 'granted') startCompass(); });
       } else startCompass();
     }
+
+    // DeviceOrientation の alpha だけは、端末を平らに置いた時の見出しとしては使えるが、
+    // スマホを縦に構えると「画面上端の方位」から90°ずれる。webkitCompassHeading が無い
+    // Android等では、alpha・beta・gamma から画面上端の水平投影を求める。
+    function deviceHeadingFromOrientation(e) {
+      const nativeHeading = Number(e.webkitCompassHeading);
+      if (Number.isFinite(nativeHeading)) return norm(nativeHeading);
+
+      const alpha = Number(e.alpha), beta = Number(e.beta), gamma = Number(e.gamma);
+      if (!Number.isFinite(alpha)) return NaN;
+      if (!Number.isFinite(beta) || !Number.isFinite(gamma)) return norm(360 - alpha);
+
+      const rad = Math.PI / 180;
+      const x = beta * rad, y = gamma * rad, z = alpha * rad;
+      const cX = Math.cos(x), cY = Math.cos(y), cZ = Math.cos(z);
+      const sX = Math.sin(x), sY = Math.sin(y), sZ = Math.sin(z);
+      // W3CのZ-X'-Y''回転から、画面上端(+Y)の地面への投影を得る。
+      const vX = -cZ * sY - sZ * sX * cY;
+      const vY = -sZ * sY + cZ * sX * cY;
+      if (Math.hypot(vX, vY) < 1e-6) return norm(360 - alpha); // 端末が水平なら従来のalpha式
+      return norm(Math.atan2(vX, vY) / rad);
+    }
+
     function compassStatus() {
       if (!isCompassActive) return { key: 'off', label: '磁気連動 OFF' };
       if (compassStability === 'unstable') return { key: 'check', label: '磁気を確認' };
@@ -2767,9 +2798,9 @@ const HUMAN_PARTS = [
       compassSamples = [];
       compassStability = 'checking';
       compassHandler = e => {
-        // 0（真北）を捨てないよう Number.isFinite で判定する
-        let hd = Number.isFinite(e.webkitCompassHeading) ? e.webkitCompassHeading
-               : (Number.isFinite(e.alpha) ? 360 - e.alpha : NaN);
+        // 0（真北）を捨てないよう Number.isFinite で判定する。
+        // 縦持ちではalpha単独を使わず、画面上端の方位へ変換する。
+        const hd = deviceHeadingFromOrientation(e);
         if (!Number.isFinite(hd)) return;
         targetHeading = norm(hd);
         recordCompassSample(targetHeading);
@@ -2816,10 +2847,10 @@ const HUMAN_PARTS = [
       const sB = Math.sin(b * R), cB = Math.cos(b * R), sG = Math.sin(g * R), cG = Math.cos(g * R);
       const tilt = Math.acos(Math.min(1, Math.max(-1, cB * cG))) * 180 / Math.PI;
       const rel = Math.atan2(sG, -sB * cG) * 180 / Math.PI;
-      // 方位の取り方は startCompass と同じ。太陽校正で学習した offset を足して真方位にする
-      const hd = Number.isFinite(e.webkitCompassHeading) ? e.webkitCompassHeading
-               : (Number.isFinite(e.alpha) ? 360 - e.alpha : NaN);
-      return { tilt, az: Number.isFinite(hd) ? norm(rel + hd + headingOffset) : null };
+      // 方位の取り方は startCompass と同じ。縦持ちでも画面上端を基準にする。
+      const hd = deviceHeadingFromOrientation(e);
+      const correction = applyShadowCalibrationToCompass ? headingOffset : 0;
+      return { tilt, az: Number.isFinite(hd) ? norm(rel + hd + correction) : null };
     }
 
     function showLevelNote(msg) {
@@ -3246,8 +3277,9 @@ const HUMAN_PARTS = [
       // 磁気センサーの生値は毎フレーム跳ねるので、最短回り方向へ補間して反映する。
       // 60fps基準で従来と同じ追従速度になるよう、フレームレートに依らない指数減衰にする。
       if (isCompassActive && targetHeading !== null) {
-        // 太陽で学習したオフセットを生値に足してから補間する
-        const corrected = norm(targetHeading + headingOffset);
+        // 磁気連動は端末の現在の方位を基準にする。影校正は、その場で明示的に実行した時だけ加える。
+        const correction = applyShadowCalibrationToCompass ? headingOffset : 0;
+        const corrected = norm(targetHeading + correction);
         if (smoothHeading === null) smoothHeading = corrected;
         const diff = ((corrected - smoothHeading + 540) % 360) - 180;
         const factor = 1 - Math.pow(0.85, dt * 60);
@@ -3362,7 +3394,7 @@ const HUMAN_PARTS = [
       if (session.wall !== wall || !fieldVerifySameWall(session.wallSnapshot, fieldVerifyWallSnapshot(wall))) return { kind: 'invalid', reason: '壁の位置・向き・大きさが変わりました' };
       if (session.date !== fieldVerifyDateKey() || Math.abs(session.lat - LAT) > 1e-7 || Math.abs(session.lon - LON) > 1e-7) return { kind: 'invalid', reason: '日付または地点が変わりました' };
       if (session.groundType !== groundPlane.type) return { kind: 'invalid', reason: '地面状態が変わりました' };
-      if (session.headingOffset !== headingOffset || session.calibratedAt !== calibratedAt || session.worldHeading !== +worldRoot.getAttribute('rotation').y) return { kind: 'invalid', reason: '方位設定が変わりました' };
+      if (session.headingOffset !== headingOffset || session.calibratedAt !== calibratedAt || session.applyShadowCalibrationToCompass !== applyShadowCalibrationToCompass || session.worldHeading !== +worldRoot.getAttribute('rotation').y) return { kind: 'invalid', reason: '方位設定が変わりました' };
       if (Date.now() - session.confirmedAt > FIELD_VERIFY_STALE_MS) return { kind: 'stale', reason: '照合から45分経過：方向を再確認してください' };
       return { kind: 'valid' };
     }
@@ -3453,7 +3485,7 @@ const HUMAN_PARTS = [
         wall,
         wallSnapshot: fieldVerifyWallSnapshot(wall),
         date: fieldVerifyDateKey(), lat: LAT, lon: LON, groundType: groundPlane.type,
-        headingOffset, calibratedAt, worldHeading: +worldRoot.getAttribute('rotation').y,
+        headingOffset, calibratedAt, applyShadowCalibrationToCompass, worldHeading: +worldRoot.getAttribute('rotation').y,
         confirmedAt: Date.now(), shadowAz: norm(sunState.azDeg + 180),
         label: (labelInput.value || '').trim() || defaultLabel
       };
@@ -4306,7 +4338,7 @@ const HUMAN_PARTS = [
       let markup = '';
 
       if (fieldFlow.compassGuideActive && isCompassActive) {
-        markup = `<div class="pf-quick-row"><span class="pf-quick-label pf-compass-guide"><strong>磁気連動 ON</strong>　スマホ上端を壁と同じ向きへ</span></div>`;
+        markup = `<div class="pf-quick-row"><span class="pf-quick-label pf-compass-guide"><strong>磁気連動 ON</strong>　スマホを縦に持ち、上端を壁と同じ向きへ</span></div>`;
       } else if (phase === 'needs-wall') {
         markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>壁を置く</strong>　影を見たい壁の位置をタップ</span>${quickActionButton('place','＋ 壁','primary')}</div>`;
       } else if (phase === 'placing') {
