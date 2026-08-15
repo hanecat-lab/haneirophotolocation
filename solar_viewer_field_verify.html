@@ -234,8 +234,9 @@
       background: rgba(9,20,25,.86); border: 1px solid rgba(120,200,196,.28); border-radius: 13px;
       backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
     .sight-top b { flex: 1; font-size: 14px; font-weight: 800; color: #e2f2f2; }
-    #sight-close { flex: 0 0 auto; min-width: 30px; min-height: 30px; padding: 2px 8px; border-radius: 8px;
-      border: 1px solid rgba(120,200,196,.28); background: rgba(255,255,255,.05); color: #e2f2f2; font-size: 15px; cursor: pointer; }
+    /* 屋外で片手で確実に押せるよう、閉じるは44px角を確保する */
+    #sight-close { flex: 0 0 auto; min-width: 44px; min-height: 44px; padding: 2px 8px; border-radius: 10px;
+      border: 1px solid rgba(120,200,196,.28); background: rgba(255,255,255,.05); color: #e2f2f2; font-size: 18px; cursor: pointer; }
     #sight-hint { margin-top: 9px; padding: 9px 12px; font-size: 12.5px; line-height: 1.5; color: #e2f2f2;
       background: rgba(9,20,25,.86); border: 1px solid rgba(120,200,196,.28); border-radius: 11px;
       backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
@@ -4357,27 +4358,41 @@ const HUMAN_PARTS = [
     //
     // 構え: 既存のコンパスと同じ「地図のように持ち、上端を目標へ向ける」流儀。このとき
     // 背面カメラは地面を向くが、上端の方位と視線方位は同じ鉛直面内なので方位は一致する。
+    // 構えの判定はヒステリシスを持たせる。閾値ちょうどで判定が往復すると、指を置いている
+    // 間にボタンの disabled が切り替わってタップが取り消される
     const SIGHT_TOP_HORIZ_MIN = 0.45;   // 上端の水平成分。これ未満は立てすぎで方位が求まらない
+    const SIGHT_TOP_HORIZ_EXIT = 0.40;  // 一度OKになった後、ここを割るまではOKを保つ
     const SIGHT_TWIST_MAX = 0.20;       // 右端の鉛直成分 = sin(ねじれ角)。約11.5°まで許容
+    const SIGHT_TWIST_EXIT = 0.24;
     const SIGHT_MATCH_DEG = 3;          // これ未満は一致とみなし校正を勧めない
     const SIGHT_LARGE_DEG = 30;         // これ以上は磁気の乱れや日時・現在地も疑う
     const SIGHT_REVERSED_DEG = 150;     // これ以上は矢印を逆に向けた可能性が高い
     const SIGHT_RECENT_MS = 1500;
+    const SIGHT_UI_INTERVAL_MS = 160;   // 照準中の表示更新。生値は参考なので毎フレーム要らない
 
     let sight = {
       open: false, phase: 'aim', stream: null, handler: null, eventName: null,
-      recent: [], capture: null, timer: null, posture: null, live: null, result: null
+      recent: [], capture: null, timer: null, posture: null, live: null, result: null,
+      issue: null, postureOk: false, builtPhase: null, arrowTone: null, lastUiAt: 0
     };
 
+    // 毎フレーム作り直すとGCが増えるので使い回す
+    const _sightEuler = new THREE.Euler();
+    const _sightUp = new THREE.Vector3();
+    const _sightRight = new THREE.Vector3();
+
     function sightPostureFrom(e) {
+      // 値の入っていない deviceorientation が届くことがある。Number(null) は 0 になるため、
+      // null/undefined を先に弾かないと「beta=0, gamma=0 の正しい構え」と誤判定する
+      if (e.beta == null || e.gamma == null) return null;
       const beta = Number(e.beta), gamma = Number(e.gamma);
       if (!Number.isFinite(beta) || !Number.isFinite(gamma)) return null;
       const R = Math.PI / 180;
-      const eul = new THREE.Euler(beta * R, gamma * R, (Number(e.alpha) || 0) * R, 'ZXY');
+      _sightEuler.set(beta * R, gamma * R, (Number(e.alpha) || 0) * R, 'ZXY');
       // deviceorientation の枠は Z が鉛直上向き
-      const up = new THREE.Vector3(0, 1, 0).applyEuler(eul);     // 端末の上端
-      const right = new THREE.Vector3(1, 0, 0).applyEuler(eul);  // 端末の右端
-      return { topHoriz: Math.hypot(up.x, up.y), twist: Math.abs(right.z) };
+      _sightUp.set(0, 1, 0).applyEuler(_sightEuler);      // 端末の上端
+      _sightRight.set(1, 0, 0).applyEuler(_sightEuler);   // 端末の右端
+      return { topHoriz: Math.hypot(_sightUp.x, _sightUp.y), twist: Math.abs(_sightRight.z) };
     }
 
     // 照準中に転がしておく直近の値。生値は常に揺れるので、磁気の安定判定にだけ使う
@@ -4401,68 +4416,126 @@ const HUMAN_PARTS = [
     function sightSignedDelta(a, b) { return ((a - b + 540) % 360) - 180; }
 
     function sightOnOrientation(e) {
-      const heading = deviceHeadingFromOrientation(e);
-      const posture = sightPostureFrom(e);
-      sight.posture = posture;
-      if (Number.isFinite(heading)) {
-        sight.live = heading;
-        sightRecordRecent(heading, Number(e.webkitCompassAccuracy));
-        if (sight.capture) sight.capture.samples.push({ heading, accuracy: Number(e.webkitCompassAccuracy) });
+      sight.posture = sightPostureFrom(e);
+      // 姿勢が読めたイベントだけを有効扱いにする。空のイベントで方位を拾うと、
+      // 実際には測れていないのに 0° を測ったことにしてしまう
+      if (sight.posture) {
+        if (sight.sensorTimer) { window.clearTimeout(sight.sensorTimer); sight.sensorTimer = null; }
+        sight.sensorMissing = null;
+        const heading = deviceHeadingFromOrientation(e);
+        if (Number.isFinite(heading)) {
+          sight.live = heading;
+          sightRecordRecent(heading, Number(e.webkitCompassAccuracy));
+          if (sight.capture) sight.capture.samples.push({ heading, accuracy: Number(e.webkitCompassAccuracy) });
+        }
       }
+      sightEvaluatePosture();
       // 構えが崩れたら測定を中断する。平均に姿勢の違う値が混ざるのを防ぐ
-      if (sight.capture && !sightPostureOk()) sightCancelCapture('構えが崩れました。もう一度測ってください');
-      if (sight.phase === 'aim') sightRenderPanel();
+      if (sight.capture && !sight.postureOk) sightCancelCapture('構えが崩れました。もう一度測ってください');
+      if (sight.phase === 'aim') sightUpdateAim();
     }
 
-    function sightPostureOk() {
+    function sightEvaluatePosture() {
       const p = sight.posture;
-      return !!p && p.topHoriz >= SIGHT_TOP_HORIZ_MIN && p.twist <= SIGHT_TWIST_MAX;
-    }
-    function sightPostureIssue() {
-      const p = sight.posture;
-      if (!p) return { key: 'none', chip: '構え 判定中', hint: '端末の傾きを取得しています。' };
-      if (p.topHoriz < SIGHT_TOP_HORIZ_MIN) return { key: 'upright', chip: '構え 立てすぎ', hint: 'スマホを立てすぎています。もっと地面へ向けてください。' };
-      if (p.twist > SIGHT_TWIST_MAX) return { key: 'twist', chip: '構え ねじれ', hint: 'スマホが傾いています。左右の傾きを戻してください。' };
-      return null;
-    }
-
-    function sightRenderPanel() {
-      const panel = $('sight-panel'), hint = $('sight-hint');
-      if (!panel) return;
-      if (sight.phase === 'result') { sightRenderResult(); return; }
-      $('sight-overlay').classList.remove('camera-off');
-
-      if (sight.phase === 'capturing') {
-        hint.className = '';
-        hint.textContent = 'この向きのまま、スマホを動かさないでください。';
-        panel.innerHTML = `<div class="sight-capturing">
-            <svg class="sight-ring" viewBox="0 0 40 40" aria-hidden="true"><circle class="trk" cx="20" cy="20" r="17"/><circle class="bar" cx="20" cy="20" r="17"/></svg>
-            <div class="sight-cap-txt">動かさないでください<small>平均を取っています</small></div>
-          </div>
-          <button class="sight-btn ghost" type="button" data-sight="cancel-capture">中止</button>`;
+      if (!p) {
+        sight.issue = { key: 'none', chip: '構え 判定中', hint: '端末の傾きを取得しています。' };
+        sight.postureOk = false;
         return;
       }
+      const topMin = sight.postureOk ? SIGHT_TOP_HORIZ_EXIT : SIGHT_TOP_HORIZ_MIN;
+      const twistMax = sight.postureOk ? SIGHT_TWIST_EXIT : SIGHT_TWIST_MAX;
+      if (p.topHoriz < topMin) sight.issue = { key: 'upright', chip: '構え 立てすぎ', hint: 'スマホを立てすぎています。もっと地面へ向けてください。' };
+      else if (p.twist > twistMax) sight.issue = { key: 'twist', chip: '構え ねじれ', hint: 'スマホが傾いています。左右の傾きを戻してください。' };
+      else sight.issue = null;
+      sight.postureOk = !sight.issue;
+    }
+    function sightPostureOk() { return sight.postureOk; }
 
-      const issue = sightPostureIssue();
-      const magOk = sightMagneticStable();
-      const arrow = $('sight-arrow');
-      if (arrow) {
+    // 照準中の表示更新。方位センサーは毎秒60回ほど発火するので、ここで innerHTML を
+    // 作り直すと指を離す前にボタン要素が別物へ入れ替わり、タップが成立しなくなる
+    // （backdrop-filter付きの再生成でメインスレッドも飽和する）。既にある要素の
+    // 文字と状態だけを書き換え、組み立ては段階が変わった時だけ行う。
+    function sightUpdateAim() {
+      const now = Date.now();
+      if (now - sight.lastUiAt < SIGHT_UI_INTERVAL_MS) return;
+      sight.lastUiAt = now;
+      const issue = sight.issue, magOk = sightMagneticStable();
+
+      const arrow = $('sight-arrow'), tone = issue ? 'warn' : 'ok';
+      if (arrow && sight.arrowTone !== tone) {
         arrow.setAttribute('stroke', issue ? '#e6b264' : '#5fd9cb');
         arrow.setAttribute('opacity', issue ? '0.55' : '0.95');
+        sight.arrowTone = tone;
       }
-      hint.className = issue || !magOk ? 'warn' : '';
-      hint.textContent = issue ? issue.hint
-        : (magOk ? 'スマホを地面へ向けて構え、矢印の先を影の先端（壁から遠い側）へ重ねてください。'
-                 : '磁気が安定しません。金属や機器から離れて測ってください。');
+
+      const hint = $('sight-hint');
+      const hintText = sight.sensorMissing ? sight.sensorMissing
+        : (issue ? issue.hint
+          : (magOk ? 'スマホを地面へ向けて構え、矢印の先を影の先端（壁から遠い側）へ重ねてください。'
+                   : '磁気が安定しません。金属や機器から離れて測ってください。'));
+      if (hint && hint.textContent !== hintText) {
+        hint.textContent = hintText;
+        hint.className = (sight.sensorMissing || issue || !magOk) ? 'warn' : '';
+      }
+
+      const chipP = $('sight-chip-posture'), chipM = $('sight-chip-mag'),
+            live = $('sight-live-value'), btn = $('sight-measure-btn');
+      if (!chipP || !chipM || !live || !btn) return;
+
+      const chipPText = issue ? issue.chip : '構え OK';
+      if (chipP.textContent !== chipPText) chipP.textContent = chipPText;
+      chipP.classList.toggle('warn', !!issue);
+      chipP.classList.toggle('good', !issue);
+
+      const chipMText = magOk ? '磁気 安定' : '磁気 不安定';
+      if (chipM.textContent !== chipMText) chipM.textContent = chipMText;
+      chipM.classList.toggle('warn', !magOk);
+      chipM.classList.toggle('good', magOk);
 
       const liveText = (issue || !Number.isFinite(sight.live))
         ? '— — —'
         : `${Math.round(norm(sight.live + sightEffectiveOffset()))}° ${getDirName(norm(sight.live + sightEffectiveOffset()))}`;
-      const chips = `<span class="sight-chip ${issue ? 'warn' : 'good'}">${issue ? issue.chip : '構え OK'}</span>`
-        + `<span class="sight-chip ${magOk ? 'good' : 'warn'}">${magOk ? '磁気 安定' : '磁気 不安定'}</span>`;
-      panel.innerHTML = `<div class="sight-chips">${chips}</div>
-        <div class="sight-live"><span>実測中</span><b>${liveText}</b></div>
-        <button class="sight-btn ${magOk ? '' : 'amber'}" type="button" data-sight="measure" ${issue ? 'disabled' : ''}>${magOk ? 'この向きで測る' : 'それでも測る'}</button>`;
+      if (live.textContent !== liveText) live.textContent = liveText;
+
+      const label = magOk ? 'この向きで測る' : 'それでも測る';
+      if (btn.textContent !== label) btn.textContent = label;
+      btn.classList.toggle('amber', !magOk);
+      if (btn.disabled !== !!issue) btn.disabled = !!issue;
+    }
+
+    function sightRenderPanel() {
+      const panel = $('sight-panel');
+      if (!panel) return;
+      if (sight.phase === 'result') { sight.builtPhase = 'result'; sightRenderResult(); return; }
+      $('sight-overlay').classList.remove('camera-off');
+
+      if (sight.builtPhase !== sight.phase) {
+        if (sight.phase === 'capturing') {
+          panel.innerHTML = `<div class="sight-capturing">
+              <svg class="sight-ring" viewBox="0 0 40 40" aria-hidden="true"><circle class="trk" cx="20" cy="20" r="17"/><circle class="bar" cx="20" cy="20" r="17"/></svg>
+              <div class="sight-cap-txt">動かさないでください<small>平均を取っています</small></div>
+            </div>
+            <button class="sight-btn ghost" type="button" data-sight="cancel-capture">中止</button>`;
+        } else {
+          panel.innerHTML = `<div class="sight-chips">
+              <span class="sight-chip" id="sight-chip-posture">構え 判定中</span>
+              <span class="sight-chip good" id="sight-chip-mag">磁気 安定</span>
+            </div>
+            <div class="sight-live"><span>実測中</span><b id="sight-live-value">— — —</b></div>
+            <button class="sight-btn" type="button" data-sight="measure" id="sight-measure-btn" disabled>この向きで測る</button>`;
+        }
+        sight.builtPhase = sight.phase;
+        sight.arrowTone = null;
+        sight.lastUiAt = 0;
+      }
+
+      if (sight.phase === 'capturing') {
+        const hint = $('sight-hint');
+        hint.className = '';
+        hint.textContent = 'この向きのまま、スマホを動かさないでください。';
+      } else {
+        sightUpdateAim();
+      }
     }
 
     function sightRenderResult() {
@@ -4576,15 +4649,29 @@ const HUMAN_PARTS = [
       $('sight-overlay').classList.add('camera-off');
     }
 
+    // センサーが一度も来ない端末・不許可の場合、「構え 判定中」のまま測定ボタンが
+    // 押せない画面に取り残される。理由を出して、閉じる以外の道が無いことを明示する
+    function sightSensorUnavailable(reason) {
+      sight.sensorMissing = reason;
+      const hint = $('sight-hint');
+      if (hint) { hint.className = 'warn'; hint.textContent = reason; }
+    }
     function sightStartOrientation() {
       if (sight.handler) return;
+      sight.sensorMissing = null;
       sight.eventName = ('ondeviceorientationabsolute' in window) ? 'deviceorientationabsolute' : 'deviceorientation';
       sight.handler = e => sightOnOrientation(e);
       window.addEventListener(sight.eventName, sight.handler, true);
+      sight.sensorTimer = window.setTimeout(() => {
+        sight.sensorTimer = null;
+        sightSensorUnavailable('この端末では方位センサーを取得できませんでした。閉じて、方位タブの校正をお使いください。');
+      }, 2500);
     }
     function sightStopOrientation() {
+      if (sight.sensorTimer) { window.clearTimeout(sight.sensorTimer); sight.sensorTimer = null; }
       if (sight.handler) { window.removeEventListener(sight.eventName, sight.handler, true); sight.handler = null; }
       sight.eventName = null;
+      sight.sensorMissing = null;
     }
 
     function sightCameraSupported() { return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia); }
@@ -4593,6 +4680,10 @@ const HUMAN_PARTS = [
       if (!sunState.aboveHorizon) return;
       sight.phase = 'aim';
       sight.result = null; sight.recent = []; sight.capture = null; sight.posture = null; sight.live = null;
+      // builtPhase を消して、開くたびにパネルを組み立て直す
+      sight.builtPhase = null; sight.postureOk = false; sight.arrowTone = null; sight.lastUiAt = 0;
+      // 姿勢が読める前に「構えOK」の案内を出さないよう、判定中から始める
+      sightEvaluatePosture();
       $('sight-overlay').classList.add('on');
       $('sight-overlay').classList.remove('camera-off');
       sightRenderPanel();
@@ -4616,7 +4707,9 @@ const HUMAN_PARTS = [
       };
       sight.open = true;
       if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-        DeviceOrientationEvent.requestPermission().then(res => { if (res === 'granted') begin(); }).catch(() => {});
+        DeviceOrientationEvent.requestPermission()
+          .then(res => { if (res === 'granted') begin(); else sightSensorUnavailable('センサーの使用が許可されませんでした。閉じて、方位タブの校正をお使いください。'); })
+          .catch(() => sightSensorUnavailable('センサーを開始できませんでした。閉じて、方位タブの校正をお使いください。'));
       } else begin();
     }
 
@@ -4630,6 +4723,7 @@ const HUMAN_PARTS = [
     }
 
     $('sight-close').onclick = closeSightView;
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && sight.open) closeSightView(); });
     $('sight-panel').addEventListener('click', e => {
       const btn = e.target.closest('[data-sight]');
       if (!btn) return;
