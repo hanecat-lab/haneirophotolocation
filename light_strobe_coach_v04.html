@@ -25,6 +25,8 @@
     .mode-switch button { padding: 11px 6px; border:0; border-radius: 10px; background:transparent; color: var(--muted); font-weight:800; font-size:12px; }
     .mode-switch button.active { background: #1c4c49; color:#eafff8; box-shadow: inset 0 0 0 1px rgba(122,240,202,.35); }
     .mode-hint { margin:6px 2px 12px; color:var(--muted); font-size:10.5px; line-height:1.5; text-align:center; }
+    .look-switch { grid-template-columns: 1fr 1fr; }
+    .look-switch button { font-size:11px; padding:9px 6px; }
     .grid { display:grid; gap:12px; }
     .card { border:1px solid var(--line); border-radius: var(--radius); background: linear-gradient(145deg, rgba(23,42,47,.96), rgba(13,24,29,.96)); overflow:hidden; margin-top:12px; }
     .card:first-of-type { margin-top:0; }
@@ -164,6 +166,14 @@
       <button data-mode-btn="nowindow" type="button">窓なし</button>
     </nav>
     <p class="mode-hint">外で撮った写真なら屋外、室内で窓の光を使ったなら窓あり、ストロボやLEDだけなら窓なし</p>
+
+    <nav class="mode-switch look-switch" aria-label="狙った光のイメージ">
+      <button class="active" data-look-btn="standard" type="button">標準</button>
+      <button data-look-btn="dramatic" type="button">ドラマチック</button>
+      <button data-look-btn="cinematic" type="button">シネマティック</button>
+      <button data-look-btn="soft" type="button">ふんわり</button>
+    </nav>
+    <p class="mode-hint">狙った雰囲気を選ぶと「次の一手」の目標が切り替わります。選んだあとも比率などの数値は個別に調整できます。</p>
 
     <section class="card">
       <div class="card-head"><h2 class="card-title">1. 写真を取り込む</h2><span class="card-sub">EXIFから自動反映</span></div>
@@ -484,6 +494,7 @@
       // 窓なしは方位に意味がないため cameraBearing を 0 に固定し、key/fill2 は相対角として扱う。
       strobeBearing: 90, keyBearingRel: -45, fill2BearingRel: 45, mapTarget: 'camera',
       strobeUsed: true, // 屋外・窓ありのみ意味を持つ。窓なしは常に人工光前提のため対象外
+      lookPreset: 'standard', // 狙った光のイメージ。standardは既存の固定しきい値と完全一致させる
       estimateArc: null, // 写真から推定したカメラ方位の候補範囲 { ranges:[[from,to]...], label }
       // 窓なしモード専用。光源1つを前提に、設定値と申告位置を持つ。
       // apertureLocked/isoLocked/roomMaxDistanceはユーザーの現在の選好・制約であり、
@@ -505,6 +516,19 @@
       // 助言はこれを基準に計算し、撮り直す前に入力欄だけ変えても指示が発散しないようにする。
       measurementSettings: null, measurementSettings2: null
     };
+    // 狙った光のイメージ別プリセット。3軸（背景差bgTarget/bgTolerance・左右比率ratioMax/
+    // ratioTarget・絶対輝度brightnessBias）の目標値の組み合わせに名前を付けたもの。
+    // standardは既存の固定しきい値（±1.5段・比率上限1.5・フィル比目標1・輝度バイアス無し）
+    // と完全に一致させ、プリセットを選ばない限り挙動が変わらないようにする。
+    // 料理プリセットは対象外（測定パイプラインが顔の左右差・背景差を前提にしており、
+    // 皿・料理を測る仕組みがないため）。
+    const LOOK_PRESETS = {
+      standard:  { label: '標準',         bgTarget: 0,   bgTolerance: 1.5, ratioMax: 1.5, ratioTarget: 1,   brightnessBias: 0 },
+      dramatic:  { label: 'ドラマチック',   bgTarget: 2.0, bgTolerance: 1.0, ratioMax: 3.0, ratioTarget: 2.5, brightnessBias: -0.5 },
+      cinematic: { label: 'シネマティック', bgTarget: 1.0, bgTolerance: 1.2, ratioMax: 2.5, ratioTarget: 2.0, brightnessBias: -0.3 },
+      soft:      { label: 'ふんわり',       bgTarget: 0,   bgTolerance: 1.0, ratioMax: 0.8, ratioTarget: 0.5, brightnessBias: 0.4 },
+    };
+    function currentLook() { return LOOK_PRESETS[state.lookPreset] || LOOK_PRESETS.standard; }
 
     function toLocalInputValue(date) {
       const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
@@ -1156,25 +1180,37 @@
       const lightSide = relative > 5 ? '右' : relative < -5 ? '左' : '正面';
       const shadeSide = relative > 5 ? '左' : relative < -5 ? '右' : '正面';
       const rotFor = side => side === '右' ? 90 : side === '左' ? -90 : 0;
+      const look = currentLook();
+      // diff: 顔-背景差の実測が、狙ったイメージの目標(bgTarget)からどれだけずれているか。
+      // standardはbgTarget=0なので、diffは従来のfaceVsBackgroundとそのまま一致する。
+      const diff = measurement.faceVsBackground - look.bgTarget;
 
       if (measurement.face.clipHigh > 0.05) {
         return { arrow: '↑', rot: rotFor(shadeSide), text: `顔が白飛びしています。${shadeSide}へ半歩下がってください。` };
       }
-      if (measurement.faceVsBackground <= -1.5) {
+      if (diff <= -look.bgTolerance) {
         const fix = state.strobeUsed ? '顔を光の側へ少し向けるか、フィルを足してください。' : '日陰から光の当たる場所へ回るか、反射板で起こしてください。';
-        return { arrow: '↑', rot: rotFor(lightSide), text: `顔が背景より${Math.abs(measurement.faceVsBackground).toFixed(1)}段暗いです。${fix}` };
+        const lead = look.bgTarget === 0 ? '顔が背景より' : `狙い（背景差${look.bgTarget}段）より`;
+        return { arrow: '↑', rot: rotFor(lightSide), text: `${lead}${Math.abs(diff).toFixed(1)}段暗いです。${fix}` };
       }
-      if (measurement.faceSplit >= 1.5) {
+      if (measurement.faceSplit >= look.ratioMax) {
         const darkSide = measurement.brightSide === 'left' ? '右' : '左';
-        return { arrow: '↑', rot: rotFor(darkSide), text: `顔の${darkSide}側だけ暗いです。暗い側へ半歩回り込んでください。` };
+        const note = state.lookPreset === 'standard' ? '' : `（このイメージの上限${look.ratioMax}段）`;
+        return { arrow: '↑', rot: rotFor(darkSide), text: `顔の${darkSide}側だけ暗いです${note}。暗い側へ半歩回り込んでください。` };
       }
       if (measurement.background.clipHigh >= 0.20) {
         return { arrow: '↑', rot: rotFor(shadeSide), text: `背景が白飛びしています。背景を避けて${shadeSide}へ動いてください。` };
       }
-      if (measurement.faceVsBackground >= 1.5) {
-        const text = state.strobeUsed
-          ? '顔が背景より明るすぎます。ストロボの出力を下げてください。'
-          : '背景が暗く沈みます。動ける場所があれば明るい方へ、動けなければ背景の白飛びは気にせず顔基準で撮ってください。';
+      if (diff >= look.bgTolerance) {
+        let text;
+        if (look.bgTarget === 0) {
+          text = state.strobeUsed
+            ? '顔が背景より明るすぎます。ストロボの出力を下げてください。'
+            : '背景が暗く沈みます。動ける場所があれば明るい方へ、動けなければ背景の白飛びは気にせず顔基準で撮ってください。';
+        } else {
+          const over = `狙い（背景差${look.bgTarget}段）より${diff.toFixed(1)}段明るすぎます。`;
+          text = state.strobeUsed ? `${over}ストロボの出力を下げてください。` : `${over}動ける場所があれば背景に近づいてください。`;
+        }
         return { arrow: '↑', rot: 0, text };
       }
       return { arrow: '✓', rot: 0, text: 'このまま撮れます。' };
@@ -1325,7 +1361,9 @@
       if (!state.measurement) return null;
       const gamma = computeGammaEff();
       const faceLum = Math.max(state.measurement.face.luminance, 1e-4);
-      const dEVjpeg = Math.log2(Math.max(state.target.luminance, 1e-4) / faceLum);
+      // 狙ったイメージの明るさバイアス（例：ドラマチックはやや暗め）を目標輝度へ反映する。
+      const effectiveTarget = state.target.luminance * Math.pow(2, currentLook().brightnessBias);
+      const dEVjpeg = Math.log2(Math.max(effectiveTarget, 1e-4) / faceLum);
       const needed = dEVjpeg / gamma.gamma;
       return { gamma, dEVjpeg, needed };
     }
@@ -1641,6 +1679,15 @@
       document.querySelectorAll('[data-mode-btn]').forEach(button => button.classList.toggle('active', button.dataset.modeBtn === mode));
       renderAll();
     }
+    // プリセット選択時は、窓なしモードのフィル比率スライダーの初期値だけ差し替える
+    // （背景灯の目標は既存の選択肢と軸の意味が異なるため触らない）。差し替え後も
+    // スライダー自体は従来通り個別に動かせる。
+    function setLookPreset(name) {
+      state.lookPreset = name;
+      document.querySelectorAll('[data-look-btn]').forEach(button => button.classList.toggle('active', button.dataset.lookBtn === name));
+      $('nw2-target-ratio').value = LOOK_PRESETS[name].ratioTarget;
+      renderAll();
+    }
     $('geo-btn').addEventListener('click', () => {
       if (!navigator.geolocation) { $('geo-status').textContent = 'このブラウザは位置情報に対応していません。手入力で続けてください。'; $('geo-status').className='status warn'; return; }
       $('geo-status').textContent = '位置情報を取得中…'; $('geo-status').className='status';
@@ -1659,6 +1706,7 @@
     document.querySelectorAll('[data-camera-dir]').forEach(button => button.addEventListener('click', () => setCameraBearing(Number(button.dataset.cameraDir))));
     document.querySelectorAll('[data-window-dir]').forEach(button => button.addEventListener('click', () => setWindowBearing(Number(button.dataset.windowDir))));
     document.querySelectorAll('[data-mode-btn]').forEach(button => button.addEventListener('click', () => setMode(button.dataset.modeBtn)));
+    document.querySelectorAll('[data-look-btn]').forEach(button => button.addEventListener('click', () => setLookPreset(button.dataset.lookBtn)));
     // 見取り図の操作。ドラッグ中も追随させるため、pointerdownで捕捉しpointermoveで更新する。
     document.querySelectorAll('[data-map-target]').forEach(button => button.addEventListener('click', () => setMapTarget(button.dataset.mapTarget)));
     $('strobe-used').addEventListener('change', () => {
