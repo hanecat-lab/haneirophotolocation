@@ -1220,6 +1220,7 @@
     let humanObjects = [], isFps = false, isCompassActive = false, selectedEl = null, pendingType = null, moveState = { fwd: 0, bwd: 0, left: 0, right: 0 };
     let compassHandler = null, compassEventName = null, targetHeading = null, smoothHeading = null;
     let arActive = false, arStream = null, arOrientationHandler = null, arOrientationEventName = null, arPreviousCamera = 'orbit';
+    let arGroundEl = null, arGroundOriginalMaterial = null;
     // 方位センサーの急な揺れは精度の断定ではなく、「影で確認へ戻る」ための注意として扱う。
     let compassSamples = [], compassStability = 'off';
     let LAT = 35.6895, LON = 139.6917;
@@ -2929,6 +2930,25 @@ const HUMAN_PARTS = [
       return el && el.object3D;
     }
 
+    // 実写の上に「影が落ちた場所だけ暗くなる」ShadowMaterialを重ねる。地面ごと隠すと
+    // 影の受け面まで消えてしまうため、表示用マテリアルだけを差し替えて実写を透かす。
+    // A-Frameのmaterialコンポーネント（属性文字列）には触れないので、applyGroundPlane()や
+    // applyTheme()が管理する状態とは衝突しない
+    function arApplyGroundShadowMaterial(groundEl) {
+      const mesh = groundEl && groundEl.getObject3D('mesh');
+      if (!mesh) return;
+      arGroundEl = groundEl;
+      arGroundOriginalMaterial = mesh.material;
+      mesh.material = new THREE.ShadowMaterial({ opacity: 0.45 });
+    }
+    function arRestoreGroundMaterial() {
+      if (arGroundEl) {
+        const mesh = arGroundEl.getObject3D('mesh');
+        if (mesh && arGroundOriginalMaterial) mesh.material = arGroundOriginalMaterial;
+      }
+      arGroundEl = null; arGroundOriginalMaterial = null;
+    }
+
     function updateArCameraOrientation(e) {
       const heading = deviceHeadingFromOrientation(e);
       if (!Number.isFinite(heading)) return;
@@ -2973,6 +2993,8 @@ const HUMAN_PARTS = [
       video.srcObject = null;
       $('scene-sky').setAttribute('visible', true);
       $('ground').setAttribute('visible', true);
+      $('slope-ground').setAttribute('visible', groundPlane.type === 'slope');
+      arRestoreGroundMaterial();
       if (sceneEl.renderer) sceneEl.renderer.setClearAlpha(1);
       arSetActiveCamera(false);
       arActive = false;
@@ -2998,8 +3020,14 @@ const HUMAN_PARTS = [
             // videoタグのautoplay属性がフォールバックになる）
             video.play().catch(() => {});
             $('scene-sky').setAttribute('visible', false);
-            // 地面(#ground)は不透明な板なので、隠さないと実写のうち下半分が塗り潰される
-            $('ground').setAttribute('visible', false);
+            // 地面(#ground)は不透明な板なので、隠さないと実写のうち下半分が塗り潰される。
+            // ただし完全に隠すと影の受け面ごと消えるため、今有効な地面（水平なら#ground、
+            // 傾斜なら#slope-ground）だけ「影が落ちた場所だけ暗くなる」ShadowMaterialに
+            // 差し替える。使っていない側は従来通り隠す
+            const arIsSlope = groundPlane.type === 'slope';
+            arApplyGroundShadowMaterial(arIsSlope ? $('slope-ground') : $('ground'));
+            $('ground').setAttribute('visible', !arIsSlope);
+            $('slope-ground').setAttribute('visible', arIsSlope);
             if (sceneEl.renderer) sceneEl.renderer.setClearAlpha(0);
             arSetActiveCamera(true);
             arOrientationEventName = ('ondeviceorientationabsolute' in window) ? 'deviceorientationabsolute' : 'deviceorientation';
@@ -3480,7 +3508,10 @@ const HUMAN_PARTS = [
 
       // 磁気センサーの生値は毎フレーム跳ねるので、最短回り方向へ補間して反映する。
       // 60fps基準で従来と同じ追従速度になるよう、フレームレートに依らない指数減衰にする。
-      if (isCompassActive && targetHeading !== null) {
+      // AR中は#ar-cameraが同じ生の方位信号を直接消費して向きを合わせるため、ここで
+      // #world-rootまで一緒に追従させると二重補正になり打ち消し合う。AR中は世界の回転を
+      // その時点のまま凍結する（=実世界との対応付けのスナップショットとして使う）
+      if (isCompassActive && targetHeading !== null && !arActive) {
         // 磁気連動は端末の現在の方位を基準にする。影校正は、その場で明示的に実行した時だけ加える。
         const correction = applyShadowCalibrationToCompass ? headingOffset : 0;
         const corrected = norm(targetHeading + correction);
@@ -4969,7 +5000,16 @@ const HUMAN_PARTS = [
       const light = currentTheme === 'light';
       const sky = $('scene-sky'), ground = $('ground'), ambient = $('ambient-light');
       if (sky) sky.setAttribute('color', light ? '#d6e4e7' : '#111');
+      // AR中は#groundのmesh.materialをShadowMaterialへ差し替えている。A-Frameのmaterial
+      // コンポーネントはmesh.materialのプロパティをその場で書き換えるだけでオブジェクトを
+      // 作り直さないため、そのままだとShadowMaterial自身が書き換わってしまい、保存してある
+      // 「本来のmaterial」に新しいテーマ色が反映されない。書き換え対象を一時的に本来の
+      // materialへ戻してからsetAttributeし、その後で改めてShadowMaterialを掛け直す
+      const groundMeshForTheme = ground && ground.getObject3D('mesh');
+      const groundWasShadowSwapped = !!(arActive && arGroundEl === ground && groundMeshForTheme && groundMeshForTheme.material && groundMeshForTheme.material.isShadowMaterial);
+      if (groundWasShadowSwapped) groundMeshForTheme.material = arGroundOriginalMaterial;
       if (ground) ground.setAttribute('material', `color: ${light ? '#e5edef' : '#222'}; roughness: 0.9`);
+      if (groundWasShadowSwapped) arApplyGroundShadowMaterial(ground);
       if (ambient) ambient.setAttribute('light', `type: ambient; intensity: ${light ? 0.78 : 0.5}`);
       if (sceneEl && sceneEl.renderer) sceneEl.renderer.setClearColor(light ? '#d6e4e7' : '#111', 1);
       recolorGrid(currentTheme);
