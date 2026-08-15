@@ -682,12 +682,6 @@
     .pf-stepper-value { flex: 1; min-width: 0; min-height: 32px; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(98,207,198,.36); border-radius: 8px; background: rgba(12,48,53,.62); color: #d8fffa; font-size: 16px; font-weight: 800; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .pf-shadow-time-note { color: #accbd0; font-size: 10px; line-height: 1.35; }
     .pf-shadow-time-result { width: 100%; padding: 7px 8px; border-left: 3px solid #65ded0; border-radius: 7px; background: rgba(38,129,121,.18); color: #d9fffa; font-size: 11px; line-height: 1.45; }
-
-    /* 実写重ね合わせ（align/compare専用）。背面カメラ映像を#main-sceneの背後に敷き、
-       視線往復（画面⇔実際の空）を無くす。距離は現場の実測とは対応しないため、
-       あくまで「向きの目安」であることをラベルで明示する（位置合わせの精度は主張しない）。 */
-    #ar-video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; z-index: 0; display: none; }
-    #ar-video.on { display: block; }
     .pf-shadow-time-result strong { display: block; color: #effffb; font-size: 13px; }
     .pf-status-chip.shadow-time { cursor: pointer; color: #c8fff8; border-color: rgba(93,220,208,.42); background: rgba(15,72,72,.62); }
     :root[data-theme="light"] .pf-stepper-value { background: #def4f1; border-color: #69bbb3; color: #145f5e; }
@@ -1142,9 +1136,7 @@
     </div>
   </div>
 
-  <!-- 実写重ね合わせ用。#main-sceneのcanvasより前にDOM配置し、既定の重なり順で背面に敷く -->
-  <video id="ar-video" autoplay playsinline muted></video>
-  <a-scene id="main-scene" vr-mode-ui="enabled: false" shadow="type: pcfsoft" cursor="rayOrigin: mouse" raycaster="objects: .clickable" renderer="alpha: true">
+  <a-scene id="main-scene" vr-mode-ui="enabled: false" shadow="type: pcfsoft" cursor="rayOrigin: mouse" raycaster="objects: .clickable">
     <a-assets></a-assets>
     <!-- maxPolarAngle は aframe-orbit-controls が度数として受け取り内部でラジアンに変換する。
          85.9(≈ラジアン1.5相当、水平よりわずかに上で止める)を指定する。1.5をそのまま
@@ -1162,9 +1154,6 @@
            wasd-controls もリグ内でカメラを別に動かし D-pad と二重になるので外す。 -->
       <a-entity id="fps-camera" camera active="false"></a-entity>
     </a-entity>
-    <!-- 実写重ね合わせ専用カメラ。#world-rootの外に置き、向きは毎フレームではなく
-         deviceorientationイベントごとにupdateArCameraOrientation()で直接設定する -->
-    <a-entity id="ar-camera" camera="fov: 62" position="0 1.6 0" active="false"></a-entity>
     <a-sky id="scene-sky" color="#111"></a-sky>
     <a-entity id="world-root" rotation="0 0 0">
       <!-- シャドウの解像度・範囲・バイアスは SHADOW_CFG から initShadowQuality() で設定する -->
@@ -1219,8 +1208,6 @@
     const previewHuman = $('preview-human');
     let humanObjects = [], isFps = false, isCompassActive = false, selectedEl = null, pendingType = null, moveState = { fwd: 0, bwd: 0, left: 0, right: 0 };
     let compassHandler = null, compassEventName = null, targetHeading = null, smoothHeading = null;
-    let arActive = false, arStream = null, arOrientationHandler = null, arOrientationEventName = null, arPreviousCamera = 'orbit';
-    let arGroundEl = null, arGroundOriginalMaterial = null;
     // 方位センサーの急な揺れは精度の断定ではなく、「影で確認へ戻る」ための注意として扱う。
     let compassSamples = [], compassStability = 'off';
     let LAT = 35.6895, LON = 139.6917;
@@ -2917,140 +2904,6 @@ const HUMAN_PARTS = [
       if (typeof fieldFlow !== 'undefined' && isLocScout && !fieldFlow.detailOpen) renderProgressiveFlow();
     }
 
-    // ─── 実写重ね合わせ（現地照合の align/compare 専用）───────────────
-    // 画面の3Dシーンと実際の空を交互に見比べる視線往復をなくすため、背面カメラの映像を
-    // #main-scene の背後に敷き、その上に3Dの壁・影を重ねて表示する。
-    // 壁・影のワールド座標は現場の実測距離とは対応していない（地面をタップした任意の座標）ため、
-    // ここで合わせられるのは「向き」だけ。位置合わせの精度（実写のピクセルに正確に重なる）は
-    // 主張しない前提で、UI文言でも「向きの目安」と明示する。
-    // 方位はvfLevelReadingFrom()（「構えガイド」用に既にある、スマホを縦に構えた姿勢基準の
-    // pitch/roll算出）をそのまま転用する。傾きの意味付けを2重に持たないための再利用。
-    function arCameraObj() {
-      const el = $('ar-camera');
-      return el && el.object3D;
-    }
-
-    // 実写の上に「影が落ちた場所だけ暗くなる」ShadowMaterialを重ねる。地面ごと隠すと
-    // 影の受け面まで消えてしまうため、表示用マテリアルだけを差し替えて実写を透かす。
-    // A-Frameのmaterialコンポーネント（属性文字列）には触れないので、applyGroundPlane()や
-    // applyTheme()が管理する状態とは衝突しない
-    function arApplyGroundShadowMaterial(groundEl) {
-      const mesh = groundEl && groundEl.getObject3D('mesh');
-      if (!mesh) return;
-      arGroundEl = groundEl;
-      arGroundOriginalMaterial = mesh.material;
-      mesh.material = new THREE.ShadowMaterial({ opacity: 0.45 });
-    }
-    function arRestoreGroundMaterial() {
-      if (arGroundEl) {
-        const mesh = arGroundEl.getObject3D('mesh');
-        if (mesh && arGroundOriginalMaterial) mesh.material = arGroundOriginalMaterial;
-      }
-      arGroundEl = null; arGroundOriginalMaterial = null;
-    }
-
-    function updateArCameraOrientation(e) {
-      const heading = deviceHeadingFromOrientation(e);
-      if (!Number.isFinite(heading)) return;
-      const obj = arCameraObj();
-      if (!obj) return;
-      const correction = applyShadowCalibrationToCompass ? headingOffset : 0;
-      // #ar-camera は #world-root の外に置いているので、world-root側の回転(=方位校正)ぶんを
-      // 差し引いて、シーンのローカル角度に変換する
-      const worldYaw = +((worldRoot.getAttribute('rotation') || {}).y || 0);
-      const sceneAz = norm(heading + correction - worldYaw);
-      const tilt = vfLevelReadingFrom(e);
-      const elDeg = tilt ? Math.max(-89, Math.min(89, tilt.pitch)) : 0;
-      const rollDeg = tilt ? tilt.roll : 0;
-      const azRad = sceneAz * Math.PI / 180, elRad = elDeg * Math.PI / 180;
-      const dir = new THREE.Vector3(Math.cos(elRad) * Math.sin(azRad), Math.sin(elRad), -Math.cos(elRad) * Math.cos(azRad));
-      obj.up.set(0, 1, 0);
-      obj.lookAt(obj.position.x + dir.x, obj.position.y + dir.y, obj.position.z + dir.z);
-      obj.rotateZ(-rollDeg * Math.PI / 180);
-    }
-
-    function arSetActiveCamera(useAr) {
-      const orbit = $('orbit-camera'), fps = $('fps-camera'), ar = $('ar-camera');
-      if (useAr) {
-        arPreviousCamera = isFps ? 'fps' : 'orbit';
-        orbit.setAttribute('camera', 'active', false);
-        fps.setAttribute('camera', 'active', false);
-        ar.setAttribute('camera', 'active', true);
-      } else {
-        ar.setAttribute('camera', 'active', false);
-        orbit.setAttribute('camera', 'active', arPreviousCamera === 'orbit');
-        fps.setAttribute('camera', 'active', arPreviousCamera === 'fps');
-      }
-    }
-
-    function stopAR() {
-      if (!arActive) return;
-      if (arOrientationHandler) { window.removeEventListener(arOrientationEventName, arOrientationHandler, true); arOrientationHandler = null; }
-      if (arStream) { arStream.getTracks().forEach(t => t.stop()); arStream = null; }
-      const video = $('ar-video');
-      video.classList.remove('on');
-      video.pause();
-      video.srcObject = null;
-      $('scene-sky').setAttribute('visible', true);
-      $('ground').setAttribute('visible', true);
-      $('slope-ground').setAttribute('visible', groundPlane.type === 'slope');
-      arRestoreGroundMaterial();
-      if (sceneEl.renderer) sceneEl.renderer.setClearAlpha(1);
-      arSetActiveCamera(false);
-      arActive = false;
-    }
-
-    function startAR() {
-      if (arActive) return;
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
-      const begin = () => {
-        // 向きの目安を見るための映像なので高解像度は不要。デコード・描画の負荷（＝発熱）を
-        // 抑えるため、解像度とフレームレートは低めに要求する（対応していない端末はideal無視で動く）
-        navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' }, width: { ideal: 960 }, height: { ideal: 540 }, frameRate: { ideal: 24, max: 30 } },
-          audio: false
-        })
-          .then(stream => {
-            arStream = stream;
-            const video = $('ar-video');
-            video.srcObject = stream;
-            video.classList.add('on');
-            // srcObjectの設定だけでは自動再生されない環境があるため、明示的に再生を促す
-            // （ボタン操作起点の非同期チェーンなので通常はブロックされない。失敗しても
-            // videoタグのautoplay属性がフォールバックになる）
-            video.play().catch(() => {});
-            $('scene-sky').setAttribute('visible', false);
-            // 地面(#ground)は不透明な板なので、隠さないと実写のうち下半分が塗り潰される。
-            // ただし完全に隠すと影の受け面ごと消えるため、今有効な地面（水平なら#ground、
-            // 傾斜なら#slope-ground）だけ「影が落ちた場所だけ暗くなる」ShadowMaterialに
-            // 差し替える。使っていない側は従来通り隠す
-            const arIsSlope = groundPlane.type === 'slope';
-            arApplyGroundShadowMaterial(arIsSlope ? $('slope-ground') : $('ground'));
-            $('ground').setAttribute('visible', !arIsSlope);
-            $('slope-ground').setAttribute('visible', arIsSlope);
-            if (sceneEl.renderer) sceneEl.renderer.setClearAlpha(0);
-            arSetActiveCamera(true);
-            arOrientationEventName = ('ondeviceorientationabsolute' in window) ? 'deviceorientationabsolute' : 'deviceorientation';
-            arOrientationHandler = ev => updateArCameraOrientation(ev);
-            window.addEventListener(arOrientationEventName, arOrientationHandler, true);
-            arActive = true;
-            if (typeof renderProgressiveFlow === 'function') renderProgressiveFlow();
-          })
-          .catch(() => { arActive = false; if (typeof renderProgressiveFlow === 'function') renderProgressiveFlow(); });
-      };
-      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-        DeviceOrientationEvent.requestPermission()
-          .then(res => { if (res === 'granted') begin(); else if (typeof renderProgressiveFlow === 'function') renderProgressiveFlow(); })
-          .catch(() => { if (typeof renderProgressiveFlow === 'function') renderProgressiveFlow(); });
-      } else begin();
-    }
-
-    function toggleAR() { if (arActive) stopAR(); else startAR(); }
-
-    // 画面を伏せてバッグに入れる・他アプリへ切り替える等でタブが非表示になっても
-    // カメラ・GPU描画・センサー受信が裏で回り続けないよう、その場で止める
-    document.addEventListener('visibilitychange', () => { if (document.hidden && arActive) stopAR(); });
-
     // ─── 水準器（スマホを斜面に置いて傾斜角と傾斜方向を測る）─────────────
     // 画面を上にして斜面に置くと、画面の外向き法線がそのまま斜面の上向き法線になる。
     // 端末を地球座標へ回す行列 R = Rz(α)Rx(β)Ry(γ) の第3列が端末+Z の向きなので、
@@ -3508,10 +3361,7 @@ const HUMAN_PARTS = [
 
       // 磁気センサーの生値は毎フレーム跳ねるので、最短回り方向へ補間して反映する。
       // 60fps基準で従来と同じ追従速度になるよう、フレームレートに依らない指数減衰にする。
-      // AR中は#ar-cameraが同じ生の方位信号を直接消費して向きを合わせるため、ここで
-      // #world-rootまで一緒に追従させると二重補正になり打ち消し合う。AR中は世界の回転を
-      // その時点のまま凍結する（=実世界との対応付けのスナップショットとして使う）
-      if (isCompassActive && targetHeading !== null && !arActive) {
+      if (isCompassActive && targetHeading !== null) {
         // 磁気連動は端末の現在の方位を基準にする。影校正は、その場で明示的に実行した時だけ加える。
         const correction = applyShadowCalibrationToCompass ? headingOffset : 0;
         const corrected = norm(targetHeading + correction);
@@ -4573,7 +4423,6 @@ const HUMAN_PARTS = [
       progressiveRefresh();
     }
     function progressiveExitScout() {
-      stopAR();
       document.body.classList.remove('field-flow-primary', 'field-detail-open', 'field-comparing');
       // ロケハン中にinlineで開いた照合シートが通常の配置パネルへ残らないよう、
       // OFF時には確実に閉じる。通常モードは従来の壁編集だけを表示する。
@@ -4708,18 +4557,9 @@ const HUMAN_PARTS = [
     function quickActionButton(action, label, className = '') {
       return `<button type="button" class="pf-quick-btn ${className}" data-q-action="${action}">${label}</button>`;
     }
-    // 実写重ね合わせの行。位置合わせの精度は主張しないので「向きの目安」と明記する
-    function arQuickRow() {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return '';
-      const label = arActive ? '実写に重ねています（向きの目安）' : '実写に重ねて比べる';
-      const btn = quickActionButton('ar-toggle', arActive ? '実写を閉じる' : '📷 実写に重ねる', arActive ? 'good' : '');
-      return `<div class="pf-quick-row"><span class="pf-quick-label">${label}</span>${btn}</div>`;
-    }
     function renderFieldQuickbar() {
       const bar = $('field-quickbar');
       if (!bar) return;
-      // 実写重ね合わせは align/compare 専用。それ以外の段階へ移ったら確実にカメラを止める
-      if (arActive && (!isLocScout || fieldFlow.detailOpen || (fieldFlow.phase !== 'align' && fieldFlow.phase !== 'compare'))) stopAR();
       if (!isLocScout || fieldFlow.detailOpen) { bar.innerHTML = ''; return; }
       const wall = fieldFlow.referenceWall;
       const wallName = wall && wall.isConnected ? progressiveWallLabel(wall) : '未設定';
@@ -4743,9 +4583,9 @@ const HUMAN_PARTS = [
         const restore = canRestore
           ? quickActionButton('restore-rotation','戻す')
           : `<button type="button" class="pf-quick-btn" disabled title="影比較を始めた後に使えます">戻す</button>`;
-        markup = `${moveLine}<div class="pf-quick-row"><span class="pf-quick-label"><strong>基準の壁を回す</strong></span>${quickActionButton('move','移動')}</div><div class="pf-quick-row"><span class="pf-quick-label">回転</span><input id="pf-quick-rotate" class="pf-quick-rotate" type="range" min="0" max="359" value="${rot}" aria-label="壁の回転"><span id="pf-quick-rotate-out" class="pf-quick-label" style="flex:0 0 auto;">${rot}°</span>${restore}${quickActionButton('aligned','影を見る','primary')}</div>${arQuickRow()}`;
+        markup = `${moveLine}<div class="pf-quick-row"><span class="pf-quick-label"><strong>基準の壁を回す</strong></span>${quickActionButton('move','移動')}</div><div class="pf-quick-row"><span class="pf-quick-label">回転</span><input id="pf-quick-rotate" class="pf-quick-rotate" type="range" min="0" max="359" value="${rot}" aria-label="壁の回転"><span id="pf-quick-rotate-out" class="pf-quick-label" style="flex:0 0 auto;">${rot}°</span>${restore}${quickActionButton('aligned','影を見る','primary')}</div>`;
       } else if (phase === 'compare') {
-        markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>3Dの影と実際の影を見比べる</strong></span></div><div class="pf-quick-grid">${quickActionButton('match','同じ','good')}${quickActionButton('mismatch','違う','warn')}${quickActionButton('unclear','見えない')}</div><div class="pf-quick-row"><span class="pf-quick-label">構図を先に見つけた時</span>${quickActionButton('shadow-target','ここへ影','primary')}</div><div class="pf-quick-row"><span class="pf-quick-label">長さを測らない時</span>${quickActionButton('direction-only','影の向きだけ確認')}</div>${arQuickRow()}`;
+        markup = `<div class="pf-quick-row"><span class="pf-quick-label"><strong>3Dの影と実際の影を見比べる</strong></span></div><div class="pf-quick-grid">${quickActionButton('match','同じ','good')}${quickActionButton('mismatch','違う','warn')}${quickActionButton('unclear','見えない')}</div><div class="pf-quick-row"><span class="pf-quick-label">構図を先に見つけた時</span>${quickActionButton('shadow-target','ここへ影','primary')}</div><div class="pf-quick-row"><span class="pf-quick-label">長さを測らない時</span>${quickActionButton('direction-only','影の向きだけ確認')}</div>`;
       } else if (phase === 'steps') {
         const d = progressiveShadowAt(+$('time-range').value);
         const note = d.ok ? `壁から影先端まで　約 ${progressiveStepText(d.steps)}` : d.reason;
@@ -4893,7 +4733,6 @@ const HUMAN_PARTS = [
       else if (action === 'save') { $('save-scene-btn').click(); progressiveSetPhase('details'); }
       else if (action === 'wall-detail') progressiveOpenDetail('wall');
       else if (action === 'close-details') { fieldFlow.phase = fieldFlow.referenceWall ? (progressiveReferenceValid() ? 'compare' : 'align') : 'needs-wall'; }
-      else if (action === 'ar-toggle') toggleAR();
       renderProgressiveFlow();
     });
     function applyQuickWallRotation(value) {
@@ -5000,16 +4839,7 @@ const HUMAN_PARTS = [
       const light = currentTheme === 'light';
       const sky = $('scene-sky'), ground = $('ground'), ambient = $('ambient-light');
       if (sky) sky.setAttribute('color', light ? '#d6e4e7' : '#111');
-      // AR中は#groundのmesh.materialをShadowMaterialへ差し替えている。A-Frameのmaterial
-      // コンポーネントはmesh.materialのプロパティをその場で書き換えるだけでオブジェクトを
-      // 作り直さないため、そのままだとShadowMaterial自身が書き換わってしまい、保存してある
-      // 「本来のmaterial」に新しいテーマ色が反映されない。書き換え対象を一時的に本来の
-      // materialへ戻してからsetAttributeし、その後で改めてShadowMaterialを掛け直す
-      const groundMeshForTheme = ground && ground.getObject3D('mesh');
-      const groundWasShadowSwapped = !!(arActive && arGroundEl === ground && groundMeshForTheme && groundMeshForTheme.material && groundMeshForTheme.material.isShadowMaterial);
-      if (groundWasShadowSwapped) groundMeshForTheme.material = arGroundOriginalMaterial;
       if (ground) ground.setAttribute('material', `color: ${light ? '#e5edef' : '#222'}; roughness: 0.9`);
-      if (groundWasShadowSwapped) arApplyGroundShadowMaterial(ground);
       if (ambient) ambient.setAttribute('light', `type: ambient; intensity: ${light ? 0.78 : 0.5}`);
       if (sceneEl && sceneEl.renderer) sceneEl.renderer.setClearColor(light ? '#d6e4e7' : '#111', 1);
       recolorGrid(currentTheme);
