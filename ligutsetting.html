@@ -29,12 +29,438 @@
     const host=document.querySelector('#scene'), scene=new THREE.Scene(), camera=new THREE.PerspectiveCamera(42,1,.1,100), renderer=new THREE.WebGLRenderer({antialias:true});
     renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap; renderer.outputColorSpace=THREE.SRGBColorSpace; renderer.toneMapping=THREE.ACESFilmicToneMapping; renderer.toneMappingExposure=1.08; host.append(renderer.domElement); camera.position.set(4.4,2.65,5.2);
     const controls=new OrbitControls(camera,renderer.domElement); controls.target.set(0,1,0); controls.enableDamping=true; controls.maxPolarAngle=Math.PI/2.02;
-    const material=new THREE.MeshStandardMaterial({color:'#cbd0cf',roughness:.84});
+    const material=new THREE.MeshStandardMaterial({color:'#d6d7d2',roughness:.76,metalness:.015});
     const ground=new THREE.Mesh(new THREE.PlaneGeometry(20,20),new THREE.MeshStandardMaterial({color:'#aaa89e',roughness:.95}));ground.rotation.x=-Math.PI/2;ground.receiveShadow=true;scene.add(ground,new THREE.HemisphereLight('#dbe7ea','#716d63',.68));
     const wall=new THREE.Mesh(new THREE.PlaneGeometry(4.8,3.4),new THREE.MeshStandardMaterial({color:'#b8b3a9',roughness:.9}));wall.position.set(0,1.7,-1.15);wall.receiveShadow=true;scene.add(wall);
     const sun=new THREE.DirectionalLight('#ffe1a2',2);sun.castShadow=true;sun.shadow.mapSize.set(1024,1024);sun.shadow.camera.left=sun.shadow.camera.bottom=-6;sun.shadow.camera.right=sun.shadow.camera.top=6;sun.target.position.set(0,1,0);scene.add(sun,sun.target);
-    function limb(a,b,r){const d=new THREE.Vector3().subVectors(b,a),m=new THREE.Mesh(new THREE.CapsuleGeometry(r,Math.max(.04,d.length()-r*2),10,16),material);m.position.copy(a).add(b).multiplyScalar(.5);m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),d.normalize());m.castShadow=true;return m}
-    function mannequin(pose){const g=new THREE.Group(),leg=(h,k,a)=>g.add(limb(h,k,.13),limb(k,a,.112)),arm=(s,e,h)=>g.add(limb(s,e,.09),limb(e,h,.075));let p=new THREE.Vector3(0,1,0),s=new THREE.Vector3(0,1.72,0),n=new THREE.Vector3(0,1.93,0),head=new THREE.Vector3(0,2.2,0);if(pose==='standing'){leg(new THREE.Vector3(-.22,1,0),new THREE.Vector3(-.25,.52,.03),new THREE.Vector3(-.25,.09,.08));leg(new THREE.Vector3(.22,1,0),new THREE.Vector3(.25,.52,.03),new THREE.Vector3(.25,.09,.08));arm(new THREE.Vector3(-.34,1.7,0),new THREE.Vector3(-.48,1.22,.02),new THREE.Vector3(-.4,.88,.03));arm(new THREE.Vector3(.34,1.7,0),new THREE.Vector3(.48,1.22,.02),new THREE.Vector3(.4,.88,.03))}if(pose==='crouching'){p.set(0,.88,.08);s.set(0,1.45,-.08);n.set(0,1.64,-.12);head.set(0,1.88,-.16);leg(new THREE.Vector3(-.22,.88,.08),new THREE.Vector3(-.5,.52,.25),new THREE.Vector3(-.32,.1,.48));leg(new THREE.Vector3(.22,.88,.08),new THREE.Vector3(.5,.52,.25),new THREE.Vector3(.32,.1,.48));arm(new THREE.Vector3(-.33,1.43,-.08),new THREE.Vector3(-.58,1.08,.03),new THREE.Vector3(-.45,.76,.16));arm(new THREE.Vector3(.33,1.43,-.08),new THREE.Vector3(.58,1.08,.03),new THREE.Vector3(.45,.76,.16))}if(pose==='seated'){p.set(0,.84,.16);s.set(0,1.5,.12);n.set(0,1.7,.1);head.set(0,1.96,.08);leg(new THREE.Vector3(-.22,.84,.16),new THREE.Vector3(-.22,.57,.72),new THREE.Vector3(-.22,.1,.72));leg(new THREE.Vector3(.22,.84,.16),new THREE.Vector3(.22,.57,.72),new THREE.Vector3(.22,.1,.72));arm(new THREE.Vector3(-.34,1.48,.12),new THREE.Vector3(-.58,1.13,.18),new THREE.Vector3(-.45,.92,.54));arm(new THREE.Vector3(.34,1.48,.12),new THREE.Vector3(.58,1.13,.18),new THREE.Vector3(.45,.92,.54))}if(pose==='leaning'){p.set(0,1.05,.05);s.set(0,1.65,-.3);n.set(0,1.82,-.36);head.set(0,2.08,-.4);leg(new THREE.Vector3(-.22,1.05,.05),new THREE.Vector3(-.32,.55,.18),new THREE.Vector3(-.3,.1,.42));leg(new THREE.Vector3(.22,1.05,.05),new THREE.Vector3(.32,.55,.18),new THREE.Vector3(.3,.1,.42));arm(new THREE.Vector3(-.32,1.64,-.3),new THREE.Vector3(-.67,1.44,-.6),new THREE.Vector3(-.8,1.09,-.75));arm(new THREE.Vector3(.32,1.64,-.3),new THREE.Vector3(.63,1.28,-.51),new THREE.Vector3(.65,.96,-.38))}g.add(limb(p,s,.22),limb(s,n,.13));const h=new THREE.Mesh(new THREE.SphereGeometry(.23,18,16),material);h.position.copy(head);h.castShadow=true;g.add(h);return g}
+    /* ======================================================================
+       撮影用マネキン — 人体モデル生成システム
+       比率(P) → 骨格(buildSkeleton) → ポーズ(POSES) → 断面ロフト(loft) → 面
+       この区画だけが人体形状を担当する。ライト/影/UI/太陽計算とは独立。
+       ====================================================================== */
+
+    const MAN_HEIGHT = 1.80;                        // 全高[m]。寸法は全て全高=1.0の比率で保持しここで実寸化する
+
+    // --- STEP 1: 人体比率（すべて全高=1.0 に正規化） ----------------------
+    const P = {
+      // 基準高さ（床からの比率）
+      CROWN:0.998, CHIN:0.862, SKULL_BASE:0.892, NECK:0.872,
+      NECK_ROOT:0.848, GIRDLE:0.818, SHOULDER_J:0.805, CHEST:0.740, RIB:0.700,
+      ABDOMEN:0.665, WAIST:0.625, HIP:0.530, CROTCH:0.455,
+      ELBOW:0.625, WRIST:0.485, KNEE:0.285, ANKLE:0.039,
+      // 左右オフセット（関節位置）
+      SHOULDER_X:0.087, HIP_X:0.048,
+      // 頭部の左右／前後の半値（上下は CROWN と CHIN から導出する）
+      HEAD_W:0.047, HEAD_D:0.059,
+      // 足
+      FOOT_LEN:0.143, HEEL_LEN:0.027, FOOT_W:0.031
+    };
+    // 骨長は比率から導出する。ポーズが変わってもこの値は不変（STEP 22 の保証）
+    P.THIGH      = P.HIP - P.KNEE;          // 大腿
+    P.SHANK      = P.KNEE - P.ANKLE;        // 下腿
+    P.UPPER_ARM  = P.SHOULDER_J - P.ELBOW;  // 上腕
+    P.FOREARM    = P.ELBOW - P.WRIST;       // 前腕
+    P.HAND       = 0.098;                   // 手
+    P.HEAD_C     = (P.CROWN+P.CHIN)/2;      // 頭部中心の高さ
+    P.HEAD_H     = (P.CROWN-P.CHIN)/2;      // 頭部の上下半値
+
+    const H = MAN_HEIGHT, D2R = Math.PI/180;
+    const V3 = (x,y,z)=>new THREE.Vector3(x,y,z);
+
+    // --- 断面テーブル -------------------------------------------------------
+    // 各 station = { y:高さ比率, z:前後オフセット, w:左右半幅, dF:前方厚み, dB:後方厚み, n:超楕円指数 }
+    // 胸・腹・腰・骨盤・肩甲帯・首はすべて「1本のロフトの station」であり独立オブジェクトではない
+    const TRUNK = [
+      { y:P.CROTCH,    z:-0.005, w:0.042, dF:0.038, dB:0.042, n:2.0 },  // 骨盤底（左右の大腿の間に収まる）
+      { y:0.478,       z:-0.004, w:0.062, dF:0.052, dB:0.058, n:2.1 },
+      { y:0.500,       z:-0.003, w:0.077, dF:0.061, dB:0.066, n:2.2 },
+      { y:0.518,       z:-0.001, w:0.085, dF:0.066, dB:0.070, n:2.2 },
+      { y:P.HIP,       z: 0.000, w:0.089, dF:0.067, dB:0.070, n:2.3 },  // 骨盤（腰より広い）
+      { y:0.575,       z: 0.006, w:0.086, dF:0.065, dB:0.059, n:2.4 },
+      { y:P.WAIST,     z: 0.008, w:0.081, dF:0.062, dB:0.054, n:2.4 },  // 腰（最も細い）
+      { y:P.ABDOMEN,   z: 0.005, w:0.084, dF:0.067, dB:0.056, n:2.4 },  // 腹
+      { y:P.RIB,       z: 0.000, w:0.088, dF:0.071, dB:0.060, n:2.5 },  // 上腹／肋骨下端
+      { y:P.CHEST,     z:-0.004, w:0.088, dF:0.073, dB:0.063, n:2.5 },  // 胸郭（前方に厚い）
+      { y:0.782,       z:-0.008, w:0.089, dF:0.067, dB:0.065, n:2.5 },  // 胸郭上部（胴体の最大幅）
+      { y:0.806,       z:-0.009, w:0.086, dF:0.061, dB:0.063, n:2.5 },
+      { y:P.GIRDLE,    z:-0.010, w:0.080, dF:0.057, dB:0.061, n:2.4 },  // 肩甲帯（肩幅は腕側の三角筋が作る）
+      { y:0.834,       z:-0.011, w:0.066, dF:0.047, dB:0.055, n:2.3 },  // 僧帽筋の傾斜
+      { y:P.NECK_ROOT, z:-0.010, w:0.048, dF:0.040, dB:0.048, n:2.2 },  // 胸郭→首へ連続して細くなる
+      { y:P.NECK,      z:-0.005, w:0.033, dF:0.031, dB:0.035, n:2.1 },  // 首
+      { y:P.SKULL_BASE,z:-0.002, w:0.031, dF:0.029, dB:0.034, n:2.0 }   // 頭蓋底（頭部と重なって連続する）
+    ];
+
+    // 脚: t は 大腿(0→1) / 下腿(0→1)。断面の前後差でふくらはぎの膨らみを作る
+    const LEG = [
+      { seg:'thigh', t:-0.30, ox:-0.022, w:0.044, dF:0.045, dB:0.047, n:2.2 },  // 骨盤に食い込ませ段差を消す
+      { seg:'thigh', t:-0.12, ox:-0.009, w:0.053, dF:0.052, dB:0.056, n:2.2 },
+      { seg:'thigh', t: 0.06, w:0.055, dF:0.053, dB:0.057, n:2.3 },  // 大腿上部（太い）
+      { seg:'thigh', t: 0.35, w:0.049, dF:0.048, dB:0.050, n:2.2 },
+      { seg:'thigh', t: 0.68, w:0.041, dF:0.041, dB:0.042, n:2.2 },
+      { seg:'thigh', t: 0.93, w:0.034, dF:0.036, dB:0.034, n:2.3 },  // 膝上（細くなる）
+      { seg:'shank', t: 0.02, w:0.036, dF:0.037, dB:0.031, n:2.5 },  // 膝（横に広く後面は扁平）
+      { seg:'shank', t: 0.18, w:0.036, dF:0.031, dB:0.044, n:2.2 },  // ふくらはぎ（後方に膨らむ）
+      { seg:'shank', t: 0.40, w:0.032, dF:0.028, dB:0.037, n:2.2 },
+      { seg:'shank', t: 0.70, w:0.024, dF:0.023, dB:0.026, n:2.2 },
+      { seg:'shank', t: 1.00, w:0.019, dF:0.020, dB:0.022, n:2.2 }   // 足首
+    ];
+
+    // 腕: t は 上腕(0→1) / 前腕(0→1) / 手(0→1)。肩甲帯の中から始めて三角筋の丸みを作る
+    const ARM = [
+      { seg:'upper', t:-0.03, ox:-0.017, w:0.032, dF:0.033, dB:0.033, n:2.2 },  // 肩甲帯の中から立ち上げる
+      { seg:'upper', t: 0.03, w:0.042, dF:0.042, dB:0.042, n:2.2 },  // 三角筋（肩の丸み）
+      { seg:'upper', t: 0.26, w:0.037, dF:0.037, dB:0.038, n:2.2 },  // 上腕（肩側が太い）
+      { seg:'upper', t: 0.60, w:0.029, dF:0.029, dB:0.030, n:2.2 },
+      { seg:'upper', t: 0.92, w:0.025, dF:0.025, dB:0.025, n:2.3 },  // 肘の手前で細くなる
+      { seg:'fore',  t: 0.04, w:0.026, dF:0.025, dB:0.026, n:2.4 },  // 肘
+      { seg:'fore',  t: 0.26, w:0.026, dF:0.025, dB:0.027, n:2.2 },  // 前腕の膨らみ
+      { seg:'fore',  t: 0.62, w:0.021, dF:0.020, dB:0.021, n:2.2 },
+      { seg:'fore',  t: 1.00, w:0.015, dF:0.013, dB:0.014, n:2.3 },  // 手首（細い）
+      { seg:'hand',  t: 0.30, w:0.014, dF:0.025, dB:0.023, n:2.7 },  // 手（扁平な板・手のひらは体側を向く）
+      { seg:'hand',  t: 0.72, w:0.013, dF:0.024, dB:0.021, n:2.7 },
+      { seg:'hand',  t: 1.00, w:0.008, dF:0.016, dB:0.014, n:2.7 }
+    ];
+
+    /* ----------------------------------------------------------------------
+       STEP 3: 断面ロフト
+       背骨ポリラインに沿って断面リングを押し出し、連続した1枚の面を作る。
+       球やカプセルは使わない。
+       ---------------------------------------------------------------------- */
+
+    // Catmull-Rom（1次元）
+    function cr(p0,p1,p2,p3,t){
+      const t2=t*t, t3=t2*t;
+      return 0.5*((2*p1)+(-p0+p2)*t+(2*p0-5*p1+4*p2-p3)*t2+(-p0+3*p1-3*p2+p3)*t3);
+    }
+    function crAt(arr,u,get){
+      const n=arr.length, i=Math.min(n-2,Math.max(0,Math.floor(u))), f=u-i;
+      const g=k=>get(arr[Math.min(n-1,Math.max(0,k))]);
+      return cr(g(i-1),g(i),g(i+1),g(i+2),f);
+    }
+    function crVec(arr,u,out){
+      out.set(crAt(arr,u,s=>s.p.x),crAt(arr,u,s=>s.p.y),crAt(arr,u,s=>s.p.z));
+      return out;
+    }
+
+    // 超楕円断面（前後非対称）。n が大きいほど角張り、2 で楕円。
+    // 極角でパラメータ化した radial superellipse なので、頂点が円周に均等に載る
+    function ringPoint(theta,w,dF,dB,n){
+      const c=Math.cos(theta), s=Math.sin(theta);
+      const k=Math.pow(Math.pow(Math.abs(c),n)+Math.pow(Math.abs(s),n),-1/n);
+      const dMid=(dF+dB)/2, dAsym=(dF-dB)/2;
+      return [w*c*k,(dMid+dAsym*s)*s*k];
+    }
+
+    /**
+     * stations: [{p:Vector3, w, dF, dB, n}]（近位→遠位）
+     * opts: { seg:分割数, radial:円周分割, capStart, capEnd, front:初期前方ベクトル }
+     */
+    function loft(stations,opts){
+      opts=opts||{};
+      const RAD=opts.radial||28, SEG=opts.seg||(stations.length-1)*6;
+      const capS=opts.capStart!==false, capE=opts.capEnd!==false;
+      const front=opts.front||V3(0,0,1);
+      const uMax=stations.length-1;
+
+      // 1) 背骨と断面パラメータをサンプリング
+      const pts=[],prm=[];
+      for(let i=0;i<=SEG;i++){
+        const u=uMax*i/SEG;
+        pts.push(crVec(stations,u,V3()));
+        prm.push({
+          w:crAt(stations,u,s=>s.w), dF:crAt(stations,u,s=>s.dF),
+          dB:crAt(stations,u,s=>s.dB), n:crAt(stations,u,s=>s.n)
+        });
+      }
+      // 1b) 断面パラメータを平滑化する。
+      //     Catmull-Rom は節点で曲率が不連続になり、滑らかな面に横縞の陰影が出るため。
+      const relax=(key,passes)=>{
+        for(let k=0;k<passes;k++){
+          const a=prm.map(o=>o[key]);
+          for(let i=1;i<SEG;i++) prm[i][key]=0.25*a[i-1]+0.5*a[i]+0.25*a[i+1];
+        }
+      };
+      ['w','dF','dB','n'].forEach(k=>relax(k,24));
+
+      // 2) 平行移動フレーム（ねじれ防止）
+      const T=[],B=[],N=[];
+      for(let i=0;i<=SEG;i++){
+        const a=pts[Math.max(0,i-1)], b=pts[Math.min(SEG,i+1)];
+        T.push(V3().subVectors(b,a).normalize());
+      }
+      B[0]=V3().copy(front).addScaledVector(T[0],-front.dot(T[0]));
+      if(B[0].lengthSq()<1e-8) B[0].set(1,0,0).addScaledVector(T[0],-T[0].x);
+      B[0].normalize();
+      for(let i=1;i<=SEG;i++){
+        const q=new THREE.Quaternion().setFromUnitVectors(T[i-1],T[i]);
+        B[i]=B[i-1].clone().applyQuaternion(q).normalize();
+      }
+      for(let i=0;i<=SEG;i++) N[i]=V3().crossVectors(T[i],B[i]).normalize();
+
+      // 3) 頂点生成（継ぎ目は頂点を共有するので法線が割れない）
+      const pos=[],idx=[];
+      const push=(v)=>{pos.push(v.x,v.y,v.z);return pos.length/3-1;};
+      const rings=[];
+      const makeRing=(i,scale,slide)=>{
+        const row=[],c=pts[i].clone().addScaledVector(T[i],slide||0);
+        for(let j=0;j<RAD;j++){
+          const th=j/RAD*Math.PI*2;
+          const[a,b]=ringPoint(th,prm[i].w*scale,prm[i].dF*scale,prm[i].dB*scale,prm[i].n);
+          row.push(push(V3().copy(c).addScaledVector(N[i],a).addScaledVector(B[i],b)));
+        }
+        return row;
+      };
+      // 開始側の丸めキャップ
+      if(capS){
+        const r0=Math.min(prm[0].w,(prm[0].dF+prm[0].dB)/2);
+        const CS=8;
+        for(let k=CS;k>=1;k--){
+          const a=k/CS*Math.PI/2;
+          rings.push(makeRing(0,Math.cos(a),-Math.sin(a)*r0));
+        }
+      }
+      for(let i=0;i<=SEG;i++) rings.push(makeRing(i,1,0));
+      if(capE){
+        const r1=Math.min(prm[SEG].w,(prm[SEG].dF+prm[SEG].dB)/2);
+        const CS=8;
+        for(let k=1;k<=CS;k++){
+          const a=k/CS*Math.PI/2;
+          rings.push(makeRing(SEG,Math.cos(a),Math.sin(a)*r1));
+        }
+      }
+      for(let r=0;r<rings.length-1;r++){
+        for(let j=0;j<RAD;j++){
+          const j2=(j+1)%RAD, a=rings[r][j], b=rings[r][j2], c=rings[r+1][j2], d=rings[r+1][j];
+          idx.push(a,d,b, b,d,c);
+        }
+      }
+      const g=new THREE.BufferGeometry();
+      g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+      g.setIndex(idx);
+      g.computeVertexNormals();
+      return g;
+    }
+
+    /* ----------------------------------------------------------------------
+       STEP 2: 骨格
+       standing を基準に、ポーズは関節角として与える。
+       骨長 × 方向ベクトルの前進計算なので、どのポーズでも骨長は変化しない。
+       ---------------------------------------------------------------------- */
+
+    // 下向き(0,-1,0)を基準に pitch(前が正) / abduct(外側が正) で方向を作る
+    function dir(pitch,abduct,side){
+      const v=V3(0,-1,0);
+      v.applyAxisAngle(V3(0,0,1),side*abduct*D2R);
+      v.applyAxisAngle(V3(1,0,0),-pitch*D2R);
+      return v;
+    }
+
+    // 4姿勢。人体そのものは作り直さず、この角度だけが変わる
+    const POSES = {
+      standing : { rootY:P.HIP, rootZ: 0.00, spine:  2, head: 0,
+                   hip: -1, knee:  3, ankle:  0, footPitch: 0,
+                   armPitch:  3, armAbduct:  9, elbow:  6, wristPitch: 4 },
+      crouching: { rootY:0.330, rootZ: 0.03, spine: 22, head:-16,
+                   hip: 74, knee:-88, ankle: 24, footPitch: 0,
+                   armPitch: 10, armAbduct: 18, elbow: 34, wristPitch: 6 },
+      seated   : { rootY:0.300, rootZ:-0.02, spine:  6, head: -5,
+                   hip: 86, knee:-86, ankle:  2, footPitch: 0,
+                   armPitch:  8, armAbduct: 16, elbow: 32, wristPitch: 6 },
+      leaning  : { rootY:P.HIP-0.012, rootZ: 0.07, spine:-16, head:11,
+                   hip: 13, knee:-11, ankle: 12, footPitch: 0,
+                   armPitch: -1, armAbduct: 13, elbow: 16, wristPitch: 5 }
+    };
+
+    /**
+     * 胴体チェーン: 骨盤(HIP)を基点に、上へ行くほど脊柱の回転を強める。
+     * 各セグメントは長さを保ったまま回されるので、胴体長はポーズで変わらない。
+     */
+    function bendTrunk(pose){
+      const root=V3(0,pose.rootY*H,pose.rootZ*H);
+      const top=P.SKULL_BASE-P.HIP;
+      const ease=y=>{const t=THREE.MathUtils.clamp(y/top,0,1);return t*t*(3-2*t);};
+      const local=TRUNK.map(s=>({s,l:V3(0,(s.y-P.HIP)*H,s.z*H),a:pose.spine*ease(s.y-P.HIP)*D2R}));
+      const anchor=local.findIndex(o=>o.s.y===P.HIP);
+      const out=new Array(local.length);
+      out[anchor]={p:root.clone(),a:local[anchor].a};
+      const rot=(v,a)=>v.clone().applyAxisAngle(V3(1,0,0),a);   // 正の角度で前傾する
+      for(let i=anchor+1;i<local.length;i++){
+        const d=V3().subVectors(local[i].l,local[i-1].l);
+        out[i]={p:out[i-1].p.clone().add(rot(d,local[i].a)),a:local[i].a};
+      }
+      for(let i=anchor-1;i>=0;i--){
+        const d=V3().subVectors(local[i].l,local[i+1].l);
+        out[i]={p:out[i+1].p.clone().add(rot(d,local[i].a)),a:local[i].a};
+      }
+      return out;
+    }
+    // 胴体チェーン上の任意の高さの位置と回転を取り出す
+    function atHeight(chain,y){
+      for(let i=0;i<chain.length-1;i++){
+        const a=TRUNK[i].y,b=TRUNK[i+1].y;
+        if(y>=a&&y<=b){
+          const f=(y-a)/(b-a);
+          return {p:chain[i].p.clone().lerp(chain[i+1].p,f),a:THREE.MathUtils.lerp(chain[i].a,chain[i+1].a,f)};
+        }
+      }
+      return {p:chain[chain.length-1].p.clone(),a:chain[chain.length-1].a};
+    }
+
+    /** 骨格生成: 名前付きジョイント一式を返す */
+    function buildSkeleton(poseName){
+      const q=POSES[poseName]||POSES.standing, chain=bendTrunk(q), J={_chain:chain,_pose:q};
+      const off=(base,x,y,z)=>base.p.clone().add(V3(x,y,z).applyAxisAngle(V3(1,0,0),base.a));
+
+      const pelvis=atHeight(chain,P.HIP), girdle=atHeight(chain,P.GIRDLE), skull=atHeight(chain,P.SKULL_BASE);
+      J.pelvis=pelvis.p.clone();
+      J.chest=atHeight(chain,P.CHEST).p.clone();
+      J.neck=atHeight(chain,P.NECK).p.clone();
+      J.head=off(skull,0,(P.HEAD_C-P.SKULL_BASE)*H,-0.004*H);
+      J.headAngle=skull.a+q.head*D2R;
+
+      [['L',-1],['R',1]].forEach(([S,sg])=>{
+        // 脚: 股関節 → 膝 → 足首 → 爪先（固定骨長のFK）
+        const hip=off(pelvis,sg*P.HIP_X*H,-0.006*H,0);
+        const knee=hip.clone().addScaledVector(dir(q.hip,1.2,sg),P.THIGH*H);
+        const ankle=knee.clone().addScaledVector(dir(q.hip+q.knee,0.6,sg),P.SHANK*H);
+        const toe=ankle.clone().add(V3(0,0,1).applyAxisAngle(V3(1,0,0),-q.footPitch*D2R).multiplyScalar((P.FOOT_LEN-P.HEEL_LEN)*H));
+        J['hip'+S]=hip; J['knee'+S]=knee; J['ankle'+S]=ankle; J['foot'+S]=toe;
+        // 腕: 肩 → 肘 → 手首 → 手
+        const sh=off(girdle,sg*P.SHOULDER_X*H,(P.SHOULDER_J-P.GIRDLE)*H,0.004*H);
+        const el=sh.clone().addScaledVector(dir(q.armPitch,q.armAbduct,sg),P.UPPER_ARM*H);
+        const wr=el.clone().addScaledVector(dir(q.armPitch+q.elbow,q.armAbduct*0.5,sg),P.FOREARM*H);
+        const hd=wr.clone().addScaledVector(dir(q.armPitch+q.elbow+q.wristPitch,q.armAbduct*0.3,sg),P.HAND*H);
+        J['shoulder'+S]=sh; J['elbow'+S]=el; J['hand'+S]=hd; J['wrist'+S]=wr;
+      });
+      return J;
+    }
+
+    /* ----------------------------------------------------------------------
+       STEP 4-9: ボリューム生成
+       ---------------------------------------------------------------------- */
+
+    // 胴体: 骨盤 → 腰 → 腹 → 胸郭 → 肩甲帯 → 首 → 頭蓋底 を1本のロフトで作る
+    function buildTrunk(J){
+      const stations=J._chain.map((c,i)=>({p:c.p.clone(),w:TRUNK[i].w*H,dF:TRUNK[i].dF*H,dB:TRUNK[i].dB*H,n:TRUNK[i].n}));
+      return loft(stations,{radial:36,seg:140});
+    }
+
+    // 脚: 股関節 → 大腿 → 膝 → ふくらはぎ → 足首 を1本のロフトで作る
+    function buildLeg(J,S){
+      const hip=J['hip'+S],knee=J['knee'+S],ankle=J['ankle'+S];
+      const sg=S==='L'?-1:1;
+      const stations=LEG.map(s=>{
+        const a=s.seg==='thigh'?hip:knee, b=s.seg==='thigh'?knee:ankle;
+        const p=a.clone().lerp(b,s.t);
+        if(s.ox) p.x+=sg*s.ox*H;   // 骨盤側は内側へ寄せて腰との段差をなくす
+        return {p,w:s.w*H,dF:s.dF*H,dB:s.dB*H,n:s.n};
+      });
+      return loft(stations,{radial:26,seg:64});
+    }
+
+    // 腕: 肩甲帯の内側 → 三角筋 → 上腕 → 肘 → 前腕 → 手首 → 手 を1本のロフトで作る
+    function buildArm(J,S){
+      const sh=J['shoulder'+S],el=J['elbow'+S],wr=J['wrist'+S],hd=J['hand'+S];
+      const pair={upper:[sh,el],fore:[el,wr],hand:[wr,hd]};
+      const sg=S==='L'?-1:1;
+      const stations=ARM.map(s=>{
+        const[a,b]=pair[s.seg];
+        const p=a.clone().lerp(b,s.t);
+        if(s.ox) p.x+=sg*s.ox*H;   // 付け根は内側へ寄せ、開口を胴体の中に隠す
+        return {p,w:s.w*H,dF:s.dF*H,dB:s.dB*H,n:s.n};
+      });
+      return loft(stations,{radial:22,seg:60});
+    }
+
+    /* ----------------------------------------------------------------------
+       STEP 13-17: 頭部
+       頭蓋と顔面を1枚の連続した面として生成する。
+       目玉・眉毛・唇・鼻を別Geometryで貼らない。すべて同じ面の変位で作る。
+       ---------------------------------------------------------------------- */
+    function buildHead(){
+      const RU=52, RV=40;
+      const HW=P.HEAD_W*H, HH=P.HEAD_H*H, HD=P.HEAD_D*H, S=H/1.8;
+      const gauss=(v,c,s)=>Math.exp(-((v-c)/s)*((v-c)/s));
+      const smooth=(a,b,t)=>{const x=THREE.MathUtils.clamp((t-a)/(b-a),0,1);return x*x*(3-2*x);};
+      const pos=[],idx=[];
+      for(let iv=0;iv<=RV;iv++){
+        const phi=iv/RV*Math.PI, uy=Math.cos(phi), ur=Math.sin(phi);
+        for(let iu=0;iu<RU;iu++){
+          const th=iu/RU*Math.PI*2;                 // th=0 が正面(+Z)
+          const ux=ur*Math.sin(th), uz=ur*Math.cos(th);
+          let px=ux*HW, py=uy*HH, pz=uz*HD;
+
+          // 頭蓋: 下方を顎に向かって絞る／後頭部をわずかに膨らませる
+          const jaw=smooth(-0.26,-0.98,uy);
+          px*=1-0.36*jaw;
+          if(pz<0){ pz*=(1-0.30*jaw)*(1+0.07*gauss(uy,0.12,0.55)); }
+          else {                                     // 顔面は球より平らな「面」にする
+            const face=Math.max(0,uz)*smooth(0.44,0.02,uy);   // 眉から下の顔面
+            pz*=(1-0.20*jaw)*(1-0.09*Math.max(0,uz)-0.11*face);
+          }
+
+          // 顔の座標（-1..1）。正面ほど効き、側面へ滑らかに消える
+          const fx=px/HW, fy=py/HH, fw=Math.max(0,uz);
+          let d=0;
+          d+=0.0105*gauss(fy,0.13,0.10)*gauss(fx,0,0.60);                        // 眉骨
+          d-=0.0105*(gauss(fx,0.42,0.21)+gauss(fx,-0.42,0.21))*gauss(fy,0.00,0.13);  // 眼窩（浅い後退）
+          d+=0.0275*gauss(fx,0,0.12)*smooth(0.26,-0.04,fy)*smooth(-0.42,-0.26,fy);   // 鼻根→鼻梁→鼻先
+          d+=0.0070*(gauss(fx,0.150,0.08)+gauss(fx,-0.150,0.08))*gauss(fy,-0.29,0.07); // 小鼻
+          d+=0.0090*(gauss(fx,0.54,0.30)+gauss(fx,-0.54,0.30))*gauss(fy,-0.20,0.26);   // 頬
+          d-=0.0055*gauss(fy,-0.52,0.11)*gauss(fx,0,0.34);                       // 口元（わずかな後退）
+          d+=0.0095*gauss(fy,-0.84,0.15)*gauss(fx,0,0.30);                       // 顎の丸み
+          pz+=d*S*fw;
+
+          pos.push(px,py,pz);
+        }
+      }
+      for(let iv=0;iv<RV;iv++)for(let iu=0;iu<RU;iu++){
+        const a=iv*RU+iu,b=iv*RU+(iu+1)%RU,c=(iv+1)*RU+(iu+1)%RU,e=(iv+1)*RU+iu;
+        idx.push(a,e,b, b,e,c);
+      }
+      const g=new THREE.BufferGeometry();
+      g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+      g.setIndex(idx);
+      g.computeVertexNormals();
+      return g;
+    }
+
+    // 足: 踵 → 甲 → 爪先
+    function buildFoot(J,S){
+      const ankle=J['ankle'+S],toe=J['foot'+S];
+      const fwd=V3().subVectors(toe,ankle).setY(0).normalize();
+      const p=(fz,fy)=>ankle.clone().addScaledVector(fwd,fz*H).add(V3(0,fy*H,0));
+      const stations=[
+        {p:p(-P.HEEL_LEN,0.010),      w:0.022,dF:0.018,dB:0.018,n:2.3},
+        {p:p(-P.HEEL_LEN*0.3,-0.005), w:0.027,dF:0.024,dB:0.024,n:2.4},
+        {p:p(0.022,-0.019),           w:0.030,dF:0.022,dB:0.022,n:2.5},
+        {p:p(0.072,-0.026),           w:P.FOOT_W,dF:0.014,dB:0.014,n:2.6},
+        {p:p(P.FOOT_LEN-P.HEEL_LEN,-0.028), w:0.024,dF:0.009,dB:0.009,n:2.6}
+      ].map(s=>({p:s.p,w:s.w*H,dF:s.dF*H,dB:s.dB*H,n:s.n}));
+      return loft(stations,{radial:22,seg:40,front:V3(0,1,0)});
+    }
+
+    /* ----------------------------------------------------------------------
+       組み立て
+       ---------------------------------------------------------------------- */
+    const meshCache={};
+    function buildMannequin(poseName){
+      const g=new THREE.Group(), J=buildSkeleton(poseName);
+      // 影は落とすが自身では受けない（曲面が細かいため、受影にするとシャドウアクネが出る）
+      const add=geo=>{const m=new THREE.Mesh(geo,material);m.castShadow=true;g.add(m);};
+      add(buildTrunk(J));
+      ['L','R'].forEach(S=>{add(buildLeg(J,S));add(buildFoot(J,S));add(buildArm(J,S));});
+      const head=new THREE.Mesh(buildHead(),material);
+      head.position.copy(J.head); head.rotation.x=J.headAngle;
+      head.castShadow=true; g.add(head);
+      // 接地: どのポーズでも最下点が床(y=0)に来るようにする
+      const box=new THREE.Box3().setFromObject(g);
+      g.position.y=-box.min.y;
+      return g;
+    }
+    function mannequin(pose){
+      return meshCache[pose]||(meshCache[pose]=buildMannequin(pose));
+    }
     let active='key',pose='standing',outdoors=true,model=mannequin(pose);scene.add(model);const data=[{id:'key',label:'ストロボ 1',role:'key',on:true,angle:45,distance:2.2,height:2.4,power:74,softness:62},{id:'fill',label:'フィル 2',role:'fill',on:false,angle:-42,distance:2.8,height:1.65,power:32,softness:78},{id:'rim',label:'リム 3',role:'rim',on:false,angle:152,distance:2.6,height:2.2,power:46,softness:35}];
     const calibrate={key:42,fill:90,rim:50},kits=data.map(()=>{const t=new THREE.Object3D(),l=new THREE.SpotLight('#fff6e7',0,10,Math.PI/5.4,.34,1.45);l.castShadow=true;l.shadow.mapSize.set(512,512);scene.add(l,t);return{l,t}});const color={key:'#67aef5',fill:'#bff4e9',rim:'#b9d3ff'};
     const now=new Date();document.querySelector('#date').value=now.toISOString().slice(0,10);document.querySelector('#time').value='16:30';document.querySelector('#lat').value='35.681';document.querySelector('#lng').value='139.767';
