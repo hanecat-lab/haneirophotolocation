@@ -627,6 +627,8 @@ function nowCardBody(ev, cue) {
   const names = cue.castIds.map(id => (ev.cast.find(p => p.id === id) || {}).name).filter(Boolean);
   const k = cue.constraints || {};
   let chips = '';
+  if (cue.locked) chips += '<span class="chip warm">🔒 固定予定</span>';
+  if (lockConflicts(ev)[cue.id]) chips += '<span class="chip no">⚠ 固定「' + esc(lockConflicts(ev)[cue.id]) + '」と重なる</span>';
   if (k.flash === 'ok') chips += '<span class="chip ok">⚡ フラッシュ可</span>';
   if (k.flash === 'no') chips += '<span class="chip no">🚫 フラッシュ禁止</span>';
   if (k.tripod === 'ok') chips += '<span class="chip ok">🦿 三脚可</span>';
@@ -649,6 +651,7 @@ function nowCardBody(ev, cue) {
     '<div class="now-actions">' +
       '<button class="btn mint" onclick="setCoverage(\'' + cue.id + '\',\'done\')">✓ 撮影完了</button>' +
       '<button class="btn" onclick="setCoverage(\'' + cue.id + '\',\'partial\')">△ 一部</button>' +
+      '<button class="btn" onclick="openInterruptForm()">⚡ 割り込み</button>' +
       '<button class="btn" onclick="openCueForm(\'' + cue.id + '\')">✎ 編集</button>' +
     '</div>';
 }
@@ -780,7 +783,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) tick
 function shiftPending(delta) {
   const ev = currentEvent(); if (!ev) return;
   const times = resolveTimes(ev);
-  const list = pendingCues(ev).filter(c => times[c.id] != null);
+  const list = pendingCues(ev).filter(c => times[c.id] != null && !c.locked);
   if (!list.length) { toast('動かせるキューがありません'); return; }
   snapshot('未完了 ' + list.length + '件を ' + (delta > 0 ? '+' : '') + delta + '分 移動');
   list.forEach(c => { applyAbsolute(ev, c, times[c.id] + delta * 60000); });
@@ -793,6 +796,86 @@ function syncToNow() {
   const delta = Math.round((Date.now() - times[cue.id]) / 60000);
   if (!delta) { toast('すでに現在時刻と一致しています'); return; }
   shiftPending(delta);
+}
+// 指定キューの直前に挿入し、order を1..Nへ振り直す（order は並び順の唯一の権威のため連番を保つ）
+function insertCueBefore(ev, cue, beforeCue) {
+  const list = sortedCues(ev);
+  const i = beforeCue ? list.findIndex(c => c.id === beforeCue.id) : -1;
+  list.splice(i < 0 ? list.length : i, 0, cue);
+  list.forEach((c, n) => { c.order = n + 1; });
+  ev.cues.push(cue);
+}
+// startCue の後ろの可動キューだけを、時系列を壊さず後ろへ詰め直す。
+// locked キューは動かさず、遅延の吸収点（壁）として扱う。戻り値は重なった固定キューの配列。
+function reflowAfter(ev, startCue) {
+  const times = resolveTimes(ev);
+  const list = pendingCues(ev).filter(c => times[c.id] != null);
+  const i = list.findIndex(c => c.id === startCue.id);
+  if (i < 0) return [];
+  const durMs = (c, nx) => c.durationMin != null ? c.durationMin * 60000
+    : (nx && times[nx.id] > times[c.id] ? times[nx.id] - times[c.id] : 0);
+  let cursor = times[startCue.id] + durMs(startCue, list[i + 1]);
+  const hit = [];
+  for (let j = i + 1; j < list.length; j++) {
+    const c = list[j], t = times[c.id], d = durMs(c, list[j + 1]);
+    if (c.locked) {
+      if (cursor > t) hit.push(c);
+      cursor = Math.max(cursor, t + d);
+      continue;
+    }
+    const ns = Math.max(t, cursor);
+    if (ns === t) break;
+    applyAbsolute(ev, c, ns);
+    cursor = ns + d;
+  }
+  return hit;
+}
+// 可動キューの終了が、後ろの固定キューの開始を越えている箇所を導出（表示用、常に再計算）
+function lockConflicts(ev) {
+  const times = resolveTimes(ev), out = {};
+  const list = pendingCues(ev).filter(c => times[c.id] != null);
+  list.forEach((c, i) => {
+    if (c.locked) return;
+    const end = times[c.id] + (c.durationMin || 0) * 60000;
+    for (let j = i + 1; j < list.length; j++) {
+      if (list[j].locked && times[list[j].id] < end) { out[c.id] = list[j].title; break; }
+    }
+  });
+  return out;
+}
+function openInterruptForm() {
+  const ev = currentEvent(); if (!ev) return;
+  if (!nextCue(ev)) { toast('割り込み先のキューがありません'); return; }
+  modal('<div class="modal-head"><div><h2>割り込みを追加</h2>' +
+      '<p>いま発生した撮影を次のキューとして差し込み、後ろの予定を自動でずらします。固定のキューは動かしません。</p></div>' +
+      '<button class="close" onclick="closeModal()">✕</button></div>' +
+    '<div class="fields">' +
+      '<div class="field full"><label>内容</label><input id="i-title" placeholder="例: 主催者と記念撮影"></div>' +
+      '<div class="field"><label>所要（分）</label><input id="i-dur" type="number" min="0" step="1" value="5"></div>' +
+      '<p class="hint" style="grid-column:1/-1">開始は現在時刻。詳しい制約はあとから「✎ 編集」で足せます。</p>' +
+    '</div>' +
+    '<div class="mfoot"><button class="btn" onclick="closeModal()">キャンセル</button>' +
+      '<button class="btn primary" onclick="addInterrupt()">追加してずらす</button></div>');
+  setTimeout(() => $('#i-title').focus(), 30);
+}
+function addInterrupt() {
+  const ev = currentEvent(); if (!ev) return;
+  const title = $('#i-title').value.trim();
+  if (!title) { toast('内容を入力してください'); return; }
+  const d = parseInt($('#i-dur').value, 10);
+  const before = nextCue(ev);
+  snapshot('割り込み「' + title + '」を追加');
+  const cue = {
+    id: uid(), order: 0, title: title, plannedAt: '', dayOff: 0,
+    durationMin: isNaN(d) ? null : d, castIds: [],
+    constraints: { flash: '', tripod: '', area: '', note: '' },
+    coverage: 'none', doneAt: null, locked: false
+  };
+  applyAbsolute(ev, cue, Date.now());
+  insertCueBefore(ev, cue, before);
+  const hit = reflowAfter(ev, cue);
+  save(); closeModal(); render();
+  toast(hit.length ? '⚠ 固定「' + hit[0].title + '」と重なります' : '割り込みを追加しました');
 }
 function setCoverage(cueId, cov) {
   const ev = currentEvent(); if (!ev) return;
@@ -809,15 +892,17 @@ function setCoverage(cueId, cov) {
 function renderCues(ev) {
   const box = $('#view-cues');
   if (!ev) { box.innerHTML = emptyBlock('🗒️', 'イベントがありません', '先にイベントを作成してください。'); return; }
-  const cues = sortedCues(ev), next = nextCue(ev);
+  const cues = sortedCues(ev), next = nextCue(ev), cf = lockConflicts(ev);
   box.innerHTML = cues.length
-    ? '<div class="rows">' + cues.map((c, i) => cueRow(ev, c, i, cues.length, next)).join('') + '</div>'
+    ? '<div class="rows">' + cues.map((c, i) => cueRow(ev, c, i, cues.length, next, cf)).join('') + '</div>'
     : emptyBlock('🗒️', 'キューがありません', '右上の「キュー追加」で撮影の順番を登録します。');
 }
-function cueRow(ev, c, i, n, next) {
+function cueRow(ev, c, i, n, next, cf) {
   const names = c.castIds.map(id => (ev.cast.find(p => p.id === id) || {}).name).filter(Boolean);
   const k = c.constraints || {};
   let chips = '';
+  if (c.locked) chips += '<span class="chip warm">🔒固定</span>';
+  if (cf && cf[c.id]) chips += '<span class="chip no">⚠固定と重なる</span>';
   if (k.flash === 'no') chips += '<span class="chip no">🚫フラッシュ</span>';
   if (k.tripod === 'no') chips += '<span class="chip no">🚫三脚</span>';
   if (k.area) chips += '<span class="chip warm">📍' + esc(k.area) + '</span>';
@@ -869,6 +954,10 @@ function openCueForm(id) {
         [0, 1, 2].map(d => '<option value="' + d + '"' + ((c ? (c.dayOff || 0) : suggestDayOff(ev)) === d ? ' selected' : '') + '>' +
           (d === 0 ? '開催日' : d === 1 ? '翌日（未明）' : '翌々日') + '</option>').join('') + '</select></div>' +
       '<div class="field"><label>所要（分）</label><input id="f-dur" type="number" min="0" step="1" value="' + esc(c && c.durationMin ? c.durationMin : '') + '"></div>' +
+      '<div class="field"><label>この予定</label><select id="f-lock">' +
+        '<option value="0"' + (c && c.locked ? '' : ' selected') + '>動かせる</option>' +
+        '<option value="1"' + (c && c.locked ? ' selected' : '') + '>固定（動かさない）</option>' +
+        '</select></div>' +
       '<div class="field"><label>フラッシュ</label><select id="f-flash">' + optTags(k.flash) + '</select></div>' +
       '<div class="field"><label>三脚</label><select id="f-tripod">' + optTags(k.tripod) + '</select></div>' +
       '<div class="field full"><label>場所・エリア</label><input id="f-area" value="' + esc(k.area || '') + '" placeholder="例: ステージ下手"></div>' +
@@ -898,6 +987,7 @@ function saveCue(id) {
     plannedAt: $('#f-time').value || '',
     dayOff: parseInt($('#f-day').value, 10) || 0,
     durationMin: isNaN(dur) ? null : dur,
+    locked: $('#f-lock').value === '1',
     castIds: castIds,
     constraints: {
       flash: $('#f-flash').value, tripod: $('#f-tripod').value,
