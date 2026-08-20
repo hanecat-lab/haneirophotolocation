@@ -1226,13 +1226,14 @@
     function studioWindowEligible(){return bgMode==='indoor'||bgMode==='white'||bgMode==='black';}
     function updateStudioWindow(alt,azi,environmentGain){
       const eligible=studioWindowEligible(),width=1.45*windowState.aspect,height=1.45,halfW=width/2,halfH=height/2,
-            // 入射方向は窓から被写体へ進む太陽光線の方位。太陽はその反対側にある時だけ窓を通過できる。
+            // 太陽の方向は、日時・場所・方位調整から既に算出された sun を唯一の基準にする。
+            // 窓の入射方向は太陽を曲げる値ではなく、窓がその太陽を受けられるかの向きとして使う。
             requiredSunDirection=(windowState.transmissionDirection+180)%360,
-            rayAzimuth=THREE.MathUtils.degToRad(windowState.transmissionDirection),
-            rayDirection=new THREE.Vector3(Math.sin(rayAzimuth)*Math.cos(THREE.MathUtils.degToRad(alt)),-Math.sin(THREE.MathUtils.degToRad(alt)),Math.cos(rayAzimuth)*Math.cos(THREE.MathUtils.degToRad(alt))).normalize(),
+            windowAzimuth=THREE.MathUtils.degToRad(windowState.transmissionDirection),
+            rayDirection=sun.position.clone().normalize().negate(),
             safeDown=Math.max(.12,-rayDirection.y),beamLength=Math.max(.2,windowState.height/safeDown),
-            // 高さと距離は独立。窓は指定した水平距離に置き、太陽光を被写体へ無理に曲げない。
-            horizontalDirection=new THREE.Vector3(Math.sin(rayAzimuth),0,Math.cos(rayAzimuth)),
+            // 高さと距離は独立。窓の位置を動かしても、実太陽の光線はこの方向のまま直進する。
+            horizontalDirection=new THREE.Vector3(Math.sin(windowAzimuth),0,Math.cos(windowAzimuth)),
             rigPosition=horizontalDirection.clone().multiplyScalar(-windowState.distance),beamLanding=new THREE.Vector3();
       rigPosition.y=windowState.height;beamLanding.copy(rigPosition).addScaledVector(rayDirection,beamLength);beamLanding.y=0;
       studioWindow.visible=eligible&&windowState.on;
@@ -1273,8 +1274,9 @@
       // 一つの主光を床・壁まで十分に届かせ、影マップの範囲も開口〜着地点を覆う。
       const directIntensity=admitted?2.05*environmentGain*Math.pow(alignment,1.65)*sunElevation:0;
       windowSun.intensity=directIntensity;
-      // 窓面からの空光と室内反射の近似。床・壁・被写体へ同じ補助光として届き、格子影は直射主光が担当する。
-      const bounceFactor=windowState.bounce/100,skyIntensity=admitted ? (.22+.28*bounceFactor)*environmentGain*(.35+.65*sunElevation):0;
+      // 窓面からの空光と室内反射の近似。0%なら補助光は消え、窓を通る単一太陽主光だけを検証できる。
+      // 補助光は影を作らず、格子影の主役は常に直射主光とする。
+      const bounceFactor=windowState.bounce/100,skyIntensity=admitted ? .32*bounceFactor*environmentGain*(.35+.65*sunElevation):0;
       windowSkyTarget.position.copy(beamLanding);windowSkyFill.position.copy(rigPosition).addScaledVector(rayDirection,.08);windowSkyFill.distance=Math.max(9,beamLength+3);windowSkyFill.intensity=skyIntensity;
       ground.receiveShadow=true;wall.receiveShadow=true;ground.material.needsUpdate=true;wall.material.needsUpdate=true;
       windowLandingMarker.visible=admitted;windowLandingMarker.position.copy(beamLanding);windowLandingMarker.position.y=.012;windowLandingMarker.scale.setScalar(THREE.MathUtils.clamp(width/.95,.8,1.6));
@@ -1282,11 +1284,11 @@
       const landingDistance=Math.hypot(beamLanding.x,beamLanding.z),landingBearing=(Math.atan2(beamLanding.x,beamLanding.z)*180/Math.PI+360)%360,
             subjectFootprint=Math.exp(-Math.pow(landingDistance/Math.max(.5,width*.62),2)),
             floorDirect=directIntensity*Math.max(0,-rayDirection.y),wallDirect=directIntensity*Math.max(0,-rayDirection.z),
-            roomBounce=directIntensity*(.08+.16*bounceFactor),
+            roomBounce=directIntensity*.14*bounceFactor,
             probeRaw={subject:directIntensity*(.72*subjectFootprint)+skyIntensity*.72+roomBounce,floor:floorDirect+skyIntensity*.88+roomBounce,wall:wallDirect+skyIntensity*.72+roomBounce},
             probeMax=Math.max(probeRaw.subject,probeRaw.floor,probeRaw.wall,.001),metrics={subject:Math.round(probeRaw.subject/probeMax*100),floor:Math.round(probeRaw.floor/probeMax*100),wall:Math.round(probeRaw.wall/probeMax*100)};
       windowPaneMaterial.color.set(admitted?'#e6f7ff':'#a9deef');windowPaneMaterial.opacity=admitted?(bgMode==='black' ? .40 : .29):(bgMode==='black' ? .36 : .25);
-      return{eligible,diff,alignment,admitted,requiredSunDirection,beamLength,beamLanding,landingDistance,landingBearing,metrics};
+      return{eligible,diff,alignment,admitted,requiredSunDirection,beamLength,beamLanding,landingDistance,landingBearing,metrics,solarRayDirection:rayDirection.clone()};
     }
     function updateWindowControls(alt=null,azi=null,info=null){
       const panel=document.querySelector('#windowControls');if(!panel)return;
@@ -1305,7 +1307,7 @@
       const diff=angleDifference(azi,requiredSunDirection),day=alt>0,admitted=windowState.on&&day&&diff<=58;
       const downAngle=Math.max(0,alt),approxLength=THREE.MathUtils.clamp(windowState.height/Math.max(.12,Math.sin(THREE.MathUtils.degToRad(Math.max(alt,0)))),2.2,8.0);
       const metricText=info&&info.admitted?' <br><strong>光の落点:</strong> 被写体から '+info.landingDistance.toFixed(1)+'m、'+directionLabel(info.landingBearing)+' '+info.landingBearing.toFixed(0)+'°。<br><strong>相対照度:</strong> 被写体 '+info.metrics.subject+' / 床 '+info.metrics.floor+' / 壁 '+info.metrics.wall+'。':'';
-      readout.innerHTML=!windowState.on?'<strong>窓リグは未配置です。</strong>追加すると、単一の太陽主光を矩形開口だけから室内へ入れます。':!day?'<strong>太陽は地平線下です。</strong>窓の直射日光と格子影は発生しません。':admitted?'<strong>自然な窓光が有効</strong>高さと水平距離は独立です。太陽高度 '+downAngle.toFixed(0)+'°、入射方向 '+directionLabel(windowState.transmissionDirection)+' '+windowState.transmissionDirection+'°から、単一の主光と開口由来の空光が床・壁・被写体へ届きます。'+(windowState.grid?' 十字格子影をモデル・床・壁へ投影します。':' 格子なしの矩形開口影をモデル・床・壁へ投影します。')+metricText:'<strong>太陽方位ロック外です。</strong>必要な太陽方位は '+directionLabel(requiredSunDirection)+' '+requiredSunDirection+'°（現在との差 '+diff.toFixed(0)+'°、許容±58°）です。';
+      readout.innerHTML=!windowState.on?'<strong>窓リグは未配置です。</strong>追加すると、単一の太陽主光を矩形開口だけから室内へ入れます。':!day?'<strong>太陽は地平線下です。</strong>窓の直射日光と格子影は発生しません。':admitted?'<strong>実太陽光による窓採光が有効</strong>日時・場所から算出した太陽方向をそのまま窓開口へ通しています。高さと水平距離は独立です。太陽高度 '+downAngle.toFixed(0)+'°、窓の受光側 '+directionLabel(requiredSunDirection)+' '+requiredSunDirection+'°。'+(windowState.bounce===0?' 室内反射0%のため、直射主光と格子影のみを確認できます。':' 室内反射 '+windowState.bounce+'%が床・壁・影側を補います。')+(windowState.grid?' 十字格子影をモデル・床・壁へ投影します。':' 格子なしの矩形開口影をモデル・床・壁へ投影します。')+metricText:'<strong>太陽方位ロック外です。</strong>必要な太陽方位は '+directionLabel(requiredSunDirection)+' '+requiredSunDirection+'°（現在との差 '+diff.toFixed(0)+'°、許容±58°）です。';
     }
     function solarCalculationDate(dateValue,minutes,longitude){
       // 入力された現地時刻を、経度から求める最寄りの標準時でUTCに換算する。
@@ -1338,8 +1340,7 @@
       sun.intensity=outdoors&&alt>0?2*environmentGain:0;
       // 黒ホリは背景へ回り込む環境光を抑え、ストロボで作る輪郭と影を保つ。
       // 直射太陽光はスタジオ系セットでは常にOFFのままにする。
-      const studioAmbientMultiplier=bgMode==='black' ? .18 : 1;
-      hemi.intensity=.68*environmentGain*studioAmbientMultiplier;
+      const studioAmbientMultiplier=bgMode==='black' ? .18 : 1,baseStudioAmbient=.68*environmentGain*studioAmbientMultiplier;
       renderer.toneMappingExposure=1.08;
       scene.background=new THREE.Color(preset.bg).multiplyScalar(Math.min(4,environmentGain));
       ground.material.color.set(preset.ground);
@@ -1348,6 +1349,10 @@
       applyProductSurface();
       applyPortraitWall();
       const windowDaylightInfo=updateStudioWindow(alt,azi,environmentGain);
+      // 窓直射中は環境光を抑え、反射量0%で主光・人物影・格子影だけを確認できるようにする。
+      // 窓なし・屋外・方位ロック外では既存の環境光挙動を保つ。
+      const windowAmbientRatio=windowDaylightInfo.admitted ? (.10+.30*(windowState.bounce/100)) : 1;
+      hemi.intensity=baseStudioAmbient*windowAmbientRatio;
       wall.visible=modelType==='food'?!outdoors:true;
       chair.visible=modelType!=='food'&&pose==='seated';
 
