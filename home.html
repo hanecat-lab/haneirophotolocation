@@ -414,8 +414,8 @@
           </div>
           <p class="appearance-status" id="appearanceStatus" aria-live="polite"></p>
         </section>
-        <section class="settings-block"><h3>ライブラリをエクスポート</h3><p>登録したアプリ情報をJSONファイルとして保存します。別のブラウザへ移すときにも便利です。</p><div class="settings-actions"><button class="button secondary sm" id="exportButton" type="button">JSONをダウンロード</button></div></section>
-        <section class="settings-block"><h3>ライブラリをインポート</h3><p>以前に書き出したJSONを選ぶと、現在のライブラリをその内容で置き換えます。</p><div class="settings-actions"><label class="button secondary sm" for="importInput">JSONを選択</label><input id="importInput" type="file" accept="application/json,.json" hidden /></div></section>
+        <section class="settings-block"><h3>ランチャーを完全バックアップ</h3><p>登録アプリ、手動の並び順、カテゴリ、お気に入り、外観、検索履歴を1つのJSONファイルへ保存します。別のリポジトリやブラウザへの移行前に書き出してください。</p><div class="settings-actions"><button class="button secondary sm" id="exportButton" type="button">完全バックアップを保存</button></div></section>
+        <section class="settings-block"><h3>完全バックアップを復元</h3><p>App ShelfのバックアップJSONを選ぶと、現在のランチャーデータをその内容で安全に置き換えます。以前の簡易バックアップにも対応しています。</p><div class="settings-actions"><label class="button secondary sm" for="importInput">JSONを選択して復元</label><input id="importInput" type="file" accept="application/json,.json" hidden /></div></section>
         <section class="settings-block"><h3>初期サンプルへ戻す</h3><p>カスタム登録を削除し、最初から入っている3つのサンプルアプリに戻します。</p><div class="settings-actions"><button class="button danger sm" id="resetButton" type="button">ライブラリを初期化</button></div></section>
       </div>
       <p class="settings-message" id="settingsMessage" aria-live="polite"></p>
@@ -455,11 +455,12 @@
       const appForm = $('#appForm');
 
       function cloneDefaults() { return DEFAULT_APPS.map(app => ({ ...app })); }
+      function sanitizeSearchHistory(value) {
+        return Array.isArray(value) ? value.filter(item => typeof item === 'string' && item.trim()).map(item => item.trim().slice(0, 80)).slice(0, 6) : [];
+      }
       function loadSearchHistory() {
-        try {
-          const saved = JSON.parse(localStorage.getItem(SEARCH_HISTORY_KEY));
-          return Array.isArray(saved) ? saved.filter(item => typeof item === 'string' && item.trim()).slice(0, 6) : [];
-        } catch (error) { return []; }
+        try { return sanitizeSearchHistory(JSON.parse(localStorage.getItem(SEARCH_HISTORY_KEY))); }
+        catch (error) { return []; }
       }
       function saveSearchHistory() { localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(searchHistory)); }
       function rememberSearch() {
@@ -475,14 +476,15 @@
         if (!searchHistory.length) { assist.innerHTML = ''; return; }
         assist.innerHTML = `<span>最近の検索</span>${searchHistory.map(term => `<button class="history-chip" type="button" data-search-term="${escapeHTML(term)}">${escapeHTML(term)}</button>`).join('')}<button class="history-clear" type="button" data-action="clear-history">履歴を消去</button>`;
       }
+      function sanitizePreferences(value) {
+        return {
+          mode: ['system', 'light', 'dark'].includes(value?.mode) ? value.mode : 'system',
+          theme: ['indigo', 'ocean', 'forest', 'sunset', 'violet'].includes(value?.theme) ? value.theme : 'indigo'
+        };
+      }
       function loadPreferences() {
-        try {
-          const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY));
-          return {
-            mode: ['system', 'light', 'dark'].includes(saved?.mode) ? saved.mode : 'system',
-            theme: ['indigo', 'ocean', 'forest', 'sunset', 'violet'].includes(saved?.theme) ? saved.theme : 'indigo'
-          };
-        } catch (error) { return { mode: 'system', theme: 'indigo' }; }
+        try { return sanitizePreferences(JSON.parse(localStorage.getItem(SETTINGS_KEY))); }
+        catch (error) { return sanitizePreferences(null); }
       }
       function savePreferences() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(preferences)); }
       function resolvedMode() { return preferences.mode === 'system' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : preferences.mode; }
@@ -771,29 +773,53 @@
         const app = apps.find(item => item.id === id);
         if (app && confirm(`「${app.name}」をライブラリから削除しますか？`)) { apps = apps.filter(item => item.id !== id); saveApps(); closeDialog('appDialog'); render(); }
       });
+      function createFullBackup() {
+        return {
+          schema: 'app-shelf-full-backup',
+          version: 3,
+          exportedAt: new Date().toISOString(),
+          data: {
+            apps,
+            appearance: preferences,
+            searchHistory
+          },
+          summary: {
+            appCount: apps.length,
+            includes: ['apps', 'manualOrder', 'categories', 'favorites', 'appearance', 'searchHistory']
+          }
+        };
+      }
+      function extractBackupData(data) {
+        const complete = data && data.schema === 'app-shelf-full-backup' && data.version >= 3 && data.data;
+        const payload = complete ? data.data : data;
+        const candidate = Array.isArray(payload) ? payload : payload?.apps;
+        if (!Array.isArray(candidate)) throw new Error('format');
+        const imported = candidate.filter(isValidApp).map(normalizeApp).filter(app => app.name && isSafeUrl(app.url));
+        if (!imported.length) throw new Error('empty');
+        return {
+          complete,
+          apps: imported,
+          appearance: payload?.appearance && typeof payload.appearance === 'object' ? sanitizePreferences(payload.appearance) : null,
+          searchHistory: complete ? sanitizeSearchHistory(payload.searchHistory) : null
+        };
+      }
       $('#exportButton').addEventListener('click', () => {
-        const blob = new Blob([JSON.stringify({ version: 2, exportedAt: new Date().toISOString(), apps, appearance: preferences }, null, 2)], { type: 'application/json' });
-        const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `app-shelf-backup-${new Date().toISOString().slice(0,10)}.json`; link.click(); URL.revokeObjectURL(link.href);
-        showSettingsMessage('JSONファイルをダウンロードしました。');
+        const blob = new Blob([JSON.stringify(createFullBackup(), null, 2)], { type: 'application/json' });
+        const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `app-shelf-full-backup-${new Date().toISOString().slice(0,10)}.json`; link.click(); URL.revokeObjectURL(link.href);
+        showSettingsMessage(`完全バックアップを保存しました（${apps.length}件のアプリ）。`);
       });
       $('#importInput').addEventListener('change', async event => {
         const file = event.target.files[0]; if (!file) return;
         try {
-          const data = JSON.parse(await file.text());
-          const candidate = Array.isArray(data) ? data : data.apps;
-          if (!Array.isArray(candidate)) throw new Error('format');
-          const imported = candidate.filter(isValidApp).map(normalizeApp).filter(app => app.name && isSafeUrl(app.url));
-          if (!imported.length) throw new Error('empty');
-          apps = imported;
-          if (data.appearance && typeof data.appearance === 'object') {
-            preferences = {
-              mode: ['system', 'light', 'dark'].includes(data.appearance.mode) ? data.appearance.mode : preferences.mode,
-              theme: ['indigo', 'ocean', 'forest', 'sunset', 'violet'].includes(data.appearance.theme) ? data.appearance.theme : preferences.theme
-            };
-            savePreferences(); applyAppearance();
-          }
-          saveApps(); render(); showSettingsMessage(`${apps.length}件のアプリを読み込みました。`);
-        } catch (error) { showSettingsMessage('読み込めませんでした。App ShelfのJSONバックアップを選択してください。', true); }
+          const backup = extractBackupData(JSON.parse(await file.text()));
+          const detail = backup.complete ? 'アプリ、手動順、外観、検索履歴' : 'アプリ一覧（旧形式のため、外観は含まれている場合のみ）';
+          if (!confirm(`${backup.apps.length}件のアプリを復元します。\n現在のランチャーデータはこの内容で置き換えられます。\n\n復元対象：${detail}\n\n続けますか？`)) { event.target.value = ''; return; }
+          apps = backup.apps;
+          if (backup.appearance) preferences = backup.appearance;
+          if (backup.complete) searchHistory = backup.searchHistory;
+          saveApps(); savePreferences(); saveSearchHistory(); applyAppearance(); render();
+          showSettingsMessage(`${backup.apps.length}件を${backup.complete ? '完全バックアップから' : '互換バックアップから'}復元しました。`);
+        } catch (error) { showSettingsMessage('復元できませんでした。App ShelfのバックアップJSONを選択してください。', true); }
         event.target.value = '';
       });
       $('#resetButton').addEventListener('click', () => {
