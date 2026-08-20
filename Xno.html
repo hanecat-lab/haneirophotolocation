@@ -3,7 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>X分割カルーセルメーカー（100%パディング対応）</title>
+  <title>X分割カルーセルメーカー（ドラッグ＆一括保存対応）</title>
+  <!-- JSZipライブラリ (ZIP一括圧縮用) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
     body { font-family: sans-serif; max-width: 850px; margin: 20px auto; padding: 0 15px; color: #333; }
     .box { border: 2px dashed #ccc; padding: 20px; text-align: center; margin-bottom: 20px; border-radius: 8px; }
@@ -11,22 +13,28 @@
     .control-item { display: flex; flex-direction: column; gap: 5px; }
     .recommend-badge { background: #1da1f2; color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; }
     
-    /* プレビュー表示エリア */
-    #previewWrapper { text-align: center; margin: 20px 0; background: #222; padding: 15px; border-radius: 8px; }
-    #mainCanvas { max-width: 100%; height: auto; border: 1px solid #555; }
-    .slider-box { margin-top: 10px; color: white; display: flex; align-items: center; justify-content: center; gap: 10px; }
+    /* プレビュー表示エリア (ドラッグ可能) */
+    #previewWrapper { text-align: center; margin: 20px 0; background: #222; padding: 15px; border-radius: 8px; user-select: none; }
+    #mainCanvas { max-width: 100%; height: auto; border: 1px solid #555; cursor: grab; }
+    #mainCanvas:active { cursor: grabbing; }
     
-    /* 書き出し結果 */
+    /* ボタンエリア */
+    .btn-group { display: flex; justify-content: center; gap: 15px; margin-top: 15px; flex-wrap: wrap; }
+    button { background: #1da1f2; color: white; border: none; padding: 12px 24px; border-radius: 20px; cursor: pointer; font-weight: bold; font-size: 1em; }
+    button:hover { background: #0d8ddb; }
+    button.zip-btn { background: #17bf63; }
+    button.zip-btn:hover { background: #129c50; }
+
+    /* 結果プレビュー */
     #resultContainer { display: flex; gap: 10px; overflow-x: auto; margin-top: 20px; padding-bottom: 10px; }
     .result-item { flex: 0 0 auto; text-align: center; }
     .result-item img { max-height: 200px; border: 1px solid #ddd; border-radius: 4px; }
-    button { background: #1da1f2; color: white; border: none; padding: 12px 24px; border-radius: 20px; cursor: pointer; font-weight: bold; font-size: 1em; }
-    button:hover { background: #0d8ddb; }
   </style>
 </head>
 <body>
 
   <h1>X分割カルーセルメーカー</h1>
+  <p style="font-size: 0.9em; color: #666;">画像をドラッグして位置を微調整できます。完成画像はZIPで一括保存可能です。</p>
   
   <div class="box">
     <input type="file" id="imageInput" accept="image/jpeg, image/png, image/webp">
@@ -34,22 +42,6 @@
 
   <div id="settings" style="display:none;">
     <div class="controls">
-      <div class="control-item">
-        <label>分割モード:</label>
-        <select id="fitMode">
-          <option value="crop">切り抜き（クロップ）</option>
-          <option value="pad" selected>余白を追加（元画像100%維持）</option>
-        </select>
-      </div>
-
-      <div class="control-item" id="bgColorGroup">
-        <label>余白の色:</label>
-        <select id="bgColor">
-          <option value="#000000">黒</option>
-          <option value="#ffffff">白</option>
-        </select>
-      </div>
-
       <div class="control-item">
         <label>分割数:</label>
         <select id="splitCount">
@@ -70,21 +62,27 @@
       </div>
 
       <div class="control-item">
+        <label>背景（余白）の色:</label>
+        <select id="bgColor">
+          <option value="#000000">黒</option>
+          <option value="#ffffff">白</option>
+        </select>
+      </div>
+
+      <div class="control-item">
         <span id="recommendText" class="recommend-badge"></span>
       </div>
     </div>
 
-    <!-- 切り取り位置プレビュー -->
+    <!-- プレビュー（キャンバスドラッグ対応） -->
     <div id="previewWrapper">
       <canvas id="mainCanvas"></canvas>
-      <div class="slider-box" id="sliderGroup">
-        <label for="offsetSlider">位置調整:</label>
-        <input type="range" id="offsetSlider" min="0" max="100" value="50" style="width: 60%;">
-      </div>
+      <p style="color: #aaa; font-size: 0.85em; margin-top: 5px;">↑ 枠内をドラッグ（スワイプ）して画像の位置を調整できます</p>
     </div>
 
-    <div style="text-align: center; margin-top: 15px;">
-      <button id="processBtn">分割書き出し</button>
+    <div class="btn-group">
+      <button id="processBtn">分割プレビュー生成</button>
+      <button id="zipDownloadBtn" class="zip-btn" style="display:none;">まとめてZIP保存</button>
     </div>
   </div>
 
@@ -92,7 +90,14 @@
 
 <script>
   let loadedImage = null;
-  let currentCrop = { startX: 0, startY: 0, cropW: 0, cropH: 0 };
+  let generatedDataUrls = []; // ZIP出力用
+
+  // ドラッグ操作用の変数
+  let imgOffsetX = 0;
+  let imgOffsetY = 0;
+  let isDragging = false;
+  let startX = 0;
+  let startY = 0;
 
   const ratios = [
     { label: '1:1', val: 1.0 },
@@ -102,6 +107,9 @@
   ];
   const counts = [2, 3, 4];
 
+  const canvas = document.getElementById('mainCanvas');
+  const ctx = canvas.getContext('2d');
+
   // 画像読み込み
   document.getElementById('imageInput').addEventListener('change', (e) => {
     const file = e.target.files[0];
@@ -110,24 +118,30 @@
     const img = new Image();
     img.onload = () => {
       loadedImage = img;
+      imgOffsetX = 0;
+      imgOffsetY = 0;
       document.getElementById('settings').style.display = 'block';
-      autoSelectBestPattern(img.width, img.height);
+      document.getElementById('zipDownloadBtn').style.display = 'none';
+      document.getElementById('resultContainer').innerHTML = '';
+      autoSelectMinPaddingPattern(img.width, img.height);
       updatePreview();
     };
     img.src = URL.createObjectURL(file);
   });
 
-  // 自動判定
-  function autoSelectBestPattern(imgWidth, imgHeight) {
+  // 自動パターン判定
+  function autoSelectMinPaddingPattern(imgWidth, imgHeight) {
     const R = imgWidth / imgHeight;
-    let bestRetention = -1, bestCount = 2, bestRatioVal = 1.0;
+    let minDifference = Infinity;
+    let bestCount = 2;
+    let bestRatioVal = 1.0;
 
     counts.forEach(count => {
       ratios.forEach(r => {
         const F = r.val * count;
-        const retention = Math.min(R, F) / Math.max(R, F);
-        if (retention > bestRetention || (Math.abs(retention - bestRetention) < 0.0001 && count > bestCount)) {
-          bestRetention = retention;
+        const diff = Math.abs(R - F);
+        if (diff < minDifference) {
+          minDifference = diff;
           bestCount = count;
           bestRatioVal = r.val;
         }
@@ -136,137 +150,97 @@
 
     document.getElementById('splitCount').value = bestCount;
     document.getElementById('aspectRatio').value = bestRatioVal;
-    updateRecommendText();
+
+    const chosenF = bestRatioVal * bestCount;
+    const paddingPercent = Math.abs(1 - (Math.min(R, chosenF) / Math.max(R, chosenF))) * 100;
+    
+    document.getElementById('recommendText').innerText = 
+      `おすすめ: ${bestCount}分割 (余白約 ${paddingPercent.toFixed(1)}%)`;
   }
 
-  function updateRecommendText() {
-    const mode = document.getElementById('fitMode').value;
-    if (mode === 'pad') {
-      document.getElementById('recommendText').innerText = `元画像 100% 保持 (余白補正)`;
-    } else {
-      const R = loadedImage.width / loadedImage.height;
-      const count = parseInt(document.getElementById('splitCount').value);
-      const aspect = parseFloat(document.getElementById('aspectRatio').value);
-      const F = aspect * count;
-      const retention = Math.min(R, F) / Math.max(R, F);
-      document.getElementById('recommendText').innerText = `残存率: ${(retention * 100).toFixed(1)}%`;
-    }
-  }
-
-  // イベントリスナー
-  document.getElementById('fitMode').addEventListener('change', () => {
-    const isPad = document.getElementById('fitMode').value === 'pad';
-    document.getElementById('bgColorGroup').style.display = isPad ? 'flex' : 'none';
-    document.getElementById('sliderGroup').style.display = isPad ? 'none' : 'flex';
-    updateRecommendText();
-    updatePreview();
-  });
+  // イベント
+  document.getElementById('splitCount').addEventListener('change', () => { imgOffsetX = 0; imgOffsetY = 0; updatePreview(); });
+  document.getElementById('aspectRatio').addEventListener('change', () => { imgOffsetX = 0; imgOffsetY = 0; updatePreview(); });
   document.getElementById('bgColor').addEventListener('change', updatePreview);
-  document.getElementById('splitCount').addEventListener('change', () => { updateRecommendText(); updatePreview(); });
-  document.getElementById('aspectRatio').addEventListener('change', () => { updateRecommendText(); updatePreview(); });
-  document.getElementById('offsetSlider').addEventListener('input', updatePreview);
 
-  // プレビュー描画処理
+  // マウス/タッチ ドラッグ処理
+  canvas.addEventListener('mousedown', startDrag);
+  canvas.addEventListener('mousemove', drag);
+  canvas.addEventListener('mouseup', endDrag);
+  canvas.addEventListener('mouseleave', endDrag);
+
+  canvas.addEventListener('touchstart', (e) => startDrag(e.touches[0]));
+  canvas.addEventListener('touchmove', (e) => drag(e.touches[0]));
+  canvas.addEventListener('touchend', endDrag);
+
+  function startDrag(e) {
+    if (!loadedImage) return;
+    isDragging = true;
+    const rect = canvas.getBoundingClientRect();
+    const scale = canvas.width / rect.width;
+    startX = e.clientX * scale - imgOffsetX;
+    startY = e.clientY * scale - imgOffsetY;
+  }
+
+  function drag(e) {
+    if (!isDragging) return;
+    const rect = canvas.getBoundingClientRect();
+    const scale = canvas.width / rect.width;
+    imgOffsetX = e.clientX * scale - startX;
+    imgOffsetY = e.clientY * scale - startY;
+    updatePreview();
+  }
+
+  function endDrag() { isDragging = false; }
+
+  // プレビュー再描画
   function updatePreview() {
     if (!loadedImage) return;
 
-    const mode = document.getElementById('fitMode').value;
     const count = parseInt(document.getElementById('splitCount').value);
     const aspect = parseFloat(document.getElementById('aspectRatio').value);
     const bgColor = document.getElementById('bgColor').value;
-    const sliderVal = parseInt(document.getElementById('offsetSlider').value) / 100;
-
-    const canvas = document.getElementById('mainCanvas');
-    const ctx = canvas.getContext('2d');
 
     const R = loadedImage.width / loadedImage.height;
     const F = aspect * count;
 
-    if (mode === 'pad') {
-      // 100%残すための余白キャンバスサイズ計算
-      let targetW, targetH;
-      if (R > F) {
-        targetW = loadedImage.width;
-        targetH = targetW / F;
-      } else {
-        targetH = loadedImage.height;
-        targetW = targetH * F;
-      }
-
-      canvas.width = targetW;
-      canvas.height = targetH;
-
-      // 背景塗りつぶし
-      ctx.fillStyle = bgColor;
-      ctx.fillRect(0, 0, targetW, targetH);
-
-      // 中央配置
-      const drawX = (targetW - loadedImage.width) / 2;
-      const drawY = (targetH - loadedImage.height) / 2;
-      ctx.drawImage(loadedImage, drawX, drawY);
-
-      currentCrop = { startX: 0, startY: 0, cropW: targetW, cropH: targetH };
-
-      // 分割線（赤破線）
-      const pieceW = targetW / count;
-      ctx.strokeStyle = '#ff3333';
-      ctx.lineWidth = Math.max(2, targetW / 400);
-      ctx.setLineDash([10, 5]);
-
-      for (let i = 1; i < count; i++) {
-        const lineX = pieceW * i;
-        ctx.beginPath();
-        ctx.moveTo(lineX, 0);
-        ctx.lineTo(lineX, targetH);
-        ctx.stroke();
-      }
-
+    let targetW, targetH;
+    if (R > F) {
+      targetW = loadedImage.width;
+      targetH = targetW / F;
     } else {
-      // クロップモード
-      canvas.width = loadedImage.width;
-      canvas.height = loadedImage.height;
-      ctx.drawImage(loadedImage, 0, 0);
+      targetH = loadedImage.height;
+      targetW = targetH * F;
+    }
 
-      let cropW, cropH, startX = 0, startY = 0;
-      if (R > F) {
-        cropH = loadedImage.height;
-        cropW = cropH * F;
-        startX = (loadedImage.width - cropW) * sliderVal;
-      } else {
-        cropW = loadedImage.width;
-        cropH = cropW / F;
-        startY = (loadedImage.height - cropH) * sliderVal;
-      }
+    canvas.width = targetW;
+    canvas.height = targetH;
 
-      currentCrop = { startX, startY, cropW, cropH };
+    // 背景描画
+    ctx.fillStyle = bgColor;
+    ctx.fillRect(0, 0, targetW, targetH);
 
-      // 枠外を暗くする
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-      ctx.fillRect(0, 0, canvas.width, startY);
-      ctx.fillRect(0, startY + cropH, canvas.width, canvas.height - (startY + cropH));
-      ctx.fillRect(0, startY, startX, cropH);
-      ctx.fillRect(startX + cropW, startY, canvas.width - (startX + cropW), cropH);
+    // 画像描画（ドラッグオフセット反映）
+    const baseDrawX = (targetW - loadedImage.width) / 2;
+    const baseDrawY = (targetH - loadedImage.height) / 2;
+    ctx.drawImage(loadedImage, baseDrawX + imgOffsetX, baseDrawY + imgOffsetY);
 
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = Math.max(2, canvas.width / 300);
-      ctx.strokeRect(startX, startY, cropW, cropH);
+    // 赤色分割線
+    const pieceW = targetW / count;
+    ctx.strokeStyle = '#ff3333';
+    ctx.lineWidth = Math.max(2, targetW / 400);
+    ctx.setLineDash([10, 5]);
 
-      const pieceW = cropW / count;
-      ctx.strokeStyle = '#ff3333';
-      ctx.lineWidth = Math.max(2, canvas.width / 400);
-      ctx.setLineDash([10, 5]);
-
-      for (let i = 1; i < count; i++) {
-        const lineX = startX + (pieceW * i);
-        ctx.beginPath();
-        ctx.moveTo(lineX, startY);
-        ctx.lineTo(lineX, startY + cropH);
-        ctx.stroke();
-      }
+    for (let i = 1; i < count; i++) {
+      const lineX = pieceW * i;
+      ctx.beginPath();
+      ctx.moveTo(lineX, 0);
+      ctx.lineTo(lineX, targetH);
+      ctx.stroke();
     }
   }
 
-  // 書き出し処理
+  // 画像分割処理
   document.getElementById('processBtn').addEventListener('click', () => {
     if (!loadedImage) return;
 
@@ -274,27 +248,28 @@
     const aspect = parseFloat(document.getElementById('aspectRatio').value);
     const container = document.getElementById('resultContainer');
     container.innerHTML = '';
+    generatedDataUrls = [];
 
-    const previewCanvas = document.getElementById('mainCanvas');
-    const pieceW = currentCrop.cropW / count;
+    const pieceW = canvas.width / count;
 
     for (let i = 0; i < count; i++) {
-      const canvas = document.createElement('canvas');
+      const exportCanvas = document.createElement('canvas');
       const piecePixelW = 1080;
       const piecePixelH = piecePixelW / aspect;
       
-      canvas.width = piecePixelW;
-      canvas.height = piecePixelH;
-      const ctx = canvas.getContext('2d');
+      exportCanvas.width = piecePixelW;
+      exportCanvas.height = piecePixelH;
+      const exportCtx = exportCanvas.getContext('2d');
 
-      const sx = currentCrop.startX + (i * pieceW);
-      const sy = currentCrop.startY;
+      const sx = i * pieceW;
 
-      // プレビューの描画状態（余白付与済みまたは元画像）から切り出し
-      ctx.drawImage(previewCanvas, sx, sy, pieceW, currentCrop.cropH, 0, 0, piecePixelW, piecePixelH);
+      // プレビューの描画結果から正確にスライス
+      exportCtx.drawImage(canvas, sx, 0, pieceW, canvas.height, 0, 0, piecePixelW, piecePixelH);
 
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+      const dataUrl = exportCanvas.toDataURL('image/jpeg', 0.92);
+      generatedDataUrls.push(dataUrl);
 
+      // 個別プレビュー表示
       const itemDiv = document.createElement('div');
       itemDiv.className = 'result-item';
       
@@ -312,6 +287,29 @@
       itemDiv.appendChild(link);
       container.appendChild(itemDiv);
     }
+
+    // ZIPダウンロードボタン表示
+    document.getElementById('zipDownloadBtn').style.display = 'inline-block';
+  });
+
+  // ZIP一括保存処理
+  document.getElementById('zipDownloadBtn').addEventListener('click', () => {
+    if (generatedDataUrls.length === 0) return;
+
+    const zip = new JSZip();
+    
+    generatedDataUrls.forEach((dataUrl, idx) => {
+      // Base64からバイナリ抽出
+      const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, "");
+      zip.file(`x_split_${idx + 1}.jpg`, base64Data, { base64: true });
+    });
+
+    zip.generateAsync({ type: "blob" }).then((content) => {
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(content);
+      link.download = "x_carousel_images.zip";
+      link.click();
+    });
   });
 </script>
 </body>
