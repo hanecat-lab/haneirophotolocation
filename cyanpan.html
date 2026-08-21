@@ -123,12 +123,14 @@
     <div id="fallback"><div class="load-card"><p class="eyebrow">3D Preview Unavailable</p><p>このブラウザでは3D表示を開始できませんでした。WebGL対応の最新ブラウザでお試しください。</p></div></div>
   </main>
 
+
   <script type="importmap">
-    {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/"}}
+    {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.185.1/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.185.1/examples/jsm/"}}
   </script>
   <script type="module">
     import * as THREE from 'three';
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 
     const viewport = document.getElementById('viewport');
     const loading = document.getElementById('loading');
@@ -140,241 +142,379 @@
     const autoInput = document.getElementById('autorotate');
     const resetButton = document.getElementById('reset-view');
 
-    let renderer, scene, camera, controls, clock;
-    let tower = null;
-    let floor = null;
+    let renderer, scene, camera, controls, clock, pmrem;
+    let tower = null, room = null, lightRig = null;
     let materials, geometries;
     const requestState = new URLSearchParams(location.search);
     let currentMode = requestState.get('mode') === 'tower' ? 'tower' : 'study';
     let currentLevels = Math.max(1, Math.min(10, Number.parseInt(requestState.get('levels'), 10) || 1));
     levelsInput.value = currentLevels;
     modeButtons.forEach(button => button.classList.toggle('active', button.dataset.mode === currentMode));
-    const isSmall = matchMedia('(max-width: 660px)').matches;
+
+    // 1 unit = 100mm。実寸のクープグラス（口径95mm / 全高130mm / 台座径65mm）をそのまま数値で扱う。
+    const GLASS = {
+      rimY: 1.30,          // 縁の高さ 130mm
+      rimOuter: .4775,     // 口径 95.5mm
+      rimThickness: .0125, // 縁の肉厚 2.5mm（折り返しの半径）
+      floorY: .862,        // 鉢の内底。外底 .782 との差 8mm がボウル底のガラス厚
+      liquidLevel: 1.115,  // 縁から18.5mm下。鉢の6割弱
+      baseR: .3145,        // 台座 直径63mm
+      pitch: .962,         // タワーで縁同士が触れる間隔
+      stack: 1.3125        // 縁の頂点。上段の台座はここに載る
+    };
 
     try { init(); animate(); } catch (error) { console.error(error); loading.style.display = 'none'; fallback.style.display = 'grid'; }
 
     function init() {
       scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x0e0b09);
-      scene.fog = new THREE.FogExp2(0x0e0b09, .072);
+      scene.background = new THREE.Color(0x090807);
+      scene.fog = new THREE.FogExp2(0x090807, .028);
 
-      camera = new THREE.PerspectiveCamera(36, innerWidth / innerHeight, .1, 100);
-      camera.position.set(4.8, 3.3, 7.8);
+      camera = new THREE.PerspectiveCamera(36, innerWidth / innerHeight, .05, 200);
 
       renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
       renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
       renderer.setSize(innerWidth, innerHeight);
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 1.18;
-      renderer.transmissionResolutionScale = .58;
+      renderer.toneMappingExposure = .88;
       renderer.shadowMap.enabled = true;
       renderer.shadowMap.type = THREE.PCFSoftShadowMap;
       viewport.appendChild(renderer.domElement);
+
+      RectAreaLightUniformsLib.init();
+      buildEnvironmentMap();
       createSharedAssets();
 
       controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
       controls.dampingFactor = .055;
-      controls.minDistance = 2.2;
-      controls.maxDistance = 27;
-      controls.maxPolarAngle = Math.PI * .49;
-      controls.target.set(0, 1.72, 0);
-      controls.autoRotate = true;
-      controls.autoRotateSpeed = .48;
+      controls.maxPolarAngle = Math.PI * .495;
+      controls.autoRotate = autoInput.checked;
+      controls.autoRotateSpeed = .42;
       controls.screenSpacePanning = true;
       controls.touches.ONE = THREE.TOUCH.ROTATE;
       controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
-      controls.update();
       clock = new THREE.Clock();
 
-      addEnvironment();
+      addRoom();
       buildTower(currentLevels, currentMode);
       addEventListeners();
       setTimeout(() => { loading.style.opacity = '0'; loading.style.transition = 'opacity .45s'; setTimeout(() => loading.remove(), 480); }, 350);
     }
 
-    function addEnvironment() {
-      const env = new THREE.Group();
-      // 背景の明暗面を環境反射として使用する、控えめなホテルバーのセット。
-      const wallMat = new THREE.MeshStandardMaterial({ color: 0x211a14, roughness: .9, metalness: .03 });
-      const backWall = new THREE.Mesh(new THREE.PlaneGeometry(24, 12), wallMat);
-      backWall.position.set(0, 4.3, -4.9);
-      backWall.receiveShadow = true;
-      env.add(backWall);
+    // ── 環境マップ ─────────────────────────────────────────────
+    // ガラスの見た目は「ガラスに映るもの」で決まる。撮影セットと同じ配置の発光面を組み、
+    // PMREM で scene.environment に焼き込む。これが無いとPBRガラスは黒く沈み、プラスチックになる。
+    function buildEnvironmentMap() {
+      const envScene = new THREE.Scene();
+      envScene.background = new THREE.Color(0x050404);
 
-      const leftPanel = new THREE.Mesh(new THREE.PlaneGeometry(5.5, 7), new THREE.MeshStandardMaterial({ color: 0x0b1115, roughness: .34, metalness: .18 }));
-      leftPanel.position.set(-4.4, 3.2, -2.4); leftPanel.rotation.y = Math.PI / 3.3; env.add(leftPanel);
-      const rightPanel = leftPanel.clone(); rightPanel.material = new THREE.MeshStandardMaterial({ color: 0x2b2118, roughness: .48, metalness: .1 }); rightPanel.position.x = 4.5; rightPanel.rotation.y = -Math.PI / 3.3; env.add(rightPanel);
+      const room = new THREE.Mesh(new THREE.BoxGeometry(26, 14, 26), new THREE.MeshBasicMaterial({ color: 0x060505, side: THREE.BackSide }));
+      room.position.y = 5;
+      envScene.add(room);
 
-      const floorMat = new THREE.MeshPhysicalMaterial({ color: 0x1b1511, roughness: .28, metalness: .18, clearcoat: .34, clearcoatRoughness: .28 });
-      floor = new THREE.Mesh(new THREE.PlaneGeometry(30, 30), floorMat);
-      floor.rotation.x = -Math.PI / 2;
-      floor.receiveShadow = true;
-      env.add(floor);
+      const emitter = (hex, gain, w, h, x, y, z) => {
+        const material = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+        material.color.setHex(hex, THREE.SRGBColorSpace).multiplyScalar(gain);
+        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), material);
+        mesh.position.set(x, y, z); mesh.lookAt(0, 1, 0); envScene.add(mesh);
+      };
+      emitter(0xfff3dd, 2.6, 4.6, 3.2, 2.3, 4.8, 2.6);   // 大型ソフトライト
+      emitter(0xdce9ff, 1.1, 4.2, 5.0, -4.6, 2.2, 1.2);  // 左の寒色リフレクター
+      emitter(0xffcf95, 1.3, 3.0, 3.4, 4.4, 1.9, -1.4);  // 右の暖色リフレクター
+      emitter(0xffd9a4, 5.0, 2.4, .95, 0, 1.05, -3.0);   // 背面ライト（液体を透かす）
+      emitter(0xfff0d8, .5, 3.2, 3.2, .4, 6.6, -.6);     // 上部ライト
+      emitter(0x120d09, 1.0, 16, 16, 0, -.02, 0);        // 床からの弱い反射
 
-      const rug = new THREE.Mesh(new THREE.CircleGeometry(4.7, 64), new THREE.MeshStandardMaterial({ color: 0x110e0c, roughness: .96 }));
-      rug.rotation.x = -Math.PI / 2; rug.position.y = .006; env.add(rug);
-
-      // 遠景の縦方向アクセント。
-      const glowMat = new THREE.MeshBasicMaterial({ color: 0x8c5c27, transparent: true, opacity: .21 });
-      [-2.45, 2.45].forEach(x => { const glow = new THREE.Mesh(new THREE.PlaneGeometry(.48, 4.9), glowMat); glow.position.set(x, 3.3, -4.85); env.add(glow); });
-      scene.add(env);
-
-      const hemi = new THREE.HemisphereLight(0xc4d8ef, 0x2a170b, 1.0); scene.add(hemi);
-      addRectLight(0xfff1d0, 4.9, 4.3, 3.2, 5.6, 2.8, 1.9);  // 大型ソフトライト
-      addRectLight(0xbcd8ff, 2.2, -3.4, 2.8, 1.8, 1.2, .7); // 左の寒色ハイライト
-      addRectLight(0xffc06c, 2.4, 3.7, 2.2, -1.8, 1.0, .7); // 右の暖色ハイライト
-      addRectLight(0xffc877, 2.8, 0, 5.7, -3.3, 3.2, .9);   // 背面リムライト
-      const key = new THREE.SpotLight(0xffebc6, 780, 18, Math.PI / 5.7, .6, 1.15);
-      key.position.set(-1.6, 7.5, 3.5); key.target.position.set(0, 0, 0); key.castShadow = true; key.shadow.mapSize.set(1024, 1024); scene.add(key, key.target);
-      const bounce = new THREE.PointLight(0x9ac4ef, 10, 10, 2); bounce.position.set(-1.5, .55, 2.7); scene.add(bounce);
+      pmrem = new THREE.PMREMGenerator(renderer);
+      const target = pmrem.fromScene(envScene, .012);
+      scene.environment = target.texture;
+      scene.environmentIntensity = 1.0;
+      envScene.traverse(object => { if (object.isMesh) { object.geometry.dispose(); object.material.dispose(); } });
     }
 
-    function addRectLight(color, intensity, x, y, z, width, height) {
-      const light = new THREE.RectAreaLight(color, intensity, width, height);
-      light.position.set(x, y, z); light.lookAt(0, 1.5, 0); scene.add(light);
+    // ── 背景 ───────────────────────────────────────────────────
+    // 撮影のホリゾント紙にあたるグラデーション。上が沈み、グラス背後がわずかに持ち上がる。
+    function createBackdropTexture() {
+      const canvas = document.createElement('canvas');
+      canvas.width = 32; canvas.height = 256;
+      const context = canvas.getContext('2d');
+      const gradient = context.createLinearGradient(0, 0, 0, 256);
+      gradient.addColorStop(0, '#070605');
+      gradient.addColorStop(.52, '#0d0a08');
+      gradient.addColorStop(.78, '#241a12');
+      gradient.addColorStop(1, '#120d09');
+      context.fillStyle = gradient; context.fillRect(0, 0, 32, 256);
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      return texture;
+    }
+
+    function addRoom() {
+      room = new THREE.Group();
+      const backWall = new THREE.Mesh(new THREE.PlaneGeometry(80, 30), new THREE.MeshBasicMaterial({ map: createBackdropTexture() }));
+      backWall.position.set(0, 10, -11); backWall.receiveShadow = true; room.add(backWall);
+
+      // 石材のテーブル面。わずかな鏡面反射だけを残し、映り込みで接地を見せる。
+      const floor = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), new THREE.MeshStandardMaterial({ color: 0x070605, roughness: .86, metalness: 0, envMapIntensity: .2 }));
+      floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; room.add(floor);
+      scene.add(room);
+    }
+
+    // 撮影セットの寸法はグラス1個に合わせてある。タワーが高くなったら、
+    // ライトも背景もセットごと同じ倍率で大きくする（照明の見え方を保ったまま被写体だけ大きくなる）。
+    function applySceneScale(scale) {
+      room.scale.setScalar(scale);
+      scene.fog.density = .028 / scale;
+      addLights(scale);
+    }
+
+    function addLights(scale = 1) {
+      if (lightRig) { scene.remove(lightRig); lightRig.traverse(object => { if (object.isLight && object.dispose) object.dispose(); }); }
+      lightRig = new THREE.Group();
+      lightRig.add(new THREE.HemisphereLight(0x2a3240, 0x120c07, .18));
+      // 面光源は位置も寸法も同じ倍率で拡大するので、被写体が受ける照度は変わらない。
+      const rect = (hex, intensity, w, h, x, y, z) => {
+        const light = new THREE.RectAreaLight(hex, intensity, w * scale, h * scale);
+        light.position.set(x * scale, y * scale, z * scale); light.lookAt(0, .9 * scale, 0); lightRig.add(light);
+      };
+      rect(0xfff3dd, 3.6, 4.6, 3.2, 2.3, 4.8, 2.6);   // 大型ソフトライト
+      rect(0xdce9ff, .9, 4.2, 5.0, -4.6, 2.2, 1.2);   // 左の反射
+      rect(0xffcf95, 1.1, 3.0, 3.4, 4.4, 1.9, -1.4);  // 右の反射
+      rect(0xffd9a4, 9.0, 2.4, .95, 0, 1.05, -3.0);   // 背面ライト（液体を透かす）
+      rect(0xfff0d8, .6, 3.2, 3.2, .4, 6.6, -.6);     // 上部ライト
+
+      // 接地影のためのスポット。演出ではなく、床にグラスを置くための1灯。
+      // 点光源は距離減衰があるので、倍率に合わせて光量を上げる。
+      const key = new THREE.SpotLight(0xffeed2, 30 * Math.pow(scale, 1.7), 22 * scale, Math.PI / 9, .95, 1.7);
+      key.position.set(1.5 * scale, 6.2 * scale, 2.1 * scale);
+      key.target.position.set(0, 0, 0);
+      key.castShadow = true;
+      key.shadow.mapSize.set(2048, 2048);
+      key.shadow.bias = -.0012;
+      key.shadow.normalBias = .012 * scale;
+      key.shadow.camera.near = 1 * scale; key.shadow.camera.far = 24 * scale;
+      lightRig.add(key, key.target);
+      scene.add(lightRig);
+    }
+
+    // ── ガラス形状 ─────────────────────────────────────────────
+    // 外面・内面・縁・底を1本の閉じた輪郭にして、1つの LatheGeometry として回転させる。
+    // 厚みが形状として存在するので、屈折と全反射が縁とボウル底に自然に出る。
+    function pushSpline(points, controls, steps) {
+      const sampled = new THREE.SplineCurve(controls.map(p => new THREE.Vector2(p[0], p[1]))).getPoints(Math.max(2, steps));
+      for (let i = 1; i < sampled.length; i++) points.push(sampled[i]);
+    }
+    function pushArc(points, cx, cy, radius, from, to, steps) {
+      const count = Math.max(2, steps);
+      for (let i = 1; i <= count; i++) {
+        const angle = from + (to - from) * (i / count);
+        points.push(new THREE.Vector2(cx + Math.cos(angle) * radius, cy + Math.sin(angle) * radius));
+      }
+    }
+
+    function createCoupeProfile(detail = 1, variance = 0) {
+      const rimT = GLASS.rimThickness * (1 + variance);
+      const s = n => Math.max(2, Math.round(n * detail));
+      const points = [new THREE.Vector2(0, .0075)];
+      // 台座の裏。中央を浅く凹ませ、接地するのは縁だけにする。
+      pushSpline(points, [[0, .0075], [.14, .0045], [.235, .0065], [.288, .017]], s(9));
+      // 台座の縁。ここに乗るハイライトがガラスの厚みを語る。
+      pushArc(points, .2885, .0295, .0135, -Math.PI / 2.1, Math.PI / 2.3, s(9));
+      // 台座上面 → ステム付け根へドーム状に立ち上がる。
+      pushSpline(points, [[.2865, .0425], [.215, .0525], [.128, .0755], [.0745, .1155], [.0525, .175]], s(13));
+      // ステム。
+      pushSpline(points, [[.0525, .175], [.0428, .30], [.0405, .44], [.047, .58], [.062, .665]], s(13));
+      // 鉢の外面。
+      pushSpline(points, [[.062, .665], [.115, .735], [.20, .782], [.315, .822], [.408, .878], [.4585, .965], [.4735, 1.075], [.4775, 1.19]], s(24));
+      points.push(new THREE.Vector2(GLASS.rimOuter, GLASS.rimY));
+      // 縁。外面から内面へ厚み分だけ回り込ませる。
+      pushArc(points, GLASS.rimOuter - rimT, GLASS.rimY, rimT, 0, Math.PI, s(14));
+      // 鉢の内面 → 内底。
+      pushSpline(points, [[GLASS.rimOuter - rimT * 2, GLASS.rimY], [.4495, 1.14], [.4385, 1.03], [.386, .935], [.281, .8775], [.152, .8565], [.062, .8535]], s(22));
+      points.push(new THREE.Vector2(0, GLASS.floorY));
+      return points;
+    }
+
+    function createLiquidProfile(level, detail = 1) {
+      const s = n => Math.max(2, Math.round(n * detail));
+      const points = [new THREE.Vector2(0, GLASS.floorY - .0022)];
+      pushSpline(points, [[0, GLASS.floorY - .0022], [.062, .8513], [.152, .8543], [.281, .8753], [.386, .9328], [.4385, 1.028], [.4473, 1.10]], s(18));
+      points.push(new THREE.Vector2(.4477, level - .0008));
+      points.push(new THREE.Vector2(.4470, level));  // 液面。ごく短い面取りで縁を立たせる
+      points.push(new THREE.Vector2(0, level));
+      return points;
     }
 
     function createSharedAssets() {
-      // 厚み・IOR・低いラフネスを持つPBRガラス。4段階の微差を共有プールで持ち、個体差と描画効率を両立する。
+      // ガラス：Alphaを使わず、transmission と実形状の厚みだけで透明感を出す。
+      const glassBase = {
+        color: 0xffffff, metalness: 0, transmission: 1, ior: 1.5,
+        thickness: .028, attenuationColor: new THREE.Color(0xe6f2ea), attenuationDistance: 3.2,
+        specularIntensity: 1, envMapIntensity: 1, side: THREE.DoubleSide, transparent: false, depthWrite: true
+      };
       materials = {
-        glass: [0, 1, 2, 3].map(i => new THREE.MeshPhysicalMaterial({ color: 0xf7fbff, metalness: 0, roughness: .03 + i * .006, transmission: 1, thickness: .16, ior: 1.49, transparent: true, opacity: 1, clearcoat: 1, clearcoatRoughness: .03, side: THREE.DoubleSide, depthWrite: false, envMapIntensity: 1.55 })),
-        edge: new THREE.MeshPhysicalMaterial({ color: 0xffffff, metalness: 0, roughness: .018, transmission: 1, thickness: .2, ior: 1.5, transparent: true, opacity: 1, clearcoat: 1, clearcoatRoughness: .025, side: THREE.DoubleSide, depthWrite: false, envMapIntensity: 1.9 }),
-        champagne: new THREE.MeshPhysicalMaterial({ color: 0xb77716, metalness: 0, roughness: .1, transmission: .6, thickness: .5, attenuationColor: 0xca8520, attenuationDistance: 1.25, ior: 1.34, transparent: true, opacity: .94, clearcoat: .4, clearcoatRoughness: .1, side: THREE.DoubleSide, depthWrite: false }),
-        surface: new THREE.MeshPhysicalMaterial({ color: 0xd89827, metalness: 0, roughness: .075, transmission: .25, transparent: true, opacity: .72, clearcoat: .65, side: THREE.DoubleSide, depthWrite: false }),
-        bubble: new THREE.MeshPhysicalMaterial({ color: 0xfff4c9, roughness: .04, transmission: .92, transparent: true, opacity: .76, ior: 1.1 })
+        // §9 個体差。肉眼で歪みに見えない範囲の roughness 微差。
+        glass: [.028, .034, .041].map(roughness => new THREE.MeshPhysicalMaterial({ ...glassBase, roughness })),
+        // シャンパンは非透過側に置く。透過マテリアル同士は互いの屈折用バックドロップに載らず、
+        // 液体を transmission にするとガラス越しに消えてしまうため。
+        // 透明感は「ガラスが液体を屈折させる」ことと、背面ライトを受ける低ラフネスの表面で出す。
+        liquid: new THREE.MeshPhysicalMaterial({
+          color: 0xd9b268, metalness: 0, roughness: .10, ior: 1.34,
+          emissive: new THREE.Color(0x140b02), emissiveIntensity: 1,
+          clearcoat: .3, clearcoatRoughness: .12, specularIntensity: 1,
+          envMapIntensity: 2.1, side: THREE.FrontSide, transparent: false, depthWrite: true
+        }),
+        // 液面。拡散主体だと平坦なクリーム色の円板になるため、環境を映す光沢面として分離する。
+        liquidSurface: new THREE.MeshPhysicalMaterial({
+          color: 0x6d4a14, metalness: 0, roughness: .035, ior: 1.34,
+          clearcoat: 1, clearcoatRoughness: .04, specularIntensity: 1,
+          envMapIntensity: 1.9, side: THREE.FrontSide, transparent: false, depthWrite: true
+        }),
+        bubble: new THREE.MeshPhysicalMaterial({
+          color: 0xfff3d8, metalness: 0, roughness: .045, ior: 1.34,
+          clearcoat: 1, clearcoatRoughness: .02, specularIntensity: 1,
+          envMapIntensity: 2.2, side: THREE.FrontSide, transparent: false, depthWrite: true
+        })
       };
-      // 高段数では深度書き込みを有効にしたPBR派生材を用い、何百もの透明面の累積で白飛びしないようにする。
-      materials.towerGlass = materials.glass[0].clone();
-      materials.towerGlass.transparent = false; materials.towerGlass.depthWrite = true; materials.towerGlass.side = THREE.FrontSide; materials.towerGlass.roughness = .072; materials.towerGlass.transmission = .84;
-      materials.towerEdge = materials.edge.clone();
-      materials.towerEdge.transparent = false; materials.towerEdge.depthWrite = true; materials.towerEdge.side = THREE.FrontSide; materials.towerEdge.roughness = .035;
-      materials.towerChampagne = materials.champagne.clone();
-      materials.towerChampagne.transparent = false; materials.towerChampagne.depthWrite = true; materials.towerChampagne.side = THREE.FrontSide;
-      const outerPts = [new THREE.Vector2(0, .25), new THREE.Vector2(.28, .25), new THREE.Vector2(.66, .30), new THREE.Vector2(.88, .42), new THREE.Vector2(.96, .56), new THREE.Vector2(.93, .64)];
-      const innerPts = [new THREE.Vector2(0, .30), new THREE.Vector2(.24, .30), new THREE.Vector2(.61, .34), new THREE.Vector2(.84, .44), new THREE.Vector2(.91, .55), new THREE.Vector2(.887, .62)];
-      const liquidPts = [new THREE.Vector2(0, .315), new THREE.Vector2(.27, .315), new THREE.Vector2(.58, .35), new THREE.Vector2(.80, .45), new THREE.Vector2(.84, .535)];
       geometries = {
-        outer: new THREE.LatheGeometry(outerPts, 56), inner: new THREE.LatheGeometry(innerPts, 56), liquid: new THREE.LatheGeometry(liquidPts, 56),
-        rim: new THREE.TorusGeometry(.907, .038, 12, 64), bottomDisc: new THREE.CylinderGeometry(.305, .268, .075, 56),
-        surface: new THREE.CircleGeometry(.842, 56), stem: new THREE.CylinderGeometry(.065, .08, .98, 32), stemTop: new THREE.SphereGeometry(.12, 28, 20),
-        base: new THREE.CylinderGeometry(.64, .48, .072, 56), baseEdge: new THREE.TorusGeometry(.615, .025, 10, 56), bubble: new THREE.SphereGeometry(1, 10, 8)
+        glass: new THREE.LatheGeometry(createCoupeProfile(1), 128),
+        liquid: new THREE.LatheGeometry(createLiquidProfile(GLASS.liquidLevel, 1), 128),
+        // タワー用は同じ輪郭の低解像度版。形は変えずに頂点数だけ落とす。
+        glassLow: new THREE.LatheGeometry(createCoupeProfile(.45), 44),
+        liquidLow: new THREE.LatheGeometry(createLiquidProfile(GLASS.liquidLevel, .45), 44),
+        surface: new THREE.CircleGeometry(.4462, 96),
+        surfaceLow: new THREE.CircleGeometry(.4462, 40),
+        bubble: new THREE.SphereGeometry(1, 12, 8)
       };
-    }
-
-    function createGlass(seed = 0, bubbleCount = 7) {
-      const group = new THREE.Group();
-      group.userData.seed = seed;
-      const glassMaterial = materials.glass[seed % materials.glass.length];
-      const outer = new THREE.Mesh(geometries.outer, glassMaterial); outer.castShadow = true; group.add(outer);
-      const inner = new THREE.Mesh(geometries.inner, glassMaterial); inner.renderOrder = 1; group.add(inner);
-      // 縁、ボウル底、ステム、台座を独立させて、光が拾う実際のガラス厚を表現する。
-      const rim = new THREE.Mesh(geometries.rim, materials.edge); rim.position.y = .62; rim.scale.z = .96; rim.renderOrder = 2; group.add(rim);
-      const bottomDisc = new THREE.Mesh(geometries.bottomDisc, materials.edge); bottomDisc.position.y = .262; bottomDisc.renderOrder = 2; group.add(bottomDisc);
-      const liquidLevel = .535 + ((seed * 17) % 7) * .002;
-      const liquid = new THREE.Mesh(geometries.liquid, materials.champagne); liquid.scale.y = 1 + ((liquidLevel - .535) / .22); liquid.renderOrder = 0; group.add(liquid);
-      const surface = new THREE.Mesh(geometries.surface, materials.surface); surface.rotation.x = -Math.PI / 2; surface.position.y = liquidLevel + .001; surface.renderOrder = 2; group.add(surface);
-      const stem = new THREE.Mesh(geometries.stem, glassMaterial); stem.position.y = -.25; stem.castShadow = true; stem.renderOrder = 1; group.add(stem);
-      const stemTop = new THREE.Mesh(geometries.stemTop, materials.edge); stemTop.scale.y = .72; stemTop.position.y = .24; stemTop.renderOrder = 2; group.add(stemTop);
-      const base = new THREE.Mesh(geometries.base, materials.edge); base.position.y = -.765; base.scale.z = 1.03; base.castShadow = true; base.renderOrder = 2; group.add(base);
-      const baseEdge = new THREE.Mesh(geometries.baseEdge, materials.edge); baseEdge.rotation.x = Math.PI / 2; baseEdge.position.y = -.727; baseEdge.renderOrder = 3; group.add(baseEdge);
-      // 気泡は少数に抑え、個体ごとのグループとして将来的な液体アニメーション拡張に備える。
-      const bubbles = new THREE.Group(); const random = mulberry32(seed * 281 + 17);
-      for (let i = 0; i < bubbleCount; i++) {
-        const y = .33 + random() * (liquidLevel - .36); const radius = Math.sqrt(random()) * (.48 - (y - .28) * .25); const a = random() * Math.PI * 2; const r = .009 + random() * .013;
-        const bubble = new THREE.Mesh(geometries.bubble, materials.bubble); bubble.scale.setScalar(r); bubble.position.set(Math.cos(a) * radius, y, Math.sin(a) * radius); bubble.userData = { phase: random() * Math.PI * 2, initialY: y, speed: .08 + random() * .1 }; bubbles.add(bubble);
-      }
-      bubbles.userData.isBubbles = true; group.add(bubbles); group.position.y = .79; return group;
     }
 
     function mulberry32(a) { return function() { let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 
-    function createInstancedTower(actualLevels) {
-      const instances = new THREE.Group();
-      const spacing = 1.85;
+    function createGlass(seed = 0, bubbleCount = 9, detailed = true) {
+      const group = new THREE.Group();
+      const random = mulberry32(seed * 281 + 17);
+      const body = new THREE.Mesh(detailed ? geometries.glass : geometries.glassLow, materials.glass[seed % materials.glass.length]);
+      body.castShadow = true;
+      group.add(body);
+
+      const level = GLASS.liquidLevel + (random() - .5) * .012; // §9 シャンパン量の微差
+      const liquid = new THREE.Mesh(detailed ? geometries.liquid : geometries.liquidLow, materials.liquid);
+      liquid.position.y = level - GLASS.liquidLevel;
+      group.add(liquid);
+      const surface = new THREE.Mesh(detailed ? geometries.surface : geometries.surfaceLow, materials.liquidSurface);
+      surface.rotation.x = -Math.PI / 2; surface.position.y = level + .0016;
+      group.add(surface);
+
+      // 気泡。液面に達した泡と、内壁ぎわに集まるコルレット（泡の輪）として置く。
+      // 少数に抑え、将来アニメーション化できるよう個体ごとのグループで持つ。
+      const bubbles = new THREE.Group();
+      for (let i = 0; i < bubbleCount; i++) {
+        const edgeBiased = i % 4 !== 0;
+        const spread = edgeBiased ? .398 + random() * .042 : .06 + random() * .30;
+        const angle = random() * Math.PI * 2;
+        const radius = .0075 + random() * (edgeBiased ? .006 : .0095);
+        const y = level + radius * .45;
+        const bubble = new THREE.Mesh(geometries.bubble, materials.bubble);
+        bubble.scale.setScalar(radius);
+        bubble.position.set(Math.cos(angle) * spread, y, Math.sin(angle) * spread);
+        bubble.userData = { phase: random() * Math.PI * 2, initialY: y, speed: .08 + random() * .1 };
+        bubbles.add(bubble);
+      }
+      bubbles.userData.isBubbles = true;
+      group.add(bubbles);
+      group.userData.seed = seed;
+      return group;
+    }
+
+    // ── 配置 ───────────────────────────────────────────────────
+    // 配置ロジックはグラス生成から独立させ、将来の形状（正方形・円形・横長）追加に備える。
+    function createLayout(levels) {
       const placements = [];
-      let count = 0;
-      for (let level = 0; level < actualLevels; level++) {
-        const side = actualLevels - level;
-        for (let ix = 0; ix < side; ix++) {
-          for (let iz = 0; iz < side; iz++) {
-            placements.push({
-              x: (ix - (side - 1) / 2) * spacing + ((level % 2) * .002),
-              y: level * 1.44 + .79,
-              z: (iz - (side - 1) / 2) * spacing + ((level % 2) * .002),
-              rotation: ((count * 13) % 11 - 5) * .0027,
-              level: .535 + ((count * 17) % 7) * .002
-            });
-            count++;
-          }
+      for (let level = 0; level < levels; level++) {
+        const side = levels - level;
+        for (let ix = 0; ix < side; ix++) for (let iz = 0; iz < side; iz++) {
+          placements.push({
+            x: (ix - (side - 1) / 2) * GLASS.pitch,
+            y: level * GLASS.stack,
+            z: (iz - (side - 1) / 2) * GLASS.pitch,
+            rotation: ((placements.length * 13) % 11 - 5) * .0032 // §9 微小な回転差
+          });
         }
       }
-      const addLayer = (geometry, material, offsetY = 0, scale = new THREE.Vector3(1, 1, 1), rotationX = 0, perGlassScaleY = false) => {
+      return placements;
+    }
+
+    function createInstancedTower(placements) {
+      const instances = new THREE.Group();
+      const count = placements.length;
+      const addLayer = (geometry, material, offsetY = 0, rotationX = 0) => {
         const mesh = new THREE.InstancedMesh(geometry, material, count);
-        const position = new THREE.Vector3(); const quaternion = new THREE.Quaternion(); const scaleVector = new THREE.Vector3(); const matrix = new THREE.Matrix4();
+        const position = new THREE.Vector3(); const quaternion = new THREE.Quaternion();
+        const scale = new THREE.Vector3(1, 1, 1); const matrix = new THREE.Matrix4(); const euler = new THREE.Euler();
         placements.forEach((item, index) => {
           position.set(item.x, item.y + offsetY, item.z);
-          quaternion.setFromEuler(new THREE.Euler(rotationX, item.rotation, 0));
-          scaleVector.copy(scale);
-          if (perGlassScaleY) scaleVector.y *= 1 + ((item.level - .535) / .22);
-          matrix.compose(position, quaternion, scaleVector);
+          euler.set(rotationX, item.rotation, 0);
+          quaternion.setFromEuler(euler);
+          matrix.compose(position, quaternion, scale);
           mesh.setMatrixAt(index, matrix);
         });
         mesh.instanceMatrix.needsUpdate = true;
-        mesh.renderOrder = 1;
+        mesh.castShadow = true;
         instances.add(mesh);
       };
-      // 高段数時は共有ジオメトリのインスタンシングで、10段（385脚）の描画負荷を抑える。
-      // 遠景では内壁・接続部の重複レイヤーを省き、透過・反射・液面・縁の読みやすさを優先する。
-      addLayer(geometries.outer, materials.towerGlass);
-      addLayer(geometries.rim, materials.towerEdge, .62, new THREE.Vector3(1, 1, .96));
-      addLayer(geometries.liquid, materials.towerChampagne, 0, new THREE.Vector3(1, 1, 1), 0, true);
-      addLayer(geometries.surface, materials.towerChampagne, .536, new THREE.Vector3(1, 1, 1), -Math.PI / 2);
-      addLayer(geometries.stem, materials.towerGlass, -.25);
-      addLayer(geometries.base, materials.towerEdge, -.765, new THREE.Vector3(1, 1, 1.03));
+      // 385脚（10段）でも1ドローコールに収める。
+      addLayer(geometries.glassLow, materials.glass[0]);
+      addLayer(geometries.liquidLow, materials.liquid);
+      addLayer(geometries.surfaceLow, materials.liquidSurface, GLASS.liquidLevel + .0016, -Math.PI / 2);
+
       const bubbles = new Float32Array(count * 2 * 3);
-      const random = mulberry32(actualLevels * 101);
+      const random = mulberry32(count * 101 + 7);
       placements.forEach((item, index) => {
         for (let b = 0; b < 2; b++) {
-          const angle = random() * Math.PI * 2; const radius = Math.sqrt(random()) * .44; const point = (index * 2 + b) * 3;
-          bubbles[point] = item.x + Math.cos(angle) * radius;
-          bubbles[point + 1] = item.y + .35 + random() * .14;
-          bubbles[point + 2] = item.z + Math.sin(angle) * radius;
+          const angle = random() * Math.PI * 2; const spread = Math.sqrt(random()) * .34; const at = (index * 2 + b) * 3;
+          bubbles[at] = item.x + Math.cos(angle) * spread;
+          bubbles[at + 1] = item.y + .92 + random() * .2;
+          bubbles[at + 2] = item.z + Math.sin(angle) * spread;
         }
       });
-      const bubbleGeometry = new THREE.BufferGeometry(); bubbleGeometry.setAttribute('position', new THREE.BufferAttribute(bubbles, 3));
-      const bubbleMaterial = new THREE.PointsMaterial({ color: 0xffedb0, size: .026, transparent: true, opacity: .72, sizeAttenuation: true, depthWrite: false });
-      const bubblePoints = new THREE.Points(bubbleGeometry, bubbleMaterial); bubblePoints.userData.dynamicAsset = true; instances.add(bubblePoints);
-      return { group: instances, count };
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(bubbles, 3));
+      const material = new THREE.PointsMaterial({ color: 0xffeec2, size: .014, transparent: true, opacity: .68, sizeAttenuation: true, depthWrite: false });
+      const points = new THREE.Points(geometry, material);
+      points.userData.dynamicAsset = true;
+      instances.add(points);
+      return instances;
     }
 
     function buildTower(levels, mode = 'tower') {
       if (tower) { scene.remove(tower); disposeObject(tower); }
       tower = new THREE.Group();
-      const buildAsStudy = mode === 'study';
-      const actualLevels = buildAsStudy ? 1 : levels;
-      let count = 0;
+      const study = mode === 'study';
+      const actualLevels = study ? 1 : levels;
+      const placements = createLayout(actualLevels);
       if (actualLevels >= 6) {
-        const instanced = createInstancedTower(actualLevels);
-        tower.add(instanced.group); count = instanced.count;
+        tower.add(createInstancedTower(placements));
       } else {
-        const spacing = 1.85; const bubbleCount = 7;
-        for (let level = 0; level < actualLevels; level++) {
-          const side = actualLevels - level; const y = level * 1.44;
-          for (let ix = 0; ix < side; ix++) for (let iz = 0; iz < side; iz++) {
-            const glass = createGlass(count + 1, bubbleCount);
-            glass.position.set((ix - (side - 1) / 2) * spacing + ((level % 2) * .002), y, (iz - (side - 1) / 2) * spacing + ((level % 2) * .002));
-            glass.rotation.y = ((count * 13) % 11 - 5) * .0027; tower.add(glass); count++;
-          }
-        }
+        placements.forEach((item, index) => {
+          const glass = createGlass(index + 1, study ? 16 : 7, actualLevels <= 3);
+          glass.position.set(item.x, item.y, item.z);
+          glass.rotation.y = item.rotation;
+          tower.add(glass);
+        });
       }
-      tower.userData = { levels: actualLevels, count, study: buildAsStudy };
-      scene.add(tower); updateStatus(count, actualLevels, buildAsStudy); frameCamera(actualLevels, buildAsStudy, true);
+      tower.userData = { levels: actualLevels, count: placements.length, study };
+      scene.add(tower);
+      const towerHeight = (actualLevels - 1) * GLASS.stack + GLASS.rimY;
+      applySceneScale(Math.max(1, towerHeight / 1.5));
+      renderer.transmissionResolutionScale = study ? 1 : (actualLevels >= 6 ? .5 : .75);
+      updateStatus(placements.length, actualLevels, study);
+      frameCamera(actualLevels, study, true);
     }
 
     function disposeObject(object) {
-      object.traverse(child => { if (child.userData.dynamicAsset) { child.geometry.dispose(); child.material.dispose(); } });
+      object.traverse(child => { if (child.userData.dynamicAsset) { child.geometry.dispose(); child.material.dispose(); } if (child.isInstancedMesh) child.dispose(); });
       object.clear();
     }
 
@@ -383,16 +523,27 @@
       levelValue.textContent = levelsInput.value;
     }
 
+    // 画角から必要距離を縦横それぞれ求め、大きい方を採用する。10段でも画面からはみ出さない。
     function frameCamera(levels, study, instant = false) {
-      const height = study ? 2.4 : 1.5 + (levels - 1) * 1.44 + 1.65;
-      const width = study ? 2.9 : 1.9 + (levels - 1) * 1.85;
-      const distance = Math.max(4.9, Math.max(height * .9, width * 1.23) + 3.45);
-      const targetY = study ? 1.25 : Math.max(1.5, height * .44);
-      const desired = new THREE.Vector3(distance * .62, targetY + distance * .26, distance * .79);
+      const height = (levels - 1) * GLASS.stack + GLASS.rimY;
+      const radius = study ? GLASS.rimOuter : levels * GLASS.pitch * .5;
+      // 被写体を包む球で距離を決める。カメラを見上げ／見下ろしても収まりが崩れない。
+      const margin = study ? 1.32 : 1.06;
+      const halfV = THREE.MathUtils.degToRad(camera.fov) / 2;
+      const halfH = Math.atan(Math.tan(halfV) * camera.aspect);
+      const bounding = Math.hypot(height * .5, radius);
+      const distance = bounding / Math.sin(Math.min(halfV, halfH)) * margin;
+      const targetY = study ? height * .52 : height * .5;
+      const elevation = study ? .17 : .28, azimuth = .62;
+      const desired = new THREE.Vector3(
+        Math.sin(azimuth) * Math.cos(elevation) * distance,
+        targetY + Math.sin(elevation) * distance,
+        Math.cos(azimuth) * Math.cos(elevation) * distance
+      );
       if (instant) { camera.position.copy(desired); controls.target.set(0, targetY, 0); controls.update(); }
       else animateCamera(desired, new THREE.Vector3(0, targetY, 0));
-      controls.minDistance = Math.max(2.1, distance * .42);
-      controls.maxDistance = Math.max(15, distance * 2.1);
+      controls.minDistance = Math.max(.55, distance * .28);
+      controls.maxDistance = distance * 3.2;
     }
 
     function animateCamera(destination, target) {
@@ -402,7 +553,10 @@
     }
 
     function addEventListeners() {
-      addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight);
+        if (tower) frameCamera(tower.userData.levels, tower.userData.study, true);
+      });
       levelsInput.addEventListener('input', () => { levelValue.textContent = levelsInput.value; });
       levelsInput.addEventListener('change', () => {
         currentLevels = +levelsInput.value;
@@ -422,7 +576,7 @@
       if (tower) tower.traverse(obj => {
         if (obj.parent && obj.parent.userData.isBubbles) {
           const d = obj.userData;
-          obj.position.y = d.initialY + Math.sin(elapsed * d.speed * 4 + d.phase) * .018;
+          obj.position.y = d.initialY + Math.sin(elapsed * d.speed * 4 + d.phase) * .0022;
         }
       });
       controls.update();
