@@ -44,6 +44,17 @@
       padding: 18px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); backdrop-filter: blur(18px) saturate(125%); box-shadow: 0 16px 60px rgba(0,0,0,.28);
     }
     .panel-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 17px; }
+    /* 折りたたみ。畳んでも脚数と段数は残すので、操作の存在と情報の両方が見える。 */
+    #panel-toggle {
+      flex: none; align-self: center; width: 34px; height: 34px; padding: 0; margin: -4px -4px -4px 0;
+      display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%;
+      color: #d9cdc0; background: transparent; cursor: pointer; transition: color .18s ease, background .18s ease;
+    }
+    #panel-toggle:hover { color: #251a0a; background: var(--gold); }
+    #panel-toggle svg { width: 14px; height: 14px; transition: transform .24s ease; }
+    #control-panel.collapsed .panel-top { margin-bottom: 0; }
+    #control-panel.collapsed #panel-toggle svg { transform: rotate(180deg); }
+    #control-panel.collapsed #panel-body { display: none; }
     .eyebrow { margin: 0 0 3px; color: var(--gold); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; }
     h1 { margin: 0; font-family: Georgia, "Times New Roman", serif; font-size: 22px; font-weight: 400; letter-spacing: .01em; }
     .glass-count { flex: none; text-align: right; color: #f7e5c0; font-family: Georgia, "Times New Roman", serif; font-size: 23px; line-height: .9; }
@@ -102,7 +113,11 @@
       <div class="panel-top">
         <div><p class="eyebrow">Configuration</p><h1>静かな祝祭</h1></div>
         <div class="glass-count" id="glassCount">1<span>Coupe glass</span></div>
+        <button id="panel-toggle" type="button" aria-expanded="true" aria-controls="panel-body" aria-label="設定パネルの開閉">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 6l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
       </div>
+      <div id="panel-body">
       <div class="rule"></div>
       <div class="control-row">
         <div><div class="control-label">段数</div><div class="control-caption">1〜10段を自動配置</div></div>
@@ -117,6 +132,7 @@
         <label class="switch"><input id="autorotate" type="checkbox" checked /><span class="switch-ui"></span><span>ON</span></label>
       </div>
       <button id="reset-view" type="button">カメラを整える</button>
+      </div>
     </section>
     <div class="hint"><kbd>ドラッグ</kbd> 回転　 <kbd>ホイール / ピンチ</kbd> ズーム　 <kbd>2本指</kbd> 移動</div>
     <div id="loading"><div class="load-card"><p class="eyebrow">Preparing the glass</p><div class="loading-line"></div></div></div>
@@ -141,6 +157,21 @@
     const modeButtons = [...document.querySelectorAll('[data-mode]')];
     const autoInput = document.getElementById('autorotate');
     const resetButton = document.getElementById('reset-view');
+    const controlPanel = document.getElementById('control-panel');
+    const panelToggle = document.getElementById('panel-toggle');
+
+    // 携帯では設定パネルが画面の4割を占めてタワーを隠すので、初期状態を畳んでおく。
+    // 既存CSSも660pxでレイアウトを切り替えているため、同じ境目を使う。選択は記憶する。
+    const PANEL_KEY = 'cyanpan.panel';
+    function setPanelCollapsed(collapsed, remember = true) {
+      controlPanel.classList.toggle('collapsed', collapsed);
+      panelToggle.setAttribute('aria-expanded', String(!collapsed));
+      if (remember) { try { localStorage.setItem(PANEL_KEY, collapsed ? 'collapsed' : 'open'); } catch (error) { /* プライベートモード等 */ } }
+    }
+    let storedPanel = null;
+    try { storedPanel = localStorage.getItem(PANEL_KEY); } catch (error) { /* 読めなくても既定で動く */ }
+    setPanelCollapsed(storedPanel ? storedPanel === 'collapsed' : matchMedia('(max-width: 660px)').matches, false);
+    panelToggle.addEventListener('click', () => setPanelCollapsed(!controlPanel.classList.contains('collapsed')));
 
     let renderer, scene, camera, controls, clock, pmrem;
     let tower = null, room = null, lightRig = null, pour = null, elapsed = 0;
@@ -215,10 +246,50 @@
     // 縁からあふれた液が伝う道すじ。グラスの外側の輪郭そのものを使う。
     // 段の間隔(1.3125)とグラスの全高(1.30)がほぼ同じで、上段の台座は下段の縁のすぐ上に載る。
     // 自由落下できる隙間が無いので、実物と同じく鉢の外側→ステム→台座を伝わせる。
-    const RIVULET_TOP = GLASS.rimY;
     const RIVULET_BASE = COUPE_OUTER.baseEdge[1];                // 台座のふち。ここまで伝う
     const RIVULET_BOTTOM = GLASS.liquidLevel - GLASS.stack;      // 下段の液面（局所座標で約 -0.21）
     const RIVULET_R = COUPE_OUTER.baseEdge[0] + COUPE_OUTER.baseEdge[2]; // 台座のふちの半径
+
+    // 垂れの前進は「毎秒いくら高さが下がるか」ではなく「毎秒いくら道のりを進むか」で決める。
+    // 経路は高さ方向で約1.51、実際の道のりは約1.83あり、台座上面は高さ0.14しか下がらないのに
+    // 道のりは0.28ある。高さを定速で下げると台座の上だけ液が倍近い速さで外へ走ってしまう。
+    // 物理的にも逆で、重力で流れる薄膜は面が寝るほど遅くなる（実物で足元に溜まって見えるのはこのため）。
+    const RIVULET_PATH = (() => {
+      const points = createRivuletProfile(1);
+      const heights = [], distances = [];
+      let travelled = 0;
+      // 輪郭は下から上へ並ぶので、縁からの道のりにするため逆順に積む。
+      for (let i = points.length - 1; i >= 0; i--) {
+        if (i < points.length - 1) travelled += points[i].distanceTo(points[i + 1]);
+        heights.push(points[i].y);
+        distances.push(travelled);
+      }
+      return { heights, distances, total: travelled };
+    })();
+
+    // 縁から測った道のり → 高さ。単調に下る経路なので線形探索を二分で置き換えるまでもない。
+    function rivuletHeightAt(distance) {
+      const { heights, distances } = RIVULET_PATH;
+      const target = THREE.MathUtils.clamp(distance, 0, RIVULET_PATH.total);
+      let low = 0, high = distances.length - 1;
+      while (high - low > 1) {
+        const mid = (low + high) >> 1;
+        if (distances[mid] <= target) low = mid; else high = mid;
+      }
+      const span = distances[high] - distances[low];
+      return span > 1e-9 ? THREE.MathUtils.lerp(heights[low], heights[high], (target - distances[low]) / span) : heights[low];
+    }
+    // 高さ → 縁から測った道のり。下端（台座のふち／下段の液面）を道のりに直すのに使う。
+    function rivuletDistanceAt(height) {
+      const { heights, distances } = RIVULET_PATH;
+      for (let i = 1; i < heights.length; i++) {
+        if (heights[i] <= height) {
+          const span = heights[i - 1] - heights[i];
+          return span > 1e-9 ? THREE.MathUtils.lerp(distances[i - 1], distances[i], (heights[i - 1] - height) / span) : distances[i];
+        }
+      }
+      return RIVULET_PATH.total;
+    }
 
     try { init(); animate(); } catch (error) { console.error(error); loading.style.display = 'none'; fallback.style.display = 'grid'; }
 
@@ -628,14 +699,21 @@
         }
       };
 
-      // 最下段は下にグラスが無いので、垂れは台座のふちで止める。
-      placements.forEach((item, index) => { bottom[index] = item.level === 0 ? RIVULET_BASE : RIVULET_BOTTOM; });
+      // 最下段は下にグラスが無いので、垂れは台座のふちで止める。道のりで持つので変換しておく。
+      placements.forEach((item, index) => {
+        bottom[index] = rivuletDistanceAt(item.level === 0 ? RIVULET_BASE : RIVULET_BOTTOM);
+      });
 
       const top = tiers[levels - 1][0];
       // 1脚なら約3秒、10段385脚で約25秒。下段ほど脚数が増えるので体感の進みは自然に落ちる。
       const POUR_SLOWDOWN = 1.6;
       const rate = (.45 + count / 16) / POUR_SLOWDOWN;
-      const FLOW_SPEED = 4.3; // 縁から台座のふちまで（約1.27）を0.3秒で伝う
+      // 縁から台座のふちまで（道のり約1.4）を約1.1秒で伝う。垂れ切るときはその半分の速さで余韻を残す。
+      const FLOW_SPEED = 1.25, DRAIN_SPEED = .6;
+      // 伝っている間に溜まった液を一度に落とすと、下段が瞬間的に満杯を通り越す。
+      // 伝う時間と同程度の時定数で解放する。指数のままだと裾が十数秒残るので、
+      // 毎秒の最低解放量を決めて必ず終わらせる。
+      const TRANSIT_DRAIN = 1.1, TRANSIT_MIN = .5;
 
       const spill = new Float32Array(count); // このフレームであふれている脚
       let pouring = true, flowing = false;
@@ -649,7 +727,8 @@
           fill.fill(full ? 1 : 0);
           transit.fill(0);
           // 満タン指定（?pour=0）では注ぎ終わった後の姿なので、垂れは残さない。
-          for (let i = 0; i < count; i++) { front[i] = tail[i] = full ? bottom[i] : RIVULET_TOP; }
+          // front/tail は縁から測った道のり。0 が縁、bottom[i] が下端。
+          for (let i = 0; i < count; i++) { front[i] = tail[i] = full ? bottom[i] : 0; }
           pouring = !full;
           refreshLevels();
         },
@@ -664,19 +743,29 @@
           refreshNeed();
           for (let tier = levels - 1; tier >= 0; tier--) {
             for (const i of tiers[tier]) {
+              const down = downstream[i]; // 最下段は null。あふれは床へ捨てる
+              const landed = front[i] >= bottom[i] - 1e-4;
+              let send = 0;
+              // 伝い終わった脚は、溜まっていた分を一度に落とさず時定数で解放する。
+              // 注ぎが止まったあとも残りを流し切りたいので、受け取りの有無とは切り離す。
+              if (down && transit[i] > 0 && landed) {
+                const released = Math.min(transit[i], Math.max(transit[i] * step / TRANSIT_DRAIN, TRANSIT_MIN * step));
+                transit[i] -= released;
+                send += released;
+              }
               const incoming = amount[i];
-              if (incoming <= 0) continue;
-              const room = 1 - fill[i];
-              if (incoming <= room) { fill[i] += incoming; continue; }
-              fill[i] = 1;
-              const over = incoming - room;
-              const down = downstream[i];
-              spill[i] = 1;
-              if (!down) continue; // 最下段のあふれは床へ捨てる
-              // 垂れがまだ下端に届いていない間は、液は表面を伝っている途中なので下段へ渡さない。
-              if (front[i] > bottom[i] + 1e-4) { transit[i] += over; continue; }
-              const send = over + transit[i];
-              transit[i] = 0;
+              if (incoming > 0) {
+                const room = 1 - fill[i];
+                if (incoming <= room) fill[i] += incoming;
+                else {
+                  fill[i] = 1;
+                  spill[i] = 1;
+                  const over = incoming - room;
+                  // 垂れがまだ下端に届いていない間は、液は表面を伝っている途中なので下段へ渡さない。
+                  if (down) { if (landed) send += over; else transit[i] += over; }
+                }
+              }
+              if (send <= 0 || !down) continue;
               let total = 0;
               for (const j of down) total += need[j];
               if (total > 1e-6) for (const j of down) amount[j] += send * need[j] / total;
@@ -687,12 +776,14 @@
           flowing = false;
           for (let i = 0; i < count; i++) {
             if (spill[i]) {
-              tail[i] = RIVULET_TOP;
-              front[i] = Math.max(front[i] - FLOW_SPEED * step, bottom[i]);
+              tail[i] = 0;
+              front[i] = Math.min(front[i] + FLOW_SPEED * step, bottom[i]);
               flowing = true;
-            } else if (tail[i] > bottom[i]) {
-              front[i] = Math.max(front[i] - FLOW_SPEED * step, bottom[i]);
-              tail[i] = Math.max(tail[i] - FLOW_SPEED * step, bottom[i]);
+              // front > 0 は「一度でも伝い始めた脚」。これが無いと、垂れ切る側の速度を
+              // 下げた時点で、まだあふれていない脚でもリボンが伸び始めてしまう。
+            } else if (front[i] > 0 && (tail[i] < bottom[i] || transit[i] > 1e-6)) {
+              front[i] = Math.min(front[i] + FLOW_SPEED * step, bottom[i]);
+              tail[i] = Math.min(tail[i] + DRAIN_SPEED * step, bottom[i]);
               flowing = true;
             }
           }
@@ -826,12 +917,16 @@
               group.visible = level[index] > LIQUID_EMPTY + .012;
             }
           }
+          // 制御は道のりで持ち、描画は高さで切るので、ここで変換する。
+          // 道のりが大きいほど下なので、front が下端(小さいY)、tail が上端(大きいY)。
           const flow = flowAttribute.array;
           for (let index = 0; index < count; index++) {
+            const low = rivuletHeightAt(controller.front[index]);
+            const high = rivuletHeightAt(controller.tail[index]);
             for (let r = 0; r < RIVULETS; r++) {
               const at = (index * RIVULETS + r) * 2;
-              flow[at] = controller.front[index];
-              flow[at + 1] = controller.tail[index];
+              flow[at] = low;
+              flow[at + 1] = high;
             }
           }
           flowAttribute.needsUpdate = true;
