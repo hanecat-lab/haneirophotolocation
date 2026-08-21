@@ -684,7 +684,8 @@
     // position + aOffset * 太さ * (1 + 波) で両方が出せる。
     // 垂れが使う clipFlowRange は触らない。
     function clipStreamRange(material) {
-      material.userData.uniforms = { uTime: { value: 0 }, uWidth: { value: 1 }, uWave: { value: 1 } };
+      material.userData.uniforms = { uTime: { value: 0 }, uWidth: { value: 1 }, uWave: { value: 1 },
+        uFade: { value: new THREE.Color(0, 0, 0) } };
       material.onBeforeCompile = shader => {
         Object.assign(shader.uniforms, material.userData.uniforms);
         shader.vertexShader = shader.vertexShader
@@ -696,16 +697,24 @@
             uniform float uWidth;
             uniform float uWave;
             varying vec2 vFlow;
-            varying float vLocalY;`)
+            varying float vLocalY;
+            varying float vArc;`)
           .replace('#include <begin_vertex>', `#include <begin_vertex>
             vFlow = aFlow;
             // 波が流れ落ちることで、太さのゆらぎとハイライトの移動が同時に出る。
             float wave = sin(aStream.x * 26. - uTime * 7.) * aStream.y * uWave;
             transformed = position + aOffset * uWidth + normalize(aOffset + 1e-6) * wave;
-            vLocalY = transformed.y;`);
+            vLocalY = transformed.y;
+            vArc = aStream.x;`);
         shader.fragmentShader = shader.fragmentShader
-          .replace('#include <common>', '#include <common>\nvarying vec2 vFlow;\nvarying float vLocalY;')
-          .replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\nif (vFlow.y <= vFlow.x + 1e-4 || vLocalY < vFlow.x || vLocalY > vFlow.y) discard;');
+          .replace('#include <common>', '#include <common>\nuniform vec3 uFade;\nvarying vec2 vFlow;\nvarying float vLocalY;\nvarying float vArc;')
+          .replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\nif (vFlow.y <= vFlow.x + 1e-4 || vLocalY < vFlow.x || vLocalY > vFlow.y) discard;')
+          // 上流を周囲の背景輝度へ溶かす。層流のジェットは光を屈折・反射して初めて見えるので、
+          // 照らされていない部分が見えないのは正しい描画。弾道は後ろへ延長できず（遡ると頂点で
+          // 反転して「下から湧き上がる」軌道になる）、フレームでも10段では隠しきれない。
+          // トーンマッピング前＝線形空間で混ぜないと背景と輝度が合わない。
+          .replace('#include <tonemapping_fragment>',
+            'gl_FragColor.rgb = mix(gl_FragColor.rgb, uFade, 1. - smoothstep(0., .20, vArc));\n#include <tonemapping_fragment>');
       };
       material.customProgramCacheKey = () => 'stream-range-clip';
     }
@@ -1101,6 +1110,8 @@
         // 画面上の補正やカメラ追従は行わない（3D空間の位置はそのまま）。
         const uniforms = materials.stream.userData.uniforms;
         const distance = camera.position.distanceTo(pourPoint);
+        // 溶かす先は scene.background から取る。ここを黒と書くと、明るいテーマで作り直しになる。
+        if (scene.background && scene.background.isColor) uniforms.uFade.value.copy(scene.background);
         uniforms.uTime.value = streamTime;
         uniforms.uWidth.value = Math.max(streamWidth, 1e-4);
         uniforms.uWave.value = THREE.MathUtils.clamp(1 - (distance - 4) / 10, 0, 1);
