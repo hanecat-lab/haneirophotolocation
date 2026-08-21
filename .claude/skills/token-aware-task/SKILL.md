@@ -1,12 +1,12 @@
 ---
 name: token-aware-task
-description: Convert an implementation request into a narrowly scoped, token-efficient Claude Code task brief before editing.
+description: 実装依頼を、範囲を絞ったトークン効率の良いタスクブリーフへ変換する。編集を始める前に使う。
 ---
 
-Create a concise task brief before implementation. State the precise goal, named files, acceptance criteria, relevant command or log excerpt, and whether a plan is required. Do not search broadly unless the brief explicitly requires discovery.
+実装に入る前に、短いタスクブリーフを作る。目的、対象ファイル名、完了条件、関係するコマンドまたはログの抜粋、計画提示が必要かどうかを書く。ブリーフが探索を明示的に求めていない限り、広く検索しない。
 
-Classify the work as `small`, `standard`, or `complex`.
+作業規模を `small` / `standard` / `complex` のいずれかに分類する。
 
-For `small`, perform only the requested edit and its closest verification. For `standard`, propose a short plan and wait for confirmation if the requested behavior or file set is ambiguous. For `complex`, use plan mode first and delegate broad repository research to a subagent; preserve only the summary in the main session.
+`small` は、依頼された編集とその最小限の検証だけを行う。`standard` は、求められた挙動または対象ファイルが曖昧な場合に短い計画を示し、確認を待つ。`complex` は、まず plan mode を使い、リポジトリ全体の調査はサブエージェントへ委譲して、本セッションには要約だけを残す。
 
-Never paste a full test log. Ask for, or produce with the local CLI, only the error and 20–30 surrounding lines. After two failed correction paths, stop and provide a clean restart brief that incorporates what was learned.
+テストログ全文は貼らない。エラー行とその前後20〜30行だけを、依頼するかローカルの CLI で取り出す。2回修正に失敗したら、その場での試行をやめ、判明した内容を織り込んだ再出発用のブリーフを示す。

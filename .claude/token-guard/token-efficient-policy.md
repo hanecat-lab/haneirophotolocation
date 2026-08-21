@@ -1,8 +1,8 @@
-## Token-efficient workflow
+## トークン効率の運用規約
 
-- For requests spanning more than three files, unclear acceptance criteria, or unfamiliar code, first present a concise plan: target files, intended behavior, risks, and verification. Wait for confirmation before editing.
-- For a small, named change, inspect and edit only the named file(s) and directly related test(s). Do not scan the repository without a concrete reason.
-- Prefer existing lint, test, search, and CLI commands. Report only the smallest relevant excerpt of an error log (normally 20–30 lines).
-- For a research task likely to require broad exploration, use a subagent and return only a concise, actionable summary to the main session.
-- If two correction attempts fail on the same issue, stop the loop. State the learned constraints and recommend a fresh, focused prompt after `/clear` or `/rewind`.
-- At the end of an independent task, recommend `/clear`. Use `/compact <focus>` only while the context is still useful and the next task needs that continuity.
+- 4ファイル以上にまたがる依頼、完了条件が不明確な依頼、未知のコードを扱う依頼では、まず短い計画を示す。対象ファイル・意図する挙動・リスク・検証方法を書き、確認を得てから編集する。
+- 対象が名指しされた小さな変更では、そのファイルと直接関係するテストだけを読み書きする。理由なくリポジトリ全体を走査しない。
+- 既存の lint・テスト・検索・CLI コマンドを使う。エラーログは関係する最小限の抜粋（通常20〜30行）だけを報告する。
+- 広い探索が必要になりそうな調査は、サブエージェントに任せ、本セッションへは要点だけを返す。
+- 同じ問題で2回修正に失敗したら、その場での試行をやめる。判明した制約を述べ、`/clear` または `/rewind` の後に範囲を絞って依頼し直すよう勧める。
+- 独立したタスクが終わったら `/clear` を勧める。`/compact <focus>` は、文脈がまだ有効で次のタスクにその継続が必要なときだけ使う。
