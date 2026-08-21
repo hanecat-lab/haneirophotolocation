@@ -250,34 +250,72 @@
     const RIVULET_BOTTOM = GLASS.liquidLevel - GLASS.stack;      // 下段の液面（局所座標で約 -0.21）
     const RIVULET_R = COUPE_OUTER.baseEdge[0] + COUPE_OUTER.baseEdge[2]; // 台座のふちの半径
 
-    // 注ぎ口からの流れ。質量保存より断面積×速度が一定なので、半径は速度の平方根に反比例する。
-    // 単なる円錐ではなく、落ちるほど細まる速度が上がる曲線になる。
+    // 注ぎ口からの流れ。真上から垂直に落とすとCG的な棒に見えるので、
+    // 注ぎ口から水平に出て自由落下する放物線にする。少し横からグラスへ流れ込む。
     // 1 unit = 100mm なので g = 9.8 m/s² は 98。
     const STREAM_G = 98;
-    const STREAM_V0 = 4;                    // 注ぎ口の初速 0.4 m/s
-    const STREAM_R0 = .045;                 // 注ぎ口の半径 4.5mm（口径9mm）
-    const STREAM_SOURCE = GLASS.rimY + 1.6; // 注ぐ高さ。縁の160mm上
-    // 画面の外へ出た部分はラスタライザが捨てるので、上端を切る必要はない。
-    // 「常に画面の外まで届く長さがあればよい」だけ。注ぎ口より上は半径が一定なので、
-    // いくら伸ばしても形は変わらず、コストも増えない（輪郭の点数は変わらないため）。
-    // 10段を最大までズームアウトしても画角の縦は約35なので、余裕をみて60とる。
-    const STREAM_TOP = GLASS.rimY + 60;
-    const STREAM_FALL = 22;                 // 注ぎが止まったあと、流れの上端が落ちる速さ
-    function streamRadiusAt(y) {
-      // 注ぎ口より上（ズームアウト時のみ見える）は初速のままなので頭打ちにする。
-      const fall = Math.max(0, STREAM_SOURCE - y);
-      return STREAM_R0 * Math.sqrt(STREAM_V0 / Math.sqrt(STREAM_V0 * STREAM_V0 + 2 * STREAM_G * fall));
+    // 落差を大きく取ると視野に入るのは末端の急な部分だけになり、傾いた直線に見えてしまう。
+    // 浅く広い弧にして、曲がっているところを見せる（注ぎ口は縁の73mm上）。
+    const STREAM_DROP = 1.15;  // 空のグラスの液面までの落差 115mm
+    const STREAM_REACH = 1.45; // 水平距離 145mm
+    const STREAM_R0 = .05;     // 注ぎ口の半径 5mm
+    const STREAM_TIME = Math.sqrt(2 * STREAM_DROP / STREAM_G);  // 飛行時間 約0.153秒
+    const STREAM_VX = STREAM_REACH / STREAM_TIME;               // 水平速度 約9.47
+    // 着地は「空のグラスの液面＝軸上」に合わせる。満ちるほど着水点は軌道上を手前へ戻るので、
+    // 常に鉢の内側に収まる。満タン位置に合わせると、空のとき軌道が軸を通り越して鉢を突き抜ける。
+    const STREAM_END = Math.sqrt(2 * (STREAM_DROP + .05) / STREAM_G);
+    const STREAM_SEGMENTS = 48, STREAM_SIDES = 10;
+    const STREAM_FALL = 12;    // 注ぎが止まったあと、途切れた側が落ちる速さ
+
+    // 質量保存より断面積×速度が一定なので、半径は速度の平方根に反比例する。
+    function streamRadiusAt(t) {
+      const speed = Math.hypot(STREAM_VX, STREAM_G * t);
+      const physical = STREAM_R0 * Math.sqrt(STREAM_VX / speed);
+      // 注ぎ口では本来いちばん太いが、ボトルを描かない以上そこに切り口が出てしまう。
+      // §2「見えないボトルから注いでいる」に沿って、始点だけ細らせて湧き出るように見せる。
+      const emerge = Math.min(1, (t / STREAM_END) / .10);
+      return physical * (.25 + .75 * emerge * emerge * (3 - 2 * emerge));
     }
-    function createStreamProfile(steps = 40) {
-      // 細まるのは注ぎ口より下だけなので、そこを密に刻む。上は一定半径なので2点で足りる。
-      const points = [];
-      const low = GLASS.rimY - GLASS.bowlInnerB; // 下端は最上段の内底。表示範囲はシェーダが液面で切る
-      for (let i = 0; i <= steps; i++) {
-        const y = low + (STREAM_SOURCE - low) * (i / steps);
-        points.push(new THREE.Vector2(streamRadiusAt(y), y));
+
+    // チューブは「中心線 + 半径方向のオフセット」で持つ。頂点シェーダで
+    // position + aOffset * 太さ * (1 + 波) とすれば、太さの制御と流れる揺らぎが同じ仕組みで出せる。
+    // 軌道は平面内なので、水平の垂線を固定軸にすればねじれの無いフレームになる。
+    function createStreamGeometry(direction) {
+      const across = new THREE.Vector3(-direction.z, 0, direction.x).normalize();
+      const positions = [], offsets = [], normals = [], streams = [], indices = [];
+      const centre = new THREE.Vector3(), tangent = new THREE.Vector3();
+      const radial = new THREE.Vector3(), up = new THREE.Vector3();
+      for (let i = 0; i <= STREAM_SEGMENTS; i++) {
+        const t = STREAM_END * i / STREAM_SEGMENTS;
+        // 注ぎ口を原点に、水平に出て自由落下する。
+        centre.copy(direction).multiplyScalar(STREAM_VX * t);
+        centre.y = -.5 * STREAM_G * t * t;
+        tangent.copy(direction).multiplyScalar(STREAM_VX);
+        tangent.y = -STREAM_G * t;
+        tangent.normalize();
+        up.crossVectors(tangent, across).normalize(); // ねじれない第2軸
+        const radius = streamRadiusAt(t);
+        for (let j = 0; j <= STREAM_SIDES; j++) {
+          const angle = Math.PI * 2 * j / STREAM_SIDES;
+          radial.copy(across).multiplyScalar(Math.cos(angle)).addScaledVector(up, Math.sin(angle));
+          positions.push(centre.x, centre.y, centre.z);
+          offsets.push(radial.x * radius, radial.y * radius, radial.z * radius);
+          normals.push(radial.x, radial.y, radial.z);
+          streams.push(i / STREAM_SEGMENTS, radius * .08); // 弧に沿った位置と、揺らぎの振幅
+        }
       }
-      points.push(new THREE.Vector2(STREAM_R0, STREAM_TOP));
-      return points;
+      const ring = STREAM_SIDES + 1;
+      for (let i = 0; i < STREAM_SEGMENTS; i++) for (let j = 0; j < STREAM_SIDES; j++) {
+        const a = i * ring + j, b = a + ring;
+        indices.push(a, b, a + 1, a + 1, b, b + 1);
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+      geometry.setAttribute('aOffset', new THREE.Float32BufferAttribute(offsets, 3));
+      geometry.setAttribute('aStream', new THREE.Float32BufferAttribute(streams, 2));
+      geometry.setIndex(indices);
+      return geometry;
     }
 
     // 垂れの前進は「毎秒いくら高さが下がるか」ではなく「毎秒いくら道のりを進むか」で決める。
@@ -591,7 +629,7 @@
       clipLiquidAtLevel(materials.liquid);
       clipFlowRange(materials.rivulet);
       clipFoamRing(materials.foam);
-      clipFlowRange(materials.stream);
+      clipStreamRange(materials.stream);
       geometries = {
         glass: new THREE.LatheGeometry(createCoupeProfile(1), 128),
         liquid: new THREE.LatheGeometry(createLiquidProfile(LIQUID_BAKE, 1), 128),
@@ -605,7 +643,8 @@
         rivulet: new THREE.LatheGeometry(createRivuletProfile(1), 3, 0, .09),
         rivuletLow: new THREE.LatheGeometry(createRivuletProfile(.5), 3, 0, .09),
         // 注ぎ口からの流れ。自由落下で細まる輪郭を式から焼く。
-        stream: new THREE.LatheGeometry(createStreamProfile(56), 20),
+        // 注ぎの弧。既定カメラに対して横から来る向きに固定する（3D空間に固定。カメラ追従はしない）。
+        stream: createStreamGeometry(new THREE.Vector3(-.81, 0, .59)),
         bubble: new THREE.SphereGeometry(1, 12, 8)
       };
     }
@@ -638,6 +677,37 @@
           .replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\nif (vFlow.y <= vFlow.x + 1e-4 || vLocalY < vFlow.x || vLocalY > vFlow.y) discard;');
       };
       material.customProgramCacheKey = () => 'flow-range-clip';
+    }
+
+    // 注ぎの弧。区間切りに加えて、太さの制御と流れる揺らぎを同じ頂点シェーダで行う。
+    // 中心線(position)と半径方向(aOffset)を分けて持たせてあるので、
+    // position + aOffset * 太さ * (1 + 波) で両方が出せる。
+    // 垂れが使う clipFlowRange は触らない。
+    function clipStreamRange(material) {
+      material.userData.uniforms = { uTime: { value: 0 }, uWidth: { value: 1 }, uWave: { value: 1 } };
+      material.onBeforeCompile = shader => {
+        Object.assign(shader.uniforms, material.userData.uniforms);
+        shader.vertexShader = shader.vertexShader
+          .replace('#include <common>', `#include <common>
+            attribute vec2 aFlow;
+            attribute vec3 aOffset;
+            attribute vec2 aStream;
+            uniform float uTime;
+            uniform float uWidth;
+            uniform float uWave;
+            varying vec2 vFlow;
+            varying float vLocalY;`)
+          .replace('#include <begin_vertex>', `#include <begin_vertex>
+            vFlow = aFlow;
+            // 波が流れ落ちることで、太さのゆらぎとハイライトの移動が同時に出る。
+            float wave = sin(aStream.x * 26. - uTime * 7.) * aStream.y * uWave;
+            transformed = position + aOffset * uWidth + normalize(aOffset + 1e-6) * wave;
+            vLocalY = transformed.y;`);
+        shader.fragmentShader = shader.fragmentShader
+          .replace('#include <common>', '#include <common>\nvarying vec2 vFlow;\nvarying float vLocalY;')
+          .replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\nif (vFlow.y <= vFlow.x + 1e-4 || vLocalY < vFlow.x || vLocalY > vFlow.y) discard;');
+      };
+      material.customProgramCacheKey = () => 'stream-range-clip';
     }
 
     // 液面を覆うムース。液面と同じ単位円を重ね、中心からの半径が内側しきい値より小さい所を捨てる。
@@ -947,15 +1017,19 @@
       foamMesh.userData.ownGeometry = true;
 
       // 注ぎ口からの流れ。最上段の真上に立てる。回転対称なのでカメラが周回しても崩れない。
+      // §5 注ぎ位置は3D空間の構造として持つ。TargetGlass が変われば軌道も自動的に追従する。
       const topGlass = placements[placements.length - 1];
+      const pourTarget = new THREE.Vector3(topGlass.x, topGlass.y + LIQUID_EMPTY, topGlass.z);
+      // ジオメトリは注ぎ口を原点に焼いてあるので、満タンの液面へ着地するよう原点を置く。
+      const pourPoint = pourTarget.clone().add(new THREE.Vector3(.81, STREAM_DROP, -.59).multiply(new THREE.Vector3(STREAM_REACH, 1, STREAM_REACH)));
       const streamGeometry = geometries.stream.clone();
       const streamAttribute = new THREE.InstancedBufferAttribute(new Float32Array(2), 2);
       streamGeometry.setAttribute('aFlow', streamAttribute);
       const stream = new THREE.InstancedMesh(streamGeometry, materials.stream, 1);
       stream.castShadow = false;
       stream.userData.ownGeometry = true;
-      stream.frustumCulled = false; // 上端をカメラに合わせて切るので、包含球では判断できない
-      let streamWidth = 0; // 注ぎ始めに立ち上げ、終わりに絞る
+      stream.frustumCulled = false;
+      let streamWidth = 0, streamTime = 0; // 注ぎ始めに立ち上げ、終わりに絞る
 
       // 垂れる流れ。上段の台座は下段4脚の縁に45°ずつの4方向で接しているので、
       // そこを伝った液がそのまま下段のグラスへ落ちる。少しばらつかせて整列感を消す。
@@ -1004,17 +1078,32 @@
         streamWidth = target > streamWidth
           ? Math.min(target, streamWidth + speed * step)
           : Math.max(target, streamWidth - speed * step);
+        // 区間切りはメッシュのローカルYで行う。原点は注ぎ口なので、液面をそこからの相対に直す。
+        const localLevel = topGlass.y + topLevel - pourPoint.y;
         const flow = streamAttribute.array;
-        flow[0] = topLevel; // 下端は最上段の液面
-        // 注ぎが止まったら、まず注ぎ口の高さで切れて（ボトルを戻した瞬間）、そこから落ちて消える。
-        flow[1] = controller.pouring ? STREAM_TOP
-          : Math.max(topLevel, Math.min(flow[1], STREAM_SOURCE) - STREAM_FALL * step);
+        flow[0] = localLevel; // 下端は最上段の液面。満ちるほど着水点が軌道上を上へ移動する
+        // 注ぎが止まったら、注ぎ口の側から途切れて落ちていく。
+        flow[1] = controller.pouring ? .01
+          : Math.max(localLevel, Math.min(flow[1], .01) - STREAM_FALL * step);
         streamAttribute.needsUpdate = true;
-        position.set(topGlass.x, topGlass.y, topGlass.z);
-        const width = Math.max(streamWidth, 1e-4);
-        matrix.compose(position, quaternion.identity(), scale.set(width, 1, width));
+
+        // §4 軌道のわずかな揺らぎ。着地点はタワー軸上なので、Y回転させても着地点は動かず
+        // 注ぎの向きだけがゆっくり揺れる。注ぎ手の指先の揺れにあたる。
+        streamTime += step;
+        euler.set(0, Math.sin(streamTime * .9) * .02 + Math.sin(streamTime * .37) * .012, 0);
+        // 回転の中心をタワー軸に置くため、注ぎ口をターゲット中心の相対位置として回す。
+        position.copy(pourPoint).sub(pourTarget).applyEuler(euler).add(pourTarget);
+        matrix.compose(position, quaternion.setFromEuler(euler), scale.set(1, 1, 1));
         stream.setMatrixAt(0, matrix);
         stream.instanceMatrix.needsUpdate = true;
+
+        // §ズーム対応 距離による簡略化。遠距離では波が1画素未満になり、ちらつきの原因にしかならない。
+        // 画面上の補正やカメラ追従は行わない（3D空間の位置はそのまま）。
+        const uniforms = materials.stream.userData.uniforms;
+        const distance = camera.position.distanceTo(pourPoint);
+        uniforms.uTime.value = streamTime;
+        uniforms.uWidth.value = Math.max(streamWidth, 1e-4);
+        uniforms.uWave.value = THREE.MathUtils.clamp(1 - (distance - 4) / 10, 0, 1);
         stream.visible = streamWidth > .002;
       }
       const layer = {
