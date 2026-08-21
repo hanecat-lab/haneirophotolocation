@@ -250,6 +250,36 @@
     const RIVULET_BOTTOM = GLASS.liquidLevel - GLASS.stack;      // 下段の液面（局所座標で約 -0.21）
     const RIVULET_R = COUPE_OUTER.baseEdge[0] + COUPE_OUTER.baseEdge[2]; // 台座のふちの半径
 
+    // 注ぎ口からの流れ。質量保存より断面積×速度が一定なので、半径は速度の平方根に反比例する。
+    // 単なる円錐ではなく、落ちるほど細まる速度が上がる曲線になる。
+    // 1 unit = 100mm なので g = 9.8 m/s² は 98。
+    const STREAM_G = 98;
+    const STREAM_V0 = 4;                    // 注ぎ口の初速 0.4 m/s
+    const STREAM_R0 = .045;                 // 注ぎ口の半径 4.5mm（口径9mm）
+    const STREAM_SOURCE = GLASS.rimY + 1.6; // 注ぐ高さ。縁の160mm上
+    // 画面の外へ出た部分はラスタライザが捨てるので、上端を切る必要はない。
+    // 「常に画面の外まで届く長さがあればよい」だけ。注ぎ口より上は半径が一定なので、
+    // いくら伸ばしても形は変わらず、コストも増えない（輪郭の点数は変わらないため）。
+    // 10段を最大までズームアウトしても画角の縦は約35なので、余裕をみて60とる。
+    const STREAM_TOP = GLASS.rimY + 60;
+    const STREAM_FALL = 22;                 // 注ぎが止まったあと、流れの上端が落ちる速さ
+    function streamRadiusAt(y) {
+      // 注ぎ口より上（ズームアウト時のみ見える）は初速のままなので頭打ちにする。
+      const fall = Math.max(0, STREAM_SOURCE - y);
+      return STREAM_R0 * Math.sqrt(STREAM_V0 / Math.sqrt(STREAM_V0 * STREAM_V0 + 2 * STREAM_G * fall));
+    }
+    function createStreamProfile(steps = 40) {
+      // 細まるのは注ぎ口より下だけなので、そこを密に刻む。上は一定半径なので2点で足りる。
+      const points = [];
+      const low = GLASS.rimY - GLASS.bowlInnerB; // 下端は最上段の内底。表示範囲はシェーダが液面で切る
+      for (let i = 0; i <= steps; i++) {
+        const y = low + (STREAM_SOURCE - low) * (i / steps);
+        points.push(new THREE.Vector2(streamRadiusAt(y), y));
+      }
+      points.push(new THREE.Vector2(STREAM_R0, STREAM_TOP));
+      return points;
+    }
+
     // 垂れの前進は「毎秒いくら高さが下がるか」ではなく「毎秒いくら道のりを進むか」で決める。
     // 経路は高さ方向で約1.51、実際の道のりは約1.83あり、台座上面は高さ0.14しか下がらないのに
     // 道のりは0.28ある。高さを定速で下げると台座の上だけ液が倍近い速さで外へ走ってしまう。
@@ -547,6 +577,10 @@
         clearcoat: .1, clearcoatRoughness: .45, specularIntensity: .5,
         envMapIntensity: .9, side: THREE.FrontSide, transparent: false, depthWrite: true
       });
+      // 注ぎ口からの流れ。可視範囲は「下端=液面, 上端=画角の外」というYの区間なので、
+      // 垂れと同じ clipFlowRange をそのまま使える。新しいシェーダは要らない。
+      materials.stream = materials.liquid.clone();
+      materials.stream.roughness = .05;
       // 垂れる流れ。開いたリボンなので裏から見ても消えないよう DoubleSide にする。
       materials.rivulet = materials.liquid.clone();
       materials.rivulet.side = THREE.DoubleSide;
@@ -557,6 +591,7 @@
       clipLiquidAtLevel(materials.liquid);
       clipFlowRange(materials.rivulet);
       clipFoamRing(materials.foam);
+      clipFlowRange(materials.stream);
       geometries = {
         glass: new THREE.LatheGeometry(createCoupeProfile(1), 128),
         liquid: new THREE.LatheGeometry(createLiquidProfile(LIQUID_BAKE, 1), 128),
@@ -569,6 +604,8 @@
         // 垂れる流れは部分回転の細いリボン。幅は縁で約4.3mm、台座のふちで約2.4mm。
         rivulet: new THREE.LatheGeometry(createRivuletProfile(1), 3, 0, .09),
         rivuletLow: new THREE.LatheGeometry(createRivuletProfile(.5), 3, 0, .09),
+        // 注ぎ口からの流れ。自由落下で細まる輪郭を式から焼く。
+        stream: new THREE.LatheGeometry(createStreamProfile(56), 20),
         bubble: new THREE.SphereGeometry(1, 12, 8)
       };
     }
@@ -744,12 +781,14 @@
 
       const spill = new Float32Array(count); // このフレームであふれている脚
       let pouring = true, flowing = false, foaming = false;
+      const topIndex = count - 1; // createLayout は下段から積むので、最後が最上段の1脚
       const refreshLevels = () => {
         for (let i = 0; i < count; i++) level[i] = fillToLevel(fill[i]) + variance[i] * fill[i];
       };
 
       const controller = {
-        fill, level, front, tail, foam, placements,
+        fill, level, front, tail, foam, placements, topIndex,
+        get pouring() { return pouring; },
         reset(full = false) {
           fill.fill(full ? 1 : 0);
           transit.fill(0);
@@ -907,6 +946,17 @@
       foamMesh.castShadow = false;
       foamMesh.userData.ownGeometry = true;
 
+      // 注ぎ口からの流れ。最上段の真上に立てる。回転対称なのでカメラが周回しても崩れない。
+      const topGlass = placements[placements.length - 1];
+      const streamGeometry = geometries.stream.clone();
+      const streamAttribute = new THREE.InstancedBufferAttribute(new Float32Array(2), 2);
+      streamGeometry.setAttribute('aFlow', streamAttribute);
+      const stream = new THREE.InstancedMesh(streamGeometry, materials.stream, 1);
+      stream.castShadow = false;
+      stream.userData.ownGeometry = true;
+      stream.frustumCulled = false; // 上端をカメラに合わせて切るので、包含球では判断できない
+      let streamWidth = 0; // 注ぎ始めに立ち上げ、終わりに絞る
+
       // 垂れる流れ。上段の台座は下段4脚の縁に45°ずつの4方向で接しているので、
       // そこを伝った液がそのまま下段のグラスへ落ちる。少しばらつかせて整列感を消す。
       const RIVULETS = 4;
@@ -939,13 +989,37 @@
         }
       });
       rivulets.instanceMatrix.needsUpdate = true;
-      tower.add(body, surface, foamMesh, rivulets);
+      tower.add(body, surface, foamMesh, rivulets, stream);
 
       const flat = new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0));
       const points = tower.getObjectByProperty('isPoints', true);
+
+      function updateStream(topLevel, step) {
+        // 注ぎ始めは即座に立ち上げ、終わりは細くなって切れる。
+        // 絞り切る前に update() が止まると流れが残るが、注ぎが終わる瞬間は
+        // 最後に満ちた脚が液を受け取った直後なので必ず泡が立っており、
+        // 泡が引くまでの数秒は更新が続く。0.35秒の絞りはその中に収まる。
+        const target = controller.pouring ? 1 : 0;
+        const speed = controller.pouring ? 1 / .15 : 1 / .35;
+        streamWidth = target > streamWidth
+          ? Math.min(target, streamWidth + speed * step)
+          : Math.max(target, streamWidth - speed * step);
+        const flow = streamAttribute.array;
+        flow[0] = topLevel; // 下端は最上段の液面
+        // 注ぎが止まったら、まず注ぎ口の高さで切れて（ボトルを戻した瞬間）、そこから落ちて消える。
+        flow[1] = controller.pouring ? STREAM_TOP
+          : Math.max(topLevel, Math.min(flow[1], STREAM_SOURCE) - STREAM_FALL * step);
+        streamAttribute.needsUpdate = true;
+        position.set(topGlass.x, topGlass.y, topGlass.z);
+        const width = Math.max(streamWidth, 1e-4);
+        matrix.compose(position, quaternion.identity(), scale.set(width, 1, width));
+        stream.setMatrixAt(0, matrix);
+        stream.instanceMatrix.needsUpdate = true;
+        stream.visible = streamWidth > .002;
+      }
       const layer = {
         controller,
-        apply() {
+        apply(step = 0) {
           const level = controller.level;
           for (let index = 0; index < count; index++) {
             const item = placements[index];
@@ -980,6 +1054,7 @@
               flow[at + 1] = high;
             }
           }
+          updateStream(controller.level[controller.topIndex], step);
           flowAttribute.needsUpdate = true;
           levelAttribute.needsUpdate = true;
           foamAttribute.needsUpdate = true;
@@ -1112,7 +1187,7 @@
       requestAnimationFrame(animate);
       const delta = clock.getDelta();
       elapsed += delta;
-      if (pour && pour.controller.update(delta)) pour.apply();
+      if (pour && pour.controller.update(delta)) pour.apply(delta);
       if (tower) tower.traverse(obj => {
         if (obj.parent && obj.parent.userData.isBubbles) {
           const d = obj.userData;
