@@ -143,7 +143,7 @@
     const resetButton = document.getElementById('reset-view');
 
     let renderer, scene, camera, controls, clock, pmrem;
-    let tower = null, room = null, lightRig = null;
+    let tower = null, room = null, lightRig = null, pour = null, elapsed = 0;
     let materials, geometries;
     const requestState = new URLSearchParams(location.search);
     let currentMode = requestState.get('mode') === 'tower' ? 'tower' : 'study';
@@ -170,6 +170,35 @@
 
     const LIQUID_RX = GLASS.bowlInnerR - .003, LIQUID_RY = GLASS.bowlInnerB - .0025;
     const liquidTopRadius = level => bowlRadiusAt(LIQUID_RX, LIQUID_RY, level);
+    // 液体ボディは満タンで1回だけ焼き、液面より上をシェーダで捨てる。個体差(±.006)より上に取る。
+    const LIQUID_BAKE = GLASS.liquidLevel + .012;
+    const LIQUID_EMPTY = GLASS.rimY - LIQUID_RY; // 鉢の内底
+
+    // 鉢は楕円回転体なので、一定流量でも液面上昇は底ほど速く上ほど遅い。
+    // 体積 V(h) = πrx²[(ry - h) - (ry³ - h³)/(3ry²)]（h は縁からの深さ）を逆に解いて
+    // 「注いだ量 → 液面高さ」の表を作る。線形補間だと機械的な上がり方になる。
+    const bowlVolume = h => Math.PI * LIQUID_RX * LIQUID_RX *
+      ((LIQUID_RY - h) - (Math.pow(LIQUID_RY, 3) - h * h * h) / (3 * LIQUID_RY * LIQUID_RY));
+    const LEVEL_STEPS = 64;
+    const LEVEL_LUT = (() => {
+      const full = bowlVolume(GLASS.rimY - GLASS.liquidLevel);
+      const table = new Float32Array(LEVEL_STEPS + 1);
+      for (let k = 0; k <= LEVEL_STEPS; k++) {
+        const want = full * k / LEVEL_STEPS;
+        let low = GLASS.rimY - GLASS.liquidLevel, high = LIQUID_RY; // h が大きいほど浅い
+        for (let step = 0; step < 26; step++) {
+          const mid = (low + high) / 2;
+          if (bowlVolume(mid) > want) low = mid; else high = mid;
+        }
+        table[k] = GLASS.rimY - (low + high) / 2;
+      }
+      return table;
+    })();
+    function fillToLevel(fill) {
+      const t = THREE.MathUtils.clamp(fill, 0, 1) * LEVEL_STEPS;
+      const index = Math.min(LEVEL_STEPS - 1, Math.floor(t));
+      return THREE.MathUtils.lerp(LEVEL_LUT[index], LEVEL_LUT[index + 1], t - index);
+    }
 
     try { init(); animate(); } catch (error) { console.error(error); loading.style.display = 'none'; fallback.style.display = 'grid'; }
 
@@ -403,16 +432,34 @@
           envMapIntensity: 2.2, side: THREE.FrontSide, transparent: false, depthWrite: true
         })
       };
+      // 液面はジオメトリではなくシェーダで決める。385脚が別々の液面を持てて、
+      // 追加のドローコールもジオメトリ再生成も要らない。
+      clipLiquidAtLevel(materials.liquid);
       geometries = {
         glass: new THREE.LatheGeometry(createCoupeProfile(1), 128),
-        liquid: new THREE.LatheGeometry(createLiquidProfile(GLASS.liquidLevel, 1), 128),
+        liquid: new THREE.LatheGeometry(createLiquidProfile(LIQUID_BAKE, 1), 128),
         // タワー用は同じ輪郭の低解像度版。形は変えずに頂点数だけ落とす。
         glassLow: new THREE.LatheGeometry(createCoupeProfile(.45), 44),
-        liquidLow: new THREE.LatheGeometry(createLiquidProfile(GLASS.liquidLevel, .45), 44),
-        surface: new THREE.CircleGeometry(liquidTopRadius(GLASS.liquidLevel) * .997, 96),
-        surfaceLow: new THREE.CircleGeometry(liquidTopRadius(GLASS.liquidLevel) * .997, 40),
+        liquidLow: new THREE.LatheGeometry(createLiquidProfile(LIQUID_BAKE, .45), 44),
+        // 液面ディスクは単位円。半径は liquidTopRadius(level) をインスタンス行列で反映する。
+        surface: new THREE.CircleGeometry(1, 96),
+        surfaceLow: new THREE.CircleGeometry(1, 40),
         bubble: new THREE.SphereGeometry(1, 12, 8)
       };
+    }
+
+    // 液体ボディの「ローカルYが液面より上」を捨てる。液面高さは脚ごとのインスタンス属性。
+    // 切り口は平らになるが、そこには光沢面（materials.liquidSurface）が重なるので断面は見えない。
+    function clipLiquidAtLevel(material) {
+      material.onBeforeCompile = shader => {
+        shader.vertexShader = shader.vertexShader
+          .replace('#include <common>', '#include <common>\nattribute float aLevel;\nvarying float vLevel;\nvarying float vLocalY;')
+          .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLevel = aLevel;\nvLocalY = position.y;');
+        shader.fragmentShader = shader.fragmentShader
+          .replace('#include <common>', '#include <common>\nvarying float vLevel;\nvarying float vLocalY;')
+          .replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\nif (vLocalY > vLevel) discard;');
+      };
+      material.customProgramCacheKey = () => 'liquid-level-clip';
     }
 
     function mulberry32(a) { return function() { let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
@@ -424,16 +471,10 @@
       body.castShadow = true;
       group.add(body);
 
-      const level = GLASS.liquidLevel + (random() - .5) * .012; // §9 シャンパン量の微差
-      const liquid = new THREE.Mesh(detailed ? geometries.liquid : geometries.liquidLow, materials.liquid);
-      liquid.position.y = level - GLASS.liquidLevel;
-      group.add(liquid);
-      const surface = new THREE.Mesh(detailed ? geometries.surface : geometries.surfaceLow, materials.liquidSurface);
-      surface.rotation.x = -Math.PI / 2; surface.position.y = level + .0016;
-      group.add(surface);
-
+      // 液体と液面は段数によらずタワー側の InstancedMesh がまとめて描く。
       // 気泡。液面に達した泡と、内壁ぎわに集まるコルレット（泡の輪）として置く。
-      // 少数に抑え、将来アニメーション化できるよう個体ごとのグループで持つ。
+      // 満タン時の液面を基準に組み、実際の液面へはグループごと動かして追従させる。
+      const level = GLASS.liquidLevel;
       const bubbles = new THREE.Group();
       for (let i = 0; i < bubbleCount; i++) {
         const edgeBiased = i % 4 !== 0;
@@ -465,11 +506,110 @@
             x: (ix - (side - 1) / 2) * GLASS.pitch,
             y: level * GLASS.stack,
             z: (iz - (side - 1) / 2) * GLASS.pitch,
-            rotation: ((placements.length * 13) % 11 - 5) * .0032 // §9 微小な回転差
+            rotation: ((placements.length * 13) % 11 - 5) * .0032, // §9 微小な回転差
+            level, ix, iz // カスケードの上下関係を組むために保持する
           });
         }
       }
       return placements;
+    }
+
+    // ── 注ぐ演出 ───────────────────────────────────────────────
+    // 流体シミュレーションは不要。各グラスに「どれだけ入っているか」を持たせ、
+    // 上段から順に、あふれた分を真下の4脚へ配るだけでカスケードになる。
+    // 下段ほど脚数が増えるので、実物どおり進行が遅くなる。
+    function createPourController(placements, levels) {
+      const count = placements.length;
+      const fill = new Float32Array(count);
+      const amount = new Float32Array(count);
+      const level = new Float32Array(count);
+      const variance = new Float32Array(count); // §9 シャンパン量の微差は満タン側に残す
+      const random = mulberry32(count * 977 + 31);
+      for (let i = 0; i < count; i++) variance[i] = (random() - .5) * .012;
+
+      // 段 L の (ix, iz) を載せている下段の4脚は (ix, iz) (ix+1, iz) (ix, iz+1) (ix+1, iz+1)。
+      const key = (l, ix, iz) => l * 1e6 + ix * 1e3 + iz;
+      const lookup = new Map();
+      const tiers = Array.from({ length: levels }, () => []);
+      placements.forEach((item, index) => {
+        lookup.set(key(item.level, item.ix, item.iz), index);
+        tiers[item.level].push(index);
+      });
+      const downstream = placements.map(item => item.level === 0 ? null : [
+        lookup.get(key(item.level - 1, item.ix, item.iz)),
+        lookup.get(key(item.level - 1, item.ix + 1, item.iz)),
+        lookup.get(key(item.level - 1, item.ix, item.iz + 1)),
+        lookup.get(key(item.level - 1, item.ix + 1, item.iz + 1))
+      ]);
+      // 各グラスを支えている上段の数。外周ほど少なく、角は1脚しかない。
+      const upstreamCount = new Float32Array(count).fill(0);
+      downstream.forEach(down => { if (down) for (const j of down) upstreamCount[j]++; });
+
+      // 「この脚から下に、まだどれだけ空きが残っているか」。あふれた分をこれに比例して配る。
+      // 均等に4分割すると、角の脚は上段の角1脚からしか供給されず (1/4)^段数 になって永遠に満ちない。
+      // 実物では注ぎ手がボトルを動かして空いている側へ注ぎ分けるので、それをモデル化している。
+      const need = new Float32Array(count);
+      const refreshNeed = () => {
+        for (let tier = 0; tier < levels; tier++) { // 下段から積み上げる
+          for (const i of tiers[tier]) {
+            let remaining = 1 - fill[i];
+            const down = downstream[i];
+            if (down) for (const j of down) remaining += need[j] / upstreamCount[j];
+            need[i] = remaining;
+          }
+        }
+      };
+
+      const top = tiers[levels - 1][0];
+      // 1脚なら約2秒、10段385脚で約16秒。下段ほど脚数が増えるので体感の進みは自然に落ちる。
+      const rate = .45 + count / 16;
+
+      let pouring = true;
+      const refreshLevels = () => {
+        for (let i = 0; i < count; i++) level[i] = fillToLevel(fill[i]) + variance[i] * fill[i];
+      };
+
+      const controller = {
+        fill, level, placements,
+        reset(full = false) {
+          fill.fill(full ? 1 : 0);
+          pouring = !full;
+          refreshLevels();
+        },
+        update(dt) {
+          if (!pouring) return false;
+          amount.fill(0);
+          // タブ復帰時の巨大な dt で一気に満ちないよう頭を抑える。
+          // ここを詰めすぎると低fps端末で実時間より遅くなるので、4fps 相当までは素通しする。
+          amount[top] = rate * Math.min(dt, .25);
+          refreshNeed();
+          for (let tier = levels - 1; tier >= 0; tier--) {
+            for (const i of tiers[tier]) {
+              const incoming = amount[i];
+              if (incoming <= 0) continue;
+              const room = 1 - fill[i];
+              if (incoming <= room) { fill[i] += incoming; continue; }
+              fill[i] = 1;
+              const over = incoming - room;
+              const down = downstream[i];
+              if (!down) continue; // 最下段のあふれは床へ捨てる
+              let total = 0;
+              for (const j of down) total += need[j];
+              if (total > 1e-6) for (const j of down) amount[j] += over * need[j] / total;
+              else for (const j of down) amount[j] += over * .25;
+            }
+          }
+          // 満杯になった瞬間を数える方式だと、空き容量ぴったりに注がれた脚を数え落とす。
+          // 残量の合計で判定する。
+          let remaining = 0;
+          for (let i = 0; i < count; i++) remaining += 1 - fill[i];
+          if (remaining <= 1e-6) pouring = false;
+          refreshLevels();
+          return true;
+        }
+      };
+      controller.reset(requestState.get('pour') === '0');
+      return controller;
     }
 
     function createInstancedTower(placements) {
@@ -490,28 +630,103 @@
         mesh.castShadow = true;
         instances.add(mesh);
       };
-      // 385脚（10段）でも1ドローコールに収める。
+      // 385脚（10段）でも1ドローコールに収める。液体と液面はタワー側でまとめて描く。
       addLayer(geometries.glassLow, materials.glass[0]);
-      addLayer(geometries.liquidLow, materials.liquid);
-      addLayer(geometries.surfaceLow, materials.liquidSurface, GLASS.liquidLevel + .0016, -Math.PI / 2);
 
-      const bubbles = new Float32Array(count * 2 * 3);
+      // 気泡。液面に追従させるため、グラス中心からの相対位置（半径比）で保持する。
+      const positions = new Float32Array(count * 2 * 3);
+      const base = new Float32Array(count * 2 * 3);
       const random = mulberry32(count * 101 + 7);
-      placements.forEach((item, index) => {
+      for (let index = 0; index < count; index++) {
         for (let b = 0; b < 2; b++) {
-          const angle = random() * Math.PI * 2; const spread = Math.sqrt(random()) * .34; const at = (index * 2 + b) * 3;
-          bubbles[at] = item.x + Math.cos(angle) * spread;
-          bubbles[at + 1] = item.y + .92 + random() * .2;
-          bubbles[at + 2] = item.z + Math.sin(angle) * spread;
+          const angle = random() * Math.PI * 2; const ratio = Math.sqrt(random()) * .78; const at = (index * 2 + b) * 3;
+          base[at] = Math.cos(angle) * ratio;
+          base[at + 1] = .004 + random() * .006; // 液面からの高さ
+          base[at + 2] = Math.sin(angle) * ratio;
         }
-      });
+      }
       const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute('position', new THREE.BufferAttribute(bubbles, 3));
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
       const material = new THREE.PointsMaterial({ color: 0xffeec2, size: .014, transparent: true, opacity: .68, sizeAttenuation: true, depthWrite: false });
       const points = new THREE.Points(geometry, material);
-      points.userData.dynamicAsset = true;
+      points.userData.ownGeometry = true;
+      points.userData.ownMaterial = true;
+      points.userData.bubbleBase = base;
       instances.add(points);
       return instances;
+    }
+
+    // 液体・液面は段数によらず InstancedMesh に統一する。脚ごとの液面をインスタンス属性で
+    // 持たせるためで、study（1脚）でも count=1 のインスタンスとして描く。
+    function createPourLayer(placements, levels, bubbleGroups) {
+      const count = placements.length;
+      const detailed = levels <= 3;
+      const controller = createPourController(placements, levels);
+
+      const geometry = (detailed ? geometries.liquid : geometries.liquidLow).clone();
+      const levelAttribute = new THREE.InstancedBufferAttribute(new Float32Array(count), 1);
+      geometry.setAttribute('aLevel', levelAttribute);
+      const body = new THREE.InstancedMesh(geometry, materials.liquid, count);
+      body.castShadow = false; // 影はガラス本体が落とす。液体の影まで液面に追従させる必要をなくす。
+      body.userData.ownGeometry = true;
+
+      const surface = new THREE.InstancedMesh(detailed ? geometries.surface : geometries.surfaceLow, materials.liquidSurface, count);
+      surface.castShadow = false;
+
+      // 液体ボディの姿勢は固定。動くのは液面の高さ（属性）だけ。
+      const matrix = new THREE.Matrix4(), position = new THREE.Vector3();
+      const quaternion = new THREE.Quaternion(), scale = new THREE.Vector3(1, 1, 1), euler = new THREE.Euler();
+      placements.forEach((item, index) => {
+        position.set(item.x, item.y, item.z);
+        euler.set(0, item.rotation, 0);
+        matrix.compose(position, quaternion.setFromEuler(euler), scale);
+        body.setMatrixAt(index, matrix);
+      });
+      body.instanceMatrix.needsUpdate = true;
+      tower.add(body, surface);
+
+      const flat = new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0));
+      const points = tower.getObjectByProperty('isPoints', true);
+      const layer = {
+        controller,
+        apply() {
+          const level = controller.level;
+          for (let index = 0; index < count; index++) {
+            const item = placements[index];
+            levelAttribute.array[index] = level[index];
+            // 液面ディスクは半径を液面に合わせる。空のグラスでは半径0になり自然に消える。
+            const radius = Math.max(liquidTopRadius(level[index]) * .997, 1e-4);
+            position.set(item.x, item.y + level[index] + .0016, item.z);
+            matrix.compose(position, flat, scale.set(radius, radius, radius));
+            surface.setMatrixAt(index, matrix);
+            const group = bubbleGroups[index];
+            if (group) {
+              const ratio = radius / liquidTopRadius(GLASS.liquidLevel);
+              group.position.y = level[index] - GLASS.liquidLevel;
+              group.scale.set(ratio, 1, ratio);
+              group.visible = level[index] > LIQUID_EMPTY + .012;
+            }
+          }
+          levelAttribute.needsUpdate = true;
+          surface.instanceMatrix.needsUpdate = true;
+          scale.set(1, 1, 1);
+          if (points) {
+            const base = points.userData.bubbleBase, array = points.geometry.attributes.position.array;
+            for (let index = 0; index < count; index++) {
+              const item = placements[index], radius = liquidTopRadius(level[index]);
+              for (let b = 0; b < 2; b++) {
+                const at = (index * 2 + b) * 3;
+                array[at] = item.x + base[at] * radius;
+                array[at + 1] = item.y + level[index] + base[at + 1];
+                array[at + 2] = item.z + base[at + 2] * radius;
+              }
+            }
+            points.geometry.attributes.position.needsUpdate = true;
+          }
+        }
+      };
+      layer.apply();
+      return layer;
     }
 
     function buildTower(levels, mode = 'tower') {
@@ -520,6 +735,7 @@
       const study = mode === 'study';
       const actualLevels = study ? 1 : levels;
       const placements = createLayout(actualLevels);
+      const bubbleGroups = [];
       if (actualLevels >= 6) {
         tower.add(createInstancedTower(placements));
       } else {
@@ -527,9 +743,11 @@
           const glass = createGlass(index + 1, study ? 16 : 7, actualLevels <= 3);
           glass.position.set(item.x, item.y, item.z);
           glass.rotation.y = item.rotation;
+          glass.traverse(child => { if (child.userData.isBubbles) bubbleGroups[index] = child; });
           tower.add(glass);
         });
       }
+      pour = createPourLayer(placements, actualLevels, bubbleGroups);
       tower.userData = { levels: actualLevels, count: placements.length, study };
       scene.add(tower);
       const towerHeight = (actualLevels - 1) * GLASS.stack + GLASS.rimY;
@@ -540,7 +758,12 @@
     }
 
     function disposeObject(object) {
-      object.traverse(child => { if (child.userData.dynamicAsset) { child.geometry.dispose(); child.material.dispose(); } if (child.isInstancedMesh) child.dispose(); });
+      // マテリアルは共有物なので、そのオブジェクト専用のものだけを解放する。
+      object.traverse(child => {
+        if (child.userData.ownGeometry && child.geometry) child.geometry.dispose();
+        if (child.userData.ownMaterial && child.material) child.material.dispose();
+        if (child.isInstancedMesh) child.dispose();
+      });
       object.clear();
     }
 
@@ -594,11 +817,26 @@
       }));
       autoInput.addEventListener('change', () => { controls.autoRotate = autoInput.checked; });
       resetButton.addEventListener('click', () => frameCamera(tower.userData.levels, tower.userData.study));
+
+      // 画面をタップすると最初から注ぎ直す。カメラのドラッグと区別するため、
+      // 押してから離すまでの移動が小さく、時間も短いときだけ発火させる。
+      let pressedAt = 0, pressedX = 0, pressedY = 0;
+      renderer.domElement.addEventListener('pointerdown', event => {
+        pressedAt = performance.now(); pressedX = event.clientX; pressedY = event.clientY;
+      });
+      renderer.domElement.addEventListener('pointerup', event => {
+        const moved = Math.hypot(event.clientX - pressedX, event.clientY - pressedY);
+        if (!pour || moved > 6 || performance.now() - pressedAt > 300) return;
+        pour.controller.reset();
+        pour.apply();
+      });
     }
 
     function animate() {
       requestAnimationFrame(animate);
-      const elapsed = clock.getElapsedTime();
+      const delta = clock.getDelta();
+      elapsed += delta;
+      if (pour && pour.controller.update(delta)) pour.apply();
       if (tower) tower.traverse(obj => {
         if (obj.parent && obj.parent.userData.isBubbles) {
           const d = obj.userData;
