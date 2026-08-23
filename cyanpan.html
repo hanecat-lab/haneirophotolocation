@@ -300,6 +300,10 @@
     const envTargetCache = new Map();
     let tower = null, room = null, lightRig = null, pour = null, elapsed = 0;
     let themeVisuals = null, sceneScale = 1, themePulse = 0, finishPulse = 0;
+    // 祝祭ライトアップの「舞台照明」量。celebrationFxEnabled へ緩やかに追従する 0..1。
+    // 1 に近づくほど周囲の光源が落ち、タワーを狙う光が上がる（＝店内を暗くしてスポットを当てる）。
+    // 遷移そのものが演出になるので、トグルに別途パルスを足す必要はない。
+    let stageLight = 0; // 初期値は celebrationFxEnabled の確定後に入れる（この時点ではまだ未初期化）
     let frameDistance = 0; // frameCamera が決めた基準距離。ズーム上限の再計算に使う
     // 関数宣言は巻き上げられるため、初期レンダー前に安全なサウンドエンジンを用意できる。
     let soundEngine = createSoundEngine();
@@ -338,6 +342,7 @@
     try { celebrationFxEnabled = localStorage.getItem(CELEBRATION_FX_KEY) !== 'off'; } catch (error) { /* 保存不可時は既定オン */ }
     if (requestState.get('fx') === '0') celebrationFxEnabled = false;
     if (requestState.get('fx') === '1') celebrationFxEnabled = true;
+    stageLight = celebrationFxEnabled ? 1 : 0; // 初期表示はフェード無しで確定状態から始める
     levelsInput.value = currentLevels;
     modeButtons.forEach(button => button.classList.toggle('active', button.dataset.mode === currentMode));
 
@@ -653,7 +658,7 @@
     // PMREM で scene.environment に焼き込む。これが無いとPBRガラスは黒く沈み、プラスチックになる。
     function buildEnvironmentMap() {
       const config = theme();
-      scene.environmentIntensity = currentTheme === 'cute' ? 1.12 : 1;
+      scene.environmentIntensity = scene.userData.baseEnvironmentIntensity = currentTheme === 'cute' ? 1.12 : 1;
       // 環境マップはテーマだけで決まり、段数・形状・シャンパン色には依存しない。
       // キャッシュに有れば PMREM を再生成せず、その場で貼り替える。
       const cached = envTargetCache.get(currentTheme);
@@ -1026,6 +1031,7 @@
         halo.userData.ownGeometry = true; halo.userData.ownMaterial = true; halo.userData.ownTexture = true;
         halo.userData.haloY = 2.2; halo.userData.haloRadius = ROOM.radius - .35;
         halo.position.set(0, halo.userData.haloY, -halo.userData.haloRadius);
+        halo.userData.baseOpacity = halo.material.opacity;
         room.add(halo); themeVisuals.backHalo = halo;
 
         // 床のフェイク反射。タワー直下に加算合成の光だまりを敷いて画面下の黒つぶれを解消する。
@@ -1035,6 +1041,7 @@
           new THREE.MeshBasicMaterial({ map: createRadialGlowTexture('rgba(255,210,172,.80)', 'rgba(214,124,142,.20)'), transparent: true, opacity: .15, blending: THREE.AdditiveBlending, depthWrite: false }));
         pool.userData.ownGeometry = true; pool.userData.ownMaterial = true; pool.userData.ownTexture = true;
         pool.rotation.x = -Math.PI / 2; pool.position.y = .02; room.add(pool);
+        pool.userData.baseOpacity = pool.material.opacity; themeVisuals.floorPool = pool;
 
         // 背景家具は最小限。アーチとアーチの間、壁ぎわに2組だけ。
         [3, 15].forEach(index => {
@@ -1083,7 +1090,10 @@
     function addLights(scale = 1) {
       if (lightRig) { scene.remove(lightRig); lightRig.traverse(object => { if (object.isLight && object.dispose) object.dispose(); }); }
       const config = theme(); lightRig = new THREE.Group();
-      lightRig.add(new THREE.HemisphereLight(config.ambientSky, config.ambientGround, currentTheme === 'cute' ? .21 : .18));
+      // 祝祭ライトアップで落とす側なので、基準値とともに参照を持っておく（updateThemeResponse が毎フレーム書き直す）。
+      const ambient = new THREE.HemisphereLight(config.ambientSky, config.ambientGround, currentTheme === 'cute' ? .21 : .18);
+      ambient.userData.baseIntensity = ambient.intensity;
+      lightRig.add(ambient); lightRig.userData.ambientLight = ambient;
       const rect = (entry) => { const [hex, intensity, w, h, x, y, z] = entry; const light = new THREE.RectAreaLight(hex, intensity, w * scale, h * scale); light.position.set(x * scale, y * scale, z * scale); light.lookAt(0, .9 * scale, 0); lightRig.add(light); };
       config.lights.forEach(rect);
       // cute は距離を短く切り、タワーの真下だけに光の池を作って右側の床へ伸びすぎないようにする。
@@ -1102,13 +1112,16 @@
       // 「タワー直下だけ反射・画面端は最暗」という優先順位を、強度を上げたあとでも保てる。
       key.position.set(1.5 * scale, 6.2 * scale, 2.1 * scale); key.target.position.set(0, 0, 0); key.castShadow = true;
       key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -.0012; key.shadow.normalBias = .012 * scale; key.shadow.camera.near = 1 * scale; key.shadow.camera.far = 24 * scale;
-      lightRig.add(key, key.target);
+      // 祝祭ライトアップで上げる側。
+      key.userData.baseIntensity = key.intensity;
+      lightRig.add(key, key.target); lightRig.userData.keyLight = key;
       // リムライト。タワーの真裏やや上から当てて、全グラスの縁にエッジを入れる。
       // 平行光なので距離減衰が無く、段数スケールの影響を受けない（どの段数でも同じ効き）。
       // 影は落とさないので追加コストはほぼ無い。部屋は全周回れるため、固定位置だと方位に
       // よって正面光になってしまう。実際の位置は updateThemeResponse がカメラの真裏へ毎フレーム追従させる。
       if (currentTheme === 'cute') {
         const rim = new THREE.DirectionalLight(0xfff0d8, 2.6);
+        rim.userData.baseIntensity = rim.intensity;
         rim.position.set(0, 0, -6 * scale); // 実際の位置は毎フレーム更新される。初期値も同じ「真横」にしておく
         lightRig.add(rim, rim.target);
         lightRig.userData.rimLight = rim;
@@ -1120,7 +1133,10 @@
       // ——同じ不整合は lounge にも残っている。
       const SIDE_DECAY = 2, cute = currentTheme === 'cute';
       const sideFalloff = cute ? Math.pow(scale, SIDE_DECAY) : scale;
-      const sideAIntensity = (cute ? 3.0 : 5.2) * sideFalloff, sideBIntensity = (cute ? 2.2 : 3.8) * sideFalloff;
+      // 祝祭点光源は従来シーン全体の照度の2%程度しか担っておらず（原点での照度 約0.11 に対し
+      // RectAreaLight 群は合計 約6）、ONにしても見た目が変わらなかった。実際に効く桁へ上げる。
+      // 位置がタワーに近く decay 2 なので、強くしても遠くの壁までは届かない（＝スポット的に効く）。
+      const sideAIntensity = (cute ? 62 : 5.2) * sideFalloff, sideBIntensity = (cute ? 46 : 3.8) * sideFalloff;
       const sideA = new THREE.PointLight(celebrationColour, celebrationFxEnabled ? sideAIntensity : 0, 9 * scale, SIDE_DECAY);
       const sideB = new THREE.PointLight(currentTheme === 'cute' ? 0x9c7f96 : 0xffe1a2, celebrationFxEnabled ? sideBIntensity : 0, 8 * scale, SIDE_DECAY);
       sideA.position.set(-2.5 * scale, 2.1 * scale, 2.4 * scale); sideB.position.set(2.8 * scale, 3.7 * scale, -1.3 * scale);
@@ -1960,13 +1976,41 @@
       themePulse = Math.max(active, Math.max(0, themePulse - delta * .22));
       finishPulse = Math.max(0, finishPulse - delta * .42);
       const response = Math.max(themePulse, finishPulse * .82);
+      // 舞台照明。celebrationFxEnabled へ約1.4秒かけて寄せる。ONで周囲を落とし、タワーを上げる。
+      const stageTarget = celebrationFxEnabled ? 1 : 0;
+      stageLight += (stageTarget - stageLight) * Math.min(1, delta * 2.8);
+      if (Math.abs(stageTarget - stageLight) < .002) stageLight = stageTarget;
+      // 部屋の常時照明を落とす。RectAreaLight 群はタワーも照らしているが、そのぶんは
+      // タワー至近の祝祭点光源が肩代わりする。落とす側と上げる側を分けないとコントラストは付かない。
+      const roomDim = 1 - stageLight * .58;   // 環境光（部屋の地明かり）
+      const rectDim = 1 - stageLight * .38;   // 面光源はタワーも照らすので、落とす分は祝祭点光源が肩代わりする
+      const glowDim = 1 - stageLight * .82;   // 壁の間接照明・背景グラデは部屋そのものなので深く落とす
+      // cute の RectAreaLight 5基は全て lookAt でタワーを向いた「タワーの主照明」でもある。
+      // ここを深く落とすと周囲より先にタワーが暗くなるので、部屋側の減衰はごく浅く留める。
       const rectLights = lightRig.children.filter(item => item.isRectAreaLight);
-      rectLights.forEach((light, index) => { const base = theme().lights[index]?.[1] || 1; light.intensity = base * (1 + response * (index === 3 ? .34 : .16)); });
-      if (themeVisuals.glow) themeVisuals.glow.forEach((item, index) => { const base = currentTheme === 'cute' ? (.055 + index * .01) : .075; item.material.opacity = base + response * (currentTheme === 'cute' ? .12 : .10); if (currentTheme === 'lounge') item.position.x = -4.4 + Math.sin(elapsed * .55) * response * 1.1; });
+      rectLights.forEach((light, index) => { const base = theme().lights[index]?.[1] || 1; light.intensity = base * (1 + response * (index === 3 ? .34 : .16)) * rectDim; });
+      if (themeVisuals.glow) themeVisuals.glow.forEach((item, index) => { const base = currentTheme === 'cute' ? (.055 + index * .01) : .075; item.material.opacity = (base + response * (currentTheme === 'cute' ? .12 : .10)) * glowDim; if (currentTheme === 'lounge') item.position.x = -4.4 + Math.sin(elapsed * .55) * response * 1.1; });
+      const ambientLight = lightRig.userData.ambientLight;
+      if (ambientLight) ambientLight.intensity = ambientLight.userData.baseIntensity * roomDim;
+      // このシーンの明るさは PMREM で焼いた環境マップ（IBL）が支配していて、光源配列だけ
+      // 落としても絵はほとんど変わらない（実測: RectAreaLight を45%落としても画面は±2%）。
+      // 部屋を暗くするにはここを動かすのが本筋。ガラスは強化した点光源とキーが受け持つので、
+      // 落としても黒く沈まない。
+      scene.environmentIntensity = scene.userData.baseEnvironmentIntensity * (1 - stageLight * .42);
+      if (themeVisuals.backHalo) themeVisuals.backHalo.material.opacity = themeVisuals.backHalo.userData.baseOpacity * glowDim;
+      // 上げるのは「タワーの見せ場」。狙い撃ちのスポットと、その直下の光だまりはタワーの
+      // プレゼンテーションの一部なので一緒に持ち上げる（画面端の床は円錐の外なので暗いまま）。
+      const keyLight = lightRig.userData.keyLight;
+      if (keyLight) keyLight.intensity = keyLight.userData.baseIntensity * (1 + stageLight * 1.45);
+      // リムライトは水平な平行光なので、床（N·L=0）にも奥の壁（背面向き）にも乗らない。
+      // 上げてもグラスの輪郭だけが光る＝周囲を明るくせずにタワーだけ持ち上げられる唯一の光源。
+      const rimLight = lightRig.userData.rimLight;
+      if (rimLight) rimLight.intensity = rimLight.userData.baseIntensity * (1 + stageLight * 1.2);
+      if (themeVisuals.floorPool) themeVisuals.floorPool.material.opacity = themeVisuals.floorPool.userData.baseOpacity * (1 + stageLight * .85);
       // 縦パネルの明滅はLuxury Lounge専用。Concaféの壁・ニッチには各素材の不透明度を保つ。
       if (currentTheme === 'lounge' && themeVisuals.panels) themeVisuals.panels.forEach((item, index) => { item.material.opacity = .095 + response * .11 * (0.5 + 0.5 * Math.sin(elapsed * .9 + index)); });
       if (themeVisuals.motif) themeVisuals.motif.forEach((item, index) => { item.material.opacity = .16 + response * .35 * (0.5 + .5 * Math.sin(elapsed * 1.5 + index * 1.7)); item.scale.setScalar((index % 2 ? .22 : .30) * (1 + response * .12)); });
-      if (lightRig.userData.celebrationLights) lightRig.userData.celebrationLights.forEach((light, index) => { light.intensity = celebrationFxEnabled ? light.userData.baseIntensity * (.62 + response * (.72 + index * .10)) : 0; });
+      if (lightRig.userData.celebrationLights) lightRig.userData.celebrationLights.forEach((light, index) => { light.intensity = light.userData.baseIntensity * stageLight * (.62 + response * (.72 + index * .10)); });
       updateCameraFacingGlow();
       if (tower && tower.userData && tower.userData.celebration) tower.userData.celebration.update(delta, response);
     }
@@ -2460,10 +2504,16 @@
       const crown = new THREE.Mesh(new THREE.RingGeometry(.95, 1, 96), crownMaterial); crown.rotation.x = -Math.PI / 2; crown.position.y = Math.max(.4, towerHeight * .63); crown.scale.setScalar(radius * .76); crown.userData.ownMaterial = true; crown.userData.ownGeometry = true;
       group.add(particles, ring, crown);
       let localEnabled = celebrationFxEnabled;
+      // 即座に visible を切ると粒がパッと消えて安っぽいので、0→1 のフェードで出し入れする。
+      let fade = localEnabled ? 1 : 0;
       const setThemeColour = () => { const next = currentTheme === 'cute' ? 0xffd9a0 : 0xffd58b; particleMaterial.color.setHex(next); ringMaterial.color.setHex(next); crownMaterial.color.setHex(next); };
-      const setEnabled = enabled => { localEnabled = enabled; group.visible = enabled; };
+      const setEnabled = enabled => { localEnabled = enabled; if (enabled) group.visible = true; };
       const update = (delta, response) => {
-        if (!localEnabled) return;
+        const fadeTarget = localEnabled ? 1 : 0;
+        fade += (fadeTarget - fade) * Math.min(1, delta * 2.8);
+        if (Math.abs(fadeTarget - fade) < .004) fade = fadeTarget;
+        if (!fade) { group.visible = false; return; }
+        group.visible = true;
         const speed = .38 + response * .52;
         const position = geometry.attributes.position;
         for (let i = 0; i < count; i++) {
@@ -2476,9 +2526,9 @@
         position.needsUpdate = true;
         const shimmer = .55 + response * .45;
         // 待機時（response=0）でも十分きらめいて見えるよう基準値を底上げする。
-        particleMaterial.opacity = .68 + response * .30;
-        ringMaterial.opacity = .24 + response * .22;
-        crownMaterial.opacity = .19 + response * .18;
+        particleMaterial.opacity = (.68 + response * .30) * fade;
+        ringMaterial.opacity = (.24 + response * .22) * fade;
+        crownMaterial.opacity = (.19 + response * .18) * fade;
         ring.scale.setScalar(radius * (1 + Math.sin(elapsed * 1.8) * .025 * shimmer));
         crown.scale.setScalar(radius * .76 * (1 + Math.sin(elapsed * 2.1 + .8) * .035 * shimmer));
       };
@@ -2492,7 +2542,8 @@
       if (remember) { try { localStorage.setItem(CELEBRATION_FX_KEY, celebrationFxEnabled ? 'on' : 'off'); } catch (error) { /* 保存不可時も切替 */ } }
       const towerFx = tower && tower.userData ? tower.userData.celebration : null;
       if (towerFx) towerFx.setEnabled(celebrationFxEnabled);
-      if (lightRig && lightRig.userData.celebrationLights) lightRig.userData.celebrationLights.forEach(light => { light.intensity = celebrationFxEnabled ? light.userData.baseIntensity : 0; });
+      // 光源の増減は updateThemeResponse の stageLight が毎フレーム面倒を見る。
+      // ここで intensity を書いても次フレームで上書きされるだけなので触らない。
     }
 
     function buildTower(levels, mode = 'tower') {
