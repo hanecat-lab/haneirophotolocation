@@ -369,7 +369,7 @@
         // タワー背後の高い位置の発光板だけ強めて、床への映り込み（対策済み）を再燃させずに
         // タワー周囲の空気を色っぽく持ち上げる。
         // 華やかさの要望に合わせ、床へ映り込まない側（背後・上方）の光をもう一段強く。
-        lights: [[0xf5c9c8,1.5,5.4,3.8,2.3,4.6,2.6],[0xd8a8bb,.6,4.2,5,-4.6,2.2,1.2],[0xffb0ad,.55,2.2,2.6,4.4,1.9,-1.4],[0xffd9a0,.65,1.4,1.15,0,1.05,-3],[0xa04d6c,.70,3.2,3.2,.4,6.6,-.6]],
+        lights: [[0xf5c9c8,3.4,5.4,3.8,2.3,4.6,2.6],[0xd8a8bb,.6,4.2,5,-4.6,2.2,1.2],[0xffb0ad,.55,2.2,2.6,4.4,1.9,-1.4],[0xffd9a0,.65,1.4,1.15,0,1.05,-3],[0xa04d6c,1.05,3.2,3.2,.4,6.6,-.6]],
         key: 0xffdfae, ambientSky: 0x4a2436, ambientGround: 0x1c1015
       }
     };
@@ -777,6 +777,20 @@
       return texture;
     }
 
+    // 中心が明るく外へ向かって消える放射グラデ。加算合成の板に貼って
+    // 「背景の抜け」と「床の光だまり」に使う。鏡面計算を増やさずに明るさを足せる。
+    function createRadialGlowTexture(core, mid) {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 256;
+      const context = canvas.getContext('2d');
+      const gradient = context.createRadialGradient(128, 128, 4, 128, 128, 128);
+      gradient.addColorStop(0, core); gradient.addColorStop(.42, mid); gradient.addColorStop(1, 'rgba(0,0,0,0)');
+      context.fillStyle = gradient; context.fillRect(0, 0, 256, 256);
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      return texture;
+    }
+
     // 凹みの中に置く小さなディスプレイ。棚板の上に花・キャンドル・香水瓶を少量だけ。
     // 祭壇ではなく、コンセプトカフェの飾り棚に見せる。
     // 棚板の幅を 1.0 とした正規化座標で組み、実寸は呼び出し側でスケールして決める。
@@ -1001,6 +1015,27 @@
         });
         sconceMaterial.dispose(); // 複製元。実体は clone した方
 
+        // タワーの背後だけを持ち上げて、シルエットが暗い壁と同化しないようにする放射グラデ。
+        // 壁パネル18枚は createBackdropTexture の1枚を共有しているので、そこへ焼くと
+        // 全周の壁が光ってしまう。板を1枚だけ置き、updateCameraFacingGlow が
+        // カメラの真裏へ回り込ませる（部屋は全周回れるため位置固定では成立しない）。
+        // room はタワーの高さに比例して拡大されるので、寸法はタワー基準の正規化座標で持つ
+        // （タワーの高さは room 座標で常に約1.5）。
+        const halo = new THREE.Mesh(new THREE.PlaneGeometry(7, 7),
+          new THREE.MeshBasicMaterial({ map: createRadialGlowTexture('rgba(255,206,168,.92)', 'rgba(236,138,166,.34)'), transparent: true, opacity: .40, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+        halo.userData.ownGeometry = true; halo.userData.ownMaterial = true; halo.userData.ownTexture = true;
+        halo.userData.haloY = 2.2; halo.userData.haloRadius = ROOM.radius - .35;
+        halo.position.set(0, halo.userData.haloY, -halo.userData.haloRadius);
+        room.add(halo); themeVisuals.backHalo = halo;
+
+        // 床のフェイク反射。タワー直下に加算合成の光だまりを敷いて画面下の黒つぶれを解消する。
+        // 床の roughness / metalness / envMapIntensity は触らない。これは「床の右側へ伸びる
+        // 光の帯」を潰した結果の値で、鏡面を戻すと同じ問題が再燃する。
+        const pool = new THREE.Mesh(new THREE.PlaneGeometry(2.8, 2.8),
+          new THREE.MeshBasicMaterial({ map: createRadialGlowTexture('rgba(255,210,172,.80)', 'rgba(214,124,142,.20)'), transparent: true, opacity: .15, blending: THREE.AdditiveBlending, depthWrite: false }));
+        pool.userData.ownGeometry = true; pool.userData.ownMaterial = true; pool.userData.ownTexture = true;
+        pool.rotation.x = -Math.PI / 2; pool.position.y = .02; room.add(pool);
+
         // 背景家具は最小限。アーチとアーチの間、壁ぎわに2組だけ。
         [3, 15].forEach(index => {
           const seating = createVipSeating();
@@ -1053,16 +1088,43 @@
       config.lights.forEach(rect);
       // cute は距離を短く切り、タワーの真下だけに光の池を作って右側の床へ伸びすぎないようにする。
       // 強度は上げて、グラスのハイライトとタワー全体の明るさを底上げする。
-      const key = new THREE.SpotLight(config.key, (currentTheme === 'cute' ? 100 : 30) * Math.pow(scale, 1.7), (currentTheme === 'cute' ? 12 : 22) * scale, Math.PI / (currentTheme === 'cute' ? 9.5 : 9), .95, currentTheme === 'cute' ? 2.4 : 1.7);
+      //
+      // 段数が増えると applySceneScale が部屋も光源も scale 倍に拡大する。物理ベース照明では
+      // 照度が I / d^decay なので、位置を scale 倍したら強度は scale^decay 倍しないと
+      // 同じ明るさにならない。指数を decay と切り離して持つと段数ごとに明るさがずれるため、
+      // 必ず同じ値を使う（cute の decay を 2.4 にした際、指数が 1.7 のままで10段が約3倍暗かった）。
+      // 係数を上げてタワー本体を明るくする。円錐を絞ってあるので、強くしても光はタワーと
+      // その直下に留まり、画面端の床・壁は暗いまま保たれる。リムは輪郭しか照らさないので、面の明るさはここで作る。
+      const keyDecay = currentTheme === 'cute' ? 2.4 : 1.7;
+      const key = new THREE.SpotLight(config.key, (currentTheme === 'cute' ? 105 : 30) * Math.pow(scale, keyDecay), (currentTheme === 'cute' ? 12 : 22) * scale, Math.PI / (currentTheme === 'cute' ? 11 : 9), .95, keyDecay);
+      // 円錐を絞るのは明るさのためではなく、光の池を画面いっぱいに広げないため。
+      // three.js のスポット強度はカンデラなので、角度を狭めても中心は明るくならず周辺だけが落ちる。
+      // 「タワー直下だけ反射・画面端は最暗」という優先順位を、強度を上げたあとでも保てる。
       key.position.set(1.5 * scale, 6.2 * scale, 2.1 * scale); key.target.position.set(0, 0, 0); key.castShadow = true;
       key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -.0012; key.shadow.normalBias = .012 * scale; key.shadow.camera.near = 1 * scale; key.shadow.camera.far = 24 * scale;
       lightRig.add(key, key.target);
+      // リムライト。タワーの真裏やや上から当てて、全グラスの縁にエッジを入れる。
+      // 平行光なので距離減衰が無く、段数スケールの影響を受けない（どの段数でも同じ効き）。
+      // 影は落とさないので追加コストはほぼ無い。部屋は全周回れるため、固定位置だと方位に
+      // よって正面光になってしまう。実際の位置は updateThemeResponse がカメラの真裏へ毎フレーム追従させる。
+      if (currentTheme === 'cute') {
+        const rim = new THREE.DirectionalLight(0xfff0d8, 2.6);
+        rim.position.set(0, 0, -6 * scale); // 実際の位置は毎フレーム更新される。初期値も同じ「真横」にしておく
+        lightRig.add(rim, rim.target);
+        lightRig.userData.rimLight = rim;
+      }
       const celebrationColour = currentTheme === 'cute' ? 0xe0a284 : 0xffc66d;
       // 「祝祭ライトアップ」ONのときの華やかさを底上げする。
-      const sideA = new THREE.PointLight(celebrationColour, celebrationFxEnabled ? 5.2 * scale : 0, 9 * scale, 2);
-      const sideB = new THREE.PointLight(currentTheme === 'cute' ? 0x9c7f96 : 0xffe1a2, celebrationFxEnabled ? 3.8 * scale : 0, 8 * scale, 2);
+      // key と同じ理由で、decay 2 に対する補正は scale^2 が正しい（従来は scale^1 で10段が約5倍暗かった）。
+      // 係数はやはり2段基準で正規化（5.2 / 1.74 ≒ 3.0）。lounge は今回の対象外なので式を据え置く
+      // ——同じ不整合は lounge にも残っている。
+      const SIDE_DECAY = 2, cute = currentTheme === 'cute';
+      const sideFalloff = cute ? Math.pow(scale, SIDE_DECAY) : scale;
+      const sideAIntensity = (cute ? 3.0 : 5.2) * sideFalloff, sideBIntensity = (cute ? 2.2 : 3.8) * sideFalloff;
+      const sideA = new THREE.PointLight(celebrationColour, celebrationFxEnabled ? sideAIntensity : 0, 9 * scale, SIDE_DECAY);
+      const sideB = new THREE.PointLight(currentTheme === 'cute' ? 0x9c7f96 : 0xffe1a2, celebrationFxEnabled ? sideBIntensity : 0, 8 * scale, SIDE_DECAY);
       sideA.position.set(-2.5 * scale, 2.1 * scale, 2.4 * scale); sideB.position.set(2.8 * scale, 3.7 * scale, -1.3 * scale);
-      sideA.userData.baseIntensity = 5.2 * scale; sideB.userData.baseIntensity = 3.8 * scale;
+      sideA.userData.baseIntensity = sideAIntensity; sideB.userData.baseIntensity = sideBIntensity;
       lightRig.userData.celebrationLights = [sideA, sideB];
       lightRig.add(sideA, sideB); scene.add(lightRig);
     }
@@ -1863,6 +1925,35 @@
       if (kind === 'finish') { finishPulse = 1.0; themePulse = .55; soundEngine.pourFinish(); }
     }
 
+    // リムライトと背景の放射グラデを、常にカメラの真裏へ回り込ませる。
+    // 部屋は18角形のドラムでカメラが全周するため、位置を固定すると方位によって
+    // 正面光・手前グラデになって逆効果になる。方位だけ追従させれば
+    // 「タワーの向こう側から手前へ抜ける光」という関係がどの方位でも保たれる。
+    function updateCameraFacingGlow() {
+      const rim = lightRig.userData.rimLight, halo = themeVisuals.backHalo;
+      if (!rim && !halo) return;
+      const target = controls.target;
+      const dx = camera.position.x - target.x, dz = camera.position.z - target.z;
+      const length = Math.hypot(dx, dz);
+      if (!length) return;
+      const nx = dx / length, nz = dz / length; // カメラのある向き（水平）
+      if (rim) {
+        // lightRig は scene 直下なのでワールド座標。平行光なので位置は向きを決めるだけ。
+        // 仰角は付けず、ちょうど水平にする。平行光は距離減衰が無いぶん床面も一様に照らすので、
+        // わずかでも見下ろす成分があると床全体が白っぽく飛んでしまう（仰角9°でも N·L=0.15 あり、
+        // 環境光の7割に相当する量が床に乗っていた）。真横から入れれば床の N·L がちょうど0になり、
+        // 縦に立つグラスの縁だけを拾う本来のリムになる。奥の壁は N·L<0 で暗いまま保たれる。
+        rim.position.set(target.x - nx * 6 * sceneScale, target.y, target.z - nz * 6 * sceneScale);
+        rim.target.position.copy(target); rim.target.updateMatrixWorld();
+      }
+      if (halo) {
+        // halo は room の子なので room 座標。向きは placePanel と同じ「法線を中心へ」の作法で決める。
+        const radius = halo.userData.haloRadius;
+        halo.position.set(-nx * radius, halo.userData.haloY, -nz * radius);
+        halo.rotation.y = Math.atan2(-nx, -nz) + Math.PI;
+      }
+    }
+
     function updateThemeResponse(delta) {
       if (!themeVisuals || !lightRig) return;
       const active = pour && pour.controller && pour.controller.pouring ? 1 : 0;
@@ -1876,6 +1967,7 @@
       if (currentTheme === 'lounge' && themeVisuals.panels) themeVisuals.panels.forEach((item, index) => { item.material.opacity = .095 + response * .11 * (0.5 + 0.5 * Math.sin(elapsed * .9 + index)); });
       if (themeVisuals.motif) themeVisuals.motif.forEach((item, index) => { item.material.opacity = .16 + response * .35 * (0.5 + .5 * Math.sin(elapsed * 1.5 + index * 1.7)); item.scale.setScalar((index % 2 ? .22 : .30) * (1 + response * .12)); });
       if (lightRig.userData.celebrationLights) lightRig.userData.celebrationLights.forEach((light, index) => { light.intensity = celebrationFxEnabled ? light.userData.baseIntensity * (.62 + response * (.72 + index * .10)) : 0; });
+      updateCameraFacingGlow();
       if (tower && tower.userData && tower.userData.celebration) tower.userData.celebration.update(delta, response);
     }
 
