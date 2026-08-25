@@ -1007,6 +1007,8 @@
       syncDressingUI();
       syncQualityUI();
       setTimeout(() => { loading.style.opacity = '0'; loading.style.transition = 'opacity .45s'; setTimeout(() => loading.remove(), 480); }, 350);
+      // 共有リンク／品質確認向け。?theme=party&overdrive=10&finale=1 でFINAL DROPを開始する。
+      if (currentTheme === 'party' && requestState.get('finale') === '1') setTimeout(() => triggerFinale(), 640);
     }
 
     // ── 環境マップ ─────────────────────────────────────────────
@@ -1400,61 +1402,81 @@
       fireworkGeometry.setAttribute('position', new THREE.BufferAttribute(fireworkPositions, 3));
       fireworkGeometry.setAttribute('color', new THREE.BufferAttribute(fireworkColours, 3));
       const fireworkMaterial = new THREE.PointsMaterial({ size: .095, vertexColors: true, transparent: true, opacity: .0, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true });
-      const fireworks = new THREE.Points(fireworkGeometry, fireworkMaterial); fireworks.visible = false;
+      fireworkMaterial.size = .135; fireworkMaterial.opacity = 1;
+      const fireworks = new THREE.Points(fireworkGeometry, fireworkMaterial); fireworks.visible = false; fireworks.renderOrder = 7;
       fireworks.userData.ownGeometry = true; fireworks.userData.ownMaterial = true; group.add(fireworks);
+      // 粒子が密な紙吹雪に隠れないよう、花火の核になる発光リングをタワー上部へ置く。
+      const fireworkBloom = new THREE.Mesh(new THREE.RingGeometry(.12, .32, 28), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending, fog: false, toneMapped: false }));
+      fireworkBloom.userData.ownGeometry = true; fireworkBloom.userData.ownMaterial = true; fireworkBloom.renderOrder = 9; group.add(fireworkBloom);
       // 紙吹雪は背景画像ではなく、タワー周囲を通過する実体の紙片として描く。
       // 透明な正方形をインスタンス化し、色・回転・落下を個別に持たせることで前景性を確保する。
-      const confettiCapacity = 240, confettiGeometry = new THREE.PlaneGeometry(1, .56);
-      const confettiMaterial = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: .94, side: THREE.DoubleSide, depthWrite: false, blending: THREE.NormalBlending, fog: false });
-      const confetti = new THREE.InstancedMesh(confettiGeometry, confettiMaterial, confettiCapacity);
-      const confettiDummy = new THREE.Object3D(), hiddenConfettiMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
-      confetti.frustumCulled = false; confetti.userData.ownGeometry = true; confetti.userData.ownMaterial = true;
-      for (let i = 0; i < confettiCapacity; i++) { confetti.setMatrixAt(i, hiddenConfettiMatrix); confetti.setColorAt(i, palette[i % palette.length]); }
-      confetti.instanceMatrix.needsUpdate = true; if (confetti.instanceColor) confetti.instanceColor.needsUpdate = true; group.add(confetti);
+      const confettiPalette = [new THREE.Color(0xff2daa), new THREE.Color(0x52eaff), new THREE.Color(0xd9ff55), new THREE.Color(0xffcc67), new THREE.Color(0xf7f3ff)];
+      const confettiCapacity = 320, confettiGeometry = new THREE.PlaneGeometry(1, .56), confettiDummy = new THREE.Object3D(), hiddenConfettiMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+      // インスタンス色属性は一部GPUで黒く解釈されるため、明色ごとの専用マテリアルへ分離する。
+      const confettiMeshes = confettiPalette.map(colour => {
+        const material = new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: 1, side: THREE.DoubleSide, depthWrite: false, depthTest: false, blending: THREE.NormalBlending, fog: false, toneMapped: false });
+        const mesh = new THREE.InstancedMesh(confettiGeometry, material, confettiCapacity);
+        mesh.frustumCulled = false; mesh.renderOrder = 8; mesh.userData.ownGeometry = true; mesh.userData.ownMaterial = true;
+        for (let i = 0; i < confettiCapacity; i++) mesh.setMatrixAt(i, hiddenConfettiMatrix);
+        mesh.instanceMatrix.needsUpdate = true; group.add(mesh); return mesh;
+      });
       const sparks = Array.from({ length: fireworksCapacity }, () => ({ active: false, position: new THREE.Vector3(), velocity: new THREE.Vector3(), colour: new THREE.Color(), life: 0, maxLife: 1 }));
-      const confettiStates = Array.from({ length: confettiCapacity }, () => ({ active: false, position: new THREE.Vector3(), velocity: new THREE.Vector3(), colour: new THREE.Color(), rotation: new THREE.Euler(), spin: new THREE.Vector3(), life: 0, maxLife: 1, size: .08 }));
-      let sparkCursor = 0, confettiCursor = 0, sparkLimit = 52, confettiLimit = 120, beamLimit = 7, reflectionLimit = 34, updateHz = 24, updateAccumulator = 0, beatCooldown = 0, firstBurst = true, lastPouring = false;
+      const confettiStates = Array.from({ length: confettiCapacity }, () => ({ active: false, position: new THREE.Vector3(), velocity: new THREE.Vector3(), rotation: new THREE.Euler(), spin: new THREE.Vector3(), life: 0, maxLife: 1, size: .08, paletteIndex: 0, slot: 0 }));
+      let sparkCursor = 0, confettiCursor = 0, sparkLimit = 52, confettiLimit = 120, beamLimit = 7, reflectionLimit = 34, updateHz = 24, updateAccumulator = 0, beatCooldown = 0, firstBurst = true, lastPouring = false, bloomPulse = 0;
 
       const hideSpark = index => { const at = index * 3; fireworkPositions[at] = 0; fireworkPositions[at + 1] = -999; fireworkPositions[at + 2] = 0; };
       const partyTowerTop = () => Math.max(GLASS.rimY * .82, tower?.userData?.height || GLASS.rimY);
       const partyRadius = () => Math.max(.42, Math.min(1.15, .44 + partyTowerTop() * .12));
-      const hideConfetti = index => confetti.setMatrixAt(index, hiddenConfettiMatrix);
+      const hideConfetti = state => confettiMeshes[state.paletteIndex].setMatrixAt(state.slot, hiddenConfettiMatrix);
+      const paintSparkNow = state => {
+        const index = (sparkCursor - 1 + fireworksCapacity) % fireworksCapacity, at = index * 3;
+        fireworkPositions[at] = state.position.x; fireworkPositions[at + 1] = state.position.y; fireworkPositions[at + 2] = state.position.z;
+        fireworkColours[at] = state.colour.r; fireworkColours[at + 1] = state.colour.g; fireworkColours[at + 2] = state.colour.b;
+      };
       function burst(multiplier = 1) {
-        const colour = palette[Math.floor(Math.random() * palette.length)];
+        const colour = confettiPalette[Math.floor(Math.random() * confettiPalette.length)];
         const angle = elapsed * .47 + Math.random() * Math.PI * 2;
         const top = partyTowerTop(), radius = partyRadius();
-        const origin = new THREE.Vector3(Math.cos(angle) * radius * .45, top + .22 + Math.random() * .28, Math.sin(angle) * radius * .45 - radius * .12);
+        const origin = new THREE.Vector3(Math.cos(angle) * radius * .58, top + .48 + Math.random() * .28, Math.sin(angle) * radius * .58 - radius * .12);
         const levelGain = .28 + overdriveLevel * .072;
-        const count = Math.min(Math.round(sparkLimit * multiplier * levelGain), fireworksCapacity);
+        const levelTenBoost = overdriveLevel >= 10 ? 1.52 : 1;
+        const count = Math.min(Math.round(sparkLimit * multiplier * levelGain * levelTenBoost), fireworksCapacity);
         for (let i = 0; i < count; i++) {
-          const state = sparks[sparkCursor]; const theta = Math.random() * Math.PI * 2, vertical = (Math.random() - .16) * .76, speed = .42 + Math.random() * .66 + overdriveLevel * .035;
+          const state = sparks[sparkCursor]; const theta = Math.random() * Math.PI * 2, vertical = (Math.random() - .05) * .82, speed = .50 + Math.random() * .76 + overdriveLevel * .045;
           state.active = true; state.life = state.maxLife = 1.05 + Math.random() * .75; state.position.copy(origin);
           state.velocity.set(Math.cos(theta) * speed, vertical * speed + .20, Math.sin(theta) * speed); state.colour.copy(colour);
           sparkCursor = (sparkCursor + 1) % fireworksCapacity;
+          paintSparkNow(state);
         }
+        fireworkBloom.position.copy(origin); fireworkBloom.material.color.copy(colour); fireworkBloom.scale.setScalar(1.0 + multiplier * .42); fireworkBloom.material.opacity = Math.min(.96, .30 + multiplier * .18); bloomPulse = 1;
+        fireworks.visible = true; fireworkGeometry.attributes.position.needsUpdate = true; fireworkGeometry.attributes.color.needsUpdate = true;
       }
       function releaseConfetti(multiplier = 1, finale = false) {
         const top = partyTowerTop(), radius = partyRadius();
         const levelGain = .18 + overdriveLevel * .082;
-        const count = Math.min(Math.round(confettiLimit * multiplier * levelGain), confettiCapacity);
+        const levelTenBoost = overdriveLevel >= 10 ? 1.62 : 1;
+        const count = Math.min(Math.round(confettiLimit * multiplier * levelGain * levelTenBoost), confettiCapacity);
         for (let i = 0; i < count; i++) {
-          const state = confettiStates[confettiCursor], colour = palette[Math.floor(Math.random() * palette.length)];
+          const state = confettiStates[confettiCursor], paletteIndex = Math.floor(Math.random() * confettiPalette.length), colour = confettiPalette[paletteIndex];
+          confettiMeshes.forEach(mesh => mesh.setMatrixAt(confettiCursor, hiddenConfettiMatrix));
           state.active = true; state.life = state.maxLife = (finale ? 2.0 : 1.35) + Math.random() * (finale ? 1.25 : .8);
-          state.position.set((Math.random() - .5) * radius * 2.25, top + .28 + Math.random() * (finale ? 1.25 : .62), (Math.random() - .5) * radius * 2.1 - radius * .10);
+          state.position.set((Math.random() - .5) * radius * 2.75, top + .35 + Math.random() * (finale ? 1.40 : .72), (Math.random() - .5) * radius * 2.55 - radius * .18);
           state.velocity.set((Math.random() - .5) * (.34 + overdriveLevel * .055), -.16 - Math.random() * .24, (Math.random() - .5) * (.30 + overdriveLevel * .045));
           state.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
           state.spin.set((Math.random() - .5) * 7.2, (Math.random() - .5) * 8.5, (Math.random() - .5) * 6.2);
-          state.size = .045 + Math.random() * .055 + (finale ? .018 : 0); state.colour.copy(colour);
-          confetti.setColorAt(confettiCursor, colour); confettiCursor = (confettiCursor + 1) % confettiCapacity;
+          state.size = .060 + Math.random() * .070 + (finale ? .030 : 0); state.paletteIndex = paletteIndex; state.slot = confettiCursor;
+          confettiDummy.position.copy(state.position); confettiDummy.rotation.copy(state.rotation); confettiDummy.scale.setScalar(state.size); confettiDummy.updateMatrix();
+          confettiMeshes[paletteIndex].setMatrixAt(confettiCursor, confettiDummy.matrix); confettiCursor = (confettiCursor + 1) % confettiCapacity;
         }
-        if (confetti.instanceColor) confetti.instanceColor.needsUpdate = true;
+        confettiMeshes.forEach(mesh => { mesh.visible = true; mesh.instanceMatrix.needsUpdate = true; });
       }
+      function finalBurst() { burst(4.2); releaseConfetti(3.3, true); }
       function setQuality(profile) {
         const lowTier = !profile.shadows;
         beamLimit = lowTier ? 4 : (profile.pixelRatio <= 1.12 ? 6 : 9);
         reflectionLimit = lowTier ? 16 : (profile.pixelRatio <= 1.12 ? 30 : 46);
         sparkLimit = lowTier ? 24 : Math.max(46, Math.round(fireworksCapacity * profile.petalDensity * .82));
-        confettiLimit = lowTier ? 42 : Math.max(94, Math.round(confettiCapacity * profile.petalDensity * .78));
+        confettiLimit = lowTier ? 58 : Math.max(128, Math.round(confettiCapacity * profile.petalDensity * .86));
         updateHz = lowTier ? 16 : Math.min(26, profile.musicHz || profile.petalHz || 24);
       }
       function update(delta, beat) {
@@ -1463,6 +1485,11 @@
         if (updateAccumulator < (1 / updateHz)) return;
         const dt = updateAccumulator; updateAccumulator = 0;
         const t = elapsed, pouring = Boolean(pour?.controller?.pouring), finaleActive = finaleUntil > performance.now();
+        if (finaleActive) {
+          const top = partyTowerTop(), pulse = .5 + .5 * Math.sin(t * 8.4);
+          fireworkBloom.position.set(0, top + .62, -partyRadius() * .14); fireworkBloom.material.color.copy(confettiPalette[Math.floor(t * 4) % confettiPalette.length]);
+          fireworkBloom.visible = true; fireworkBloom.scale.setScalar(2.1 + pulse * 1.15); fireworkBloom.material.opacity = .62 + pulse * .28; bloomPulse = 1;
+        }
         mirrorCore.rotation.y += dt * .36; mirrorCore.rotation.x = Math.sin(t * .27) * .10;
         mirrorLines.rotation.copy(mirrorCore.rotation); mirrorGlow.intensity = active ? (1.0 + overdriveLevel * .20 + Math.max(0, beat) * 2.6 + (finaleActive ? 2.5 : 0)) : .22;
         beams.forEach((beam, index) => {
@@ -1473,7 +1500,8 @@
           beamDirection.subVectors(beamTarget, beamOrigin); const length = beamDirection.length(); beamDirection.normalize();
           beam.position.copy(beamOrigin).addScaledVector(beamDirection, length * .5); beam.quaternion.setFromUnitVectors(up, beamDirection); beam.scale.set(1, length, 1);
           const dynamicLimit = finaleActive ? beamCount : Math.min(beamLimit, 1 + Math.ceil(overdriveLevel * .90));
-          beam.visible = active && index < dynamicLimit; beam.material.opacity = beam.visible ? (.045 + overdriveLevel * .018 + (finaleActive ? .12 : 0) + .10 * (0.5 + 0.5 * Math.sin(t * speedGain + index))) : 0;
+          const levelTenFlare = overdriveLevel >= 10 ? .13 : 0;
+          beam.visible = active && index < dynamicLimit; beam.material.opacity = beam.visible ? (.045 + overdriveLevel * .020 + levelTenFlare + (finaleActive ? .15 : 0) + .10 * (0.5 + 0.5 * Math.sin(t * speedGain + index))) : 0;
         });
         floorRings.forEach((ring, index) => {
           const data = ring.userData; ring.visible = active && index < (finaleActive ? floorRings.length : Math.min(floorRings.length, Math.max(1, Math.ceil(overdriveLevel * .40))));
@@ -1509,19 +1537,22 @@
           fireworkColours[at] = state.colour.r * fade; fireworkColours[at + 1] = state.colour.g * fade; fireworkColours[at + 2] = state.colour.b * fade;
         }
         fireworks.visible = activeSparks; if (activeSparks) { fireworkGeometry.attributes.position.needsUpdate = true; fireworkGeometry.attributes.color.needsUpdate = true; fireworkMaterial.opacity = .82; }
+        bloomPulse = Math.max(0, bloomPulse - dt * 1.8);
+        if (!finaleActive) { fireworkBloom.visible = bloomPulse > .02; fireworkBloom.scale.setScalar(1 + (1 - bloomPulse) * 2.1); fireworkBloom.material.opacity = bloomPulse * (.72 + Math.max(0, beat) * .22); }
+        fireworkBloom.rotation.z += dt * 5.2;
         let activeConfetti = false;
         for (let i = 0; i < confettiStates.length; i++) {
           const state = confettiStates[i]; if (!state.active) continue; activeConfetti = true;
-          state.life -= dt; if (state.life <= 0 || !active) { state.active = false; hideConfetti(i); continue; }
+          state.life -= dt; if (state.life <= 0 || !active) { state.active = false; hideConfetti(state); continue; }
           state.velocity.y -= dt * .15; state.position.addScaledVector(state.velocity, dt);
           state.rotation.x += state.spin.x * dt; state.rotation.y += state.spin.y * dt; state.rotation.z += state.spin.z * dt;
           const fade = Math.min(1, state.life / .42);
-          confettiDummy.position.copy(state.position); confettiDummy.rotation.copy(state.rotation); confettiDummy.scale.setScalar(state.size * (.72 + fade * .28)); confettiDummy.updateMatrix(); confetti.setMatrixAt(i, confettiDummy.matrix);
+          confettiDummy.position.copy(state.position); confettiDummy.rotation.copy(state.rotation); confettiDummy.scale.setScalar(state.size * (.72 + fade * .28)); confettiDummy.updateMatrix(); confettiMeshes[state.paletteIndex].setMatrixAt(state.slot, confettiDummy.matrix);
         }
-        confetti.visible = activeConfetti; if (activeConfetti) confetti.instanceMatrix.needsUpdate = true;
+        confettiMeshes.forEach(mesh => { mesh.visible = activeConfetti; if (activeConfetti) mesh.instanceMatrix.needsUpdate = true; });
       }
       setQuality(activeQualityProfile());
-      return { group, update, setQuality, burst, releaseConfetti };
+      return { group, update, setQuality, burst, releaseConfetti, finalBurst };
     }
 
     function addRoom() {
@@ -3044,14 +3075,14 @@
 
     async function triggerFinale() {
       if (currentTheme !== 'party') return;
-      finaleUntil = performance.now() + 8200;
+      finaleUntil = performance.now() + 18000;
       themePulse = 1;
       syncPartyUI();
       pulsePrismFlash(.92);
-      themeVisuals?.party?.burst?.(2.55);
-      themeVisuals?.party?.releaseConfetti?.(2.05, true);
-      setTimeout(() => { themeVisuals?.party?.burst?.(1.8); themeVisuals?.party?.releaseConfetti?.(1.4, true); }, 260);
-      setTimeout(() => { themeVisuals?.party?.burst?.(2.1); themeVisuals?.party?.releaseConfetti?.(1.7, true); }, 680);
+      themeVisuals?.party?.finalBurst?.();
+      setTimeout(() => { themeVisuals?.party?.burst?.(2.8); themeVisuals?.party?.releaseConfetti?.(2.2, true); }, 210);
+      setTimeout(() => { themeVisuals?.party?.finalBurst?.(); }, 560);
+      setTimeout(() => { themeVisuals?.party?.burst?.(3.2); themeVisuals?.party?.releaseConfetti?.(2.8, true); }, 1020);
       const becameAudible = await soundEngine.autostart();
       if (becameAudible || soundEngine.enabled) refreshAudioUI();
     }
