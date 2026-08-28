@@ -581,6 +581,9 @@
     const envTargetCache = new Map();
     const MAX_ENV_TARGET_CACHE = 6; // PMREMはGPUメモリを使うため、夜桜×空間テーマの切替履歴を無制限に保持しない。
     let tower = null, room = null, lightRig = null, pour = null, elapsed = 0;
+    // 注水レイヤーの描画同期を間引くための状態。pourDirty はスキップした更新が
+    // 残っていることを示し、注水が終わった瞬間に必ず1回締めるために使う。
+    let pourApplyAccumulator = 0, pourDirty = false;
     let themeVisuals = null, sceneScale = 1, themePulse = 0, finishPulse = 0, controlsInteracting = false;
     // 祝祭ライトアップの「舞台照明」量。celebrationFxEnabled へ緩やかに追従する 0..1。
     // 1 に近づくほど周囲の光源が落ち、タワーを狙う光が上がる（＝店内を暗くしてスポットを当てる）。
@@ -5516,7 +5519,22 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       monitorAutoQuality(delta);
       elapsed += delta;
       updateRelayState();
-      if (pour && pour.controller.update(delta)) pour.apply(delta);
+      // 注水レイヤーは、このアプリで唯一フレームレート制御を持たない系統だった。
+      // apply() は1回で 385脚 × 5メッシュ ＝ 約1,925回の行列合成と、14本のバッファ
+      // 再アップロードを行う（脚数に線形。10段の実測で 0.433ms／回）。花火側が
+      // updateHz で 14〜20Hz へ自前で間引いているのに、ここだけ毎フレーム走っていた。
+      // 間引くのは apply()（GPUへの同期）だけで、controller.update()（充填シミュレーション
+      // 本体）は毎フレームのまま。したがってカスケードの進行そのものは一切変わらない。
+      if (pour && pour.controller.update(delta)) {
+        // 脚数が増えるインスタンス経路（6段以上）だけを対象にする。少数段は元から軽い。
+        const applyStep = (tower?.userData?.levels || 0) >= 6 ? 1 / Math.max(1, activeQualityProfile().passiveHz || 20) : 0;
+        pourApplyAccumulator += delta;
+        if (pourApplyAccumulator >= applyStep) { pour.apply(pourApplyAccumulator); pourApplyAccumulator = 0; pourDirty = false; }
+        else pourDirty = true;
+      } else if (pour && pourDirty) {
+        // 間引いたままカスケードが終わると最終状態が古いまま固定される。必ず1回締める。
+        pour.apply(pourApplyAccumulator); pourApplyAccumulator = 0; pourDirty = false;
+      }
       soundEngine.update(!!(pour && pour.controller && pour.controller.pouring));
       updateThemeResponse(delta); updatePourUI(); updatePartyHUD(); updateAnniversaryMessage(); updateFinaleCameraTour();
       if (tower?.userData?.bubbleMotionNodes) tower.userData.bubbleMotionNodes.forEach(obj => {
