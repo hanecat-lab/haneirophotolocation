@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>CARE SHIFT - Phase 4-2</title>
+<title>CARE SHIFT - Phase 5-1</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -98,15 +98,16 @@ button{
 <div id="app"></div>
 <div id="hud">
   <div class="title">CARE SHIFT</div>
-  <div class="sub">Phase 4-2 / トイレ・入浴分岐</div>
+  <div class="sub">Phase 5-1 / 複数ナースコール</div>
 </div>
 <div id="clockBadge"><span id="clockText">07:00</span></div>
 <div id="panel">
   自動生活スケジュール稼働中<br>
-  08:00 談話室へ / 09:00 ナースコール / 18:00 居室へ戻る
+  08:00 談話室へ / 09:00 コール / 09:20 追加コール / 18:00 居室へ戻る
   <div id="callStatus" style="margin-top:8px;padding:7px 8px;border-radius:8px;background:#eef1f3;">
     ナースコール：なし
   </div>
+  <div id="callQueue" style="display:none;margin-top:6px;padding:7px 8px;border-radius:8px;background:#fff3d8;font-size:11px;line-height:1.5;"></div>
   <button id="respondButton">対応開始</button>
   <div id="careProgress">介助中…</div>
   <div id="careStateDebug" style="display:none;font-size:10px;margin-top:4px;color:#607079;"></div>
@@ -117,6 +118,7 @@ button{
     <button id="debugCall">ランダムコール</button>
     <button id="debugToilet">排泄コール</button>
     <button id="debugBath">入浴コール</button>
+    <button id="debugDouble">同時コール</button>
   </div>
 </div>
 <div id="error"></div>
@@ -567,8 +569,9 @@ try{
   const toiletInsideResidentTarget = new THREE.Vector3(-9.2,0,8.0);
   const toiletReturnStaffTarget = new THREE.Vector3(-7.8,0,6.2);
 
-  const bathInsideStaffTarget = new THREE.Vector3(8.3,0,7.7);
-  const bathInsideResidentTarget = new THREE.Vector3(9.2,0,8.0);
+  // 入浴場：浴槽の当たり判定から十分離れた、カーテン内側の安全位置
+  const bathInsideStaffTarget = new THREE.Vector3(8.0,0,7.05);
+  const bathInsideResidentTarget = new THREE.Vector3(9.45,0,7.15);
   const bathReturnStaffTarget = new THREE.Vector3(7.8,0,6.2);
 
   let followRepathTimer = 0;
@@ -619,10 +622,14 @@ try{
   let movedToLoungeToday = false;
   let returnedHomeToday = false;
   let scheduledCallTriggered = false;
+  let secondCallTriggered = false;
   let activeCall = null;
+  const pendingCalls = [];
+  let callSerial = 0;
 
   const clockText = document.getElementById("clockText");
   const callStatus = document.getElementById("callStatus");
+  const callQueue = document.getElementById("callQueue");
   const pauseBtn = document.getElementById("pauseTime");
   const respondButton = document.getElementById("respondButton");
   const careProgress = document.getElementById("careProgress");
@@ -646,25 +653,48 @@ try{
     return "施設内";
   }
 
-  function startNurseCall(residentIndex, reason="ナースコール", type="TOILET"){
-    if(activeCall) return;
+  function callTypeLabel(type){
+    return type==="BATH" ? "入浴介助" : "排泄介助";
+  }
 
-    const resident = residents[residentIndex];
-    activeCall = {
-      residentIndex,
-      reason,
-      type,
-      startedAt: gameMinutes
-    };
+  function updateQueueUI(){
+    if(!pendingCalls.length){
+      callQueue.style.display = "none";
+      callQueue.innerHTML = "";
+      return;
+    }
 
-    const careLabel = type==="BATH" ? "入浴介助" : "排泄介助";
+    callQueue.style.display = "block";
+    callQueue.innerHTML =
+      '<strong>🟡 対応待ち ' + pendingCalls.length + '件</strong><br>' +
+      pendingCalls.map((call,i)=>{
+        const resident = residents[call.residentIndex];
+        const wait = Math.max(0, Math.floor(gameMinutes - call.startedAt));
+        return (i+1) + '. ' + resident.name + ' / ' +
+          callTypeLabel(call.type) + ' / 待機 ' + wait + '分';
+      }).join('<br>');
+  }
+
+  function showActiveCall(){
+    if(!activeCall){
+      callRing.visible = false;
+      targetMarker.visible = false;
+      callStatus.textContent = "ナースコール：なし";
+      respondButton.classList.remove("ready");
+      updateQueueUI();
+      return;
+    }
+
+    const resident = residents[activeCall.residentIndex];
+
     callStatus.innerHTML =
       '<strong style="color:#c62828;">🔴 対象：' + resident.name + '</strong><br>' +
-      '内容：' + careLabel + '<br>' +
+      '内容：' + callTypeLabel(activeCall.type) + '<br>' +
       '場所：' + residentLocationLabel(resident) + '<br>' +
-      '<span style="font-size:11px;">頭上の赤い「！」が対象です</span>';
+      '<span style="font-size:11px;">頭上の赤い「！」が現在の対応対象です</span>';
 
     callRing.visible = true;
+    callRing.material.color.set(0xff3b30);
     callRing.position.set(
       resident.object.position.x,
       0.04,
@@ -677,38 +707,94 @@ try{
       2.9,
       resident.object.position.z
     );
+
+    updateQueueUI();
   }
 
-  function clearNurseCall(){
+  function activateNextCall(){
+    if(activeCall || careState!=="NONE" || !pendingCalls.length) return;
+    activeCall = pendingCalls.shift();
+    showActiveCall();
+  }
+
+  function startNurseCall(residentIndex, reason="ナースコール", type="TOILET"){
+    const call = {
+      id: ++callSerial,
+      residentIndex,
+      reason,
+      type,
+      startedAt: gameMinutes
+    };
+
+    // 同じ利用者のコール重複は避ける
+    const duplicate =
+      (activeCall && activeCall.residentIndex===residentIndex) ||
+      pendingCalls.some(c=>c.residentIndex===residentIndex);
+
+    if(duplicate) return false;
+
+    if(!activeCall && careState==="NONE"){
+      activeCall = call;
+      showActiveCall();
+    }else{
+      pendingCalls.push(call);
+      updateQueueUI();
+    }
+    return true;
+  }
+
+  function clearNurseCall({advance=true}={}){
     activeCall = null;
     callRing.visible = false;
     targetMarker.visible = false;
     callStatus.textContent = "ナースコール：なし";
     respondButton.classList.remove("ready");
+
     if(careState==="NONE"){
       careProgress.classList.remove("show");
       escortGoalMarker.visible = false;
       desiredCameraFocus.set(0,0,2.2);
     }
+
+    updateQueueUI();
+
+    if(advance){
+      activateNextCall();
+    }
+  }
+
+  function freeResidentIndex(){
+    const used = new Set();
+    if(activeCall) used.add(activeCall.residentIndex);
+    pendingCalls.forEach(c=>used.add(c.residentIndex));
+
+    const candidates = residents.map((_,i)=>i).filter(i=>!used.has(i));
+    if(candidates.length) return candidates[Math.floor(Math.random()*candidates.length)];
+    return Math.floor(Math.random()*residents.length);
   }
 
   function triggerRandomCall(){
-    if(activeCall) return;
-    const index = Math.floor(Math.random()*residents.length);
+    const index = freeResidentIndex();
     const type = Math.random() < 0.5 ? "TOILET" : "BATH";
     startNurseCall(index, type==="TOILET" ? "排泄希望" : "入浴予定", type);
   }
 
   function triggerToiletCall(){
-    if(activeCall) return;
-    const index = Math.floor(Math.random()*residents.length);
-    startNurseCall(index, "排泄希望", "TOILET");
+    startNurseCall(freeResidentIndex(), "排泄希望", "TOILET");
   }
 
   function triggerBathCall(){
-    if(activeCall) return;
-    const index = Math.floor(Math.random()*residents.length);
-    startNurseCall(index, "入浴予定", "BATH");
+    startNurseCall(freeResidentIndex(), "入浴予定", "BATH");
+  }
+
+  function triggerDoubleCall(){
+    const first = freeResidentIndex();
+    const firstType = Math.random()<0.5 ? "TOILET" : "BATH";
+    startNurseCall(first, firstType==="TOILET" ? "排泄希望" : "入浴予定", firstType);
+
+    const second = freeResidentIndex();
+    const secondType = firstType==="TOILET" ? "BATH" : "TOILET";
+    startNurseCall(second, secondType==="TOILET" ? "排泄希望" : "入浴予定", secondType);
   }
 
   function updateCallInteraction(){
@@ -804,6 +890,14 @@ try{
       );
     }
 
+    // テスト用：09:20に別利用者からもう1件発生
+    if(!secondCallTriggered && gameMinutes >= 9*60+20){
+      secondCallTriggered = true;
+      const index = freeResidentIndex();
+      const type = Math.random() < 0.5 ? "TOILET" : "BATH";
+      startNurseCall(index, type==="TOILET" ? "排泄希望" : "入浴予定", type);
+    }
+
     if(!returnedHomeToday && gameMinutes >= 18*60){
       returnedHomeToday = true;
       sendResidentsHome();
@@ -820,6 +914,8 @@ try{
     movedToLoungeToday = false;
     returnedHomeToday = false;
     scheduledCallTriggered = false;
+    secondCallTriggered = false;
+    pendingCalls.length = 0;
     careState = "NONE";
     careResidentIndex = null;
     careType = null;
@@ -830,11 +926,13 @@ try{
     desiredCameraFocus.set(0,0,2.2);
     escortGoalMarker.visible = false;
     curtainButton.classList.remove("show");
-    clearNurseCall();
+    clearNurseCall({advance:false});
+    updateQueueUI();
     sendResidentsHome();
     document.getElementById("debugCall").addEventListener("click", triggerRandomCall);
   document.getElementById("debugToilet").addEventListener("click", triggerToiletCall);
   document.getElementById("debugBath").addEventListener("click", triggerBathCall);
+  document.getElementById("debugDouble").addEventListener("click", triggerDoubleCall);
 
   updateClockUI();
   });
@@ -1003,13 +1101,24 @@ try{
       const targetStaff = isBath ? bathInsideStaffTarget : toiletInsideStaffTarget;
       const targetResident = isBath ? bathInsideResidentTarget : toiletInsideResidentTarget;
 
-      const playerReady =
-        player.position.distanceTo(targetStaff) < 0.9 ||
-        playerMover.state==="IDLE";
+      // IDLEかどうかではなく、実座標が室内の安全位置に到達したかだけで判定する。
+      const playerReady = player.position.distanceTo(targetStaff) < 0.85;
+      const residentReady = resident.object.position.distanceTo(targetResident) < 0.85;
 
-      const residentReady =
-        resident.object.position.distanceTo(targetResident) < 1.0 ||
-        residentMover.state==="IDLE";
+      // 経路が止まってしまった場合は、カーテンを閉じずに再経路探索する。
+      if(!playerReady && playerMover.state==="IDLE"){
+        setRoute(playerMover, targetStaff, "CARE_ENTER_STAFF");
+      }
+
+      if(!residentReady && residentMover.state==="IDLE"){
+        setRoute(residentMover, targetResident, "CARE_ENTER_RESIDENT");
+      }
+
+      if(!playerReady || !residentReady){
+        careProgress.textContent = isBath
+          ? "職員と利用者が入浴場内へ入るのを待っています…"
+          : "職員と利用者がトイレ内へ入るのを待っています…";
+      }
 
       if(playerReady && residentReady){
         careState = "CURTAIN_CLOSE";
@@ -1017,20 +1126,46 @@ try{
 
         if(isBath){
           bathCurtain.target = 1;
-          careProgress.textContent = "入浴場のカーテンを閉めています…";
+          careProgress.textContent = "2人の入室を確認。入浴場のカーテンを閉めています…";
         }else{
           toiletCurtain.target = 1;
-          careProgress.textContent = "トイレのカーテンを閉めています…";
+          careProgress.textContent = "2人の入室を確認。トイレのカーテンを閉めています…";
         }
       }
     }
 
     if(careState==="CURTAIN_CLOSE"){
-      const curtain = careType==="BATH" ? bathCurtain : toiletCurtain;
-      if(curtain.t >= 0.98){
+      const isBath = careType==="BATH";
+      const curtain = isBath ? bathCurtain : toiletCurtain;
+
+      // 最終安全確認：利用者がカーテンより室内側にいること。
+      const residentActuallyInside = isBath
+        ? (
+            resident.object.position.x > 6.2 &&
+            resident.object.position.x < 12.8 &&
+            resident.object.position.z > 6.65 &&
+            resident.object.position.z < 8.15
+          )
+        : (
+            resident.object.position.x > -12.8 &&
+            resident.object.position.x < -6.2 &&
+            resident.object.position.z > 6.65 &&
+            resident.object.position.z < 9.0
+          );
+
+      if(curtain.t >= 0.98 && residentActuallyInside){
         careState = "CARE";
         careTimer = 0;
-        careProgress.textContent = careType==="BATH" ? "入浴介助中…" : "排泄介助中…";
+        careProgress.textContent = isBath ? "入浴介助中…" : "排泄介助中…";
+      }
+
+      if(curtain.t >= 0.98 && !residentActuallyInside){
+        // もし何らかの理由で外に残っていたら、カーテンを再び開いて入室をやり直す。
+        curtain.target = 0;
+        careState = "AUTO_ENTER";
+        careProgress.textContent = isBath
+          ? "利用者が外にいるため、入浴場内への誘導をやり直します…"
+          : "利用者が外にいるため、トイレ内への誘導をやり直します…";
       }
     }
 
@@ -1070,7 +1205,7 @@ try{
       careType = null;
       careProgress.textContent = "介助完了";
       setTimeout(()=>careProgress.classList.remove("show"),900);
-      clearNurseCall();
+      clearNurseCall({advance:true});
       callRing.material.color.set(0xff3b30);
     }
   }
@@ -1088,10 +1223,14 @@ try{
         movedToLoungeToday = false;
         returnedHomeToday = false;
         scheduledCallTriggered = false;
-        clearNurseCall();
+        secondCallTriggered = false;
+        pendingCalls.length = 0;
+        clearNurseCall({advance:false});
+        updateQueueUI();
       }
       evaluateSchedule();
       updateClockUI();
+      updateQueueUI();
     }
 
     updateFollowEscort(dt);
