@@ -581,6 +581,9 @@
     const envTargetCache = new Map();
     const MAX_ENV_TARGET_CACHE = 6; // PMREMはGPUメモリを使うため、夜桜×空間テーマの切替履歴を無制限に保持しない。
     let tower = null, room = null, lightRig = null, pour = null, elapsed = 0;
+    // 注水レイヤーの描画同期を間引くための状態。pourDirty はスキップした更新が
+    // 残っていることを示し、注水が終わった瞬間に必ず1回締めるために使う。
+    let pourApplyAccumulator = 0, pourDirty = false;
     let themeVisuals = null, sceneScale = 1, themePulse = 0, finishPulse = 0, controlsInteracting = false;
     // 祝祭ライトアップの「舞台照明」量。celebrationFxEnabled へ緩やかに追従する 0..1。
     // 1 に近づくほど周囲の光源が落ち、タワーを狙う光が上がる（＝店内を暗くしてスポットを当てる）。
@@ -2813,8 +2816,12 @@
         // 透明感は alpha で代替する。DoubleSide もやめて裏面の塗りを省く。
         // depthWrite は true のまま。materials.liquid の下のコメントと同じ理由で、
         // InstancedMesh は深度ソートされないため false にすると重なった脚でソート事故が出る。
+        // 面の拡散色を暗く落とすのが要点。白いままだと alpha 合成で暗い部屋の上に
+        // 乳白色として乗り、大量に重ねたとき全体が白く濁って形が読めなくなる（実測で確認）。
+        // 暗い面＋低ラフネスにすると、PBR の Fresnel が縁と鏡面だけを明るく残すので、
+        // 「面は透けて暗く、縁で光る」という本来のガラスの見え方に近づく。
         glassSimple: new THREE.MeshPhysicalMaterial({
-          ...glassBase, roughness: .028,
+          ...glassBase, color: 0x121821, roughness: .028,
           transmission: 0, transparent: true, opacity: .30,
           side: THREE.FrontSide, depthWrite: true
         }),
@@ -2944,6 +2951,34 @@
         material.customProgramCacheKey = () => 'champagne-liquid-surface-dynamics-v4';
       }
       addLiquidSurfaceDynamics(materials.liquidSurface);
+      // 簡易ガラスへ「ガラスらしさ」だけを戻す。面は今の低い alpha のまま触らず、
+      // 視線に対して寝ている部分＝シルエットでだけ alpha を上げる。ボウルの上縁も
+      // ステムも脚も、輪郭では ndv→0 になるのでこの1式で細く同時に出る。
+      // 発光は足さない（totalEmissiveRadiance に触れない）。alpha が上がることで
+      // 既にそこへ映っている環境の反射が濃く見えるだけなので、Fresnel の挙動と一致する。
+      // 大量に重ねたときは、1脚ずつの輪郭が締まるぶん形の可読性も上がる。
+      function addGlassRimSheen(material) {
+        material.userData.rimSheen = { uFocusDistance: { value: 6 }, uFocusSpread: { value: .2 } };
+        material.onBeforeCompile = shader => {
+          Object.assign(shader.uniforms, material.userData.rimSheen);
+          shader.fragmentShader = shader.fragmentShader
+            .replace('#include <common>', '#include <common>\nuniform float uFocusDistance;\nuniform float uFocusSpread;')
+            // diffuseColor はこの include より前で宣言済み。normal はここで確定するので直後に置く。
+            .replace('#include <normal_fragment_begin>', `#include <normal_fragment_begin>
+              float glassNdv = abs(dot(normal, normalize(vViewPosition)));
+              // 正対面（ndv→1）では 0 のまま。立ち上がりを鋭くするほど縁が細くなる。
+              float glassRim = pow(1. - glassNdv, 3.4);
+              // 手前は少し強め、奥はさらに簡略に。タワー中心までの距離との相対比で見て、
+              // 変化させる幅（uFocusSpread）もタワー自身の水平方向の実寸から決める。
+              // カメラは段数に応じて遠ざかるので、固定の閾値では奥行き差がほとんど出ない。
+              float glassRel = length(vViewPosition) / max(uFocusDistance, .0001);
+              float glassGain = mix(1.35, .45, smoothstep(1. - uFocusSpread, 1. + uFocusSpread, glassRel));
+              diffuseColor.a = clamp(diffuseColor.a * (1. + glassRim * glassGain), 0., 1.);`);
+        };
+        // シェーダーを変えたらキャッシュキーも上げる。据え置くと旧シェーダーが使われる。
+        material.customProgramCacheKey = () => 'glass-simple-rim-sheen-v1';
+      }
+      addGlassRimSheen(materials.glassSimple);
       // 液面はジオメトリではなくシェーダで決める。385脚が別々の液面を持てて、
       // 追加のドローコールもジオメトリ再生成も要らない。
       clipLiquidAtLevel(materials.liquid);
@@ -3105,13 +3140,13 @@
 
     function mulberry32(a) { return function() { let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 
-    function createGlass(seed = 0, bubbleCount = 9, detailed = true) {
+    function createGlass(seed = 0, bubbleCount = 9, detailed = true, simplifyGlass = false) {
       const group = new THREE.Group();
       const random = mulberry32(seed * 281 + 17);
       const bodyGeometry = currentGlassShape === 'flute'
         ? (detailed ? geometries.glassFlute : geometries.glassLowFlute)
         : (detailed ? geometries.glass : geometries.glassLow);
-      const body = new THREE.Mesh(bodyGeometry, materials.glass[seed % materials.glass.length]);
+      const body = new THREE.Mesh(bodyGeometry, simplifyGlass ? materials.glassSimple : materials.glass[seed % materials.glass.length]);
       body.castShadow = true;
       group.add(body);
 
@@ -3723,6 +3758,15 @@
 
     function updateThemeResponse(delta) {
       if (!themeVisuals || !lightRig) return;
+      // 縁のハイライトの距離判定は、タワー中心までの距離を基準にした相対比で行う。
+      // ここを固定値にすると段数とズームで効き方がずれる。変化させる幅は、
+      // タワーの水平方向の実寸（＝奥行き方向のばらつき）を距離で割った比で決める。
+      const rimSheen = materials?.glassSimple?.userData?.rimSheen;
+      if (rimSheen && controls) {
+        const focus = Math.max(.0001, camera.position.distanceTo(controls.target));
+        rimSheen.uFocusDistance.value = focus;
+        rimSheen.uFocusSpread.value = THREE.MathUtils.clamp((tower?.userData?.viewRadius || 0) / focus, .015, .85);
+      }
       const config = sceneConfig();
       const active = pour && pour.controller && pour.controller.pouring ? 1 : 0;
       themePulse = Math.max(active, Math.max(0, themePulse - delta * .22));
@@ -4111,8 +4155,8 @@
       dropletMaterial.opacity = .94; dropletMaterial.emissive = new THREE.Color(0x281305); dropletMaterial.emissiveIntensity = .34;
       // three.js は透過マテリアルの可視オブジェクトが1つでもあればシーン全体の透過パスを走らせる。
       // この飛沫は frustumCulled:false で常に描画対象なので、ガラスを簡易化してもここが
-      // 残るとパスが畳まれない。粒が小さく屈折はほぼ見えないため、同じ条件で 0 にする。
-      if (coarsePointer && levels >= 8) dropletMaterial.transmission = 0;
+      // 残るとパスが畳まれない。粒が小さく屈折はほぼ見えないため 0 にする。
+      dropletMaterial.transmission = 0;
       fizzMaterial.transparent = true; fizzMaterial.opacity = .92; fizzMaterial.depthWrite = false; fizzMaterial.emissive = new THREE.Color(0x2a1606); fizzMaterial.emissiveIntensity = .22;
       const droplets = new THREE.InstancedMesh(geometries.bubble, dropletMaterial, maxSpray);
       const fizz = new THREE.InstancedMesh(geometries.bubble, fizzMaterial, maxFizz);
@@ -5048,13 +5092,13 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       const bubbleGroups = [];
       const bubbleMotionNodes = [];
       if (actualLevels >= 6) {
-        // スマホの8段以上は、385脚ぶんのジオメトリを2回投入する透過パスが最大のGPU負荷に
-        // なる（applyQualityProfile のコメント参照）。ここだけガラスを簡易マテリアルへ落とし、
-        // パスそのものを畳む。PCと7段以下は従来の transmission 経路のまま。
-        tower.add(createInstancedTower(placements, coarsePointer && actualLevels >= 8));
+        // 簡易ガラスを全段の基準にする。透過パスを畳んで軽くなるだけでなく、
+        // 大量のグラスが重なったときに全体が白く濁って形が読めなくなるのを防ぐ。
+        tower.add(createInstancedTower(placements, true));
       } else {
         placements.forEach((item, index) => {
-          const glass = createGlass(index + 1, study ? 30 : 12, actualLevels <= 3);
+          // タワー表示は段数によらず簡易ガラスで揃える。study（単体の品質確認）だけ従来の質感を残す。
+          const glass = createGlass(index + 1, study ? 30 : 12, actualLevels <= 3, !study);
           glass.position.set(item.x, item.y, item.z);
           glass.rotation.y = item.rotation;
           glass.traverse(child => { if (child.userData.isBubbles) bubbleGroups[index] = child; });
@@ -5092,7 +5136,12 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       tower.add(celebration.group);
       // 毎フレームの全ツリー走査を避け、揺らす気泡ノードだけをキャッシュする。
       tower.traverse(child => { if (child.parent && child.parent.userData.isBubbles) bubbleMotionNodes.push(child); });
-      tower.userData = { levels: actualLevels, count: placements.length, study, height: towerHeight, celebration, rimSparkleMaterial, bubbleMotionNodes };
+      // 縁のハイライトを距離で変える際の「奥行きのばらつき幅」。斜めから見たとき、
+      // 手前と奥の脚の距離差はタワーの水平方向の広がりでほぼ決まるので、それを持たせる。
+      let viewRadius = 0;
+      placements.forEach(item => { viewRadius = Math.max(viewRadius, Math.hypot(item.x, item.z)); });
+      viewRadius += GLASS.rimOuter * getGlassScale(new THREE.Vector3()).x;
+      tower.userData = { levels: actualLevels, count: placements.length, study, height: towerHeight, viewRadius, celebration, rimSparkleMaterial, bubbleMotionNodes };
       scene.add(tower); if (renderer) renderer.shadowMap.needsUpdate = true;
       applySceneScale(Math.max(1, towerHeight / 1.5));
       applyQualityProfile(true);
@@ -5470,7 +5519,22 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       monitorAutoQuality(delta);
       elapsed += delta;
       updateRelayState();
-      if (pour && pour.controller.update(delta)) pour.apply(delta);
+      // 注水レイヤーは、このアプリで唯一フレームレート制御を持たない系統だった。
+      // apply() は1回で 385脚 × 5メッシュ ＝ 約1,925回の行列合成と、14本のバッファ
+      // 再アップロードを行う（脚数に線形。10段の実測で 0.433ms／回）。花火側が
+      // updateHz で 14〜20Hz へ自前で間引いているのに、ここだけ毎フレーム走っていた。
+      // 間引くのは apply()（GPUへの同期）だけで、controller.update()（充填シミュレーション
+      // 本体）は毎フレームのまま。したがってカスケードの進行そのものは一切変わらない。
+      if (pour && pour.controller.update(delta)) {
+        // 脚数が増えるインスタンス経路（6段以上）だけを対象にする。少数段は元から軽い。
+        const applyStep = (tower?.userData?.levels || 0) >= 6 ? 1 / Math.max(1, activeQualityProfile().passiveHz || 20) : 0;
+        pourApplyAccumulator += delta;
+        if (pourApplyAccumulator >= applyStep) { pour.apply(pourApplyAccumulator); pourApplyAccumulator = 0; pourDirty = false; }
+        else pourDirty = true;
+      } else if (pour && pourDirty) {
+        // 間引いたままカスケードが終わると最終状態が古いまま固定される。必ず1回締める。
+        pour.apply(pourApplyAccumulator); pourApplyAccumulator = 0; pourDirty = false;
+      }
       soundEngine.update(!!(pour && pour.controller && pour.controller.pouring));
       updateThemeResponse(delta); updatePourUI(); updatePartyHUD(); updateAnniversaryMessage(); updateFinaleCameraTour();
       if (tower?.userData?.bubbleMotionNodes) tower.userData.bubbleMotionNodes.forEach(obj => {
