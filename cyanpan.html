@@ -292,6 +292,8 @@
       #mobile-finale-button:disabled { filter: saturate(.3); opacity: .72; }
       #finale-quick-control { top: max(108px, calc(env(safe-area-inset-top) + 88px)); left: 14px; width: min(194px, calc(100vw - 28px)); padding: 6px 7px 7px; }
       #finale-quick-control.collapsed { width: min(154px, calc(100vw - 28px)); padding: 5px 6px; }
+      /* スマホは静止タブローを5.5秒見せてから、メッセージを0.9秒でゆっくり重ねる。 */
+      #anniversary-message { transition: opacity .9s var(--ease-out), transform .8s var(--ease-out); }
     }
     @media (prefers-reduced-motion: reduce) {
       #quick-pour.is-cascading, #quick-return.is-returning, #control-panel.panel-returning { animation: none; }
@@ -707,7 +709,9 @@
       if (!anniversaryEnabled || currentTheme !== 'party' || completedGradeKey !== 'pine') return;
       const now = performance.now();
       // 最終7発をスマホでも十分に見せ切り、残光が引き構図で落ち着いてから文字へ渡す。
-      anniversaryStartsAt = now + 7600; anniversaryUntil = anniversaryStartsAt + ANNIVERSARY_AFTERGLOW_MS;
+      // スマホはタワー・ミラーボール・残光を固定した静止タブローを5.5秒見せてから重ねる。
+      const anniversaryHoldMs = matchMedia('(max-width: 660px)').matches ? 5500 : 7600;
+      anniversaryStartsAt = now + anniversaryHoldMs; anniversaryUntil = anniversaryStartsAt + ANNIVERSARY_AFTERGLOW_MS;
       document.body.classList.add('anniversary-active');
       document.body.classList.remove('anniversary-dimmed');
       anniversaryDim.setAttribute('aria-hidden', 'false');
@@ -1525,6 +1529,31 @@
       return getRoundSparkTexture.texture;
     }
 
+    // 最終大玉の中心に残す「星片」専用。丸い火花ではなく四芒星にして、
+    // 塊ではなく光の破片が飛び散っているように見せる。
+    function getStarFragmentTexture() {
+      if (getStarFragmentTexture.texture) return getStarFragmentTexture.texture;
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 64;
+      const context = canvas.getContext('2d');
+      context.translate(32, 32);
+      const spike = (long, short) => {
+        context.beginPath();
+        context.moveTo(0, -long); context.quadraticCurveTo(short * .3, -short * .3, long, 0);
+        context.quadraticCurveTo(short * .3, short * .3, 0, long);
+        context.quadraticCurveTo(-short * .3, short * .3, -long, 0);
+        context.quadraticCurveTo(-short * .3, -short * .3, 0, -long);
+        context.closePath(); context.fill();
+      };
+      context.shadowColor = 'rgba(255,255,255,.9)'; context.shadowBlur = 8; context.fillStyle = '#fff';
+      spike(28, 6);
+      context.rotate(Math.PI / 4); context.shadowBlur = 4;
+      spike(14, 3);
+      getStarFragmentTexture.texture = new THREE.CanvasTexture(canvas);
+      getStarFragmentTexture.texture.colorSpace = THREE.SRGBColorSpace;
+      return getStarFragmentTexture.texture;
+    }
+
     // Magic Dressing専用の3Dスプライト。黒い背景は加算合成で消え、白い描画部分だけが粒子の色を受け取る。
     function getDressingTexture(shape) {
       if (shape === 'heart') return getHeartTexture();
@@ -1769,15 +1798,33 @@
       const fireworkBloom = new THREE.Mesh(new THREE.RingGeometry(.12, .32, 28), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending, fog: false, toneMapped: false }));
       fireworkBloom.userData.ownGeometry = true; fireworkBloom.userData.ownMaterial = true; fireworkBloom.renderOrder = 9; spectacle.add(fireworkBloom);
       const burstCoreGeometry = new THREE.SphereGeometry(.16, 12, 8), burstCores = [];
+      // 最終大玉（core.grandFinale）の「星片」用に、放射方向を固定で用意しておく。
+      // 位置は毎ignitionで書き直さず、core.stars.scale で毎フレーム伸縮させるだけにする。
+      const STAR_FRAGMENT_COUNT = 6, STAR_FRAGMENT_BASE_RADIUS = .16;
+      const starFragmentDirs = Array.from({ length: STAR_FRAGMENT_COUNT }, (_, index) => {
+        const polar = Math.acos(1 - 2 * ((index + .5) / STAR_FRAGMENT_COUNT)), azimuth = index * Math.PI * (3 - Math.sqrt(5));
+        return [Math.sin(polar) * Math.cos(azimuth), Math.cos(polar), Math.sin(polar) * Math.sin(azimuth)];
+      });
       for (let coreIndex = 0; coreIndex < 28; coreIndex++) {
         const material = new THREE.MeshBasicMaterial({ color: 0xfffcdf, transparent: true, opacity: 0, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending, toneMapped: false });
         const mesh = new THREE.Mesh(burstCoreGeometry, material); mesh.visible = false; mesh.renderOrder = 14; mesh.userData.ownGeometry = true; mesh.userData.ownMaterial = true; spectacle.add(mesh);
         const petals = Array.from({ length: 5 }, (_, petalIndex) => {
-          const petalGeometry = new THREE.TorusGeometry(.18 + petalIndex * .026, .014, 5, 16, Math.PI * .68);
-          const petalMaterial = new THREE.MeshBasicMaterial({ color: 0xfffcdf, transparent: true, opacity: 0, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending, toneMapped: false });
+          // petals[0]だけは最終大玉の「0.38秒の細いリング」用に、通常のリング形状を使う
+          // （他は円弧のみの装飾用ジオメトリで、リングとしては使えないため）。
+          const petalGeometry = petalIndex === 0
+            ? new THREE.RingGeometry(.94, 1, 40)
+            : new THREE.TorusGeometry(.18 + petalIndex * .026, .014, 5, 16, Math.PI * .68);
+          const petalMaterial = new THREE.MeshBasicMaterial({ color: 0xfffcdf, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending, toneMapped: false });
           const petal = new THREE.Mesh(petalGeometry, petalMaterial); petal.visible = false; petal.renderOrder = 13; petal.userData.ownGeometry = true; petal.userData.ownMaterial = true; spectacle.add(petal); return petal;
         });
-        burstCores.push({ mesh, petals, active: false, life: 0, maxLife: 1, colour: new THREE.Color(), target: new THREE.Color(), outwardAngle: 0, scale: 1 });
+        const starGeometry = new THREE.BufferGeometry();
+        const starPositions = new Float32Array(STAR_FRAGMENT_COUNT * 3);
+        starFragmentDirs.forEach(([x, y, z], index) => { starPositions[index * 3] = x * STAR_FRAGMENT_BASE_RADIUS; starPositions[index * 3 + 1] = y * STAR_FRAGMENT_BASE_RADIUS; starPositions[index * 3 + 2] = z * STAR_FRAGMENT_BASE_RADIUS; });
+        starGeometry.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+        starGeometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(STAR_FRAGMENT_COUNT * 3), 3));
+        const starMaterial = new THREE.PointsMaterial({ size: .09, map: getStarFragmentTexture(), alphaTest: .03, vertexColors: true, transparent: true, opacity: 0, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending, sizeAttenuation: true, toneMapped: false });
+        const stars = new THREE.Points(starGeometry, starMaterial); stars.visible = false; stars.renderOrder = 14; stars.userData.ownGeometry = true; stars.userData.ownMaterial = true; spectacle.add(stars);
+        burstCores.push({ mesh, petals, stars, active: false, life: 0, maxLife: 1, colour: new THREE.Color(), target: new THREE.Color(), outwardAngle: 0, scale: 1 });
       }
       // 実際の花火らしい放射線を確保するため、粒子とは別に星形の火花トレイルを描く。
       const trailRayCount = 20, trailCapacity = 64, fireworkTrails = [], trailStates = [];
@@ -1951,6 +1998,14 @@
         const gradeKey = partyGrade(overdriveLevel).key, baseBudget = Math.round((gradeKey === 'pine' ? 96 : (gradeKey === 'bamboo' ? 72 : 40)) * FINALE_FIREWORK_BOOST), adaptiveBudget = adaptiveTier === 2 ? Math.round(baseBudget * .58) : (adaptiveTier === 1 ? Math.round(baseBudget * .78) : baseBudget), count = Math.min(Math.round(34 * multiplier), adaptiveBudget, fireworksCapacity);
         const core = burstCores[coreCursor]; coreCursor = (coreCursor + 1) % burstCores.length;
           core.active = true; core.life = core.maxLife = .88 + fireworkScale * .14; core.colour.set(0xfffcdf); core.target.copy(palette[0]); core.outwardAngle = outwardAngle; core.scale = fireworkScale * (.72 + multiplier * .18); core.grandFinale = linger > 1.5; core.mesh.position.copy(origin); core.mesh.visible = true; core.mesh.material.color.copy(core.colour);
+          // 最終大玉だけ、星片へ段別カラー（palette[0]）を持たせておく。位置は固定の放射方向を
+          // 毎フレーム core.stars.scale で伸縮させるだけなので、ここでは色だけ書けばよい。
+          if (core.grandFinale) {
+            core.stars.position.copy(origin);
+            const starColours = core.stars.geometry.attributes.color;
+            for (let i = 0; i < STAR_FRAGMENT_COUNT; i++) { starColours.setXYZ(i, palette[0].r, palette[0].g, palette[0].b); }
+            starColours.needsUpdate = true;
+          }
         core.petals.forEach(petal => { petal.visible = false; });
         for (let i = 0; i < count; i++) {
           const state = sparks[sparkCursor], falling = i >= count - Math.max(5, Math.round(count * .14));
@@ -2093,12 +2148,41 @@
         burstCores.forEach(core => {
           if (!core.active) return;
           core.life -= dt;
-          if (core.life <= 0 || !active) { core.active = false; core.mesh.visible = false; core.petals.forEach(petal => { petal.visible = false; }); return; }
+          if (core.life <= 0 || !active) {
+            core.active = false; core.mesh.visible = false;
+            core.petals.forEach(petal => { petal.visible = false; });
+            core.stars.visible = false;
+            return;
+          }
           activeCoreCount++;
           const fade = core.life / core.maxLife, opening = 1 - fade, flash = Math.max(0, 1 - opening * 4.2);
           const coreScaleGain = core.grandFinale ? Math.min(7.20, .58 + Math.sqrt(Math.max(1, core.scale)) * .78) : 1;
-          core.mesh.visible = true; core.mesh.material.opacity = Math.min(1, (.45 + flash * .75) * fade); core.mesh.scale.setScalar((.62 + flash * 2.55 + opening * 1.75) * coreScaleGain);
-          core.petals.forEach(petal => { petal.visible = false; });
+          if (core.grandFinale) {
+            // 最終大玉は球を「置き続ける」のではなく、発火の瞬間だけの光として見せる。
+            // age(点火からの経過秒) を基準に、0.18秒の白金フラッシュ→0.38秒の細いリング→
+            // 段別カラーの星片、の3層へ分ける。球はフラッシュ後に完全非表示にして撤去する。
+            const age = core.maxLife - core.life;
+            const flashT = Math.min(1, age / .18);
+            core.mesh.visible = flashT < 1;
+            if (core.mesh.visible) { core.mesh.material.opacity = (1 - flashT) * .95; core.mesh.scale.setScalar(coreScaleGain * (.9 + flashT * .5)); }
+            const ringT = Math.min(1, age / .38), ring = core.petals[0];
+            ring.visible = ringT < 1;
+            if (ring.visible) {
+              ring.material.opacity = (1 - ringT) * .85;
+              ring.scale.setScalar(coreScaleGain * (.85 + ringT * .95));
+              ring.position.copy(core.mesh.position);
+              ring.quaternion.copy(camera.quaternion);
+            }
+            for (let p = 1; p < core.petals.length; p++) core.petals[p].visible = false;
+            core.stars.visible = true;
+            core.stars.material.opacity = Math.min(1, (.55 + flash * .45) * fade);
+            core.stars.material.size = .09 + coreScaleGain * .016;
+            core.stars.scale.setScalar(coreScaleGain * (.5 + opening * .6));
+          } else {
+            core.mesh.visible = true; core.mesh.material.opacity = Math.min(1, (.45 + flash * .75) * fade); core.mesh.scale.setScalar((.62 + flash * 2.55 + opening * 1.75) * coreScaleGain);
+            core.petals.forEach(petal => { petal.visible = false; });
+            core.stars.visible = false;
+          }
         });
         const phase = finaleActive && supernovaStartedAt > -Infinity ? t - supernovaStartedAt : -1;
         const coronationGrade = partyGrade(overdriveLevel);
