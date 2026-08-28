@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>CARE SHIFT - Phase 5-2</title>
+<title>CARE SHIFT - Phase 5-2C</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -98,12 +98,12 @@ button{
 <div id="app"></div>
 <div id="hud">
   <div class="title">CARE SHIFT</div>
-  <div class="sub">Phase 5-2 / 優先度・待機変化</div>
+  <div class="sub">Phase 5-2C / 待機リアクション</div>
 </div>
 <div id="clockBadge"><span id="clockText">07:00</span></div>
 <div id="panel">
   自動生活スケジュール稼働中<br>
-  08:00 談話室へ / 09:00 コール / 09:20 追加コール / 18:00 居室へ戻る
+  08:00 談話室へ / コールはランダム発生 / 18:00 居室へ戻る
   <div id="callStatus" style="margin-top:8px;padding:7px 8px;border-radius:8px;background:#eef1f3;">
     ナースコール：なし
   </div>
@@ -121,7 +121,7 @@ button{
     <button id="debugCall">ランダムコール</button>
     <button id="debugToilet">排泄コール</button>
     <button id="debugBath">入浴コール</button>
-    <button id="debugDouble">同時コール</button>
+    <button id="debugDouble">同時コール確認</button>
   </div>
 </div>
 <div id="error"></div>
@@ -575,6 +575,112 @@ try{
     makeMover(residentC,1.6)
   ];
 
+  // 利用者の待機リアクション
+  residents.forEach(r=>{
+    r.reaction = { timer:0, duration:0, sprite:null };
+  });
+
+  function makeSpeechSprite(text){
+    const canvas=document.createElement("canvas");
+    canvas.width=512;
+    canvas.height=192;
+    const ctx=canvas.getContext("2d");
+
+    ctx.clearRect(0,0,512,192);
+    ctx.fillStyle="rgba(255,255,255,0.97)";
+    ctx.strokeStyle="rgba(45,55,60,0.9)";
+    ctx.lineWidth=8;
+
+    const x=16,y=16,w=480,h=132,r=28;
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.lineTo(x+w-r,y);
+    ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+    ctx.lineTo(x+w,y+h-r);
+    ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+    ctx.lineTo(x+285,y+h);
+    ctx.lineTo(x+250,y+176);
+    ctx.lineTo(x+225,y+h);
+    ctx.lineTo(x+r,y+h);
+    ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+    ctx.lineTo(x,y+r);
+    ctx.quadraticCurveTo(x,y,x+r,y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle="#263238";
+    ctx.font="bold 42px system-ui,-apple-system,sans-serif";
+    ctx.textAlign="center";
+    ctx.textBaseline="middle";
+    ctx.fillText(text,256,82);
+
+    const tex=new THREE.CanvasTexture(canvas);
+    const mat=new THREE.SpriteMaterial({
+      map:tex,
+      transparent:true,
+      depthTest:false
+    });
+    const sprite=new THREE.Sprite(mat);
+    sprite.scale.set(3.8,1.45,1);
+    sprite.renderOrder=80;
+    return sprite;
+  }
+
+  function showResidentReaction(index,waitMinutes){
+    const r=residents[index];
+    if(!r) return;
+
+    let text="ありがとう";
+    if(waitMinutes>=20) text="待ってたわ…";
+    else if(waitMinutes>=10) text="遅かったね";
+    else if(waitMinutes>=5) text="来てくれた";
+
+    if(r.reaction.sprite){
+      scene.remove(r.reaction.sprite);
+      r.reaction.sprite.material.map?.dispose?.();
+      r.reaction.sprite.material.dispose?.();
+    }
+
+    const sprite=makeSpeechSprite(text);
+    scene.add(sprite);
+    r.reaction.sprite=sprite;
+    r.reaction.timer=0;
+    r.reaction.duration=2.8;
+  }
+
+  function updateResidentReactions(dt){
+    residents.forEach(r=>{
+      const reaction=r.reaction;
+      if(!reaction || reaction.duration<=0) return;
+
+      reaction.timer+=dt;
+
+      if(reaction.sprite){
+        reaction.sprite.position.set(
+          r.object.position.x,
+          r.object.position.y+3.35,
+          r.object.position.z
+        );
+      }
+
+      // 少し待たされた感じの左右揺れ
+      r.object.rotation.z=Math.sin(reaction.timer*8)*0.055;
+
+      if(reaction.timer>=reaction.duration){
+        r.object.rotation.z=0;
+        if(reaction.sprite){
+          scene.remove(reaction.sprite);
+          reaction.sprite.material.map?.dispose?.();
+          reaction.sprite.material.dispose?.();
+          reaction.sprite=null;
+        }
+        reaction.timer=0;
+        reaction.duration=0;
+      }
+    });
+  }
+
   // 居室内の安全な待機位置。ベッドの当たり判定を避ける。
   const homeTargets=[
     new THREE.Vector3(-8,0,-6.55),
@@ -645,8 +751,14 @@ try{
   const minutesPerRealSecond = 2;
   let movedToLoungeToday = false;
   let returnedHomeToday = false;
-  let scheduledCallTriggered = false;
-  let secondCallTriggered = false;
+  // ランダムコール発生管理
+  // 次の「発生群」まではゲーム内25〜50分空ける。
+  // 発生群の一部は2件同時。未対応が多い時は追加発生を止める。
+  let nextRandomCallAt = 8 * 60 + 15;
+  const RANDOM_CALL_MIN_GAP = 25;
+  const RANDOM_CALL_MAX_GAP = 50;
+  const DOUBLE_CALL_CHANCE = 0.28;
+  const MAX_OPEN_CALLS = 2;
   let activeCall = null;
   const pendingCalls = [];
   let callSerial = 0;
@@ -890,7 +1002,10 @@ try{
     pendingCalls.forEach(c=>allCalls.push(c));
 
     if(!allCalls.length){
-      el.innerHTML = "施設状況：<strong>安定</strong>";
+      const until = Math.max(0, Math.ceil(nextRandomCallAt - gameMinutes));
+      el.innerHTML =
+        "施設状況：<strong>安定</strong><br>" +
+        "次回コール判定まで：約" + until + "分";
       return;
     }
 
@@ -971,11 +1086,14 @@ try{
 
     const residentIndex = activeCall.residentIndex;
     const resident = residents[residentIndex];
+    const waitedMinutes = Math.max(0, Math.floor(gameMinutes - activeCall.startedAt));
     const dx = player.position.x - resident.object.position.x;
     const dz = player.position.z - resident.object.position.z;
     const distance = Math.hypot(dx,dz);
 
     if(distance > responseDistance) return;
+
+    showResidentReaction(residentIndex, waitedMinutes);
 
     careResidentIndex = residentIndex;
     careType = activeCall.type || "TOILET";
@@ -1025,27 +1143,71 @@ try{
     residentMovers.forEach((m,i)=>setRoute(m,homeTargets[i],"TO_ROOM"));
   }
 
+  function totalOpenCalls(){
+    return (activeCall ? 1 : 0) + pendingCalls.length;
+  }
+
+  function scheduleNextRandomCall(){
+    const gap =
+      RANDOM_CALL_MIN_GAP +
+      Math.floor(Math.random() * (RANDOM_CALL_MAX_GAP - RANDOM_CALL_MIN_GAP + 1));
+    nextRandomCallAt = gameMinutes + gap;
+  }
+
+  function triggerRandomCallGroup(){
+    // 未対応が2件ある時は新しいコールを増やさない
+    if(totalOpenCalls() >= MAX_OPEN_CALLS){
+      nextRandomCallAt = gameMinutes + 10;
+      return;
+    }
+
+    const availableSlots = MAX_OPEN_CALLS - totalOpenCalls();
+    const canDouble = availableSlots >= 2 && residents.length >= 2;
+    const makeDouble = canDouble && Math.random() < DOUBLE_CALL_CHANCE;
+
+    if(makeDouble){
+      // 2件は別利用者にする
+      const first = freeResidentIndex();
+      const firstType = Math.random() < 0.65 ? "TOILET" : "BATH";
+      startNurseCall(
+        first,
+        firstType==="TOILET" ? "排泄希望" : "入浴予定",
+        firstType
+      );
+
+      const used = new Set([first]);
+      if(activeCall) used.add(activeCall.residentIndex);
+      pendingCalls.forEach(c=>used.add(c.residentIndex));
+
+      const candidates = residents
+        .map((_,i)=>i)
+        .filter(i=>!used.has(i));
+
+      if(candidates.length){
+        const second = candidates[Math.floor(Math.random()*candidates.length)];
+        // 同時発生時は違う内容になりやすくする
+        const secondType = firstType==="TOILET" ? "BATH" : "TOILET";
+        startNurseCall(
+          second,
+          secondType==="TOILET" ? "排泄希望" : "入浴予定",
+          secondType
+        );
+      }
+    }else{
+      triggerRandomCall();
+    }
+
+    scheduleNextRandomCall();
+  }
+
   function evaluateSchedule(){
     if(!movedToLoungeToday && gameMinutes >= 8*60){
       movedToLoungeToday = true;
       sendResidentsToLounge();
     }
-    if(!scheduledCallTriggered && gameMinutes >= 9*60){
-      scheduledCallTriggered = true;
-      const scheduledType = Math.random() < 0.5 ? "TOILET" : "BATH";
-      startNurseCall(
-        1,
-        scheduledType==="TOILET" ? "排泄希望" : "入浴予定",
-        scheduledType
-      );
-    }
-
-    // テスト用：09:20に別利用者からもう1件発生
-    if(!secondCallTriggered && gameMinutes >= 9*60+20){
-      secondCallTriggered = true;
-      const index = freeResidentIndex();
-      const type = Math.random() < 0.5 ? "TOILET" : "BATH";
-      startNurseCall(index, type==="TOILET" ? "排泄希望" : "入浴予定", type);
+    // 08:15以降、固定時刻ではなくランダムでコール群を発生させる
+    if(gameMinutes >= nextRandomCallAt && gameMinutes < 18*60){
+      triggerRandomCallGroup();
     }
 
     if(!returnedHomeToday && gameMinutes >= 18*60){
@@ -1063,11 +1225,25 @@ try{
     gameMinutes = 7 * 60;
     movedToLoungeToday = false;
     returnedHomeToday = false;
-    scheduledCallTriggered = false;
-    secondCallTriggered = false;
     pendingCalls.length = 0;
+    nextRandomCallAt = 8 * 60 + 15;
     activeHeadMarker.visible = false;
     pendingHeadMarkers.forEach(m=>m.visible=false);
+
+    residents.forEach(r=>{
+      if(r.reaction?.sprite){
+        scene.remove(r.reaction.sprite);
+        r.reaction.sprite.material.map?.dispose?.();
+        r.reaction.sprite.material.dispose?.();
+        r.reaction.sprite=null;
+      }
+      if(r.reaction){
+        r.reaction.timer=0;
+        r.reaction.duration=0;
+      }
+      r.object.rotation.z=0;
+    });
+
     careState = "NONE";
     careResidentIndex = null;
     careType = null;
@@ -1379,9 +1555,8 @@ try{
         gameMinutes -= 24*60;
         movedToLoungeToday = false;
         returnedHomeToday = false;
-        scheduledCallTriggered = false;
-        secondCallTriggered = false;
         pendingCalls.length = 0;
+        nextRandomCallAt = 8 * 60 + 15;
         clearNurseCall({advance:false});
         updateQueueUI();
       }
@@ -1408,6 +1583,7 @@ try{
     applyCameraFocus();
 
     updateHeadCallMarkers();
+    updateResidentReactions(dt);
     updateFacilityStatus();
 
     // 現在対象の優先度・待機時間もリアルタイム更新
