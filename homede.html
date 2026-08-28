@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>CARE SHIFT - Phase 5-2C</title>
+<title>CARE SHIFT - Phase 5-2D</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -98,12 +98,12 @@ button{
 <div id="app"></div>
 <div id="hud">
   <div class="title">CARE SHIFT</div>
-  <div class="sub">Phase 5-2C / 待機リアクション</div>
+  <div class="sub">Phase 5-2D / コール頻度再調整</div>
 </div>
 <div id="clockBadge"><span id="clockText">07:00</span></div>
 <div id="panel">
   自動生活スケジュール稼働中<br>
-  08:00 談話室へ / コールはランダム発生 / 18:00 居室へ戻る
+  08:00 談話室へ / 通常30%・同時10%でランダム発生 / 18:00 居室へ戻る
   <div id="callStatus" style="margin-top:8px;padding:7px 8px;border-radius:8px;background:#eef1f3;">
     ナースコール：なし
   </div>
@@ -752,13 +752,21 @@ try{
   let movedToLoungeToday = false;
   let returnedHomeToday = false;
   // ランダムコール発生管理
-  // 次の「発生群」まではゲーム内25〜50分空ける。
-  // 発生群の一部は2件同時。未対応が多い時は追加発生を止める。
-  let nextRandomCallAt = 8 * 60 + 15;
-  const RANDOM_CALL_MIN_GAP = 25;
-  const RANDOM_CALL_MAX_GAP = 50;
-  const DOUBLE_CALL_CHANCE = 0.28;
+  // 通常コール：20〜100分後に判定し、30%で1人がコール
+  // 同時コール：30〜100分後に判定し、10%で2人同時コール
+  // 対応直後の連発防止として、全体クールダウンも設ける
+  const SINGLE_CALL_CHANCE = 0.30;
+  const DOUBLE_CALL_CHANCE = 0.10;
+  const SINGLE_MIN_GAP = 20;
+  const SINGLE_MAX_GAP = 100;
+  const DOUBLE_MIN_GAP = 30;
+  const DOUBLE_MAX_GAP = 100;
+  const POST_RESPONSE_COOLDOWN = 20;
   const MAX_OPEN_CALLS = 2;
+
+  let nextSingleCallCheckAt = 8 * 60 + 20;
+  let nextDoubleCallCheckAt = 8 * 60 + 30;
+  let noNewCallsBefore = 0;
   let activeCall = null;
   const pendingCalls = [];
   let callSerial = 0;
@@ -1002,10 +1010,11 @@ try{
     pendingCalls.forEach(c=>allCalls.push(c));
 
     if(!allCalls.length){
-      const until = Math.max(0, Math.ceil(nextRandomCallAt - gameMinutes));
+      const singleUntil = Math.max(0, Math.ceil(nextSingleCallCheckAt - gameMinutes));
+      const doubleUntil = Math.max(0, Math.ceil(nextDoubleCallCheckAt - gameMinutes));
       el.innerHTML =
         "施設状況：<strong>安定</strong><br>" +
-        "次回コール判定まで：約" + until + "分";
+        "通常判定：約" + singleUntil + "分 / 同時判定：約" + doubleUntil + "分";
       return;
     }
 
@@ -1147,57 +1156,72 @@ try{
     return (activeCall ? 1 : 0) + pendingCalls.length;
   }
 
-  function scheduleNextRandomCall(){
-    const gap =
-      RANDOM_CALL_MIN_GAP +
-      Math.floor(Math.random() * (RANDOM_CALL_MAX_GAP - RANDOM_CALL_MIN_GAP + 1));
-    nextRandomCallAt = gameMinutes + gap;
+  function randomInt(min,max){
+    return min + Math.floor(Math.random() * (max - min + 1));
   }
 
-  function triggerRandomCallGroup(){
-    // 未対応が2件ある時は新しいコールを増やさない
-    if(totalOpenCalls() >= MAX_OPEN_CALLS){
-      nextRandomCallAt = gameMinutes + 10;
-      return;
-    }
+  function scheduleNextSingleCheck(){
+    nextSingleCallCheckAt = gameMinutes + randomInt(SINGLE_MIN_GAP, SINGLE_MAX_GAP);
+  }
 
-    const availableSlots = MAX_OPEN_CALLS - totalOpenCalls();
-    const canDouble = availableSlots >= 2 && residents.length >= 2;
-    const makeDouble = canDouble && Math.random() < DOUBLE_CALL_CHANCE;
+  function scheduleNextDoubleCheck(){
+    nextDoubleCallCheckAt = gameMinutes + randomInt(DOUBLE_MIN_GAP, DOUBLE_MAX_GAP);
+  }
 
-    if(makeDouble){
-      // 2件は別利用者にする
-      const first = freeResidentIndex();
-      const firstType = Math.random() < 0.65 ? "TOILET" : "BATH";
+  function trySingleRandomCall(){
+    scheduleNextSingleCheck();
+
+    // 対応直後・未対応過多・終了間際は発生させない
+    if(gameMinutes < noNewCallsBefore) return;
+    if(totalOpenCalls() >= MAX_OPEN_CALLS) return;
+    if(gameMinutes >= 18*60) return;
+
+    if(Math.random() >= SINGLE_CALL_CHANCE) return;
+
+    const index = freeResidentIndex();
+    const type = Math.random() < 0.65 ? "TOILET" : "BATH";
+    startNurseCall(
+      index,
+      type==="TOILET" ? "排泄希望" : "入浴予定",
+      type
+    );
+  }
+
+  function tryDoubleRandomCall(){
+    scheduleNextDoubleCheck();
+
+    if(gameMinutes < noNewCallsBefore) return;
+    if(totalOpenCalls() > 0) return; // 同時コールは何も鳴っていない時だけ
+    if(gameMinutes >= 18*60) return;
+
+    if(Math.random() >= DOUBLE_CALL_CHANCE) return;
+
+    const first = freeResidentIndex();
+    const firstType = Math.random() < 0.65 ? "TOILET" : "BATH";
+
+    startNurseCall(
+      first,
+      firstType==="TOILET" ? "排泄希望" : "入浴予定",
+      firstType
+    );
+
+    const used = new Set([first]);
+    if(activeCall) used.add(activeCall.residentIndex);
+    pendingCalls.forEach(c=>used.add(c.residentIndex));
+
+    const candidates = residents
+      .map((_,i)=>i)
+      .filter(i=>!used.has(i));
+
+    if(candidates.length){
+      const second = candidates[Math.floor(Math.random()*candidates.length)];
+      const secondType = Math.random() < 0.65 ? "TOILET" : "BATH";
       startNurseCall(
-        first,
-        firstType==="TOILET" ? "排泄希望" : "入浴予定",
-        firstType
+        second,
+        secondType==="TOILET" ? "排泄希望" : "入浴予定",
+        secondType
       );
-
-      const used = new Set([first]);
-      if(activeCall) used.add(activeCall.residentIndex);
-      pendingCalls.forEach(c=>used.add(c.residentIndex));
-
-      const candidates = residents
-        .map((_,i)=>i)
-        .filter(i=>!used.has(i));
-
-      if(candidates.length){
-        const second = candidates[Math.floor(Math.random()*candidates.length)];
-        // 同時発生時は違う内容になりやすくする
-        const secondType = firstType==="TOILET" ? "BATH" : "TOILET";
-        startNurseCall(
-          second,
-          secondType==="TOILET" ? "排泄希望" : "入浴予定",
-          secondType
-        );
-      }
-    }else{
-      triggerRandomCall();
     }
-
-    scheduleNextRandomCall();
   }
 
   function evaluateSchedule(){
@@ -1205,9 +1229,13 @@ try{
       movedToLoungeToday = true;
       sendResidentsToLounge();
     }
-    // 08:15以降、固定時刻ではなくランダムでコール群を発生させる
-    if(gameMinutes >= nextRandomCallAt && gameMinutes < 18*60){
-      triggerRandomCallGroup();
+    // 固定時刻ではなく、通常コールと同時コールを別々にランダム判定
+    if(gameMinutes >= nextSingleCallCheckAt && gameMinutes < 18*60){
+      trySingleRandomCall();
+    }
+
+    if(gameMinutes >= nextDoubleCallCheckAt && gameMinutes < 18*60){
+      tryDoubleRandomCall();
     }
 
     if(!returnedHomeToday && gameMinutes >= 18*60){
@@ -1226,7 +1254,9 @@ try{
     movedToLoungeToday = false;
     returnedHomeToday = false;
     pendingCalls.length = 0;
-    nextRandomCallAt = 8 * 60 + 15;
+    nextSingleCallCheckAt = 8 * 60 + 20;
+    nextDoubleCallCheckAt = 8 * 60 + 30;
+    noNewCallsBefore = 0;
     activeHeadMarker.visible = false;
     pendingHeadMarkers.forEach(m=>m.visible=false);
 
@@ -1531,6 +1561,9 @@ try{
         playerMover.routeIndex = 0;
         playerMover.state = "IDLE";
 
+        // 対応直後に次々鳴らないよう20分間は新規ランダム発生を止める
+        noNewCallsBefore = Math.max(noNewCallsBefore, gameMinutes + POST_RESPONSE_COOLDOWN);
+
         clearNurseCall({advance:true});
         callRing.material.color.set(0xff3b30);
 
@@ -1556,7 +1589,9 @@ try{
         movedToLoungeToday = false;
         returnedHomeToday = false;
         pendingCalls.length = 0;
-        nextRandomCallAt = 8 * 60 + 15;
+        nextSingleCallCheckAt = 8 * 60 + 20;
+        nextDoubleCallCheckAt = 8 * 60 + 30;
+        noNewCallsBefore = 0;
         clearNurseCall({advance:false});
         updateQueueUI();
       }
