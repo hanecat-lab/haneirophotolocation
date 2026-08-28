@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>CARE SHIFT - Phase 3-2</title>
+<title>CARE SHIFT - Phase 4-1</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -41,9 +41,17 @@ canvas{display:block;width:100%;height:100%;touch-action:none}
   font-weight:800;
   font-size:14px;
 }
-#respondButton.ready{
-  display:block;
+#respondButton.ready{display:block}
+#careProgress{
+  display:none;
+  margin-top:8px;
+  padding:8px 10px;
+  border-radius:9px;
+  background:#e7f2ea;
+  color:#245c34;
+  font-weight:700;
 }
+#careProgress.show{display:block}
 button{
   margin-top:0;padding:8px 10px;border:0;border-radius:8px;background:#24303a;color:#fff;font:inherit;cursor:pointer
 }
@@ -66,7 +74,7 @@ button{
 <div id="app"></div>
 <div id="hud">
   <div class="title">CARE SHIFT</div>
-  <div class="sub">Phase 3-2 / ナースコール対応</div>
+  <div class="sub">Phase 4-1 / トイレ介助フロー</div>
 </div>
 <div id="clockBadge"><span id="clockText">07:00</span></div>
 <div id="panel">
@@ -76,6 +84,7 @@ button{
     ナースコール：なし
   </div>
   <button id="respondButton">対応開始</button>
+  <div id="careProgress">介助中…</div>
   <div id="panelButtons">
     <button id="pauseTime">時間停止</button>
     <button id="resetDay">07:00に戻す</button>
@@ -223,11 +232,20 @@ try{
 
   function addCurtainEntrance(x,z,width){
     addBox(x,2.08,z,width,0.09,0.09,metalMat);
-    addBox(x-width/2+0.35,1.1,z,0.65,1.95,0.08,curtainMat);
-    addBox(x+width/2-0.35,1.1,z,0.65,1.95,0.08,curtainMat);
+    const left = addBox(x-width/2+0.35,1.1,z,0.65,1.95,0.08,curtainMat);
+    const right = addBox(x+width/2-0.35,1.1,z,0.65,1.95,0.08,curtainMat);
+    return {
+      x,z,width,left,right,
+      openLeft:x-width/2+0.35,
+      openRight:x+width/2-0.35,
+      closedLeft:x-0.35,
+      closedRight:x+0.35,
+      t:0,
+      target:0
+    };
   }
-  addCurtainEntrance(-9.5,6.45,5.2);
-  addCurtainEntrance(9.5,6.45,6.0);
+  const toiletCurtain = addCurtainEntrance(-9.5,6.45,5.2);
+  const bathCurtain = addCurtainEntrance(9.5,6.45,6.0);
 
   function createHuman(color,role="resident"){
     const group=new THREE.Group();
@@ -305,6 +323,54 @@ try{
   }
 
   const callRing = createCallRing();
+
+  function createTargetMarker(){
+    const group = new THREE.Group();
+
+    const poleMat = new THREE.MeshBasicMaterial({color:0xff3b30});
+    const pole = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.055,0.055,0.5,10),
+      poleMat
+    );
+    pole.position.y = 0;
+    group.add(pole);
+
+    const dot = new THREE.Mesh(
+      new THREE.SphereGeometry(0.09,12,10),
+      poleMat
+    );
+    dot.position.y = -0.34;
+    group.add(dot);
+
+    const plate = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.55,0.5),
+      new THREE.MeshBasicMaterial({
+        color:0xffffff,
+        side:THREE.DoubleSide,
+        transparent:true,
+        opacity:0.96
+      })
+    );
+    plate.position.y = 0.55;
+    group.add(plate);
+
+    const tag = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.35,0.32),
+      new THREE.MeshBasicMaterial({
+        color:0xff3b30,
+        side:THREE.DoubleSide
+      })
+    );
+    tag.position.y = 0.55;
+    tag.position.z = 0.005;
+    group.add(tag);
+
+    group.visible = false;
+    scene.add(group);
+    return group;
+  }
+
+  const targetMarker = createTargetMarker();
 
   // Pathfinding
   const GRID=0.5;
@@ -440,6 +506,8 @@ try{
     new THREE.Vector3(2.9,0,2.0)
   ];
 
+  const toiletTarget = new THREE.Vector3(-9.0,0,8.2);
+
   function setRoute(mover,target,stateName="MOVING"){
     const raw=findPath(mover.object.position,target);
     if(!raw.length) return false;
@@ -491,7 +559,12 @@ try{
   const callStatus = document.getElementById("callStatus");
   const pauseBtn = document.getElementById("pauseTime");
   const respondButton = document.getElementById("respondButton");
+  const careProgress = document.getElementById("careProgress");
   const responseDistance = 1.8;
+
+  let careState = "NONE";
+  let careResidentIndex = null;
+  let careTimer = 0;
 
 
   function residentLocationLabel(resident){
@@ -515,8 +588,9 @@ try{
     };
 
     callStatus.innerHTML =
-      '<strong style="color:#c62828;">🔴 ナースコール</strong><br>' +
-      resident.name + ' / ' + residentLocationLabel(resident);
+      '<strong style="color:#c62828;">🔴 対象：' + resident.name + '</strong><br>' +
+      '場所：' + residentLocationLabel(resident) + '<br>' +
+      '<span style="font-size:11px;">頭上の赤い「！」が対象です</span>';
 
     callRing.visible = true;
     callRing.position.set(
@@ -524,13 +598,24 @@ try{
       0.04,
       resident.object.position.z
     );
+
+    targetMarker.visible = true;
+    targetMarker.position.set(
+      resident.object.position.x,
+      2.9,
+      resident.object.position.z
+    );
   }
 
   function clearNurseCall(){
     activeCall = null;
     callRing.visible = false;
+    targetMarker.visible = false;
     callStatus.textContent = "ナースコール：なし";
     respondButton.classList.remove("ready");
+    if(careState==="NONE"){
+      careProgress.classList.remove("show");
+    }
   }
 
   function triggerRandomCall(){
@@ -540,7 +625,7 @@ try{
   }
 
   function updateCallInteraction(){
-    if(!activeCall){
+    if(!activeCall || careState!=="NONE"){
       respondButton.classList.remove("ready");
       return;
     }
@@ -559,24 +644,29 @@ try{
   }
 
   respondButton.addEventListener("click",()=>{
-    if(!activeCall) return;
+    if(!activeCall || careState!=="NONE") return;
 
-    const resident = residents[activeCall.residentIndex];
+    const residentIndex = activeCall.residentIndex;
+    const resident = residents[residentIndex];
     const dx = player.position.x - resident.object.position.x;
     const dz = player.position.z - resident.object.position.z;
     const distance = Math.hypot(dx,dz);
 
     if(distance > responseDistance) return;
 
+    careResidentIndex = residentIndex;
+    careState = "TO_TOILET";
+    careProgress.classList.add("show");
+    careProgress.textContent = "トイレへ誘導中…";
+
     callStatus.innerHTML =
-      '<strong style="color:#2e6b3f;">対応中</strong><br>' +
-      resident.name + ' / ' + residentLocationLabel(resident);
+      '<strong style="color:#2e6b3f;">対応開始：' + resident.name + '</strong><br>' +
+      'トイレへ誘導しています';
 
     callRing.material.color.set(0x2e9b57);
-    setTimeout(()=>{
-      clearNurseCall();
-      callRing.material.color.set(0xff3b30);
-    },1200);
+    respondButton.classList.remove("ready");
+
+    setRoute(residentMovers[residentIndex], toiletTarget, "TO_TOILET");
   });
 
   function formatTime(totalMinutes){
@@ -624,6 +714,10 @@ try{
     movedToLoungeToday = false;
     returnedHomeToday = false;
     scheduledCallTriggered = false;
+    careState = "NONE";
+    careResidentIndex = null;
+    toiletCurtain.target = 0;
+    toiletCurtain.t = 0;
     clearNurseCall();
     sendResidentsHome();
     document.getElementById("debugCall").addEventListener("click", triggerRandomCall);
@@ -659,6 +753,63 @@ try{
     mover.object.rotation.y=Math.atan2(delta.x,delta.z);
   }
 
+
+  function updateCurtain(curtain,dt){
+    const speed = 2.2;
+    if(Math.abs(curtain.t-curtain.target)>0.001){
+      curtain.t += Math.sign(curtain.target-curtain.t) * speed * dt;
+      curtain.t = Math.max(0,Math.min(1,curtain.t));
+    }
+    curtain.left.position.x = THREE.MathUtils.lerp(curtain.openLeft, curtain.closedLeft, curtain.t);
+    curtain.right.position.x = THREE.MathUtils.lerp(curtain.openRight, curtain.closedRight, curtain.t);
+  }
+
+  function updateCareFlow(dt){
+    if(careState==="NONE" || careResidentIndex===null) return;
+
+    const mover = residentMovers[careResidentIndex];
+    const resident = residents[careResidentIndex];
+
+    if(careState==="TO_TOILET" && mover.state==="IDLE"){
+      const dist = resident.object.position.distanceTo(toiletTarget);
+      if(dist < 0.6){
+        careState = "CURTAIN_CLOSE";
+        toiletCurtain.target = 1;
+        careProgress.textContent = "カーテンを閉めています…";
+      }
+    }
+
+    if(careState==="CURTAIN_CLOSE" && toiletCurtain.t >= 0.98){
+      careState = "CARE";
+      careTimer = 0;
+      careProgress.textContent = "排泄介助中…";
+    }
+
+    if(careState==="CARE"){
+      careTimer += dt;
+      if(careTimer >= 3){
+        careState = "CURTAIN_OPEN";
+        toiletCurtain.target = 0;
+        careProgress.textContent = "介助完了・カーテンを開けています…";
+      }
+    }
+
+    if(careState==="CURTAIN_OPEN" && toiletCurtain.t <= 0.02){
+      careState = "RETURN";
+      careProgress.textContent = "談話室へ戻っています…";
+      setRoute(mover, loungeTargets[careResidentIndex], "RETURN_LOUNGE");
+    }
+
+    if(careState==="RETURN" && mover.state==="IDLE"){
+      careState = "NONE";
+      careResidentIndex = null;
+      careProgress.textContent = "介助完了";
+      setTimeout(()=>careProgress.classList.remove("show"),900);
+      clearNurseCall();
+      callRing.material.color.set(0xff3b30);
+    }
+  }
+
   const clock=new THREE.Clock();
 
   function animate(){
@@ -680,12 +831,23 @@ try{
 
     updateMover(playerMover,dt);
     residentMovers.forEach(m=>updateMover(m,dt));
+    updateCurtain(toiletCurtain,dt);
+    updateCurtain(bathCurtain,dt);
+    updateCareFlow(dt);
 
     if(activeCall){
       const r = residents[activeCall.residentIndex];
+
       callRing.position.x = r.object.position.x;
       callRing.position.z = r.object.position.z;
       callRing.material.opacity = 0.55 + Math.sin(performance.now()*0.006)*0.35;
+
+      targetMarker.position.x = r.object.position.x;
+      targetMarker.position.z = r.object.position.z;
+      targetMarker.position.y = 2.9 + Math.sin(performance.now()*0.005)*0.14;
+      targetMarker.quaternion.copy(camera.quaternion);
+      const pulse = 1.0 + Math.sin(performance.now()*0.006)*0.08;
+      targetMarker.scale.setScalar(pulse);
     }
 
     updateCallInteraction();
