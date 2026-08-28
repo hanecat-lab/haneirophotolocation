@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>CARE SHIFT - Phase 5-1B</title>
+<title>CARE SHIFT - Phase 5-2</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -98,7 +98,7 @@ button{
 <div id="app"></div>
 <div id="hud">
   <div class="title">CARE SHIFT</div>
-  <div class="sub">Phase 5-1B / コール識別・連続対応</div>
+  <div class="sub">Phase 5-2 / 優先度・待機変化</div>
 </div>
 <div id="clockBadge"><span id="clockText">07:00</span></div>
 <div id="panel">
@@ -108,6 +108,9 @@ button{
     ナースコール：なし
   </div>
   <div id="callQueue" style="display:none;margin-top:6px;padding:7px 8px;border-radius:8px;background:#fff3d8;font-size:11px;line-height:1.5;"></div>
+  <div id="facilityStatus" style="margin-top:6px;padding:7px 8px;border-radius:8px;background:#eef3f6;font-size:11px;line-height:1.45;">
+    施設状況：安定
+  </div>
   <button id="respondButton">対応開始</button>
   <div id="careProgress">介助中…</div>
   <div id="careStateDebug" style="display:none;font-size:10px;margin-top:4px;color:#607079;"></div>
@@ -674,6 +677,37 @@ try{
     return "施設内";
   }
 
+  function priorityFor(type){
+    // 現段階の暫定ルール
+    // 排泄介助は待機影響が早いため優先度4、入浴は予定業務として優先度2
+    return type==="TOILET" ? 4 : 2;
+  }
+
+  function priorityLabel(p){
+    if(p>=5) return "緊急";
+    if(p>=4) return "高";
+    if(p>=3) return "中";
+    return "低";
+  }
+
+  function effectivePriority(call){
+    const wait = Math.max(0, gameMinutes - call.startedAt);
+    let bonus = 0;
+
+    // 待機時間で実質優先度が上がる
+    if(wait >= 20) bonus = 2;
+    else if(wait >= 10) bonus = 1;
+
+    return Math.min(5, call.priority + bonus);
+  }
+
+  function waitState(call){
+    const wait = Math.max(0, gameMinutes - call.startedAt);
+    if(wait >= 20) return "長時間待機";
+    if(wait >= 10) return "待機長め";
+    return "待機中";
+  }
+
   function callTypeLabel(type){
     return type==="BATH" ? "入浴介助" : "排泄介助";
   }
@@ -686,13 +720,24 @@ try{
     }
 
     callQueue.style.display = "block";
+    // 実質優先度→待機時間の順で表示
+    const sorted = [...pendingCalls].sort((a,b)=>{
+      const pa = effectivePriority(a);
+      const pb = effectivePriority(b);
+      if(pb !== pa) return pb - pa;
+      return a.startedAt - b.startedAt;
+    });
+
     callQueue.innerHTML =
       '<strong>🟡 対応待ち ' + pendingCalls.length + '件</strong><br>' +
-      pendingCalls.map((call,i)=>{
+      sorted.map((call,i)=>{
         const resident = residents[call.residentIndex];
         const wait = Math.max(0, Math.floor(gameMinutes - call.startedAt));
+        const p = effectivePriority(call);
         return (i+1) + '. ' + resident.name + ' / ' +
-          callTypeLabel(call.type) + ' / 待機 ' + wait + '分';
+          callTypeLabel(call.type) +
+          ' / 優先度 ' + priorityLabel(p) + '(' + p + ')' +
+          ' / ' + waitState(call) + ' ' + wait + '分';
       }).join('<br>');
   }
 
@@ -709,11 +754,16 @@ try{
 
     const resident = residents[activeCall.residentIndex];
 
+    const activeP = effectivePriority(activeCall);
+    const activeWait = Math.max(0, Math.floor(gameMinutes - activeCall.startedAt));
+
     callStatus.innerHTML =
       '<strong style="color:#c62828;">🔴 対象：' + resident.name + '</strong><br>' +
       '内容：' + callTypeLabel(activeCall.type) + '<br>' +
+      '優先度：' + priorityLabel(activeP) + ' (' + activeP + ')<br>' +
+      '待機：' + activeWait + '分<br>' +
       '場所：' + residentLocationLabel(resident) + '<br>' +
-      '<span style="font-size:11px;">頭上の赤い〇が現在の対応対象です。オレンジ〇は対応待ちです。</span>';
+      '<span style="font-size:11px;">赤〇＝現在対象 / オレンジ〇＝対応待ち</span>';
 
     // 足元リング・旧「！」マーカーは使わない
     callRing.visible = false;
@@ -731,7 +781,21 @@ try{
 
   function activateNextCall(){
     if(activeCall || careState!=="NONE" || !pendingCalls.length) return;
-    activeCall = pendingCalls.shift();
+
+    // 最も実質優先度が高いコールを次対象にする
+    let bestIndex = 0;
+    for(let i=1;i<pendingCalls.length;i++){
+      const a = pendingCalls[i];
+      const b = pendingCalls[bestIndex];
+      const pa = effectivePriority(a);
+      const pb = effectivePriority(b);
+
+      if(pa > pb || (pa === pb && a.startedAt < b.startedAt)){
+        bestIndex = i;
+      }
+    }
+
+    activeCall = pendingCalls.splice(bestIndex,1)[0];
     showActiveCall();
   }
 
@@ -741,6 +805,7 @@ try{
       residentIndex,
       reason,
       type,
+      priority: priorityFor(type),
       startedAt: gameMinutes
     };
 
@@ -818,6 +883,32 @@ try{
   }
 
 
+  function updateFacilityStatus(){
+    const el = document.getElementById("facilityStatus");
+    const allCalls = [];
+    if(activeCall) allCalls.push(activeCall);
+    pendingCalls.forEach(c=>allCalls.push(c));
+
+    if(!allCalls.length){
+      el.innerHTML = "施設状況：<strong>安定</strong>";
+      return;
+    }
+
+    const longWait = allCalls.filter(c => gameMinutes - c.startedAt >= 20).length;
+    const highPriority = allCalls.filter(c => effectivePriority(c) >= 4).length;
+
+    let state = "対応中";
+    if(longWait >= 1) state = "要注意";
+    if(longWait >= 2 || highPriority >= 2) state = "逼迫";
+
+    el.innerHTML =
+      '施設状況：<strong>' + state + '</strong><br>' +
+      '対応中 ' + (activeCall ? 1 : 0) +
+      ' / 待機 ' + pendingCalls.length +
+      ' / 高優先度 ' + highPriority +
+      ' / 長時間待機 ' + longWait;
+  }
+
   function updateHeadCallMarkers(){
     // すべて一度非表示
     pendingHeadMarkers.forEach(m => m.visible = false);
@@ -840,6 +931,8 @@ try{
     pendingCalls.forEach((call, idx)=>{
       const r = residents[call.residentIndex];
       const m = pendingHeadMarkers[call.residentIndex];
+      const wait = Math.max(0, gameMinutes - call.startedAt);
+
       m.visible = true;
       m.position.set(
         r.object.position.x,
@@ -847,7 +940,10 @@ try{
         r.object.position.z
       );
       m.quaternion.copy(camera.quaternion);
-      m.scale.setScalar(1.0);
+
+      // 長く待つほど〇を少し大きくする
+      const s = wait >= 20 ? 1.35 : wait >= 10 ? 1.18 : 1.0;
+      m.scale.setScalar(s);
     });
   }
 
@@ -984,6 +1080,7 @@ try{
     curtainButton.classList.remove("show");
     clearNurseCall({advance:false});
     updateQueueUI();
+    updateFacilityStatus();
     sendResidentsHome();
     document.getElementById("debugCall").addEventListener("click", triggerRandomCall);
   document.getElementById("debugToilet").addEventListener("click", triggerToiletCall);
@@ -1291,6 +1388,7 @@ try{
       evaluateSchedule();
       updateClockUI();
       updateQueueUI();
+      updateFacilityStatus();
     }
 
     updateFollowEscort(dt);
@@ -1310,6 +1408,13 @@ try{
     applyCameraFocus();
 
     updateHeadCallMarkers();
+    updateFacilityStatus();
+
+    // 現在対象の優先度・待機時間もリアルタイム更新
+    if(activeCall && careState==="NONE"){
+      showActiveCall();
+    }
+
     updateCallInteraction();
 
     if(playerMover.state==="IDLE") marker.visible=false;
