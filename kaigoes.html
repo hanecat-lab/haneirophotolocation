@@ -2,8 +2,8 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>CARE SHIFT - Phase 8-2</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>CARE SHIFT - Phase 8-2B</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -306,7 +306,7 @@ button{
 <div id="app"></div>
 <div id="hud">
   <div class="title">CARE SHIFT</div>
-  <div class="sub">Phase 8-2 / D車椅子移送・談話室定時介助</div>
+  <div class="sub">Phase 8-2B / スマホ操作・場所連動定時介助</div>
 </div>
 <div id="clockBadge"><span id="clockText">07:00</span></div>
 <div id="externalRoutinePanel" style="display:none;">
@@ -1228,7 +1228,8 @@ try{
 
   // 3D画面操作：
   // タップ = 職員移動
-  // ドラッグ = カメラを自由移動
+  // 1本指ドラッグ = カメラ移動
+  // 2本指以上 = ゲーム側では処理せず、ピンチズームも抑止
   let cameraPointerDown = false;
   let cameraPointerId = null;
   let cameraDragStarted = false;
@@ -1237,6 +1238,7 @@ try{
   let cameraLastX = 0;
   let cameraLastY = 0;
   let manualCameraUntil = 0;
+  const activeCanvasPointers = new Set();
 
   function clampCameraFocus(){
     desiredCameraFocus.x = THREE.MathUtils.clamp(desiredCameraFocus.x,-10,10);
@@ -1265,7 +1267,30 @@ try{
 
   renderer.domElement.style.touchAction = "none";
 
+  // iOS Safariのgesture系イベントも明示的に止める
+  ["gesturestart","gesturechange","gestureend"].forEach(type=>{
+    renderer.domElement.addEventListener(type,e=>{
+      e.preventDefault();
+    },{passive:false});
+  });
+
+  renderer.domElement.addEventListener("touchmove",e=>{
+    if(e.touches.length > 1){
+      e.preventDefault();
+    }
+  },{passive:false});
+
   renderer.domElement.addEventListener("pointerdown",(e)=>{
+    activeCanvasPointers.add(e.pointerId);
+
+    // 2本目以降が触れた時点で現在のドラッグ操作を破棄
+    if(activeCanvasPointers.size > 1){
+      cameraPointerDown = false;
+      cameraPointerId = null;
+      cameraDragStarted = false;
+      return;
+    }
+
     cameraPointerDown = true;
     cameraPointerId = e.pointerId;
     cameraDragStarted = false;
@@ -1275,7 +1300,11 @@ try{
   });
 
   renderer.domElement.addEventListener("pointermove",(e)=>{
-    if(!cameraPointerDown || e.pointerId!==cameraPointerId) return;
+    if(
+      activeCanvasPointers.size !== 1 ||
+      !cameraPointerDown ||
+      e.pointerId!==cameraPointerId
+    ) return;
 
     const totalDx = e.clientX - cameraPointerStartX;
     const totalDy = e.clientY - cameraPointerStartY;
@@ -1288,8 +1317,6 @@ try{
     cameraLastX = e.clientX;
     cameraLastY = e.clientY;
 
-    // 等角投影に合わせたパン。
-    // 横ドラッグはX/Zを逆方向、縦ドラッグはX/Zを同方向へ動かす。
     const scale = innerWidth < 700 ? 0.035 : 0.025;
     desiredCameraFocus.x += (-dx + dy*0.72) * scale;
     desiredCameraFocus.z += ( dx + dy*0.72) * scale;
@@ -1300,24 +1327,33 @@ try{
   });
 
   function finishCameraPointer(e){
-    if(!cameraPointerDown || e.pointerId!==cameraPointerId) return;
+    const wasSinglePointer =
+      activeCanvasPointers.size===1 &&
+      cameraPointerDown &&
+      e.pointerId===cameraPointerId;
 
-    if(!cameraDragStarted){
+    activeCanvasPointers.delete(e.pointerId);
+
+    if(wasSinglePointer && !cameraDragStarted){
       movePlayerFromScreen(e.clientX,e.clientY);
     }
 
-    cameraPointerDown = false;
-    cameraPointerId = null;
-    cameraDragStarted = false;
-    renderer.domElement.releasePointerCapture?.(e.pointerId);
+    if(e.pointerId===cameraPointerId){
+      cameraPointerDown = false;
+      cameraPointerId = null;
+      cameraDragStarted = false;
+      renderer.domElement.releasePointerCapture?.(e.pointerId);
+    }
   }
 
   renderer.domElement.addEventListener("pointerup",finishCameraPointer);
   renderer.domElement.addEventListener("pointercancel",(e)=>{
-    if(e.pointerId!==cameraPointerId) return;
-    cameraPointerDown=false;
-    cameraPointerId=null;
-    cameraDragStarted=false;
+    activeCanvasPointers.delete(e.pointerId);
+    if(e.pointerId===cameraPointerId){
+      cameraPointerDown=false;
+      cameraPointerId=null;
+      cameraDragStarted=false;
+    }
   });
 
   // Game time / daily schedule
@@ -1819,7 +1855,10 @@ try{
         // Dは寝たきりのためベッドサイドを例外とする。
         if(
           (task.type==="HYDRATION" || task.type==="LUNCH") &&
-          !residentReadyForLoungeRoutine(task)
+          (
+            !residentReadyForLoungeRoutine(task) ||
+            !routinePlayerZoneAllows(task)
+          )
         ){
           return false;
         }
@@ -1873,6 +1912,34 @@ try{
     );
   }
 
+  function playerInDRoomWorkZone(){
+    // Dは現在、中央の居室B（ベッド中心 x=0 / z=-8）
+    return (
+      player.position.x > -3.4 &&
+      player.position.x < 3.4 &&
+      player.position.z > -11.0 &&
+      player.position.z < -5.15
+    );
+  }
+
+  function routinePlayerZoneAllows(task){
+    if(!task) return false;
+
+    if(task.type!=="HYDRATION" && task.type!=="LUNCH"){
+      return true;
+    }
+
+    const resident = residents[task.residentIndex];
+
+    // DはD居室に入った時だけ
+    if(resident.bedridden){
+      return playerInDRoomWorkZone();
+    }
+
+    // A〜Cは職員が談話室に入った時だけ
+    return playerInLoungeWorkZone();
+  }
+
   function availableBathTasks(){
     return routineTasks.filter(task =>
       task.type==="BATH" &&
@@ -1907,7 +1974,8 @@ try{
       t=>
         t.type==="HYDRATION" &&
         routineTaskWindowOpen(t) &&
-        residentReadyForLoungeRoutine(t)
+        residentReadyForLoungeRoutine(t) &&
+        routinePlayerZoneAllows(t)
     );
     if(hydration.length){
       groups.push({
@@ -1921,7 +1989,8 @@ try{
       t=>
         t.type==="LUNCH" &&
         routineTaskWindowOpen(t) &&
-        residentReadyForLoungeRoutine(t)
+        residentReadyForLoungeRoutine(t) &&
+        routinePlayerZoneAllows(t)
     );
     if(lunch.length){
       groups.push({
@@ -1996,7 +2065,10 @@ try{
           if(
             (group.type==="HYDRATION" || group.type==="LUNCH") &&
             !task.done &&
-            !residentReadyForLoungeRoutine(task)
+            (
+              !residentReadyForLoungeRoutine(task) ||
+              !routinePlayerZoneAllows(task)
+            )
           ){
             return "";
           }
@@ -2145,7 +2217,12 @@ try{
           routineActionButton.textContent =
             activeRoutineTask.type==="BATH"
               ? residentName + " 入浴の声掛け"
-              : residentName + " " + activeRoutineTask.name;
+              : (
+                  activeRoutineTask.type==="HYDRATION" ||
+                  activeRoutineTask.type==="LUNCH"
+                    ? "最寄り：" + residentName + " " + activeRoutineTask.name
+                    : residentName + " " + activeRoutineTask.name
+                );
         }
       }else{
         routineActionButton.textContent =
@@ -2174,11 +2251,14 @@ try{
 
     if(
       (task.type==="HYDRATION" || task.type==="LUNCH") &&
-      !residentReadyForLoungeRoutine(task)
+      (
+        !residentReadyForLoungeRoutine(task) ||
+        !routinePlayerZoneAllows(task)
+      )
     ){
       routineActionButton.style.display = "none";
       compactTarget.textContent = residents[task.residentIndex].bedridden
-        ? "利用者Dはベッド上で介助してください"
+        ? "利用者Dの居室で介助してください"
         : "水分・昼食介助は談話室で実施します";
       return;
     }
@@ -2323,6 +2403,7 @@ try{
     if(
       !playerNearRoutineResident(task) ||
       !residentReadyForLoungeRoutine(task) ||
+      !routinePlayerZoneAllows(task) ||
       careState!=="NONE" ||
       routineBlockedByToilet(task)
     ){
