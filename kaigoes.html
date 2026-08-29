@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-31</title>
+<title>CARE SHIFT - Phase 10-32</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -254,7 +254,12 @@ body.routine-interrupt-visible #routineActionButton{
   width:auto !important;
 }
 body.routine-interrupt-visible #routineInterruptButton{display:inline-block;}
-body.meal-or-hydration-active #pauseTime{display:none !important;}
+body.meal-or-hydration-active #pauseTime,
+body.meal-or-hydration-active #detailToggle,
+body.bath-care-active #pauseTime,
+body.bath-care-active #detailToggle{
+  display:none !important;
+}
 #detailDrawer{
   pointer-events:auto;
   display:none;
@@ -622,7 +627,7 @@ button{
 <div id="hud">
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
-  <div class="sub">Phase 10-31 / D入浴中の体位交換コール抑制</div>
+  <div class="sub">Phase 10-32 / 入浴誘導中断・介助中UI整理</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="callTray" aria-live="polite"></div>
@@ -637,7 +642,7 @@ button{
   <div id="detailDrawer">
     <div style="font-weight:800;">詳細状況</div>
     <div style="margin-top:3px;font-size:10px;color:#66737c;">
-      上部＝状態確認 / 中間＝定時業務 / 下部＝その場で実行できる操作。水分・食事中にコールが鳴っても介助は継続し、待機時間も進みます。「中断」または赤い対応ボタンでコール対応へ切り替えられます。
+      上部＝状態確認 / 中間＝定時業務 / 下部＝その場で実行できる操作。水分・食事・入浴誘導は必要に応じて「中断」し、コール対応へ切り替えられます。入浴誘導を中断した利用者は元の位置へ戻ります。
     </div>
 
     <div id="callStatus" class="section">ナースコール：なし</div>
@@ -3851,6 +3856,7 @@ try{
     routineInterruptButton.style.display = "none";
     document.body.classList.remove("routine-interrupt-visible");
       document.body.classList.remove("meal-or-hydration-active");
+      document.body.classList.remove("bath-care-active");
 
     logDecision("ROUTINE_INTERRUPTED",{
       taskId:task.id || (task.type+"-"+task.residentIndex),
@@ -3871,15 +3877,93 @@ try{
     return true;
   }
 
+  function interruptBathEscort(){
+    if(
+      careType!=="BATH" ||
+      careState!=="FOLLOW_TO_CARE" ||
+      careResidentIndex===null
+    ) return false;
+
+    const residentIndex = careResidentIndex;
+    const resident = residents[residentIndex];
+    const mover = residentMovers[residentIndex];
+
+    const bathTask = routineTasks.find(task=>
+      task.type==="BATH" &&
+      task.residentIndex===residentIndex &&
+      task.enabled!==false &&
+      task.inProgress &&
+      !task.done
+    );
+    if(bathTask){
+      bathTask.inProgress = false;
+    }
+
+    // 誘導を中断した利用者は、誘導開始前の生活場所へ戻る。
+    const returnTarget =
+      resident.bedridden
+        ? dBathTransferPoint.clone()
+        : (
+            careReturnTarget
+              ? careReturnTarget.clone()
+              : loungeTargets[residentIndex].clone()
+          );
+
+    mover.route = [];
+    mover.routeIndex = 0;
+    mover.state = "IDLE";
+    setRoute(mover, returnTarget, "BATH_INTERRUPTED_RETURN");
+
+    playerMover.route = [];
+    playerMover.routeIndex = 0;
+    playerMover.state = "IDLE";
+
+    escortGoalMarker.visible = false;
+    careProgress.textContent =
+      resident.name + "の入浴誘導を中断。元の位置へ戻っています";
+
+    logDecision("ROUTINE_INTERRUPTED",{
+      taskId:bathTask?.id || ("BATH-"+residentIndex),
+      taskType:"BATH",
+      resident:resident.name,
+      taskName:"入浴介助",
+      reason:"CALL"
+    });
+
+    careState = "NONE";
+    careResidentIndex = null;
+    careType = null;
+    careReturnTarget = null;
+    followRepathTimer = 0;
+
+    routineInterruptButton.style.display = "none";
+    document.body.classList.remove("routine-interrupt-visible");
+    document.body.classList.remove("bath-care-active");
+
+    // 入浴中に待機へ入っていたコールを通常の対応対象へ戻す。
+    if(!activeCall){
+      activateNextCall();
+    }
+    updateCallTray();
+    updateQueueUI();
+    updateRoutineUI();
+    updateCompactHUD();
+
+    setTimeout(()=>{
+      if(careState==="NONE"){
+        careProgress.classList.remove("show");
+      }
+    },900);
+
+    return true;
+  }
+
   routineInterruptButton.addEventListener("click",()=>{
+    if(interruptBathEscort()) return;
     interruptRoutineWork();
   });
 
   function updateRoutineInterruptButton(){
-    const show =
-      timeRunning && routineWorkActive && routineWorkTask &&
-      (routineWorkTask.type==="HYDRATION" || routineWorkTask.type==="LUNCH");
-
     const mealOrHydrationActive =
       timeRunning && routineWorkActive && routineWorkTask &&
       (
@@ -3887,9 +3971,27 @@ try{
         routineWorkTask.type==="LUNCH"
       );
 
+    const bathEscortActive =
+      timeRunning &&
+      careType==="BATH" &&
+      careState==="FOLLOW_TO_CARE" &&
+      careResidentIndex!==null;
+
+    const bathCareActive =
+      timeRunning &&
+      careType==="BATH" &&
+      careState!=="NONE";
+
+    const show = mealOrHydrationActive || bathEscortActive;
+
     document.body.classList.toggle("routine-interrupt-visible", !!show);
     document.body.classList.toggle("meal-or-hydration-active", !!mealOrHydrationActive);
+    document.body.classList.toggle("bath-care-active", !!bathCareActive);
+
     routineInterruptButton.style.display = show ? "inline-block" : "none";
+    if(show){
+      routineInterruptButton.textContent = "中断";
+    }
   }
 
   function updateRoutineWork(dt){
@@ -3904,6 +4006,7 @@ try{
       routineInterruptButton.style.display = "none";
       document.body.classList.remove("routine-interrupt-visible");
       document.body.classList.remove("meal-or-hydration-active");
+      document.body.classList.remove("bath-care-active");
       return;
     }
 
@@ -3928,6 +4031,7 @@ try{
       routineInterruptButton.style.display = "none";
       document.body.classList.remove("routine-interrupt-visible");
       document.body.classList.remove("meal-or-hydration-active");
+      document.body.classList.remove("bath-care-active");
 
       if(!canContinueThroughCalls && routineBlockedByToilet(task)){
         compactTarget.textContent = "排泄介助を優先してください";
@@ -3982,6 +4086,7 @@ try{
       routineInterruptButton.style.display = "none";
       document.body.classList.remove("routine-interrupt-visible");
       document.body.classList.remove("meal-or-hydration-active");
+      document.body.classList.remove("bath-care-active");
 
       // 許容時間帯内なら遅延減点なし
       const withinWindow =
@@ -5202,6 +5307,7 @@ try{
       routineInterruptButton.style.display = "none";
       document.body.classList.remove("routine-interrupt-visible");
       document.body.classList.remove("meal-or-hydration-active");
+      document.body.classList.remove("bath-care-active");
     }else{
       updateRoutineInterruptButton();
     }
@@ -6029,6 +6135,7 @@ try{
     }
 
     updateCallInteraction();
+    updateRoutineInterruptButton();
 
     if(playerMover.state==="IDLE") marker.visible=false;
 
