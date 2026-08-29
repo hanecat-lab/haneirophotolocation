@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-14</title>
+<title>CARE SHIFT - Phase 10-16</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -360,7 +360,7 @@ button{
 <div id="app"></div>
 <div id="hud">
   <div class="title">CARE SHIFT</div>
-  <div class="sub">Phase 10-14 / D定時排泄復旧</div>
+  <div class="sub">Phase 10-16 / ベッド色対応</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -577,7 +577,14 @@ try{
   addBlockingWall(13.5,9.0,0.22,5.2);
   addBlockingWall(9.5,11.6,8.0,0.22);
 
-  const bedMat=new THREE.MeshStandardMaterial({color:0x9aa6ad,roughness:.8});
+  // 利用者の見分けをしやすくするため、各居室のベッド色を服色に対応させる。
+  // 現在の部屋位置順：A / D / C / B
+  const residentBedMats = [
+    new THREE.MeshStandardMaterial({color:0xc7a77a,roughness:.8}), // A
+    new THREE.MeshStandardMaterial({color:0xb08080,roughness:.8}), // D
+    new THREE.MeshStandardMaterial({color:0x8a74a3,roughness:.8}), // C
+    new THREE.MeshStandardMaterial({color:0x6e9d76,roughness:.8})  // B
+  ];
   const furnitureMat=new THREE.MeshStandardMaterial({color:0x8b6e55,roughness:.82});
   const tvMat=new THREE.MeshStandardMaterial({color:0x30353a,roughness:.65});
   const pcMat=new THREE.MeshStandardMaterial({color:0x4a555d,roughness:.7});
@@ -587,8 +594,8 @@ try{
     color:0xb7d2d7,roughness:.8,transparent:true,opacity:.92,side:THREE.DoubleSide
   });
 
-  [-8,0,8,16].forEach(x=>{
-    addBlockingBox(x,0.35,-8.0,2.4,0.6,1.2,bedMat);
+  [-8,0,8,16].forEach((x,index)=>{
+    addBlockingBox(x,0.35,-8.0,2.4,0.6,1.2,residentBedMats[index]);
     addBlockingBox(x+1.8,0.65,-8.8,0.8,1.3,0.8,furnitureMat);
   });
 
@@ -2794,7 +2801,8 @@ try{
     if(
       activeRoutineTask &&
       careState==="NONE" &&
-      !routineWorkActive
+      !routineWorkActive &&
+      !activeCall
     ){
       routineActionButton.style.display = "inline-block";
 
@@ -2830,6 +2838,7 @@ try{
       if(
         preventiveIndex!==null &&
         careState==="NONE" &&
+        !activeCall &&
         !hasToiletCareWaiting()
       ){
         const residentName = residents[preventiveIndex].name;
@@ -2840,6 +2849,12 @@ try{
       }else{
         routineActionButton.style.display = "none";
       }
+    }
+
+    // コール発生中はメイン操作枠をコールへ譲る。
+    // D排泄などの定時業務は未完了のまま保持し、コール終了後に再表示する。
+    if(activeCall && careState==="NONE" && !routineWorkActive){
+      routineActionButton.style.display = "none";
     }
   }
 
@@ -3541,9 +3556,12 @@ try{
     if(!activeCall && careState==="NONE"){
       activeCall = call;
       showActiveCall();
+      updateCompactHUD();
+      updateCallInteraction();
     }else{
       pendingCalls.push(call);
       updateQueueUI();
+      updateCompactHUD();
     }
     return true;
   }
@@ -3772,6 +3790,51 @@ try{
     });
   }
 
+  function routeToActiveCall(){
+    if(!activeCall || careState!=="NONE") return false;
+
+    // 定時業務・入浴声掛け・事前誘導への移動予約を解除して、
+    // 新しいコール対応へ明確に切り替える。
+    if(hasCancelableTravel()){
+      cancelCurrentTravel("コール対応へ切り替えました");
+    }
+
+    const resident = residents[activeCall.residentIndex];
+    const p = resident.object.position;
+
+    const candidates = resident.bedridden
+      ? [
+          new THREE.Vector3(-1.0,0,-6.45),
+          new THREE.Vector3(0.0,0,-5.75),
+          new THREE.Vector3(-1.75,0,-5.85),
+          new THREE.Vector3(1.75,0,-5.85)
+        ]
+      : [
+          new THREE.Vector3(p.x-1.25,0,p.z),
+          new THREE.Vector3(p.x+1.25,0,p.z),
+          new THREE.Vector3(p.x,0,p.z+1.25),
+          new THREE.Vector3(p.x,0,p.z-1.25)
+        ];
+
+    candidates.sort((a,b)=>
+      player.position.distanceToSquared(a) -
+      player.position.distanceToSquared(b)
+    );
+
+    for(const target of candidates){
+      if(isBlockedPoint(target)) continue;
+      if(setRoute(playerMover,target,"CALL_APPROACH")){
+        compactTarget.textContent =
+          resident.name + "の" + callTypeLabel(activeCall.type) + "へ移動中";
+        return true;
+      }
+    }
+
+    compactTarget.textContent =
+      resident.name + "への経路を作れません。位置を変えて再度押してください";
+    return false;
+  }
+
   function updateCallInteraction(){
     if(!activeCall || careState!=="NONE"){
       respondButton.classList.remove("ready");
@@ -3793,14 +3856,18 @@ try{
         )
       : distance <= responseDistance;
 
+    // コールが存在する限り、コンパクトHUDには必ず操作を出す。
+    compactRespondButton.style.display = "inline-block";
+    compactRespondButton.disabled = false;
+
     if(canRespond){
       respondButton.classList.add("ready");
       respondButton.textContent = "対応開始";
-      compactRespondButton.style.display = "inline-block";
       compactRespondButton.textContent = "対応開始";
     }else{
       respondButton.classList.remove("ready");
-      compactRespondButton.style.display = "none";
+      compactRespondButton.textContent =
+        resident.name.replace("利用者","") + "のコールへ";
     }
   }
 
@@ -3896,7 +3963,29 @@ try{
   }
 
   respondButton.addEventListener("click",handleRespondAction);
-  compactRespondButton.addEventListener("click",handleRespondAction);
+  compactRespondButton.addEventListener("click",()=>{
+    if(!activeCall || careState!=="NONE") return;
+
+    const resident = residents[activeCall.residentIndex];
+    const dx = player.position.x - resident.object.position.x;
+    const dz = player.position.z - resident.object.position.z;
+    const distance = Math.hypot(dx,dz);
+
+    const canRespond = resident.bedridden
+      ? (
+          player.position.x >= -2.2 &&
+          player.position.x <= 2.2 &&
+          player.position.z >= -10.0 &&
+          player.position.z <= -5.9
+        )
+      : distance <= responseDistance;
+
+    if(canRespond){
+      handleRespondAction();
+    }else{
+      routeToActiveCall();
+    }
+  });
 
   function formatTime(totalMinutes){
     totalMinutes = Math.floor(totalMinutes) % (24*60);
@@ -4971,10 +5060,10 @@ try{
     applyCameraFocus();
 
     updateHeadCallMarkers();
-    updateCompactHUD();
     updateResidentReactions(dt);
     updateFacilityStatus();
     updateRoutineUI();
+    updateCompactHUD();
     updateBathVoiceTravel(dt);
     updateRoutineTravel(dt);
     updatePreventiveToiletApproach();
@@ -4983,9 +5072,11 @@ try{
     updateDeferredShiftEnd();
     updateScoreUI();
 
-    // 現在対象の優先度・待機時間もリアルタイム更新
+    // 現在対象の優先度・待機時間もリアルタイム更新。
+    // コールUIは最後に再描画して、定時業務UIとの競合を防ぐ。
     if(activeCall && careState==="NONE"){
       showActiveCall();
+      updateCompactHUD();
     }
 
     updateCallInteraction();
