@@ -4053,6 +4053,15 @@
     function startFinaleCountdown() {
       if (currentTheme !== 'party' || finaleUntil > performance.now() || finaleCountdownUntil > performance.now()) return;
       resetAnniversaryMessage();
+      // FINAL DROPは、注水カスケードが並走したまま被さっていた（フィナーレの
+      // GPU負荷に注水レイヤーの毎フレーム同期が上乗せされる構造）。カウントダウン開始と
+      // 同時にシミュレーションを完了状態まで一気に進め、満タンで始まるようにする。
+      // controller.update()は充填が終わるまで有限回で必ずfalseを返すので無限ループしない。
+      if (pour && pour.controller.pouring) {
+        while (pour.controller.update(.5)) { /* 満タン・泡の収束まで進める */ }
+        pour.apply(0);
+        pourApplyAccumulator = 0; pourDirty = false;
+      }
       const startedAt = performance.now();
       const countValues = [3, 2, 1];
       finaleCountdownUntil = startedAt + 3000;
@@ -4426,12 +4435,17 @@
       foamMesh.castShadow = false;
       foamMesh.userData.ownGeometry = true;
       // 口元を囲む丸いコルレット。斜めから見える白い発泡帯を明確にする。
-      const foamCollarGeometry = new THREE.TorusGeometry(.965, .055, 12, detailed ? 96 : 44);
-      const foamCollarAttribute = new THREE.InstancedBufferAttribute(new Float32Array(count), 1);
-      const foamCollarFadeAttribute = new THREE.InstancedBufferAttribute(new Float32Array(count), 1);
-      foamCollarGeometry.setAttribute('aFoam', foamCollarAttribute); foamCollarGeometry.setAttribute('aFoamFade', foamCollarFadeAttribute);
-      const foamCollarMesh = new THREE.InstancedMesh(foamCollarGeometry, materials.foam, count);
-      foamCollarMesh.castShadow = false; foamCollarMesh.userData.ownGeometry = true;
+      // coarsePointer端末の8段以上は、脚1本あたりの重ね描き層を1つ減らすため生成自体を省く。
+      const skipFoamCollar = coarsePointer && levels >= 8;
+      let foamCollarMesh = null, foamCollarAttribute = null, foamCollarFadeAttribute = null;
+      if (!skipFoamCollar) {
+        const foamCollarGeometry = new THREE.TorusGeometry(.965, .055, 12, detailed ? 96 : 44);
+        foamCollarAttribute = new THREE.InstancedBufferAttribute(new Float32Array(count), 1);
+        foamCollarFadeAttribute = new THREE.InstancedBufferAttribute(new Float32Array(count), 1);
+        foamCollarGeometry.setAttribute('aFoam', foamCollarAttribute); foamCollarGeometry.setAttribute('aFoamFade', foamCollarFadeAttribute);
+        foamCollarMesh = new THREE.InstancedMesh(foamCollarGeometry, materials.foam, count);
+        foamCollarMesh.castShadow = false; foamCollarMesh.userData.ownGeometry = true;
+      }
       // 白い泡面の上に重ねる金色の中心露出。aFoamFade の半径を、この実ディスクのスケールへ直結する。
       const revealMesh = new THREE.InstancedMesh(detailed ? geometries.surface : geometries.surfaceLow, materials.foamReveal, count);
       // 中央は泡キャップを物理的に開口するため、この不透明な補助円板は描かない。
@@ -4442,7 +4456,10 @@
 
       // 垂れる流れ。上段の台座は下段4脚の縁に45°ずつの4方向で接しているので、
       // そこを伝った液がそのまま下段のグラスへ落ちる。少しばらつかせて整列感を消す。
-      const RIVULETS = 4;
+      // 実機プロファイリング(iPhone Safari)で高段数フィナーレ中の1フレーム約400msの
+      // オーバードローを確認した。coarsePointer端末の8段以上だけ、伝う液膜の
+      // サブインスタンス数を半分に間引く。7段以下・PCは4本のまま完全に不変。
+      const RIVULETS = (coarsePointer && levels >= 8) ? 2 : 4;
       const rivuletSource = currentGlassShape === 'flute'
         ? (detailed ? geometries.rivuletFlute : geometries.rivuletLowFlute)
         : (detailed ? geometries.rivulet : geometries.rivuletLow);
@@ -4475,7 +4492,8 @@
         }
       });
       rivulets.instanceMatrix.needsUpdate = true;
-      tower.add(body, surface, meniscus, foamMesh, foamCollarMesh, revealMesh, rivulets);
+      tower.add(body, surface, meniscus, foamMesh, revealMesh, rivulets);
+      if (foamCollarMesh) tower.add(foamCollarMesh);
 
       const flat = new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0));
       const upright = new THREE.Quaternion(); // 立体泡キャップは Y 軸を高さに使うため回転不要。
@@ -4522,11 +4540,13 @@
             matrix.compose(position, upright, scale.set(radius, radius, radius));
             foamMesh.setMatrixAt(index, matrix);
             // 外周の丸い白いコルレットは、横からでも泡だと読める厚みを作る。
-            foamCollarAttribute.array[index] = controller.foam[index];
-            foamCollarFadeAttribute.array[index] = controller.foamFade[index];
-            position.y = foamBaseY + radius * .058;
-            matrix.compose(position, flat, scale.set(radius, radius, radius));
-            foamCollarMesh.setMatrixAt(index, matrix);
+            if (foamCollarMesh) {
+              foamCollarAttribute.array[index] = controller.foam[index];
+              foamCollarFadeAttribute.array[index] = controller.foamFade[index];
+              position.y = foamBaseY + radius * .058;
+              matrix.compose(position, flat, scale.set(radius, radius, radius));
+              foamCollarMesh.setMatrixAt(index, matrix);
+            }
             // 中心の金色露出円は泡キャップ頂点の少し上へ置く。
             const revealRatio = THREE.MathUtils.clamp(controller.foamFade[index] / 1.04, 0, 1.06);
             position.y = foamBaseY + radius * .092;
@@ -4568,8 +4588,10 @@
           meniscusAttribute.needsUpdate = true;
           meniscus.instanceMatrix.needsUpdate = true;
           foamMesh.instanceMatrix.needsUpdate = true;
-          foamCollarAttribute.needsUpdate = true; foamCollarFadeAttribute.needsUpdate = true;
-          foamCollarMesh.instanceMatrix.needsUpdate = true;
+          if (foamCollarMesh) {
+            foamCollarAttribute.needsUpdate = true; foamCollarFadeAttribute.needsUpdate = true;
+            foamCollarMesh.instanceMatrix.needsUpdate = true;
+          }
           revealMesh.instanceMatrix.needsUpdate = true;
           scale.set(1, 1, 1);
           if (points) {
