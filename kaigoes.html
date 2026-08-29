@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-38</title>
+<title>CARE SHIFT - Phase 10-39</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -651,7 +651,7 @@ button{
 <div id="hud">
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
-  <div class="sub">Phase 10-38 / 水分・食事の段階コメント</div>
+  <div class="sub">Phase 10-39 / 未対応コール自動減点・45/25/10分コメント</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="callTray" aria-live="polite"></div>
@@ -2703,6 +2703,60 @@ try{
     ).join("");
   }
 
+  function callTargetPenalty(call,wait){
+    if(!call) return 0;
+
+    if(call.type==="POSITION"){
+      if(wait < 35) return 0;
+      if(wait < 50) return -2;
+      if(wait < 70) return -5;
+      return -8;
+    }
+
+    if(wait < 25) return 0;
+    if(wait < 35) return -2;
+    if(wait < 50) return -5;
+    if(wait < 90) return -10;
+    if(wait < 120) return -20;
+    return -30;
+  }
+
+  function updateOpenCallAutoPenalties(){
+    const calls=[];
+    if(activeCall) calls.push(activeCall);
+    pendingCalls.forEach(call=>calls.push(call));
+
+    calls.forEach(call=>{
+      // 対応開始後は、それ以上の待機減点を進めない。
+      if(call.respondedAt!==null) return;
+
+      const wait=Math.max(0,gameMinutes-call.startedAt);
+      const targetPenalty=callTargetPenalty(call,wait);
+      const applied=call.autoPenaltyApplied || 0;
+
+      // targetPenalty は累積値。新たに閾値を越えた分だけ差額を減点する。
+      if(targetPenalty < applied){
+        const delta=targetPenalty-applied;
+        call.autoPenaltyApplied=targetPenalty;
+        shiftScore=Math.max(0,Math.min(100,shiftScore+delta));
+
+        lastEvaluationText=
+          residents[call.residentIndex].name+" "+
+          callTypeLabel(call.type)+" / 待機 "+
+          Math.floor(wait)+"分 / 自動 "+delta+"点";
+
+        logDecision("CALL_AUTO_PENALTY",{
+          callId:call.id,
+          resident:residents[call.residentIndex].name,
+          callLabel:callTypeLabel(call.type),
+          wait,
+          delta,
+          totalPenalty:targetPenalty
+        });
+      }
+    });
+  }
+
   function evaluateResponse(call){
     const wait = Math.max(0, gameMinutes - call.startedAt);
 
@@ -2754,7 +2808,17 @@ try{
       }
     }
 
-    shiftScore = Math.max(0, Math.min(100, shiftScore + delta));
+    // 待機中に自動減点された分は二重に引かない。
+    // 迅速対応の加点、またはまだ反映されていない差額だけをここで反映する。
+    const alreadyApplied = call.autoPenaltyApplied || 0;
+    const remainingDelta = delta - alreadyApplied;
+
+    if(remainingDelta!==0){
+      shiftScore = Math.max(0, Math.min(100, shiftScore + remainingDelta));
+    }
+
+    call.autoPenaltyApplied = Math.min(alreadyApplied, delta);
+
     completedCareCount++;
     totalWaitMinutes += wait;
     maxWaitMinutes = Math.max(maxWaitMinutes, wait);
@@ -2763,7 +2827,7 @@ try{
     lastEvaluationText =
       residents[call.residentIndex].name + " " +
       callTypeLabel(call.type) + " / " +
-      label + " / 待機 " + Math.floor(wait) + "分 / " +
+      label + " / 待機 " + Math.floor(wait) + "分 / 評価 " +
       (delta >= 0 ? "+" : "") + delta + "点";
 
     logDecision("CALL_EVALUATED",{
@@ -2863,14 +2927,14 @@ try{
     // 実施中本人には催促コメントを出さない。
     if(routineWorkActive && routineWorkTask===task) return;
 
-    // 実施時間内だけ。残り30→20→10分で一度ずつ発言する。
+    // 実施時間内だけ。残り45→25→10分で一度ずつ発言する。
     if(gameMinutes < task.due || gameMinutes > task.windowEnd) return;
 
     const remaining = task.windowEnd - gameMinutes;
     let stage = 0;
     if(remaining <= 10) stage = 3;
-    else if(remaining <= 20) stage = 2;
-    else if(remaining <= 30) stage = 1;
+    else if(remaining <= 25) stage = 2;
+    else if(remaining <= 45) stage = 1;
 
     if(stage===0) return;
 
@@ -2910,7 +2974,7 @@ try{
           let text = "";
 
           if(task.type==="HYDRATION" || task.type==="LUNCH"){
-            // 水分・食事は残り30/20/10分の段階コメントへ統合。
+            // 水分・食事は残り45/25/10分の段階コメントへ統合。
             text = "";
           }else if(task.type==="BED_TOILET"){
             text = "お願いします";
@@ -5000,7 +5064,9 @@ try{
       reason,
       type,
       priority: priorityFor(type),
-      startedAt: gameMinutes
+      startedAt: gameMinutes,
+      respondedAt: null,
+      autoPenaltyApplied: 0
     };
 
     // 同じ利用者のコール重複は避ける
@@ -5331,8 +5397,11 @@ try{
 
     if(!canRespond) return;
 
+    // ここから先は「未対応待機」ではないため、自動減点を止める。
+    activeCall.respondedAt = gameMinutes;
+
     // 待機時間の評価は介助完了時ではなく「対応開始」を押した瞬間に確定する。
-    // これにより上部の現在点へ即時反映される。
+    // すでに自動減点済みの分は evaluateResponse 内で差し引く。
     evaluateResponse(activeCall);
     updateScoreUI();
 
@@ -6512,6 +6581,11 @@ try{
         clearNurseCall({advance:false});
         updateQueueUI();
       }
+
+      // 未対応コールは、対応しなくても待機時間に応じて自動で減点。
+      // 終了処理より先に実行し、15:00時点の放置も最終得点へ残す。
+      updateOpenCallAutoPenalties();
+
       evaluateSchedule();
       updateClockUI();
       updateQueueUI();
