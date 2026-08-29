@@ -5314,11 +5314,23 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       const radius = Math.max(towerRadius, spectacleRadius);
       const halfV = THREE.MathUtils.degToRad(camera.fov) / 2, halfH = Math.atan(Math.tan(halfV) * camera.aspect);
       const distanceFor = frameHeight => Math.hypot(frameHeight * .5, radius) / Math.sin(Math.min(halfV, halfH)) * (pineCoronation ? 1.24 : 1.16);
-      const orbit = (azimuth, elevation, distanceScale = 1, targetY = stageFrameHeight * .5, frameHeight = stageFrameHeight) => {
-        const wideDistance = distanceFor(frameHeight);
+      // spinRateを渡すと、このショットが目的地に到達したあとの保持中もその場で静止せず、
+      // 同じ高さ・距離のまま毎秒spinRate[rad]でゆっくり旋回し続ける(次のショットに切り替わるまで)。
+      const orbit = (azimuth, elevation, distanceScale = 1, targetY = stageFrameHeight * .5, frameHeight = stageFrameHeight, spinRate = 0) => {
+        const distance = distanceFor(frameHeight) * distanceScale;
         return {
-        destination: new THREE.Vector3(Math.sin(azimuth) * Math.cos(elevation) * wideDistance * distanceScale, targetY + Math.sin(elevation) * wideDistance * distanceScale, Math.cos(azimuth) * Math.cos(elevation) * wideDistance * distanceScale),
+        destination: new THREE.Vector3(Math.sin(azimuth) * Math.cos(elevation) * distance, targetY + Math.sin(elevation) * distance, Math.cos(azimuth) * Math.cos(elevation) * distance),
         target: new THREE.Vector3(0, targetY, 0),
+        spin: spinRate ? { azimuth, elevation, targetY, distance, rate: spinRate } : null,
+        };
+      };
+      // 真上に近い俯瞰。段の広がりと花火の放射状の広がりを一枚で見せる。
+      // lookAtの特異点(カメラが注視点の真上に来る)を避けるため、完全な90°は避ける。
+      const overhead = (azimuth = .4, distanceScale = 1, targetY = towerHeight * .5) => {
+        const distance = Math.max(radius * 2.6, distanceFor(radius * 2)) * distanceScale, elevation = 1.40;
+        return {
+          destination: new THREE.Vector3(Math.sin(azimuth) * Math.cos(elevation) * distance, targetY + Math.sin(elevation) * distance, Math.cos(azimuth) * Math.cos(elevation) * distance),
+          target: new THREE.Vector3(0, targetY, 0),
         };
       };
       const low = (azimuth, distanceScale = 1) => {
@@ -5343,24 +5355,66 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         const safeTargetY = mobileFrame ? Math.min(targetY, safeFrameHeight * .52) : targetY;
         return { destination: new THREE.Vector3(Math.sin(azimuth) * fittedDistance, Math.max(.18, towerHeight * cameraYRatio), Math.cos(azimuth) * fittedDistance), target: new THREE.Vector3(0, safeTargetY, 0) };
       };
+      // FINAL DROP起動のたびに0/1どちらかの構図パターンが抽選される(startFinaleCameraTour参照)。
+      const variant = finaleCameraTour.variant || 0;
       const shots = pineCoronation
-        ? getPineAutoCameraShots({ orbit, low, lookUp, nearLookUp, wideLookUp, towerHeight, stageFrameHeight, skyFrameHeight })
-        : [
+        ? getPineAutoCameraShots({ orbit, low, lookUp, nearLookUp, wideLookUp, overhead, towerHeight, stageFrameHeight, skyFrameHeight, variant })
+        : (variant === 0 ? [
           { ...orbit(.62, .38, 1.02), at: 0 },
           { ...low(-.14, 1.04), at: 4300 },
           { ...low(1.58, 1.04), at: 8600 },
-          { ...orbit(2.48, .50, .92, stageFrameHeight * .55), at: 12900 },
-          { ...orbit(-.78, .66, 1.07, stageFrameHeight * .60), at: 17200 },
-          { ...low(.72, .96), at: 21500 },
-          { ...orbit(.62, .42, 1.02), at: 25800 },
-        ];
+          // 段の重なりと足元の並びを真上から見せる、俯瞰の一枚。
+          { ...overhead(.35, 1.05, stageFrameHeight * .30), at: 11700 },
+          { ...orbit(2.48, .50, .92, stageFrameHeight * .55, undefined, .10), at: 15200 },
+          { ...orbit(-.78, .66, 1.07, stageFrameHeight * .60), at: 19500 },
+          { ...low(.72, .96), at: 23800 },
+          { ...orbit(.62, .42, 1.02), at: 27600 },
+        ] : [
+          { ...overhead(.50, 1.05, stageFrameHeight * .32), at: 0 },
+          { ...orbit(-.90, .40, 1.00, stageFrameHeight * .50, undefined, .12), at: 4300 },
+          { ...low(1.35, 1.02), at: 8600 },
+          { ...orbit(2.10, .58, 1.10, stageFrameHeight * .60), at: 11700 },
+          { ...overhead(-1.60, 1.15, stageFrameHeight * .40), at: 15200 },
+          { ...low(-.45, .98), at: 19500 },
+          { ...orbit(.85, .46, 1.05, stageFrameHeight * .55, undefined, .09), at: 23800 },
+          { ...overhead(2.60, 1.20, stageFrameHeight * .35), at: 27600 },
+        ]);
       cachedFinaleCameraShotsGeneration = finaleCameraTour.generation;
       return cachedFinaleCameraShots = shots;
     }
 
     // PINEの45秒構成に同期する専用AUTO。前半の打ち上げを追い、下段→中段→上段の連続発火で高度を上げ、
-    // 最後の全段同時発火は広角の5.2秒カーテンコールで保持する。
-    function getPineAutoCameraShots({ orbit, low, lookUp, nearLookUp, wideLookUp, towerHeight, stageFrameHeight, skyFrameHeight }) {
+    // 最後の全段同時発火は広角の5.2秒カーテンコールで保持する。カーテンコール(27600ms以降)は
+    // どちらの構図パターンでも共通(finaleTail)で、フィナーレの見せ場のフレーミングは常に安定させる。
+    // variantで変わるのは0〜23800msの前半だけ。
+    function getPineAutoCameraShots({ orbit, low, lookUp, nearLookUp, wideLookUp, overhead, towerHeight, stageFrameHeight, skyFrameHeight, variant }) {
+      const finaleTail = [
+        { ...wideLookUp(-.36, 1.00, towerHeight * .34, .03), at: 27600, duration: 900 },
+        { ...wideLookUp(2.50, 1.03, towerHeight * .43, .08), at: 30000, duration: 1320 },
+        { ...wideLookUp(-.78, 1.06, towerHeight * .56, .14), at: 31500, duration: 1320 },
+        { ...wideLookUp(.34, 1.09, towerHeight * .70, .20), at: 33000, duration: 1320 },
+        { ...wideLookUp(1.18, 1.12, skyFrameHeight * .52, .27), at: 34500, duration: 1320 },
+        { ...wideLookUp(-.46, 1.15, skyFrameHeight * .64, .34), at: 36000, duration: 1320 },
+        { ...wideLookUp(.96, 1.18, skyFrameHeight * .76, .42), at: 37500, duration: 1320 },
+        // 終幕は前の広角距離へ戻し、タワーの存在感を保ちながら最終大玉を収める。
+        { ...wideLookUp(.66, 1.26, skyFrameHeight * .84, .47, skyFrameHeight * 1.16), at: 39700, duration: 5200 },
+      ];
+      if (variant === 1) return [
+        // variant1: 俯瞰と旋回ホールドを多く使う構図パターン。開幕から俯瞰で全体を見せる。
+        { ...overhead(.20, 1.05, stageFrameHeight * .35), at: 0, duration: 700 },
+        { ...low(1.10, 1.00), at: 2500, duration: 700 },
+        { ...orbit(-.40, .42, 1.05, stageFrameHeight * .55, undefined, .11), at: 5100, duration: 900 },
+        { ...nearLookUp(2.10, .96, towerHeight * .62, .05), at: 7600, duration: 1000 },
+        { ...overhead(-.85, 1.10, stageFrameHeight * .45), at: 9600, duration: 1050 },
+        { ...nearLookUp(-.30, 1.00, towerHeight * .70, .08), at: 11600, duration: 1050 },
+        { ...orbit(1.55, .50, 1.15, skyFrameHeight * .55, skyFrameHeight, .09), at: 13600, duration: 1150 },
+        { ...nearLookUp(1.05, 1.02, skyFrameHeight * .48, .13), at: 16200, duration: 1100 },
+        { ...overhead(2.30, 1.20, stageFrameHeight * .50), at: 18300, duration: 1150 },
+        { ...nearLookUp(-1.55, .98, skyFrameHeight * .44, .16), at: 20400, duration: 1050 },
+        { ...orbit(1.10, .48, 1.10, skyFrameHeight * .50, skyFrameHeight, .10), at: 22200, duration: 1000 },
+        { ...low(-.55, .96), at: 23800, duration: 900 },
+        ...finaleTail,
+      ];
       return [
         { ...orbit(.62, .37, 1.00, stageFrameHeight * .51), at: 0, duration: 620 },
         { ...low(-.20, 1.02), at: 2300, duration: 660 },
@@ -5373,17 +5427,11 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         { ...orbit(-.68, .48, 1.18, skyFrameHeight * .53, skyFrameHeight), at: 14200, duration: 1380 },
         { ...nearLookUp(.42, .96, towerHeight * .72, .10), at: 15300, duration: 1260 },
         { ...nearLookUp(-1.18, 1.00, skyFrameHeight * .50, .15), at: 17200, duration: 1320 },
-        { ...orbit(1.04, .54, 1.20, skyFrameHeight * .58, skyFrameHeight), at: 19400, duration: 1420 },
-        { ...orbit(.62, .46, 1.16, skyFrameHeight * .56, skyFrameHeight), at: 23800, duration: 1180 },
-        { ...wideLookUp(-.36, 1.00, towerHeight * .34, .03), at: 27600, duration: 900 },
-        { ...wideLookUp(2.50, 1.03, towerHeight * .43, .08), at: 30000, duration: 1320 },
-        { ...wideLookUp(-.78, 1.06, towerHeight * .56, .14), at: 31500, duration: 1320 },
-        { ...wideLookUp(.34, 1.09, towerHeight * .70, .20), at: 33000, duration: 1320 },
-        { ...wideLookUp(1.18, 1.12, skyFrameHeight * .52, .27), at: 34500, duration: 1320 },
-        { ...wideLookUp(-.46, 1.15, skyFrameHeight * .64, .34), at: 36000, duration: 1320 },
-        { ...wideLookUp(.96, 1.18, skyFrameHeight * .76, .42), at: 37500, duration: 1320 },
-        // 終幕は前の広角距離へ戻し、タワーの存在感を保ちながら最終大玉を収める。
-        { ...wideLookUp(.66, 1.26, skyFrameHeight * .84, .47, skyFrameHeight * 1.16), at: 39700, duration: 5200 },
+        // 3つのクラッカー山場が終わったところで一度、段の重なりと花火の放射状の広がりを真上から見せる。
+        { ...overhead(1.04, 1.15, stageFrameHeight * .40), at: 19400, duration: 1420 },
+        // 最終カーテンコール前の最後の引き。到達後は静止させず、ゆっくり旋回を続けて間を持たせる。
+        { ...orbit(.62, .46, 1.16, skyFrameHeight * .56, skyFrameHeight, .09), at: 23800, duration: 1180 },
+        ...finaleTail,
       ];
     }
 
@@ -5400,7 +5448,9 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       controls.enabled = false; controls.enableDamping = false; controls.autoRotate = false;
       controls.minPolarAngle = .4; controls.maxPolarAngle = Math.PI * .495;
       syncCameraAngleUI();
-      finaleCameraTour = { active: true, startedAt: performance.now(), shotIndex: -1, generation: finaleCameraTour.generation + 1, motion: null, controlsState, lastAppliedAt: 0 };
+      // ツアーの構図パターンをFINAL DROP起動のたびに抽選する。既存パターンと新パターンを
+      // 半々で切り替え、毎回同じ画角にならないようにする。
+      finaleCameraTour = { active: true, startedAt: performance.now(), shotIndex: -1, generation: finaleCameraTour.generation + 1, motion: null, controlsState, lastAppliedAt: 0, variant: Math.random() < .5 ? 0 : 1 };
       updateFinaleCameraTour();
     }
 
@@ -5432,17 +5482,26 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         const shot = shots[shotIndex], nextShot = shots[shotIndex + 1], baseDuration = shot.duration || (shotIndex === 0 ? 760 : 940), duration = mobilePineTour && nextShot ? Math.min(2380, Math.max(760, nextShot.at - shot.at - 120)) : baseDuration, now = performance.now();
         cameraTransitionUntil = now + duration;
         pulsePrismFlash(.34 + shotIndex * .035);
-        finaleCameraTour.motion = { start: camera.position.clone(), startTarget: controls.target.clone(), destination: shot.destination.clone(), target: shot.target.clone(), startedAt: now, duration };
+        finaleCameraTour.motion = { start: camera.position.clone(), startTarget: controls.target.clone(), destination: shot.destination.clone(), target: shot.target.clone(), startedAt: now, duration, spin: shot.spin || null };
       }
       const motion = finaleCameraTour.motion;
       if (!motion) return;
-      const progress = Math.min(1, Math.max(0, (performance.now() - motion.startedAt) / motion.duration)), eased = progress < .5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
-      camera.position.lerpVectors(motion.start, motion.destination, eased);
-      controls.target.lerpVectors(motion.startTarget, motion.target, eased);
+      const now2 = performance.now(), progress = Math.min(1, Math.max(0, (now2 - motion.startedAt) / motion.duration)), eased = progress < .5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+      if (progress < 1) {
+        camera.position.lerpVectors(motion.start, motion.destination, eased);
+        controls.target.lerpVectors(motion.startTarget, motion.target, eased);
+      } else if (motion.spin) {
+        // 到達後も保持中(次のショットが始まるまで)は静止させず、ゆっくり旋回を続ける。
+        const heldSeconds = (now2 - motion.startedAt - motion.duration) / 1000, spin = motion.spin, azimuth = spin.azimuth + spin.rate * heldSeconds;
+        camera.position.set(Math.sin(azimuth) * Math.cos(spin.elevation) * spin.distance, spin.targetY + Math.sin(spin.elevation) * spin.distance, Math.cos(azimuth) * Math.cos(spin.elevation) * spin.distance);
+        controls.target.set(0, spin.targetY, 0);
+      } else {
+        camera.position.copy(motion.destination);
+        controls.target.copy(motion.target);
+      }
       // OrbitControlsの内部状態に依存せず、描画直前の姿勢を明示的に反映する。
       camera.lookAt(controls.target);
       finaleCameraTour.lastAppliedAt = performance.now();
-      if (progress >= 1) finaleCameraTour.motion = null;
     }
 
     // 同じボタンを続けて押しても古い終了タイマーが新しい演出を消さないよう、再生世代を持たせる。
