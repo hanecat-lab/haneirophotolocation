@@ -98,6 +98,9 @@
     .theme-card b { position: relative; z-index: 1; display: block; font: 400 13px Georgia, "Times New Roman", serif; }
     .theme-card small { position: relative; z-index: 1; display: block; margin-top: 4px; color: #aca094; font-size: 9px; line-height: 1.35; }
     /* Magic Dressing専用。背景テーマを変えず、3D空間内に浮く装飾だけを着替えさせる。 */
+    #magic-change-button { width: 100%; margin-top: 8px; padding: 9px 10px; border: 1px solid color-mix(in srgb, #f0c9da 42%, transparent); border-radius: 10px; color: #f7e9f2; font: 400 11px/1 Georgia, "Times New Roman", serif; letter-spacing: .10em; background: linear-gradient(135deg, rgba(240,201,218,.16), rgba(186,228,237,.12)); cursor: pointer; transition: transform .18s ease, border-color .18s ease, background .18s ease; }
+    #magic-change-button:hover:not(:disabled) { transform: translateY(-1px); border-color: rgba(255,241,250,.55); }
+    #magic-change-button:disabled { opacity: .55; cursor: default; }
     #dressing-panel { display: none; }
     #dressing-panel.active { display: block; }
     .dressing-intro { margin: -1px 0 8px; color: #a99cae; font-size: 9px; line-height: 1.45; }
@@ -402,6 +405,7 @@
             <button type="button" class="dressing-card" data-dressing="bubble" data-mark="◌" style="--dress:#bae4ed"><b>Sugar Bubbles</b><small>冷たい砂糖菓子の泡</small></button>
             <button type="button" class="dressing-card" data-dressing="sakura" data-mark="✿" style="--dress:#f2b8c5"><b>Blush Petals</b><small>桜の花が乾杯の余韻に舞う</small></button>
           </div>
+          <button type="button" id="magic-change-button">MAGIC CHANGE を起動</button>
         </section>
         <div class="control-row">
           <div><div class="control-label">夜桜ライトアップ</div><div class="control-caption">すべての空間へ背景・環境光・床反射を重ねる</div></div>
@@ -530,6 +534,7 @@
     const themeButtons = [...document.querySelectorAll('[data-theme]')];
     const dressingPanel = document.getElementById('dressing-panel');
     const dressingButtons = [...document.querySelectorAll('[data-dressing]')];
+    const magicChangeButton = document.getElementById('magic-change-button');
     const ambienceButtons = [...document.querySelectorAll('[data-ambience]')];
     const nightSakuraEnabledInput = document.getElementById('night-sakura-enabled');
     const pourButton = document.getElementById('pour-button');
@@ -649,6 +654,9 @@
     syncMirrorHeightUI();
     syncLaserSpeedUI();
     let finaleUntil = 0, finaleCountdownUntil = 0, finaleGradeKey = '', lastPartyHudCopy = '';
+    // syncDressingUI() は初期化中(setDressing の定義より前)に呼ばれるため、
+    // ここで早期に宣言しないと起動時にTDZで落ちる。このファイルで既知の罠。
+    let magicChangeUntil = 0;
     // createPartyOverdrive()内の品質適応ティア(0/1/2)。anniversaryHeartLimit等が
     // 暗転後の演出で毎フレーム参照するため、createPartyOverdrive()のローカル変数ではなく
     // ここで早期(TDZ回避)に共有スコープで宣言する。
@@ -4527,6 +4535,8 @@
       const musicParticleResponse = Math.max(response, musicVisualBeatPulse * musicVisual.particle * activeQualityProfile().musicGain);
       if (tower && tower.userData && tower.userData.celebration) tower.userData.celebration.update(delta, musicParticleResponse);
       updateSakuraGlassFinish(delta, response);
+      // MAGIC CHANGE の終了。尺を過ぎたら元の装飾とBGMへ戻す。
+      if (magicChangeUntil && performance.now() >= magicChangeUntil) stopMagicChange(true);
     }
 
     // 桜が選ばれている間だけ、霞桜の色をガラスの透過色・液面・リムのハイライトへ薄く反射させる。
@@ -4606,10 +4616,39 @@
       dressingButtons.forEach(button => button.classList.toggle('active', button.dataset.dressing === currentDressing));
       ambienceButtons.forEach(button => button.classList.toggle('active', button.dataset.ambience === currentAmbience));
       nightSakuraEnabledInput.checked = nightSakuraEnabled;
+      const running = magicChangeUntil > performance.now();
+      magicChangeButton.disabled = running;
+      magicChangeButton.textContent = running ? 'MAGIC CHANGE 実行中' : 'MAGIC CHANGE を起動';
     }
 
+    // Magic Dressing の見せ場。30秒3幕（ハート → 泡 → 桜の解放 → 3つ同時）。
+    // party の FINAL DROP とは別系統で、ミラーボール・レーザー・花火は一切使わない。
+    const MAGIC_CHANGE_MS = 33000;
+    async function startMagicChange() {
+      if (currentTheme !== 'dressing' || magicChangeUntil > performance.now()) return;
+      const celebration = tower?.userData?.celebration;
+      if (!celebration?.startMagicChange) return;
+      magicChangeUntil = performance.now() + MAGIC_CHANGE_MS;
+      celebration.startMagicChange();
+      themePulse = 1;
+      pulsePrismFlash(.62);
+      syncDressingUI();
+      const becameAudible = await soundEngine.autostart();
+      if (becameAudible || soundEngine.enabled) refreshAudioUI();
+      // フィナーレBGMはテーマ非依存に作ってあるので、そのまま使える。
+      soundEngine.startFinale(MAGIC_CHANGE_MS);
+    }
+    function stopMagicChange(resumeMusic = true) {
+      if (!magicChangeUntil) return;
+      magicChangeUntil = 0;
+      tower?.userData?.celebration?.stopMagicChange?.();
+      soundEngine.stopFinale({ resume: resumeMusic });
+      syncDressingUI();
+    }
     function setDressing(nextDressing) {
       if (!DRESSINGS[nextDressing]) return;
+      // 演出中に装飾を切り替えられたら、幕の進行と食い違うので演出を終わらせる。
+      if (magicChangeUntil) stopMagicChange(true);
       currentDressing = nextDressing;
       try { localStorage.setItem(DRESSING_KEY, currentDressing); } catch (error) { /* 保存不可時も切替 */ }
       syncDressingUI();
@@ -4622,6 +4661,8 @@
     function setTheme(nextTheme) {
       if (!THEMES[nextTheme] || nextTheme === currentTheme) return;
       if (nextTheme !== 'party') resetAnniversaryMessage();
+      // Magic Dressing を離れるときは見せ場を止め、BGMを元へ戻す。
+      if (currentTheme === 'dressing' && magicChangeUntil) stopMagicChange(true);
       currentTheme = nextTheme;
       if (currentTheme === 'party') { overdriveLevel = 1; try { localStorage.removeItem(OVERDRIVE_KEY); } catch (error) { /* 保存不可時も開始値を優先 */ } }
       try { localStorage.setItem(THEME_KEY, currentTheme); } catch (error) { /* 保存不可時も表示は切替 */ }
@@ -5538,7 +5579,16 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         ripple.userData.startRadius = from; ripple.userData.endRadius = to;
         ripple.visible = true; return true;
       };
-      group.add(particles, ...petalLayers, ...groundPetalLayers, towerPetals);
+      // ハートと泡は1つのPointsとマテリアルを共有していて、mapを差し替える構造のため
+      // 同時に出せない。MAGIC CHANGE の終幕で3装飾を並べるためだけに、2枚目のPointsを持つ。
+      // 実測で +2 drawcall / 170粒。桜の +15 drawcall に対して無視できる。
+      const altPositions = new Float32Array(count * 3);
+      const altGeometry = new THREE.BufferGeometry();
+      altGeometry.setAttribute('position', new THREE.BufferAttribute(altPositions, 3));
+      const altMaterial = new THREE.PointsMaterial({ color: 0xc8ecf2, size: .072, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true });
+      const particlesAlt = new THREE.Points(altGeometry, altMaterial);
+      particlesAlt.userData.ownGeometry = true; particlesAlt.userData.ownMaterial = true; particlesAlt.visible = false;
+      group.add(particles, particlesAlt, ...petalLayers, ...groundPetalLayers, towerPetals);
       // 桜の群れの近傍だけを淡く持ち上げる小さな光。タワー全体を照らさず、花びらの余韻を作る。
       const petalGlow = new THREE.PointLight(0xffbdd6, 0, Math.max(4.2, radius * 2.25), 2);
       petalGlow.castShadow = false; petalGlow.position.set(0, towerHeight * .54, 0); group.add(petalGlow);
@@ -5573,6 +5623,54 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         setLod(lodLevel < 0 ? 0 : lodLevel);
       };
       const setEnabled = enabled => { localEnabled = enabled; if (enabled) group.visible = true; };
+      // ── MAGIC CHANGE（Magic Dressing の見せ場・30秒3幕） ────────────────
+      // 序 → ハート → 泡 → 桜(積もった花びらの解放) → 3つが同時に舞う終幕。
+      // 幕の切替は setDressing() を呼ばず、各レイヤーの不透明度を重ねて遷移させる。
+      // マテリアルの差し替えを起こさないので再コンパイルもちらつきも発生しない。
+      let magicChange = null;
+      const MAGIC_ACTS = { lead: 3, heart: 11, bubble: 19, sakura: 29, all: 33 };
+      const startMagicChange = () => {
+        magicChange = { time: 0, release: 0 };
+        // ハート・泡を選んでいると settlement は 0.11/秒 で減衰し切っている。
+        // 第3幕が空振りしないよう、解放するぶんの花びらを最低限まで押し上げる。
+        sakuraSettlement = Math.max(sakuraSettlement, .60);
+      };
+      const stopMagicChange = () => { magicChange = null; };
+      const magicChangeActive = () => !!magicChange;
+      // 各装飾の混ざり具合を時刻から決める。合計が1になる必要はない（終幕は3つとも1に近い）。
+      const magicChangeMix = time => {
+        const ramp = (from, to, t) => THREE.MathUtils.clamp((t - from) / (to - from), 0, 1);
+        const A = MAGIC_ACTS;
+        if (time < A.lead) { const t = ramp(0, A.lead, time); return { heart: t * .35, bubble: 0, sakura: 0, release: 0 }; }
+        // 幕はクロスフェードで重ねる。前の幕が消え切る前に次が立ち上がる。
+        const heart = time < A.heart ? 1 : (time < A.bubble ? 1 - ramp(A.heart, A.heart + 2.5, time) * .75 : .25 + ramp(A.sakura, A.all, time) * .75);
+        const bubble = time < A.heart ? 0 : (time < A.sakura ? ramp(A.heart, A.heart + 2.0, time) : Math.max(.65, 1 - ramp(A.sakura - 1.5, A.sakura + 1.5, time) * .35) );
+        const sakura = time < A.bubble ? 0 : ramp(A.bubble, A.bubble + 2.2, time);
+        const release = time < A.sakura - 6 ? 0 : ramp(A.sakura - 6, A.all, time);
+        return { heart, bubble, sakura, release };
+      };
+      const releaseMatrix = new THREE.Matrix4(), releaseQuaternion = new THREE.Quaternion();
+      const releaseScale = new THREE.Vector3(), releaseEuler = new THREE.Euler(), releasePos = new THREE.Vector3();
+      // 積もった花びらを上向きの螺旋へ舞い上げる。花びらごとに高さと回転をばらけさせる。
+      const composeReleased = (mesh, data, visibleCount, release, heightSpan) => {
+        const eased = release * release * (3 - 2 * release);
+        for (let i = 0; i < visibleCount; i++) {
+          const base = data.positions[i], spin = data.rotations[i], scaleValue = data.scales[i];
+          // rotations は 0〜2π の既存の乱数。これを個体差の種として使い回す。
+          const variance = spin / (Math.PI * 2);
+          const lift = eased * heightSpan * (.45 + variance * 1.05);
+          const swirl = eased * (1.9 + variance * 2.6);
+          const baseAngle = Math.atan2(base.z, base.x), baseRadius = Math.hypot(base.x, base.z);
+          const radial = baseRadius * (1 + eased * (.18 + variance * .40));
+          const angle = baseAngle + swirl;
+          releasePos.set(Math.cos(angle) * radial, base.y + lift, Math.sin(angle) * radial);
+          // 寝ている花びら(-π/2)から、舞い上がるにつれて立ち上がる。
+          releaseEuler.set(-Math.PI / 2 + eased * (1.1 + variance * .9), spin + swirl * 1.7, eased * variance * 2.2);
+          releaseMatrix.compose(releasePos, releaseQuaternion.setFromEuler(releaseEuler), releaseScale.setScalar(scaleValue));
+          mesh.setMatrixAt(i, releaseMatrix);
+        }
+        mesh.instanceMatrix.needsUpdate = true;
+      };
       const update = (delta, response) => {
         const fadeTarget = localEnabled ? 1 : 0;
         fade += (fadeTarget - fade) * Math.min(1, delta * 2.8);
@@ -5580,8 +5678,14 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         if (!fade) { group.visible = false; return; }
         group.visible = true;
         const relayActive = updateRelayEffects(delta);
+        if (magicChange) magicChange.time += delta;
+        const mcMix = magicChange ? magicChangeMix(magicChange.time) : null;
         const motion = activeDressing()?.motion || 'orbit';
-        const isSakura = motion === 'sakura';
+        // MAGIC CHANGE 中は選択中の装飾ではなく、幕の進行が可視状態を決める。
+        const isSakura = mcMix ? mcMix.sakura > .004 : motion === 'sakura';
+        // 主Pointsはハート、副Pointsは泡を受け持つ。通常時は主Pointsだけが選択中の装飾を描く。
+        const showMain = mcMix ? mcMix.heart > .004 : !isSakura;
+        const showAlt = mcMix ? mcMix.bubble > .004 : false;
         const isPouring = Boolean(pour && pour.controller && pour.controller.pouring);
         const cameraDistance = camera && controls ? camera.position.distanceTo(controls.target) : frameDistance;
         const nextLod = cameraDistance > frameDistance * 2.05 ? 2 : (cameraDistance > frameDistance * 1.42 ? 1 : 0);
@@ -5600,18 +5704,22 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         idleSakuraAccumulator = 0;
         const speed = .38 + response * .52;
         const position = geometry.attributes.position;
+        const altPosition = altGeometry.attributes.position;
         // Magic Dressingではタワー外周〜半径2倍の広い環状エリアを、既存個数のまま使う。
         const spread = activeDressing() ? 2 : 1;
         const innerRadius = radius * (activeDressing() ? .98 : .45);
-        if (!isSakura) for (let i = 0; i < activeParticleCount; i++) {
-          const at = i * 4, out = i * 3, phase = phases[at] + elapsed * speed * phases[at + 3];
+        // 位置計算をmotion指定で呼べるようにし、MAGIC CHANGE中は主Points(ハート)と
+        // 副Points(泡)へ別々の軌道を書く。通常時は従来どおり主Pointsのみ1回走る。
+        const writePositions = (kind, target, phaseShift) => {
+        for (let i = 0; i < activeParticleCount; i++) {
+          const at = i * 4, out = i * 3, phase = phases[at] + phaseShift + elapsed * speed * phases[at + 3];
           let radial = radius * spread * phases[at + 1] * (1 + Math.sin(elapsed * 1.15 + phases[at]) * .045);
           let y = towerHeight * phases[at + 2] + Math.sin(phase * 1.7) * .13 + .08;
           let driftAngle = phase;
-          if (motion === 'bubble') {
+          if (kind === 'bubble') {
             const lift = (phases[at + 2] + elapsed * .13 * phases[at + 3]) % 1;
             y = .06 + towerHeight * lift; radial *= .94 + .06 * Math.sin(phase * 1.4);
-          } else if (motion === 'sakura') {
+          } else if (kind === 'sakura') {
             // 落下を線形にせず、滞空→風に押される→散り際というゆるい起伏を付ける。
             const fall = (phases[at + 2] + elapsed * .045 * phases[at + 3]) % 1;
             const descent = .5 - .5 * Math.cos(Math.PI * fall);
@@ -5623,17 +5731,29 @@ function createCelebrationEffects(levels, towerHeight, placements) {
             driftAngle = phase + gust * .43 + windPulse * .35 + Math.sin(elapsed * .58 + phases[at]) * .16;
           }
           radial = Math.max(innerRadius, radial);
-          position.array[out] = Math.cos(driftAngle) * radial;
-          position.array[out + 1] = y;
-          position.array[out + 2] = Math.sin(driftAngle) * radial;
+          target.array[out] = Math.cos(driftAngle) * radial;
+          target.array[out + 1] = y;
+          target.array[out + 2] = Math.sin(driftAngle) * radial;
         }
-        if (!isSakura) position.needsUpdate = true;
+        target.needsUpdate = true;
+        };
+        if (showMain) writePositions(mcMix ? 'orbit' : motion, position, 0);
+        // 副Pointsは位相を半周ずらし、主Pointsと同じ場所に重ならないようにする。
+        if (showAlt) writePositions('bubble', altPosition, Math.PI);
         // 俯瞰時（真上に近い視点）だけ粒子を軽く持ち上げる。
         const polar = controls ? controls.getPolarAngle() : Math.PI / 4;
         const overhead = THREE.MathUtils.clamp(1 - polar / (Math.PI / 3), 0, 1);
-        particles.visible = !isSakura;
-        particleMaterial.opacity = (.68 + response * .30) * fade * (1 + overhead * .25);
+        particles.visible = showMain;
+        particleMaterial.opacity = (.68 + response * .30) * fade * (1 + overhead * .25) * (mcMix ? mcMix.heart : 1);
         particleMaterial.size = .072 * particleSizeMul * (1 + overhead * .5);
+        // 副Points(泡)。MAGIC CHANGE 中だけ現れる。
+        particlesAlt.visible = showAlt;
+        if (showAlt) {
+          if (altMaterial.map !== getDressingTexture('bubble')) { altMaterial.map = getDressingTexture('bubble'); altMaterial.needsUpdate = true; }
+          altMaterial.color.setHex(DRESSINGS.bubble.colour);
+          altMaterial.opacity = (.68 + response * .30) * fade * (1 + overhead * .25) * mcMix.bubble;
+          altMaterial.size = .072 * DRESSINGS.bubble.size * levelScale * (1 + overhead * .5);
+        }
         petalLayers.forEach(layer => {
           layer.visible = isSakura;
           if (!isSakura) return;
@@ -5644,15 +5764,24 @@ function createCelebrationEffects(levels, towerHeight, placements) {
             petalUniforms.uPetalTime.value = elapsed;
             petalUniforms.uPetalResponse.value = response;
           }
-          layer.material.opacity = variant.opacity * (.78 + response * .22) * fade;
+          layer.material.opacity = variant.opacity * (.78 + response * .22) * fade * (mcMix ? mcMix.sakura : 1);
           layer.material.size = .072 * particleSizeMul * variant.size * (1 + overhead * .38);
         });
         // 舞っている桜の一部が静かに地面へ移る。注水中は少し早く、最大で床が花びらで満ちる。
-        sakuraSettlement = THREE.MathUtils.clamp(sakuraSettlement + (isSakura ? delta * (isPouring ? .085 : .028) : -delta * .11), 0, 1);
+        // MAGIC CHANGE 中は蓄積を止めも減らしもしない。第3幕で解放する在庫を保つ。
+        if (!magicChange) sakuraSettlement = THREE.MathUtils.clamp(sakuraSettlement + (isSakura ? delta * (isPouring ? .085 : .028) : -delta * .11), 0, 1);
+        const mcRelease = mcMix ? mcMix.release : 0;
         groundPetalLayers.forEach(mesh => {
           const data = mesh.userData; mesh.visible = isSakura && sakuraSettlement > .002;
           if (!isSakura) return;
           const targetCount = Math.floor(data.scales.length * sakuraSettlement * particleDensity * lodSettlementDensity);
+          if (mcRelease > .002) {
+            // 解放中は枚数を動かさず、見えている全枚の行列を毎フレーム書き替える。
+            if (targetCount !== data.visibleCount) { mesh.count = targetCount; data.visibleCount = targetCount; }
+            composeReleased(mesh, data, data.visibleCount, mcRelease, towerHeight * .62);
+            mesh.material.opacity = data.variant.opacity * (.52 + sakuraSettlement * .28) * fade * (1 - mcRelease * .25) * mcMix.sakura;
+            return;
+          }
           if (targetCount !== data.visibleCount) {
             const matrix = new THREE.Matrix4(), quaternion = new THREE.Quaternion(), scale = new THREE.Vector3();
             const from = Math.min(targetCount, data.visibleCount), to = Math.max(targetCount, data.visibleCount);
@@ -5662,13 +5791,16 @@ function createCelebrationEffects(levels, towerHeight, placements) {
             }
             mesh.instanceMatrix.needsUpdate = true; mesh.count = targetCount; data.visibleCount = targetCount;
           }
-          mesh.material.opacity = data.variant.opacity * (.52 + sakuraSettlement * .28) * fade;
+          mesh.material.opacity = data.variant.opacity * (.52 + sakuraSettlement * .28) * fade * (mcMix ? mcMix.sakura : 1);
         });
         // タワー全体へ豊かに積もらせつつ、最上段だけは控えて注水の流れとシルエットを読めるようにする。
         const towerData = towerPetals.userData;
         const towerTargetCount = Math.floor(towerData.scales.length * Math.min(1, sakuraSettlement * 1.22) * particleDensity * lodSettlementDensity);
         towerPetals.visible = isSakura && towerTargetCount > 0;
-        if (towerTargetCount !== towerData.visibleCount) {
+        if (mcRelease > .002 && towerPetals.visible) {
+          if (towerTargetCount !== towerData.visibleCount) { towerPetals.count = towerTargetCount; towerData.visibleCount = towerTargetCount; }
+          composeReleased(towerPetals, towerData, towerData.visibleCount, mcRelease, towerHeight * .48);
+        } else if (towerTargetCount !== towerData.visibleCount) {
           const matrix = new THREE.Matrix4(), quaternion = new THREE.Quaternion(), scale = new THREE.Vector3();
           const from = Math.min(towerTargetCount, towerData.visibleCount), to = Math.max(towerTargetCount, towerData.visibleCount);
           for (let i = from; i < to; i++) {
@@ -5677,13 +5809,13 @@ function createCelebrationEffects(levels, towerHeight, placements) {
           }
           towerPetals.instanceMatrix.needsUpdate = true; towerPetals.count = towerTargetCount; towerData.visibleCount = towerTargetCount;
         }
-        towerPetalMaterial.opacity = (.38 + sakuraSettlement * .20) * fade;
+        towerPetalMaterial.opacity = (.38 + sakuraSettlement * .20) * fade * (mcMix ? mcMix.sakura : 1);
         if (isSakura) {
           // GPUで舞う群れの中心を、少数の三角関数だけで近似して淡い光源もCPU走査なしで追従させる。
           const glowAngle = elapsed * .23;
           petalGlow.position.set(Math.cos(glowAngle) * radius * 1.08, towerHeight * (.48 + Math.sin(elapsed * .31) * .12), Math.sin(glowAngle) * radius * 1.08);
         }
-        const petalGlowTarget = isSakura ? (.34 + response * .52) : 0;
+        const petalGlowTarget = isSakura ? (.34 + response * .52) * (mcMix ? mcMix.sakura : 1) : 0;
         petalGlow.intensity += (petalGlowTarget - petalGlow.intensity) * Math.min(1, delta * 1.7);
         rippleCooldown -= delta;
         if (rippleCooldown <= 0 && launchRipple(isPouring, spread)) {
@@ -5706,7 +5838,7 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       };
       setEnabled(localEnabled);
       setQuality(activeQualityProfile());
-      return { group, setEnabled, setThemeColour, setQuality, update, triggerRelay };
+      return { group, setEnabled, setThemeColour, setQuality, update, triggerRelay, startMagicChange, stopMagicChange, magicChangeActive };
     }
 
     function activeQualityKey() {
@@ -6310,6 +6442,7 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       lowAngleButtons.forEach(button => button.addEventListener('click', () => setCameraAngle(cameraAngleMode === button.dataset.lowAngle ? 'auto' : button.dataset.lowAngle)));
       themeButtons.forEach(button => button.addEventListener('click', () => { soundEngine.uiTick(); setTheme(button.dataset.theme); }));
       dressingButtons.forEach(button => button.addEventListener('click', () => { soundEngine.uiTick(); setDressing(button.dataset.dressing); }));
+      magicChangeButton.addEventListener('click', () => { startMagicChange(); });
       ambienceButtons.forEach(button => button.addEventListener('click', () => { soundEngine.uiTick(); setAmbience(button.dataset.ambience); }));
       nightSakuraEnabledInput.addEventListener('change', () => setNightSakuraEnabled(nightSakuraEnabledInput.checked));
       champagneButtons.forEach(button => button.addEventListener('click', () => setChampagne(button.dataset.champagne)));
