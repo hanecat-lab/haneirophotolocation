@@ -4563,6 +4563,9 @@
       const musicParticleResponse = Math.max(response, musicVisualBeatPulse * musicVisual.particle * activeQualityProfile().musicGain);
       if (tower && tower.userData && tower.userData.celebration) tower.userData.celebration.update(delta, musicParticleResponse);
       updateSakuraGlassFinish(delta, response);
+      // 記念メッセージが出る前は updateAnniversaryMessage() が早期returnするため、
+      // MAGIC CHANGE 中の旋回はここから進める。
+      if (magicChangeUntil) updateAnniversaryCameraSpin(performance.now());
       // 転換フェーズ: 竜巻の先端が文字の位置へ届いた瞬間に減光する。
       if (magicChangeUntil && !magicChangeDimmed && performance.now() >= magicChangeUntil - MAGIC_CHANGE_DIM_LEAD_MS) {
         magicChangeDimmed = true;
@@ -4666,10 +4669,10 @@
     // party の FINAL DROP とは別系統で、ミラーボール・レーザー・花火は一切使わない。
     // 42秒までが4装飾の終幕、42-48秒がハートの旋風。旋風の頭で記念メッセージを仕込み、
     // 旋風が最高潮になる48秒で文字が出る（FINAL DROPの「静止タブローを見せてから重ねる」と同じ作り）。
-    // 42秒までが4装飾の終幕。42秒からハートの竜巻が4フェーズで進む。
-    //   42.0-43.0 立ち上がり / 43.0-45.0 上昇して円錐に絞る
-    //   45.0-45.5 減光と同時に外側へ弾ける / 45.5- 消えた中心から文字が湧き出る
-    const MAGIC_CHANGE_MS = 45500, MAGIC_CHANGE_DIM_LEAD_MS = 500;
+    // 30秒までが4装飾の終幕。30秒からハートの竜巻が4フェーズで進む。
+    //   30.0-31.0 立ち上がり / 31.0-33.0 上昇して円錐に絞る
+    //   33.0-33.8 減光と同時にゆっくり外側へ弾ける / 33.8- 消えた中心から文字が湧き出る
+    const MAGIC_CHANGE_MS = 33800, MAGIC_CHANGE_DIM_LEAD_MS = 800;
     async function startMagicChange() {
       if (currentTheme !== 'dressing' || magicChangeUntil > performance.now()) return;
       const celebration = tower?.userData?.celebration;
@@ -4678,6 +4681,7 @@
       magicChangeMessageArmed = false; magicChangeDimmed = false;
       document.body.classList.remove('magic-change-dim');
       celebration.startMagicChange();
+      applyMagicChangeCamera();
       themePulse = 1;
       pulsePrismFlash(.62);
       syncDressingUI();
@@ -4689,8 +4693,11 @@
     function stopMagicChange(resumeMusic = true) {
       if (!magicChangeUntil) return;
       magicChangeUntil = 0;
-      // メッセージへ渡していないなら減光も戻す。渡していれば記念側の暗転が引き継ぐ。
-      if (!magicChangeMessageArmed) { magicChangeDimmed = false; document.body.classList.remove('magic-change-dim'); }
+      // メッセージへ渡していないなら減光もカメラも戻す。渡していれば記念側が引き継ぐ。
+      if (!magicChangeMessageArmed) {
+        magicChangeDimmed = false; document.body.classList.remove('magic-change-dim');
+        releaseAnniversaryCamera();
+      }
       tower?.userData?.celebration?.stopMagicChange?.();
       soundEngine.stopFinale({ resume: resumeMusic });
       syncDressingUI();
@@ -5682,7 +5689,22 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       // マテリアルの差し替えを起こさないので再コンパイルもちらつきも発生しない。
       let magicChange = null;
       // all = 4装飾が揃う終幕の終わり。vortex = ハートの旋風がタワーを包む最終幕。
-      const MAGIC_ACTS = { lead: 3, heart: 11, star: 19, bubble: 27, sakura: 36, all: 42, vortex: 48 };
+      // 各値は「その幕が終わる秒」。ハート・星・泡は4秒ずつ、桜は9秒、4装飾の終幕は6秒。
+      const MAGIC_ACTS = { lead: 3, heart: 7, star: 11, bubble: 15, sakura: 24, all: 30 };
+      // 幕の通し番号。序=0, ハート=1, 星=2, 泡=3, 桜=4, 4装飾=5, 竜巻=6。
+      const magicChangeActIndex = time => {
+        const A = MAGIC_ACTS;
+        if (time < A.lead) return 0;
+        if (time < A.heart) return 1;
+        if (time < A.star) return 2;
+        if (time < A.bubble) return 3;
+        if (time < A.sakura) return 4;
+        if (time < A.all) return 5;
+        return 6;
+      };
+      // 幕が変わるたびに逆回転させる。
+      const magicChangeSpinDirection = time => magicChangeActIndex(time) % 2 === 0 ? 1 : -1;
+      const MAGIC_SPIN_RATE = .40;
       // タワー外周(= radius * .862)の1.5倍を旋風の平均半径にする。
       // 実測で平均半径が目標の .959 倍だったぶんを補正して、狙いの1.5倍に合わせる。
       const VORTEX_RADIUS_SCALE = .862 * 1.5 / .959;
@@ -5691,11 +5713,54 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       //   1.0-3.0 上昇:      回りながら頂点へ寄り、半径が絞られて円錐になる
       //   3.0-3.5 転換:      先端が文字の位置へ届き、減光と同時に外側へ弾ける
       //   3.5-    メッセージ: 消えた竜巻の中心から文字が湧き出る
-      const VORTEX_PHASE = { spin: 1.0, rise: 3.0, burst: 3.5 };
-      // 竜巻の先端が届く高さ。文字はこの真上に出る。
-      const vortexApexY = towerHeight * 1.10;
+      const VORTEX_PHASE = { spin: 1.0, rise: 3.0, burst: 3.8 };
+      // 竜巻の先端が届く高さ。#anniversary-message は top:30% の固定オーバーレイなので、
+      // 画面の高さ30%の位置へ投影されるタワーローカルYへ先端を合わせる。そこへ収束させると
+      // 文字が竜巻の中から湧き出たように見える。celebrationのgroupはtowerの子。
+      const VORTEX_APEX_SCREEN_Y = .30;
+      const vortexApexProbe = new THREE.Vector3();
+      // (0, y, 0) を画面Y(0=上, 1=下)へ落とす。
+      const projectLocalY = y => {
+        vortexApexProbe.set(0, y, 0); tower.localToWorld(vortexApexProbe); vortexApexProbe.project(camera);
+        return -vortexApexProbe.y * .5 + .5;
+      };
+      // 透視投影なのでYと画面Yは厳密には線形でない。2点で傾きを取り、1回補正して詰める。
+      // 粒ごとではなく1フレームに1回だけ呼ぶこと（投影が3回走る）。
+      // 弾けたハートが画面の端へ届く世界半径。竜巻の高さでの画面端を投影から逆算する。
+      // 方位角によって画面横方向への寄与が変わるので、X軸とZ軸の両方を見て
+      // 「横に一番効く向き」を基準にする。粒ごとではなくフレームに1回だけ呼ぶこと。
+      const vortexEdgeProbe = new THREE.Vector3();
+      const projectLocalNdcX = (x, y, z) => {
+        vortexEdgeProbe.set(x, y, z); tower.localToWorld(vortexEdgeProbe); vortexEdgeProbe.project(camera);
+        return Number.isFinite(vortexEdgeProbe.x) ? Math.abs(vortexEdgeProbe.x) : 0;
+      };
+      const vortexEdgeRadius = apexY => {
+        if (!tower || !camera) return radius * 3;
+        // 旋回でカメラ姿勢を直接書いた直後にも正しく投影できるよう行列を確定させる。
+        camera.updateMatrixWorld();
+        const probe = towerHeight || 1;
+        const nx = Math.max(projectLocalNdcX(probe, apexY, 0), projectLocalNdcX(0, apexY, probe));
+        if (!Number.isFinite(nx) || nx < 1e-4) return radius * 3;
+        // 1.06 で画面端をわずかに越えさせ、外へ抜けていく印象にする。
+        return probe * 1.06 / nx;
+      };
+      const vortexApexY = () => {
+        if (!controls || !tower || !camera) return towerHeight * 1.10;
+        camera.updateMatrixWorld();
+        const y0 = 0, y1 = towerHeight || 1;
+        const p0 = projectLocalY(y0), p1 = projectLocalY(y1);
+        const slope = (p1 - p0) / (y1 - y0);
+        if (!Number.isFinite(slope) || Math.abs(slope) < 1e-6) return towerHeight * 1.10;
+        let y = y0 + (VORTEX_APEX_SCREEN_Y - p0) / slope;
+        const py = projectLocalY(y);
+        y += (VORTEX_APEX_SCREEN_Y - py) / slope;
+        // 文字のちょうど真上ではなくグラス1つ分だけ高い位置へ収束させ、
+        // 文字が竜巻の内側から下りてくるように見せる。
+        y += glassStack();
+        return Number.isFinite(y) ? y : towerHeight * 1.10;
+      };
       const startMagicChange = () => {
-        magicChange = { time: 0, release: 0 };
+        magicChange = { time: 0, release: 0, spin: 0 };
         // ハート・泡を選んでいると settlement は 0.11/秒 で減衰し切っている。
         // 第3幕が空振りしないよう、解放するぶんの花びらを最低限まで押し上げる。
         sakuraSettlement = Math.max(sakuraSettlement, .60);
@@ -5761,7 +5826,12 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         if (!fade) { group.visible = false; return; }
         group.visible = true;
         const relayActive = updateRelayEffects(delta);
-        if (magicChange) magicChange.time += delta;
+        if (magicChange) {
+          magicChange.time += delta;
+          // 幕ごとに向きが反転する一方向の回転。角度を積算するので、
+          // 向きが変わっても粒が瞬間移動しない（速度だけが反転する）。
+          magicChange.spin += delta * MAGIC_SPIN_RATE * magicChangeSpinDirection(magicChange.time);
+        }
         const mcMix = magicChange ? magicChangeMix(magicChange.time) : null;
         const motion = activeDressing()?.motion || 'orbit';
         // MAGIC CHANGE 中は選択中の装飾ではなく、幕の進行が可視状態を決める。
@@ -5798,10 +5868,16 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         // 位置計算をmotion指定で呼べるようにし、MAGIC CHANGE中は主Points(ハート)と
         // 副Points(泡)へ別々の軌道を書く。通常時は従来どおり主Pointsのみ1回走る。
         const writePositions = (kind, target, phaseShift, vortexBlend = 0, rise = 0, burst = 0) => {
+        // 投影を伴うので粒ごとには呼ばない。上昇フェーズのときだけ1回求める。
+        const apexY = rise > .001 ? vortexApexY() : 0;
+        const edgeRadius = burst > .001 ? vortexEdgeRadius(apexY) : 0;
+        // MAGIC CHANGE 中は揺れをやめ、全粒を同じ角速度で回す（剛体のような一方向の回転）。
+        const rigidSpin = magicChange ? magicChange.spin : null;
         for (let i = 0; i < activeParticleCount; i++) {
-          const at = i * 4, out = i * 3, phase = phases[at] + phaseShift + elapsed * speed * phases[at + 3];
-          let radial = radius * spread * phases[at + 1] * (1 + Math.sin(elapsed * 1.15 + phases[at]) * .045);
-          let y = towerHeight * phases[at + 2] + Math.sin(phase * 1.7) * .13 + .08;
+          const at = i * 4, out = i * 3;
+          const phase = phases[at] + phaseShift + (rigidSpin !== null ? rigidSpin : elapsed * speed * phases[at + 3]);
+          let radial = radius * spread * phases[at + 1] * (rigidSpin !== null ? 1 : (1 + Math.sin(elapsed * 1.15 + phases[at]) * .045));
+          let y = towerHeight * phases[at + 2] + (rigidSpin !== null ? 0 : Math.sin(phase * 1.7) * .13) + .08;
           let driftAngle = phase;
           if (kind === 'bubble') {
             const lift = (phases[at + 2] + elapsed * .13 * phases[at + 3]) % 1;
@@ -5830,15 +5906,16 @@ function createCelebrationEffects(levels, towerHeight, placements) {
               // 上昇フェーズ: 群れごと頂点へ寄せ、半径を絞って円錐の先端を作る。
               // 絞るほど角運動量が上がるので、回転も速くする。
               const riseEase = rise * rise * (3 - 2 * rise);
-              vortexY += (vortexApexY - vortexY) * riseEase;
+              vortexY += (apexY - vortexY) * riseEase;
               vortexRadial *= 1 - riseEase * .90;
               vortexAngle += riseEase * (3.2 + phases[at + 3] * 2.4);
             }
             if (burst > .001) {
               // 転換フェーズ: 先端が文字の位置へ届いた瞬間に外側へ弾ける。
-              const burstEase = burst * burst;
-              vortexRadial += burstEase * radius * 2.6 * (.55 + phases[at + 1] * .70);
-              vortexY += burstEase * towerHeight * (.06 + phases[at + 2] * .12);
+              // ゆっくり広がりつつ、行き着く先は画面の端。粒ごとに到達距離を散らす。
+              const burstEase = burst * burst * (3 - 2 * burst);
+              vortexRadial += burstEase * edgeRadius * (.78 + phases[at + 1] * .34);
+              vortexY += burstEase * towerHeight * (.03 + phases[at + 2] * .07);
             }
             // 位置そのものを補間する。motionを切り替えると粒が瞬間移動する。
             y += (vortexY - y) * vortexBlend;
@@ -6208,6 +6285,64 @@ function createCelebrationEffects(levels, towerHeight, placements) {
     // 寄せ切るまでの時間と、その後の旋回速度[rad/秒]。約60秒で一周する。
     const ANNIVERSARY_CAMERA_MOVE_MS = 1400, ANNIVERSARY_SPIN_RATE = .105;
     let anniversaryCameraActive = false, anniversaryCameraSpin = null;
+    // MAGIC CHANGE の画角。実機のスクリーンショットに合わせ、タワーの上端が画面の42%、
+    // 下端が92%に来る構図にする。縦横比によって必要な距離も注視点も変わるので、
+    // 係数を置かずに「投影された画面比率」から距離と注視点Yを数値で解く。
+    const MAGIC_CAMERA_TOP_PCT = 42, MAGIC_CAMERA_BOTTOM_PCT = 92, MAGIC_CAMERA_ELEVATION = .10;
+    const MAGIC_CAMERA_MOVE_MS = 1200;
+    const magicCameraSolver = { probe: null, point: new THREE.Vector3() };
+    function solveMagicChangeFraming(towerHeight, azimuth) {
+      const solver = magicCameraSolver;
+      if (!solver.probe) solver.probe = camera.clone();
+      const probe = solver.probe;
+      probe.fov = camera.fov; probe.aspect = camera.aspect; probe.near = camera.near; probe.far = camera.far;
+      const place = (distance, targetY) => {
+        probe.position.set(
+          Math.sin(azimuth) * Math.cos(MAGIC_CAMERA_ELEVATION) * distance,
+          targetY + Math.sin(MAGIC_CAMERA_ELEVATION) * distance,
+          Math.cos(azimuth) * Math.cos(MAGIC_CAMERA_ELEVATION) * distance
+        );
+        probe.lookAt(0, targetY, 0);
+        probe.updateMatrixWorld(true); probe.updateProjectionMatrix();
+        const at = y => { solver.point.set(0, y, 0); tower.localToWorld(solver.point); solver.point.project(probe); return (-solver.point.y * .5 + .5) * 100; };
+        return { top: at(towerHeight), bottom: at(0) };
+      };
+      const wantSpan = MAGIC_CAMERA_BOTTOM_PCT - MAGIC_CAMERA_TOP_PCT;
+      const wantCentre = (MAGIC_CAMERA_TOP_PCT + MAGIC_CAMERA_BOTTOM_PCT) / 2;
+      let distance = towerHeight * 2.2, targetY = towerHeight * .5;
+      // 距離が縦の占有率を、注視点Yが上下位置を決める。交互に詰めると数回で収束する。
+      for (let i = 0; i < 40; i++) {
+        const seen = place(distance, targetY);
+        const span = seen.bottom - seen.top;
+        if (!Number.isFinite(span) || span < .5) break;
+        distance = Math.max(towerHeight * .35, distance * (span / wantSpan));
+        const centre = (seen.top + seen.bottom) / 2;
+        // 注視点を上げると被写体は画面の下へ動く。中心が目標より下(centre大)なら注視点を下げる。
+        // 画面1%あたりの世界Yは、いま見えている縮尺(towerHeight / span)から求める。
+        targetY -= (centre - wantCentre) * (towerHeight / span) * .8;
+        if (Math.abs(span - wantSpan) < .05 && Math.abs(centre - wantCentre) < .05) break;
+      }
+      return { distance, targetY };
+    }
+    function applyMagicChangeCamera() {
+      if (!tower || !camera || !controls) return;
+      const levels = tower.userData.levels;
+      const towerHeight = tower.userData.height || ((levels - 1) * glassStack() + GLASS.rimY * glassShape().scale.y);
+      const azimuth = .62;
+      const { distance, targetY } = solveMagicChangeFraming(towerHeight, azimuth);
+      const desired = new THREE.Vector3(
+        Math.sin(azimuth) * Math.cos(MAGIC_CAMERA_ELEVATION) * distance,
+        targetY + Math.sin(MAGIC_CAMERA_ELEVATION) * distance,
+        Math.cos(azimuth) * Math.cos(MAGIC_CAMERA_ELEVATION) * distance
+      );
+      controls.minPolarAngle = .4; controls.maxPolarAngle = Math.PI * .495;
+      controls.minDistance = Math.max(.55, distance * .28);
+      frameDistance = distance; applyCameraLimits();
+      animateCamera(desired, new THREE.Vector3(0, targetY, 0), MAGIC_CAMERA_MOVE_MS);
+      // 寄せ切ったあとはゆっくり旋回し続ける。記念カットと同じ仕組みを使い回す。
+      anniversaryCameraActive = true;
+      anniversaryCameraSpin = { startsAt: performance.now() + MAGIC_CAMERA_MOVE_MS, azimuth, elevation: MAGIC_CAMERA_ELEVATION, distance, targetY };
+    }
     function applyAnniversaryCamera() {
       if (!tower || !camera || !controls) return;
       const levels = tower.userData.levels, study = tower.userData.study;
