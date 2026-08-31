@@ -693,7 +693,7 @@
     // 暗転後の連鎖: 光粒がタワーの頂から立ちのぼり、文字へ届いた頃に横線が走り、続いて「2ND」が短く輝く。
     // メッセージ出現と同時に、その周りを回るハート。プールの先頭から専有し、
     // 暗転後の通常のハート群とは別扱いにする（同じ粒が作り直されて飛ばないようにする）。
-    const ANNIVERSARY_HALO_COUNT = 12;
+    const ANNIVERSARY_HALO_COUNT = 20, ANNIVERSARY_HALO_SCATTER_MS = 1400;
     const ANNIVERSARY_MOTE_CAPACITY = 10, ANNIVERSARY_RULE_SWEEP_MS = 2600, ANNIVERSARY_ACCENT_FLARE_MS = 3200;
     // 暗転と同時にミラーボールとレーザーを引かせ、タワーと文字だけの静けさへ渡す。
     const ANNIVERSARY_STAGE_FADE_MS = 1600;
@@ -961,7 +961,7 @@
     }
     function resetAnniversaryParticles() {
       anniversaryHeartPhaseStarted = false;
-      [...anniversaryHeartStates, ...anniversaryGlitterStates, ...anniversaryMeteorStates].forEach(state => { state.active = false; state.haloSeeded = false; state.element.style.opacity = '0'; });
+      [...anniversaryHeartStates, ...anniversaryGlitterStates, ...anniversaryMeteorStates].forEach(state => { state.active = false; state.haloSeeded = false; state.haloDone = false; state.haloScatterAt = 0; state.element.style.opacity = '0'; });
       [...anniversaryCastnameStates, ...anniversaryMoteStates].forEach(state => { state.seeded = false; state.element.style.opacity = '0'; });
       anniversaryHeartLayer.setAttribute('aria-hidden', 'true'); anniversaryGlitterLayer.setAttribute('aria-hidden', 'true'); anniversaryMeteorLayer.setAttribute('aria-hidden', 'true'); anniversaryCastnameLayer.setAttribute('aria-hidden', 'true'); anniversaryMoteLayer.setAttribute('aria-hidden', 'true');
       anniversarySparkStates.forEach(state => { state.startAt = 0; state.duration = 0; state.element.style.opacity = '0'; });
@@ -1110,6 +1110,18 @@
       state.haloPhase = Math.random() * Math.PI * 2;
       state.haloScale = .52 + Math.random() * .40;
       state.haloOpacity = .38 + Math.random() * .30;
+      // 輪郭の上を滑るだけだと軌道に見える。外向き(radial)と輪郭に沿う向き(tangent)の
+      // 2つの遅い揺れを重ね、輪ではなく漂いにする。radialは0以上しか取らないので、
+      // どれだけ揺れても本文の内側へは入らない。
+      state.haloDriftR = 16 + Math.random() * 26;
+      state.haloDriftT = 10 + Math.random() * 20;
+      state.haloDriftRSpeed = .21 + Math.random() * .26;
+      state.haloDriftTSpeed = .17 + Math.random() * .24;
+      state.haloDriftRPhase = Math.random() * Math.PI * 2;
+      state.haloDriftTPhase = Math.random() * Math.PI * 2;
+      state.haloScatterAngle = (Math.random() - .5) * .8;
+      state.haloScatterDistance = 210 + Math.random() * 240;
+      state.haloScatterSpin = (Math.random() - .5) * 320;
       state.element.style.color = palette[index % palette.length];
     }
     function updateAnniversaryHaloHearts(now) {
@@ -1122,9 +1134,14 @@
       // 寄せ先は本文の左右端より外側なので、寄せても文字には重ならない。
       const halfW = rect.width / 2, halfH = rect.height / 2;
       const edge = 16;
+      // キャスト名が出たら輪の役目は終わり。外へ散らし、散り切った個体は通常の群れへ返す。
+      const scatterFrom = anniversaryStartsAt + ANNIVERSARY_DIM_DELAY_MS + ANNIVERSARY_CASTNAME_DELAY_MS;
+      const scattering = now >= scatterFrom;
       for (let index = 0; index < ANNIVERSARY_HALO_COUNT; index++) {
         const state = anniversaryHeartStates[index]; if (!state) break;
+        if (state.haloDone) continue;
         if (!state.haloSeeded) seedAnniversaryHalo(state, index, now);
+        if (scattering && !state.haloScatterAt) state.haloScatterAt = Math.max(now, scatterFrom) + index * 55;
         const elapsed = (now - state.haloFrom) / 1000;
         if (elapsed < 0) { state.element.style.opacity = '0'; continue; }
         const angle = state.haloAngle + (reduced ? 0 : elapsed * state.haloSpeed * Math.PI);
@@ -1133,14 +1150,28 @@
         const marginX = halfW + 24 * state.haloRx * breathe, marginY = halfH + 30 * state.haloRy * breathe;
         const cosA = Math.cos(angle), sinA = Math.sin(angle);
         const reach = 1 / Math.max(Math.abs(cosA) / marginX, Math.abs(sinA) / marginY);
-        const x = Math.max(edge, Math.min(window.innerWidth - edge, centreX + cosA * reach));
-        const y = Math.max(edge, Math.min(window.innerHeight - edge, centreY + sinA * reach));
+        // radialは(.5+.5*sin)で常に0以上。輪郭より内側へは寄らない。
+        const driftR = reduced ? 0 : (.5 + .5 * Math.sin(elapsed * state.haloDriftRSpeed + state.haloDriftRPhase)) * state.haloDriftR;
+        const driftT = reduced ? 0 : Math.sin(elapsed * state.haloDriftTSpeed + state.haloDriftTPhase) * state.haloDriftT;
         // 竜巻が散り切るのと入れ替わりに立ち上がる。
         const rise = Math.min(1, elapsed / .9);
+        let scatter = 0, fade = 1, spin = 0;
+        if (state.haloScatterAt && now >= state.haloScatterAt) {
+          const t = Math.min(1, (now - state.haloScatterAt) / ANNIVERSARY_HALO_SCATTER_MS);
+          scatter = (1 - Math.pow(1 - t, 2.4)) * state.haloScatterDistance;
+          fade = 1 - t; spin = t * state.haloScatterSpin;
+          if (t >= 1) { state.haloDone = true; state.active = false; state.element.style.opacity = '0'; continue; }
+        }
+        const outAngle = angle + state.haloScatterAngle * (scatter ? 1 : 0);
+        const radial = reach + driftR + scatter;
+        const px = centreX + Math.cos(outAngle) * radial - sinA * driftT;
+        const py = centreY + Math.sin(outAngle) * radial + cosA * driftT;
+        const x = Math.max(edge, Math.min(window.innerWidth - edge, px));
+        const y = Math.max(edge, Math.min(window.innerHeight - edge, py));
         state.element.style.left = `${x.toFixed(1)}px`;
         state.element.style.top = `${y.toFixed(1)}px`;
-        state.element.style.opacity = (state.haloOpacity * rise).toFixed(3);
-        state.element.style.transform = `translate(-50%, -50%) rotate(${(Math.sin(elapsed * .5 + state.haloPhase) * 22).toFixed(1)}deg) scale(${(state.haloScale * (.85 + rise * .15)).toFixed(3)})`;
+        state.element.style.opacity = (state.haloOpacity * rise * fade).toFixed(3);
+        state.element.style.transform = `translate(-50%, -50%) rotate(${(Math.sin(elapsed * .5 + state.haloPhase) * 22 + spin).toFixed(1)}deg) scale(${(state.haloScale * (.85 + rise * .15) * (1 + scatter / 900)).toFixed(3)})`;
       }
       anniversaryHeartLayer.setAttribute('aria-hidden', 'false');
     }
@@ -1149,8 +1180,8 @@
       const heartLimit = anniversaryHeartLimit(now), glitterLimit = anniversaryGlitterLimit(now), meteorLimit = matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : (adaptiveTier === 2 ? 2 : ANNIVERSARY_METEOR_CAPACITY);
       if (!anniversaryHeartPhaseStarted) { anniversaryHeartPhaseStarted = true; anniversaryHeartStates.forEach((state, index) => { if (index >= ANNIVERSARY_HALO_COUNT && index < heartLimit) seedAnniversaryHeart(state, now, index); }); }
       anniversaryHeartStates.forEach((state, index) => {
-        // 先頭のANNIVERSARY_HALO_COUNT個はメッセージを囲む輪が使い続ける。通常の群れは触らない。
-        if (index < ANNIVERSARY_HALO_COUNT) return;
+        // 先頭のANNIVERSARY_HALO_COUNT個は輪が使う。散り終えた個体だけ群れへ返る。
+        if (index < ANNIVERSARY_HALO_COUNT && !state.haloDone) return;
         if (index >= heartLimit) { state.active = false; state.element.style.opacity = '0'; return; } if (!state.active) seedAnniversaryHeart(state, now, index);
         const age = now - state.startedAt; if (age < 0) { state.element.style.opacity = '0'; return; } const progress = age / state.duration; if (progress >= 1) { seedAnniversaryHeart(state, now, index); return; }
         const fade = Math.sin(progress * Math.PI), x = state.x + Math.sin(progress * Math.PI * 2 + state.phase) * state.sway, y = state.y - progress * state.rise;
