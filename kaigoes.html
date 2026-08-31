@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-83</title>
+<title>CARE SHIFT - Phase 10-85</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -111,7 +111,7 @@ canvas{display:block;width:100%;height:100%;touch-action:none}
   box-shadow:0 6px 16px rgba(121,0,0,.24);
 }
 #callTray::before{
-  content:"ナースコール　赤＝先着 / 黄＝後発";
+  content:attr(data-label);
   display:block;
   padding:0 3px 1px;
   color:#fff;
@@ -146,6 +146,38 @@ canvas{display:block;width:100%;height:100%;touch-action:none}
   flex:0 0 auto;
   font-weight:800;
   color:#596771;
+}
+.eAlertItem{
+  width:100%;
+  border:2px solid #a65b20;
+  border-radius:10px;
+  padding:7px 9px;
+  background:#fff4e7;
+  color:#653510;
+  box-shadow:inset 5px 0 0 #a65b20,0 4px 10px rgba(0,0,0,.16);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:7px;
+  font-size:10px;
+  line-height:1.2;
+  font-weight:900;
+}
+.eAlertItem .eAlertMain{
+  min-width:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.eAlertItem .eAlertWait{
+  flex:0 0 auto;
+  padding:4px 7px;
+  border-radius:7px;
+  background:#9a5a24;
+  color:#fff;
+}
+#callTray.e-only{
+  background:rgba(132,76,30,.95);
 }
 .callTrayItem.high{
   border:2px solid #c62828;
@@ -1042,7 +1074,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-83 / 採点バランス再調整</div>
+  <div class="sub">Phase 10-85 / 利用者E訴えの可視化・リザルト反映</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -1144,6 +1176,7 @@ button{
       <div class="reportItem">平均待機<strong id="reportAvgWait">0分</strong></div>
       <div class="reportItem">最長待機<strong id="reportMaxWait">0分</strong></div>
       <div class="reportItem">定時業務<strong id="reportRoutine">0/8</strong></div>
+      <div class="reportItem">利用者E対応<strong id="reportEResponse">未発生</strong></div>
     </div>
 
     <div id="shiftReportComment">勤務結果を集計しています。</div>
@@ -1614,6 +1647,24 @@ try{
   eCane.position.set(0.48,0.62,0.04);
   eCane.rotation.z=-0.08;
   residentE.add(eCane);
+
+  // Eが訴えている間は、吹き出しだけに頼らず足元にも警告リングを出す。
+  const eAngerMarker = new THREE.Mesh(
+    new THREE.RingGeometry(0.72,1.02,32),
+    new THREE.MeshBasicMaterial({
+      color:0xd67b2b,
+      side:THREE.DoubleSide,
+      transparent:true,
+      opacity:0.92,
+      depthTest:false,
+      depthWrite:false
+    })
+  );
+  eAngerMarker.rotation.x=-Math.PI/2;
+  eAngerMarker.position.set(residentE.position.x,0.055,residentE.position.z);
+  eAngerMarker.renderOrder=72;
+  eAngerMarker.visible=false;
+  scene.add(eAngerMarker);
 
   const residentA=createHuman(0xc7a77a);
   residentA.position.set(-8,0,-6.55);
@@ -2224,11 +2275,24 @@ try{
 
   // ナースは10:00 / 12:00 / 14:00に、E→A→D→C→Bを順に巡回して詰所へ戻る。
   const nurseStationTarget=new THREE.Vector3(-9.5,0,8.05);
+  const nursePatrolCorridorTarget=new THREE.Vector3(-10.2,0,4.35);
   const nursePatrolOrder=["E",0,3,2,1];
+
+  // ナースのトイレ利用。
+  // 初回も2時間以内、その後も前回利用から概ね50〜100分で次回を設定する。
+  // 巡回と重なって少し遅れても2時間を超えにくい余裕を持たせる。
+  const nurseToiletInsideTarget=new THREE.Vector3(-15.55,0,8.05);
+  const nurseToiletWaitTarget=new THREE.Vector3(-15.15,0,5.25);
+  const nurseToiletExitTarget=new THREE.Vector3(-15.2,0,5.35);
+
   let nextNursePatrolAt=10*60;
   let nursePatrolActive=false;
   let nursePatrolIndex=0;
   let nursePatrolWait=0;
+
+  let nurseActivity="IDLE";
+  let nurseToiletUseTimer=0;
+  let nextNurseToiletAt=8*60+30+Math.random()*60;
 
   function nursePatrolTargetFor(key){
     const obj=key==="E" ? residentE : residents[key]?.object;
@@ -2251,28 +2315,208 @@ try{
     return candidates.find(p=>!isBlockedPoint(p)) || base;
   }
 
-  function startNursePatrol(){
-    if(nursePatrolActive) return;
-    nursePatrolActive=true;
-    nursePatrolIndex=0;
-    nursePatrolWait=0;
-    setRoute(nurseMover,nursePatrolTargetFor(nursePatrolOrder[0]),"NURSE_PATROL");
+  function nurseToiletOccupied(){
+    return (
+      nurseActivity==="TOILET_GO" ||
+      nurseActivity==="TOILET_CURTAIN_CLOSE" ||
+      nurseActivity==="TOILET_USE" ||
+      nurseActivity==="TOILET_CURTAIN_OPEN" ||
+      nurseActivity==="TOILET_EXIT" ||
+      nurseActivity==="TOILET_RETURN"
+    );
   }
 
-  function updateNursePatrol(dt){
-    // 報告中はナースもその場で止まり、3秒間の報告が成立するようにする。
+  function scheduleNextNurseToilet(){
+    nextNurseToiletAt=gameMinutes+50+Math.random()*50;
+  }
+
+  function playerToiletCareBusy(){
+    return careType==="TOILET" && careState!=="NONE";
+  }
+
+  function startNurseToilet(){
+    if(
+      nurseActivity!=="IDLE" ||
+      nursePatrolActive ||
+      nurseReportInProgress ||
+      gameMinutes>=14*60+50
+    ) return false;
+
+    nurseActivity="TOILET_GO";
+    nurseToiletUseTimer=0;
+
+    // Eまたは職員介助が使用中なら入口外で待つ。
+    if(eToiletOccupied() || playerToiletCareBusy()){
+      nurseActivity="TOILET_WAIT";
+      setRoute(nurseMover,nurseToiletWaitTarget,"NURSE_TOILET_WAIT");
+      return true;
+    }
+
+    if(!setRoute(nurseMover,nurseToiletInsideTarget,"NURSE_TOILET_GO")){
+      // 経路探索失敗時もトイレ内で停止し続けないよう、次回へ回す。
+      nurseActivity="IDLE";
+      scheduleNextNurseToilet();
+      return false;
+    }
+    return true;
+  }
+
+  function updateNurseToilet(dt){
     if(nurseReportInProgress) return;
 
-    if(!nursePatrolActive){
-      if(gameMinutes>=nextNursePatrolAt && gameMinutes<15*60){
-        startNursePatrol();
-        nextNursePatrolAt+=120;
+    if(nurseActivity==="IDLE"){
+      if(
+        gameMinutes>=nextNurseToiletAt &&
+        gameMinutes<14*60+50 &&
+        !nursePatrolActive
+      ){
+        startNurseToilet();
       }
       return;
     }
 
-    // 全利用者の巡回後は、寄り道せず詰所へ戻る。
-    if(nurseMover.state==="NURSE_RETURN"){
+    if(nurseActivity==="TOILET_WAIT"){
+      if(eToiletOccupied() || playerToiletCareBusy()){
+        if(
+          nurseMover.state==="IDLE" &&
+          nurse.position.distanceTo(nurseToiletWaitTarget)>0.6
+        ){
+          setRoute(nurseMover,nurseToiletWaitTarget,"NURSE_TOILET_WAIT");
+        }
+        return;
+      }
+
+      nurseActivity="TOILET_GO";
+      if(!setRoute(nurseMover,nurseToiletInsideTarget,"NURSE_TOILET_GO")){
+        nurseActivity="IDLE";
+        scheduleNextNurseToilet();
+      }
+      return;
+    }
+
+    if(nurseActivity==="TOILET_GO"){
+      // 向かっている途中で先にE/職員が入った場合は入口外へ退避。
+      if(eToiletOccupied() || playerToiletCareBusy()){
+        nurseActivity="TOILET_WAIT";
+        nurseMover.route=[];
+        nurseMover.routeIndex=0;
+        nurseMover.state="IDLE";
+        setRoute(nurseMover,nurseToiletWaitTarget,"NURSE_TOILET_WAIT");
+        return;
+      }
+
+      if(
+        nurseMover.state==="IDLE" &&
+        nurse.position.distanceTo(nurseToiletInsideTarget)<0.9
+      ){
+        nurseActivity="TOILET_CURTAIN_CLOSE";
+        toiletCurtain.target=1;
+      }else if(nurseMover.state==="IDLE"){
+        if(!setRoute(nurseMover,nurseToiletInsideTarget,"NURSE_TOILET_GO")){
+          nurseActivity="IDLE";
+          scheduleNextNurseToilet();
+        }
+      }
+      return;
+    }
+
+    if(nurseActivity==="TOILET_CURTAIN_CLOSE"){
+      if(toiletCurtain.t>=0.98){
+        nurseActivity="TOILET_USE";
+        nurseToiletUseTimer=0;
+      }
+      return;
+    }
+
+    if(nurseActivity==="TOILET_USE"){
+      nurseToiletUseTimer+=dt;
+      // ナースのトイレ滞在は実時間5秒。
+      if(nurseToiletUseTimer>=5.0){
+        nurseToiletUseTimer=0;
+        nurseActivity="TOILET_CURTAIN_OPEN";
+        toiletCurtain.target=0;
+      }
+      return;
+    }
+
+    if(nurseActivity==="TOILET_CURTAIN_OPEN"){
+      if(toiletCurtain.t<=0.02){
+        nurseActivity="TOILET_EXIT";
+        if(!setRoute(nurseMover,nurseToiletExitTarget,"NURSE_TOILET_EXIT")){
+          nurse.position.copy(nurseToiletExitTarget);
+          nurseMover.route=[];
+          nurseMover.routeIndex=0;
+          nurseMover.state="IDLE";
+        }
+      }
+      return;
+    }
+
+    if(nurseActivity==="TOILET_EXIT"){
+      const outside =
+        nurse.position.z<6.05 ||
+        nurse.position.distanceTo(nurseToiletExitTarget)<0.7;
+
+      if(outside && nurseMover.state==="IDLE"){
+        nurseActivity="TOILET_RETURN";
+        if(!setRoute(nurseMover,nurseStationTarget,"NURSE_TOILET_RETURN")){
+          nurse.position.copy(nurseStationTarget);
+          nurseMover.route=[];
+          nurseMover.routeIndex=0;
+          nurseMover.state="IDLE";
+        }
+      }else if(nurseMover.state==="IDLE"){
+        if(!setRoute(nurseMover,nurseToiletExitTarget,"NURSE_TOILET_EXIT")){
+          nurse.position.copy(nurseToiletExitTarget);
+        }
+      }
+      return;
+    }
+
+    if(nurseActivity==="TOILET_RETURN"){
+      if(
+        nurseMover.state==="IDLE" &&
+        nurse.position.distanceTo(nurseStationTarget)<0.5
+      ){
+        nurse.position.copy(nurseStationTarget);
+        nurseActivity="IDLE";
+        scheduleNextNurseToilet();
+      }else if(nurseMover.state==="IDLE"){
+        if(!setRoute(nurseMover,nurseStationTarget,"NURSE_TOILET_RETURN")){
+          nurse.position.copy(nurseStationTarget);
+          nurseActivity="IDLE";
+          scheduleNextNurseToilet();
+        }
+      }
+    }
+  }
+
+  function startNursePatrol(){
+    if(nursePatrolActive || nurseActivity!=="IDLE") return;
+
+    nursePatrolActive=true;
+    // 詰所→Eを直線探索すると左側トイレを近道に選ぶことがあるため、
+    // 必ず中央廊下へ一度出てから巡回を開始する。
+    nursePatrolIndex=-1;
+    nursePatrolWait=0;
+
+    if(!setRoute(nurseMover,nursePatrolCorridorTarget,"NURSE_PATROL_CORRIDOR")){
+      nursePatrolActive=false;
+      nursePatrolIndex=0;
+    }
+  }
+
+  function updateNursePatrol(dt){
+    // 報告中・トイレ行動中は巡回を進めない。
+    if(nurseReportInProgress || nurseActivity!=="IDLE") return;
+
+    if(!nursePatrolActive){
+      if(gameMinutes>=nextNursePatrolAt && gameMinutes<15*60){
+        startNursePatrol();
+        // 開始できなかった場合も、トイレ終了後すぐ再判定できるよう
+        // 実際に巡回が始まった時だけ次回時刻を進める。
+        if(nursePatrolActive) nextNursePatrolAt+=120;
+      }
       return;
     }
 
@@ -2281,7 +2525,9 @@ try{
       nurseMover.state==="IDLE"
     ){
       if(nurse.position.distanceTo(nurseStationTarget)>0.35){
-        setRoute(nurseMover,nurseStationTarget,"NURSE_RETURN");
+        if(!setRoute(nurseMover,nurseStationTarget,"NURSE_RETURN")){
+          nurse.position.copy(nurseStationTarget);
+        }
         return;
       }
 
@@ -2294,6 +2540,20 @@ try{
 
     if(nurseMover.state!=="IDLE") return;
 
+    // 中央廊下への退避点では停止演出を入れず、すぐEへ向かう。
+    if(nursePatrolIndex===-1){
+      nursePatrolIndex=0;
+      if(!setRoute(
+        nurseMover,
+        nursePatrolTargetFor(nursePatrolOrder[0]),
+        "NURSE_PATROL"
+      )){
+        nursePatrolActive=false;
+        nursePatrolIndex=0;
+      }
+      return;
+    }
+
     nursePatrolWait+=dt;
     if(nursePatrolWait<1.0) return;
     nursePatrolWait=0;
@@ -2301,15 +2561,23 @@ try{
     nursePatrolIndex++;
 
     if(nursePatrolIndex<nursePatrolOrder.length){
-      setRoute(
+      if(!setRoute(
         nurseMover,
         nursePatrolTargetFor(nursePatrolOrder[nursePatrolIndex]),
         "NURSE_PATROL"
-      );
+      )){
+        // 1人の経路が取れなくても巡回全体を停止させない。
+        nursePatrolIndex++;
+      }
       return;
     }
 
-    setRoute(nurseMover,nurseStationTarget,"NURSE_RETURN");
+    if(!setRoute(nurseMover,nurseStationTarget,"NURSE_RETURN")){
+      nurse.position.copy(nurseStationTarget);
+      nurseMover.route=[];
+      nurseMover.routeIndex=0;
+      nurseMover.state="IDLE";
+    }
   }
 
   function resetNursePatrol(){
@@ -2318,10 +2586,18 @@ try{
     nurseMover.state="IDLE";
     nurse.position.copy(nurseStationTarget);
     nurse.rotation.set(0,0,0);
+
     nextNursePatrolAt=10*60;
     nursePatrolActive=false;
     nursePatrolIndex=0;
     nursePatrolWait=0;
+
+    nurseActivity="IDLE";
+    nurseToiletUseTimer=0;
+    nextNurseToiletAt=8*60+30+Math.random()*60;
+
+    // 再プレイ時にナースのトイレ利用でカーテンが残らないようにする。
+    toiletCurtain.target=0;
   }
 
   // Eは他利用者の標準的な歩行速度（約4.3）の0.6倍。
@@ -2528,6 +2804,7 @@ try{
     residentEMover.routeIndex=0;
     residentEMover.state="IDLE";
     eState="ANGER";
+    eAngerMarker.visible=true;
 
     showEReaction("もう嫌だ！",3.6);
     compactTarget.textContent="利用者Eが怒っています。近くで声を掛けてください";
@@ -2569,6 +2846,7 @@ try{
     eAngerActive=false;
     eAngerEscorting=false;
     eState="WANDER";
+    eAngerMarker.visible=false;
     eAngerFollowTimer=0;
     eAngerRepeatTimer=0;
 
@@ -2661,7 +2939,9 @@ try{
 
     // Eは「誘導開始」だけでは待たない。
     // 職員が実際にトイレ／浴場エリアへ入った時点で、入口前へ退避して待つ。
-    const staffInsideToilet = insideCareArea(player.position,false,0.05);
+    const staffInsideToilet =
+      insideCareArea(player.position,false,0.05) ||
+      nurseToiletOccupied();
     const staffInsideBath = insideCareArea(player.position,true,0.05);
 
     if(eState==="TOILET_GO" && staffInsideToilet){
@@ -2890,6 +3170,9 @@ try{
     eAngerStartedAt=-1;
     eAngerPenaltyApplied=0;
     eAngerAt=randomEAngerTime();
+    eAngerMarker.visible=false;
+    eAngerMarker.position.set(residentE.position.x,0.055,residentE.position.z);
+    eAngerMarker.scale.setScalar(1);
 
     if(eReaction?.sprite){
       scene.remove(eReaction.sprite);
@@ -3607,6 +3890,7 @@ try{
   const reportMaxWait = document.getElementById("reportMaxWait");
   const reportLongWait = document.getElementById("reportLongWait");
   const reportRoutine = document.getElementById("reportRoutine");
+  const reportEResponse = document.getElementById("reportEResponse");
   const shiftReportComment = document.getElementById("shiftReportComment");
   const decisionDebriefList = document.getElementById("decisionDebriefList");
   const balanceAnalysisBody = document.getElementById("balanceAnalysisBody");
@@ -4149,6 +4433,7 @@ try{
       !activeSubtleChange ||
       careState!=="NONE" ||
       routineWorkActive ||
+      nurseActivity!=="IDLE" ||
       !playerNearNurse()
     ) return;
 
@@ -4509,6 +4794,38 @@ try{
         alt:
           "90分以上トイレに行っていない利用者がいて、コールや定時業務が落ち着いている時は、事前誘導を選ぶ余地があります。"
       });
+    }
+
+    // Eの訴えは点数だけで終わらせず、対応結果を重点振り返りへ必ず残す。
+    const eResolvedEvent =
+      [...decisionLog].reverse().find(e=>e.type==="E_ANGER_RESOLVED");
+    const eStartedEvent =
+      decisionLog.find(e=>e.type==="E_ANGER_STARTED");
+
+    if(eStartedEvent){
+      if(eResolvedEvent){
+        const eWait=Math.max(0,Number(eResolvedEvent.wait)||0);
+        const ePenalty=Number(eResolvedEvent.penalty)||0;
+        focusItems.push({
+          verdict:eWait<20 ? "○" : eWait<30 ? "△" : "△",
+          title:"利用者Eへの対応",
+          text:
+            "利用者Eの訴えに対応し、居室Eまで誘導して落ち着いてもらいました。対応まで"+
+            Math.floor(eWait)+"分"+
+            (ePenalty<0 ? "、評価"+ePenalty+"点。" : "。"),
+          alt:
+            eWait<20
+              ? "訴えを見落とさず、通常業務と並行して早めに対応できています。"
+              : "コールや定時業務との優先順位を確認しつつ、Eの訴えが長時間化しないよう対応時機を判断します。"
+        });
+      }else{
+        focusItems.push({
+          verdict:"△",
+          title:"利用者Eへの対応",
+          text:"利用者Eの訴えが発生しましたが、勤務終了まで居室への誘導完了を確認できませんでした。",
+          alt:"吹き出しだけでなく上部の要対応表示と足元リングを確認し、近くで声掛け後に居室Eまで誘導します。"
+        });
+      }
     }
 
     // 未報告は通常の最大3件に埋もれないよう、重点振り返りとして必ず追加。
@@ -6730,6 +7047,11 @@ try{
       dToiletTotal:countTotal("BED_TOILET"),
       preventiveCount,
       nurseReported:subtleChangeReported ? 1 : 0,
+      eAngerResolved:decisionLog.some(e=>e.type==="E_ANGER_RESOLVED") ? 1 : 0,
+      eAngerWait:(()=>{
+        const evt=[...decisionLog].reverse().find(e=>e.type==="E_ANGER_RESOLVED");
+        return evt ? Number((Number(evt.wait)||0).toFixed(1)) : null;
+      })(),
       calls0900to1000:balanceCalls0900to1000,
       calls1300to1500:balanceCalls1300to1500
     };
@@ -6877,6 +7199,23 @@ try{
     const enabledRoutineTasks = routineTasks.filter(t=>t.enabled!==false);
     reportRoutine.textContent =
       enabledRoutineTasks.filter(t=>t.done).length + "/" + enabledRoutineTasks.length;
+
+    if(reportEResponse){
+      const eResolved =
+        [...decisionLog].reverse().find(e=>e.type==="E_ANGER_RESOLVED");
+      const eStarted =
+        decisionLog.find(e=>e.type==="E_ANGER_STARTED");
+
+      if(eResolved){
+        reportEResponse.textContent =
+          "完了 "+Math.floor(Math.max(0,Number(eResolved.wait)||0))+"分";
+      }else if(eStarted){
+        reportEResponse.textContent = "未完了";
+      }else{
+        reportEResponse.textContent = "発生なし";
+      }
+    }
+
     const bonusText = shiftBonusPoints > 0
       ? " ボーナス +" + shiftBonusPoints + "点"
       : "";
@@ -7069,9 +7408,17 @@ try{
       return a.startedAt-b.startedAt;
     });
 
-    if(!calls.length){
+    const eAlertActive=eAngerActive;
+    callTray.dataset.label =
+      eAlertActive && calls.length
+        ? "要対応　利用者E / ナースコール"
+        : eAlertActive
+          ? "要対応イベント"
+          : "ナースコール　赤＝先着 / 黄＝後発";
+
+    if(!calls.length && !eAlertActive){
       callTray.style.display = "none";
-      callTray.classList.remove("call-alert");
+      callTray.classList.remove("call-alert","e-only");
       callTray.innerHTML = "";
       callTraySignature = "";
       syncTopPanelsLayout();
@@ -7079,16 +7426,32 @@ try{
     }
 
     const visible = calls.slice(0,2);
+    const eMode=eAlertActive ? (eState==="ANGER_FOLLOW" ? "FOLLOW" : "ANGER") : "NONE";
 
-    // DOMを毎フレーム作り直すと、iPhoneではtouchstart〜touchendの間に
-    // ボタンが差し替わり、clickが成立しないことがある。
-    // コールID構成が変わった時だけ要素を作り、普段は文字だけ更新する。
+    // Eの訴えも上部の要対応レイヤーへ常時載せる。
+    // DOM差し替えは状態構成が変わった時だけにしてiPhoneのタップを安定させる。
     const signature =
+      "E:"+eMode+"|" +
       visible.map(call=>call.id).join(",") +
       "|" + calls.length;
 
     if(signature !== callTraySignature){
       callTray.innerHTML = "";
+
+      if(eAlertActive){
+        const eItem=document.createElement("div");
+        eItem.className="eAlertItem";
+        eItem.id="eAlertTrayItem";
+
+        const main=document.createElement("span");
+        main.className="eAlertMain";
+
+        const wait=document.createElement("span");
+        wait.className="eAlertWait";
+
+        eItem.append(main,wait);
+        callTray.append(eItem);
+      }
 
       visible.forEach(call=>{
         const button = document.createElement("button");
@@ -7122,6 +7485,21 @@ try{
       callTraySignature = signature;
     }
 
+    if(eAlertActive){
+      const eItem=callTray.querySelector("#eAlertTrayItem");
+      if(eItem){
+        const waitMinutes=eAngerStartedAt>=0
+          ? Math.max(0,Math.floor(gameMinutes-eAngerStartedAt))
+          : 0;
+        eItem.querySelector(".eAlertMain").textContent =
+          eState==="ANGER_FOLLOW"
+            ? "⚠ E　居室Eへ誘導中"
+            : "⚠ E　訴えあり → 近くで声掛け";
+        eItem.querySelector(".eAlertWait").textContent =
+          eState==="ANGER_FOLLOW" ? "対応中" : waitMinutes+"分";
+      }
+    }
+
     visible.forEach((call,index)=>{
       const button = callTray.querySelector(
         "[data-call-id='" + call.id + "']"
@@ -7132,11 +7510,6 @@ try{
       const waitMinutes = Math.max(0, Math.floor(gameMinutes-call.startedAt));
       const selected = activeCall && activeCall.id===call.id;
       const responding = selected && careState!=="NONE";
-      const ready =
-        timeRunning &&
-        selected &&
-        careState==="NONE" &&
-        canRespondToCall(call);
 
       button.className =
         "callTrayItem " + callTrayClass(call) +
@@ -7167,8 +7540,10 @@ try{
     }
 
     callTray.style.display = "flex";
+    callTray.classList.toggle("e-only",eAlertActive && !calls.length);
 
     const anyWaiting =
+      eAlertActive ||
       calls.some(call=>!(activeCall && activeCall.id===call.id && careState!=="NONE"));
     callTray.classList.toggle("call-alert", anyWaiting);
 
@@ -7529,7 +7904,10 @@ try{
       return;
     }
 
-    if(careState!=="NONE" && careResidentIndex!==null){
+    if(eAngerActive && eState==="ANGER_FOLLOW"){
+      compactTarget.textContent =
+        "利用者E 居室Eへ誘導中 / 対応中…";
+    }else if(careState!=="NONE" && careResidentIndex!==null){
       const r = residents[careResidentIndex];
       const action =
         careType==="BATH"
@@ -7539,6 +7917,12 @@ try{
             : "排泄介助";
       compactTarget.textContent =
         r.name + " " + action + " / 対応中…";
+    }else if(eAngerActive && eState==="ANGER"){
+      const eWait=eAngerStartedAt>=0
+        ? Math.max(0,Math.floor(gameMinutes-eAngerStartedAt))
+        : 0;
+      compactTarget.textContent =
+        "⚠ 利用者E 訴えあり（待機"+eWait+"分）→ 近くで声掛け";
     }else if(activeCall){
       const r=residents[activeCall.residentIndex];
       const wait=Math.max(0,Math.floor(gameMinutes-activeCall.startedAt));
@@ -7566,7 +7950,8 @@ try{
     const longWait=allCalls.filter(c=>gameMinutes-c.startedAt>=20).length;
 
     let state="安定";
-    if(careState!=="NONE") state="対応中";
+    if(eAngerActive) state=eState==="ANGER_FOLLOW" ? "E対応中" : "E訴え";
+    else if(careState!=="NONE") state="対応中";
     else if(allCalls.length) state="コールあり";
     if(longWait>=1) state="要注意";
     if(longWait>=2 || highCount>=2) state="逼迫";
@@ -8697,21 +9082,27 @@ try{
 
       const occupiedByE =
         atCareEntrance && (isBath ? eBathOccupied() : eToiletOccupied());
+      const occupiedByNurse =
+        atCareEntrance && !isBath && nurseToiletOccupied();
+      const occupiedByFacilityUser = occupiedByE || occupiedByNurse;
 
-      updateEscortDelayPenalty(dt,occupiedByE);
+      updateEscortDelayPenalty(dt,occupiedByFacilityUser);
       updateEFacilityWaitReaction(dt,occupiedByE);
 
       if(atCareEntrance){
-        if(occupiedByE){
+        if(occupiedByFacilityUser){
           residentMover.route=[];
           residentMover.routeIndex=0;
           residentMover.state="IDLE";
           playerMover.route=[];
           playerMover.routeIndex=0;
           playerMover.state="IDLE";
-          careProgress.textContent =
-            "利用者Eが" + (isBath ? "入浴場" : "トイレ") +
-            "を使用中です。空くまで待ってください";
+          careProgress.textContent = occupiedByNurse
+            ? "ナースがトイレを使用中です。空くまで待ってください"
+            : (
+                "利用者Eが" + (isBath ? "入浴場" : "トイレ") +
+                "を使用中です。空くまで待ってください"
+              );
           return;
         }
 
@@ -9031,9 +9422,18 @@ try{
       residentMovers.forEach(m=>updateMover(m,dt));
       updateMover(residentEMover,dt);
       updateMover(nurseMover,dt);
+      updateNurseToilet(dt);
       updateNursePatrol(dt);
       updateResidentE(dt);
       updateEReaction(dt);
+
+      if(eAngerMarker.visible){
+        const pulse=1+Math.sin(performance.now()*0.010)*0.18;
+        eAngerMarker.scale.setScalar(pulse);
+        eAngerMarker.material.opacity=0.72+Math.sin(performance.now()*0.010)*0.20;
+        eAngerMarker.position.set(residentE.position.x,0.055,residentE.position.z);
+      }
+
       updateDWheelchairTransport();
       updateCurtain(toiletCurtain,dt);
       updateCurtain(bathCurtain,dt);
