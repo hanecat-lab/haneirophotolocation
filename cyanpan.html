@@ -657,7 +657,7 @@
     let finaleUntil = 0, finaleCountdownUntil = 0, finaleGradeKey = '', lastPartyHudCopy = '';
     // syncDressingUI() は初期化中(setDressing の定義より前)に呼ばれるため、
     // ここで早期に宣言しないと起動時にTDZで落ちる。このファイルで既知の罠。
-    let magicChangeUntil = 0;
+    let magicChangeUntil = 0, magicChangeMessageArmed = false;
     // createPartyOverdrive()内の品質適応ティア(0/1/2)。anniversaryHeartLimit等が
     // 暗転後の演出で毎フレーム参照するため、createPartyOverdrive()のローカル変数ではなく
     // ここで早期(TDZ回避)に共有スコープで宣言する。
@@ -1137,12 +1137,17 @@
     function armAnniversaryMessage(completedGradeKey = finaleGradeKey) {
       // 起動時ではなく、実際に完走したPINEの終了時刻だけを余韻の起点にする。
       if (!anniversaryEnabled || currentTheme !== 'party' || completedGradeKey !== 'pine') return;
-      const now = performance.now();
       // 最終7発をスマホでも十分に見せ切り、残光が引き構図で落ち着いてから文字へ渡す。
       // スマホはタワー・ミラーボール・残光を固定した静止タブローを5.5秒見せてから重ねる。
-      const anniversaryHoldMs = matchMedia('(max-width: 660px)').matches ? 5500 : 7600;
+      beginAnniversaryMessage(matchMedia('(max-width: 660px)').matches ? 5500 : 7600);
+    }
+    // 余韻の本体。partyのフィナーレ完走からも、Magic DressingのMAGIC CHANGEからも呼ぶ。
+    // 暗転までの間隔・キャスト名までの間隔・星ボタンまで持続する点はどちらも同じ仕様。
+    function beginAnniversaryMessage(holdMs = 0) {
+      if (!anniversaryEnabled) return;
+      const now = performance.now();
       // 星ボタンを押すまで持続する。時間による自動終了は持たない。
-      anniversaryStartsAt = now + anniversaryHoldMs; anniversaryUntil = Infinity;
+      anniversaryStartsAt = now + holdMs; anniversaryUntil = Infinity;
       document.body.classList.add('anniversary-active');
       document.body.classList.remove('anniversary-dimmed');
       anniversaryDim.setAttribute('aria-hidden', 'false');
@@ -4172,7 +4177,7 @@
       // 書法の柱は2つ。どちらも「水上で音を届かせるために書かれた」バロック祝祭曲の特徴。
       //   1. 金管と弦の掛け合い(アンティフォナル) … 動機を金管が出し、弦が応える
       //   2. テラス・ダイナミクス … 徐々に上げず、ブロックごとにゲインを切り替える
-      let finaleSession = null, finaleStopTimer = null;
+      let finaleSession = null, finaleStopTimer = null, finaleSilenced = false;
       // 長三和音を基本に、上へ開くための第9音まで。バロックなので付加6度は使わない。
       const FINALE_CHORD = [1, 1.2599, 1.4983, 2, 2.2449];
       // I → V → vi → IV → I → V → I の骨格をリトルネッロで巡らせる。
@@ -4243,8 +4248,9 @@
         // アラ・ホーンパイプに相当する3拍子系の枠。付点(長短のペア)が推進力になる。
         const beat = .40, bar = beat * 6;
         const fanfareEnd = 4.0;
-        const bloomAt = durationSec - 5.0;
-        const climbAt = bloomAt - (long ? 12.0 : 6.0);
+        const bloomAt = Math.max(fanfareEnd + 1.0, durationSec - 5.0);
+        // 尺が短いと上昇部の開始が負の時刻になり、AudioParamが例外を投げる。
+        const climbAt = Math.max(fanfareEnd, bloomAt - (long ? 12.0 : 6.0));
         const at = offset => startAt + offset;
         // 付点リズム。長short のペアで1拍半ぶんを埋める。
         const dotted = (play, base, degrees, atSec, gainValue) => {
@@ -4347,9 +4353,11 @@
         noise(at(bloomAt), 1.5, .006, 5200, destination);
       };
       const stopFinaleScore = (resume) => {
-        // 通し構成が動いていないときは何もしない。ここを素通りさせると、
+        // 通し構成が動いておらず、無音にもしていないときは何もしない。ここを素通りさせると、
         // 呼ばれるたびにscheduleMusic()が重なりmusicTimerが多重化する。
-        if (!finaleSession && !finaleStopTimer) return;
+        // finaleSilenced を見るのは、尺の終わりに無音へ渡したあと(セッションもタイマーも
+        // 消えている)でも、星ボタンからのresumeを受け取れるようにするため。
+        if (!finaleSession && !finaleStopTimer && !finaleSilenced) return;
         if (finaleStopTimer) { clearTimeout(finaleStopTimer); finaleStopTimer = null; }
         if (finaleSession && context) {
           const retiring = finaleSession; finaleSession = null;
@@ -4358,7 +4366,9 @@
           retiring.gain.exponentialRampToValueAtTime(.0001, now() + .45);
           setTimeout(() => { try { retiring.disconnect(); } catch (error) { /* 切断済み */ } }, 700);
         }
-        if (resume && enabled && context && musicPreset !== 'music-off') scheduleMusic();
+        if (!resume) return;
+        finaleSilenced = false;
+        if (enabled && context && musicPreset !== 'music-off') scheduleMusic();
       };
       const stopPourBed = () => {
         if (!pourSource || !context) return;
@@ -4378,24 +4388,24 @@
         async enable() {
           manuallyMuted = false;
           if (!await ensure()) return false;
-          enabled = true; master.gain.cancelScheduledValues(now()); master.gain.setTargetAtTime(volume * 1.40, now(), .04);
+          enabled = true; finaleSilenced = false; master.gain.cancelScheduledValues(now()); master.gain.setTargetAtTime(volume * 1.40, now(), .04);
           // 操作確認音は鳴らさず、許可されたBGMだけを開始する。
           stopMusic(); scheduleMusic(); return true;
         },
         async autostart() { return manuallyMuted || enabled ? false : this.enable(); },
-        disable() { manuallyMuted = true; enabled = false; stopFinaleScore(false); stopMusic(); stopPourBed(); if (master && context) master.gain.setTargetAtTime(.0001, now(), .06); },
+        disable() { manuallyMuted = true; enabled = false; stopFinaleScore(false); finaleSilenced = false; stopMusic(); stopPourBed(); if (master && context) master.gain.setTargetAtTime(.0001, now(), .06); },
         setVolume(next) { volume = Math.max(0, Math.min(1, next)); if (master && context && enabled) master.gain.setTargetAtTime(volume * 1.40, now(), .04); },
         setRoot(next) { root = next; },
         setPreset(nextPreset) {
           if (nextPreset === 'music-off' || musicProfiles[nextPreset]) musicPreset = nextPreset;
-          if (enabled && context) { stopFinaleScore(false); stopMusic(); if (musicPreset !== 'music-off') scheduleMusic(); }
+          if (enabled && context) { stopFinaleScore(false); finaleSilenced = false; stopMusic(); if (musicPreset !== 'music-off') scheduleMusic(); }
         },
         // BGM以外は注水音と泡音だけに限定する。UI操作音・開始音・完了チャイムは鳴らさない。
         uiTick() {},
         // FINAL DROPの間だけ、ループのプリセットを止めて通し構成へ差し替える。
         startFinale(durationMs) {
           if (!enabled || !context || musicPreset === 'music-off') return;
-          stopFinaleScore(false); stopMusic();
+          stopFinaleScore(false); stopMusic(); finaleSilenced = true;
           finaleSession = context.createGain(); finaleSession.gain.value = 1; finaleSession.connect(musicBus);
           const durationSec = Math.max(10, (durationMs || 30000) / 1000);
           scheduleFinaleScore(durationSec, finaleSession, now() + .08);
@@ -4550,8 +4560,14 @@
       const musicParticleResponse = Math.max(response, musicVisualBeatPulse * musicVisual.particle * activeQualityProfile().musicGain);
       if (tower && tower.userData && tower.userData.celebration) tower.userData.celebration.update(delta, musicParticleResponse);
       updateSakuraGlassFinish(delta, response);
-      // MAGIC CHANGE の終了。尺を過ぎたら元の装飾とBGMへ戻す。
-      if (magicChangeUntil && performance.now() >= magicChangeUntil) stopMagicChange(true);
+      // 旋風の頭で記念メッセージを仕込む。暗転までの間隔・キャスト名までの間隔・
+      // 星ボタンまで持続する点は FINAL DROP と同じ仕様（同じ関数を通る）。
+      if (magicChangeUntil && !magicChangeMessageArmed && performance.now() >= magicChangeUntil - MAGIC_CHANGE_VORTEX_MS) {
+        magicChangeMessageArmed = true;
+        beginAnniversaryMessage(MAGIC_CHANGE_VORTEX_MS);
+      }
+      // MAGIC CHANGE の終了。記念メッセージへ渡すので、BGMは無音のままにする。
+      if (magicChangeUntil && performance.now() >= magicChangeUntil) stopMagicChange(!magicChangeMessageArmed);
     }
 
     // 桜が選ばれている間だけ、霞桜の色をガラスの透過色・液面・リムのハイライトへ薄く反射させる。
@@ -4638,12 +4654,15 @@
 
     // Magic Dressing の見せ場。30秒3幕（ハート → 泡 → 桜の解放 → 3つ同時）。
     // party の FINAL DROP とは別系統で、ミラーボール・レーザー・花火は一切使わない。
-    const MAGIC_CHANGE_MS = 40000;
+    // 42秒までが4装飾の終幕、42-48秒がハートの旋風。旋風の頭で記念メッセージを仕込み、
+    // 旋風が最高潮になる48秒で文字が出る（FINAL DROPの「静止タブローを見せてから重ねる」と同じ作り）。
+    const MAGIC_CHANGE_MS = 48000, MAGIC_CHANGE_VORTEX_MS = 6000;
     async function startMagicChange() {
       if (currentTheme !== 'dressing' || magicChangeUntil > performance.now()) return;
       const celebration = tower?.userData?.celebration;
       if (!celebration?.startMagicChange) return;
       magicChangeUntil = performance.now() + MAGIC_CHANGE_MS;
+      magicChangeMessageArmed = false;
       celebration.startMagicChange();
       themePulse = 1;
       pulsePrismFlash(.62);
@@ -5646,7 +5665,8 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       // 幕の切替は setDressing() を呼ばず、各レイヤーの不透明度を重ねて遷移させる。
       // マテリアルの差し替えを起こさないので再コンパイルもちらつきも発生しない。
       let magicChange = null;
-      const MAGIC_ACTS = { lead: 3, heart: 11, star: 19, bubble: 27, sakura: 36, all: 40 };
+      // all = 4装飾が揃う終幕の終わり。vortex = ハートの旋風がタワーを包む最終幕。
+      const MAGIC_ACTS = { lead: 3, heart: 11, star: 19, bubble: 27, sakura: 36, all: 42, vortex: 48 };
       const startMagicChange = () => {
         magicChange = { time: 0, release: 0 };
         // ハート・泡を選んでいると settlement は 0.11/秒 で減衰し切っている。
@@ -5659,7 +5679,10 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       const magicChangeMix = time => {
         const ramp = (from, to, t) => THREE.MathUtils.clamp((t - from) / (to - from), 0, 1);
         const A = MAGIC_ACTS;
-        if (time < A.lead) { const t = ramp(0, A.lead, time); return { heart: t * .35, star: 0, bubble: 0, sakura: 0, release: 0 }; }
+        if (time < A.lead) { const t = ramp(0, A.lead, time); return { heart: t * .35, star: 0, bubble: 0, sakura: 0, release: 0, vortex: 0 }; }
+        // 最終幕: ハートだけが残り、タワー全体を包む旋風になる。他は引いていく。
+        const vortex = ramp(A.all, A.all + 2.6, time);
+        const settle = 1 - ramp(A.all, A.all + 3.2, time);
         // 幕はクロスフェードで重ねる。前の幕が消え切る前に次が立ち上がり、終幕で4つが揃う。
         const finale = ramp(A.sakura, A.all, time);
         const heart = time < A.heart ? 1 : Math.max(.22, 1 - ramp(A.heart, A.heart + 2.5, time) * .78) + finale * .78;
@@ -5669,7 +5692,7 @@ function createCelebrationEffects(levels, towerHeight, placements) {
           : Math.max(.30, 1 - ramp(A.bubble, A.bubble + 2.5, time) * .70) + finale * .38);
         const sakura = time < A.bubble ? 0 : ramp(A.bubble, A.bubble + 2.2, time);
         const release = time < A.sakura - 6 ? 0 : ramp(A.sakura - 6, A.all, time);
-        return { heart: Math.min(1, heart), star: Math.min(1, star), bubble: Math.min(1, bubble), sakura, release };
+        return { heart: Math.min(1, heart), star: Math.min(1, star) * settle, bubble: Math.min(1, bubble) * settle, sakura: sakura * settle, release, vortex };
       };
       const releaseMatrix = new THREE.Matrix4(), releaseQuaternion = new THREE.Quaternion();
       const releaseScale = new THREE.Vector3(), releaseEuler = new THREE.Euler(), releasePos = new THREE.Vector3();
@@ -5732,7 +5755,7 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         const innerRadius = radius * (activeDressing() ? .98 : .45);
         // 位置計算をmotion指定で呼べるようにし、MAGIC CHANGE中は主Points(ハート)と
         // 副Points(泡)へ別々の軌道を書く。通常時は従来どおり主Pointsのみ1回走る。
-        const writePositions = (kind, target, phaseShift) => {
+        const writePositions = (kind, target, phaseShift, vortexBlend = 0) => {
         for (let i = 0; i < activeParticleCount; i++) {
           const at = i * 4, out = i * 3, phase = phases[at] + phaseShift + elapsed * speed * phases[at + 3];
           let radial = radius * spread * phases[at + 1] * (1 + Math.sin(elapsed * 1.15 + phases[at]) * .045);
@@ -5753,13 +5776,26 @@ function createCelebrationEffects(levels, towerHeight, placements) {
             driftAngle = phase + gust * .43 + windPulse * .35 + Math.sin(elapsed * .58 + phases[at]) * .16;
           }
           radial = Math.max(innerRadius, radial);
+          if (vortexBlend > .001) {
+            // タワー全体を包む竜巻。下ほど広く、上ほどすぼまり、速く回る。
+            const climb = (phases[at + 2] + elapsed * .40 * (.6 + phases[at + 3] * .8)) % 1;
+            const vortexY = .05 + towerHeight * climb;
+            const vortexRadial = radius * (.55 + .85 * (1 - climb)) * (.62 + phases[at + 1] * .46);
+            const vortexAngle = phases[at] + elapsed * (2.05 + phases[at + 3] * .95);
+            // 位置そのものを補間する。motionを切り替えると粒が瞬間移動する。
+            y += (vortexY - y) * vortexBlend;
+            radial += (vortexRadial - radial) * vortexBlend;
+            let delta2 = vortexAngle - driftAngle;
+            delta2 = Math.atan2(Math.sin(delta2), Math.cos(delta2));
+            driftAngle += delta2 * vortexBlend;
+          }
           target.array[out] = Math.cos(driftAngle) * radial;
           target.array[out + 1] = y;
           target.array[out + 2] = Math.sin(driftAngle) * radial;
         }
         target.needsUpdate = true;
         };
-        if (showMain) writePositions(mcMix ? 'orbit' : motion, position, 0);
+        if (showMain) writePositions(mcMix ? 'orbit' : motion, position, 0, mcMix ? mcMix.vortex : 0);
         // 副Pointsは位相を半周ずらし、主Pointsと同じ場所に重ならないようにする。
         altChannels.forEach((channel, index) => {
           if (!altShow[index]) return;
