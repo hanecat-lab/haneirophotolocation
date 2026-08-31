@@ -4562,9 +4562,9 @@
       updateSakuraGlassFinish(delta, response);
       // 旋風の頭で記念メッセージを仕込む。暗転までの間隔・キャスト名までの間隔・
       // 星ボタンまで持続する点は FINAL DROP と同じ仕様（同じ関数を通る）。
-      if (magicChangeUntil && !magicChangeMessageArmed && performance.now() >= magicChangeUntil - MAGIC_CHANGE_VORTEX_MS) {
+      if (magicChangeUntil && !magicChangeMessageArmed && performance.now() >= magicChangeUntil - MAGIC_CHANGE_MESSAGE_LEAD_MS) {
         magicChangeMessageArmed = true;
-        beginAnniversaryMessage(MAGIC_CHANGE_VORTEX_MS);
+        beginAnniversaryMessage(0);
       }
       // MAGIC CHANGE の終了。記念メッセージへ渡すので、BGMは無音のままにする。
       if (magicChangeUntil && performance.now() >= magicChangeUntil) stopMagicChange(!magicChangeMessageArmed);
@@ -4656,7 +4656,9 @@
     // party の FINAL DROP とは別系統で、ミラーボール・レーザー・花火は一切使わない。
     // 42秒までが4装飾の終幕、42-48秒がハートの旋風。旋風の頭で記念メッセージを仕込み、
     // 旋風が最高潮になる48秒で文字が出る（FINAL DROPの「静止タブローを見せてから重ねる」と同じ作り）。
-    const MAGIC_CHANGE_MS = 48000, MAGIC_CHANGE_VORTEX_MS = 6000;
+    // 42秒までが4装飾の終幕、42-48秒がハートの旋風。旋風が立ち上がった3秒後（45秒）に
+    // 記念メッセージを出し、旋風はその上で48秒まで回り続ける。
+    const MAGIC_CHANGE_MS = 48000, MAGIC_CHANGE_MESSAGE_LEAD_MS = 3000;
     async function startMagicChange() {
       if (currentTheme !== 'dressing' || magicChangeUntil > performance.now()) return;
       const celebration = tower?.userData?.celebration;
@@ -5667,6 +5669,9 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       let magicChange = null;
       // all = 4装飾が揃う終幕の終わり。vortex = ハートの旋風がタワーを包む最終幕。
       const MAGIC_ACTS = { lead: 3, heart: 11, star: 19, bubble: 27, sakura: 36, all: 42, vortex: 48 };
+      // タワー外周(= radius * .862)の1.5倍を旋風の平均半径にする。
+      // 実測で平均半径が目標の .959 倍だったぶんを補正して、狙いの1.5倍に合わせる。
+      const VORTEX_RADIUS_SCALE = .862 * 1.5 / .959;
       const startMagicChange = () => {
         magicChange = { time: 0, release: 0 };
         // ハート・泡を選んでいると settlement は 0.11/秒 で減衰し切っている。
@@ -5679,10 +5684,13 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       const magicChangeMix = time => {
         const ramp = (from, to, t) => THREE.MathUtils.clamp((t - from) / (to - from), 0, 1);
         const A = MAGIC_ACTS;
-        if (time < A.lead) { const t = ramp(0, A.lead, time); return { heart: t * .35, star: 0, bubble: 0, sakura: 0, release: 0, vortex: 0 }; }
+        if (time < A.lead) { const t = ramp(0, A.lead, time); return { heart: t * .35, star: 0, bubble: 0, sakura: 0, release: 0, vortex: 0, vortexDense: 0 }; }
         // 最終幕: ハートだけが残り、タワー全体を包む旋風になる。他は引いていく。
         const vortex = ramp(A.all, A.all + 2.6, time);
         const settle = 1 - ramp(A.all, A.all + 3.2, time);
+        // 星と泡が消え切ったあと、その2本のチャンネルをハートへ転用して密度を3倍にする。
+        // 新しいPointsは足さない。切替は不透明度が0の区間で起きるので見えない。
+        const vortexDense = ramp(A.all + 3.2, A.all + 4.8, time);
         // 幕はクロスフェードで重ねる。前の幕が消え切る前に次が立ち上がり、終幕で4つが揃う。
         const finale = ramp(A.sakura, A.all, time);
         const heart = time < A.heart ? 1 : Math.max(.22, 1 - ramp(A.heart, A.heart + 2.5, time) * .78) + finale * .78;
@@ -5692,7 +5700,7 @@ function createCelebrationEffects(levels, towerHeight, placements) {
           : Math.max(.30, 1 - ramp(A.bubble, A.bubble + 2.5, time) * .70) + finale * .38);
         const sakura = time < A.bubble ? 0 : ramp(A.bubble, A.bubble + 2.2, time);
         const release = time < A.sakura - 6 ? 0 : ramp(A.sakura - 6, A.all, time);
-        return { heart: Math.min(1, heart), star: Math.min(1, star) * settle, bubble: Math.min(1, bubble) * settle, sakura: sakura * settle, release, vortex };
+        return { heart: Math.min(1, heart), star: Math.min(1, star) * settle, bubble: Math.min(1, bubble) * settle, sakura: sakura * settle, release, vortex, vortexDense };
       };
       const releaseMatrix = new THREE.Matrix4(), releaseQuaternion = new THREE.Quaternion();
       const releaseScale = new THREE.Vector3(), releaseEuler = new THREE.Euler(), releasePos = new THREE.Vector3();
@@ -5731,7 +5739,11 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         // 主Pointsはハート、副Pointsは泡を受け持つ。通常時は主Pointsだけが選択中の装飾を描く。
         const showMain = mcMix ? mcMix.heart > .004 : !isSakura;
         // 副チャンネル(星・泡)は MAGIC CHANGE 中だけ、それぞれの混ざり具合で現れる。
-        const altShow = altChannels.map(channel => mcMix ? mcMix[channel.key] > .004 : false);
+        // 旋風の後半は同じ2本をハートへ転用し、粒数を増やさずに密度だけ上げる。
+        const denseHearts = mcMix ? mcMix.vortexDense : 0;
+        const altKeyOf = channel => denseHearts > .004 ? 'pearl' : channel.key;
+        const altMixOf = channel => denseHearts > .004 ? mcMix.heart * denseHearts : mcMix[channel.key];
+        const altShow = altChannels.map(channel => mcMix ? altMixOf(channel) > .004 : false);
         const isPouring = Boolean(pour && pour.controller && pour.controller.pouring);
         const cameraDistance = camera && controls ? camera.position.distanceTo(controls.target) : frameDistance;
         const nextLod = cameraDistance > frameDistance * 2.05 ? 2 : (cameraDistance > frameDistance * 1.42 ? 1 : 0);
@@ -5780,7 +5792,9 @@ function createCelebrationEffects(levels, towerHeight, placements) {
             // タワー全体を包む竜巻。下ほど広く、上ほどすぼまり、速く回る。
             const climb = (phases[at + 2] + elapsed * .40 * (.6 + phases[at + 3] * .8)) % 1;
             const vortexY = .05 + towerHeight * climb;
-            const vortexRadial = radius * (.55 + .85 * (1 - climb)) * (.62 + phases[at + 1] * .46);
+            // celebrationのradiusは タワー外周 ÷ .862 相当（radius = levels * glassPitch() * .58、
+            // タワー外周 = levels * glassPitch() * .5）。その1.5倍を平均半径に置く。
+            const vortexRadial = radius * VORTEX_RADIUS_SCALE * (.72 + .56 * (1 - climb)) * (.82 + phases[at + 1] * .22);
             const vortexAngle = phases[at] + elapsed * (2.05 + phases[at + 3] * .95);
             // 位置そのものを補間する。motionを切り替えると粒が瞬間移動する。
             y += (vortexY - y) * vortexBlend;
@@ -5799,7 +5813,8 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         // 副Pointsは位相を半周ずらし、主Pointsと同じ場所に重ならないようにする。
         altChannels.forEach((channel, index) => {
           if (!altShow[index]) return;
-          writePositions(DRESSINGS[channel.key].motion, channel.geometry.attributes.position, channel.phaseShift);
+          const key = altKeyOf(channel);
+          writePositions(DRESSINGS[key].motion, channel.geometry.attributes.position, channel.phaseShift, key === 'pearl' ? mcMix.vortex : 0);
         });
         // 俯瞰時（真上に近い視点）だけ粒子を軽く持ち上げる。
         const polar = controls ? controls.getPolarAngle() : Math.PI / 4;
@@ -5811,9 +5826,10 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         altChannels.forEach((channel, index) => {
           channel.points.visible = altShow[index];
           if (!altShow[index]) return;
-          const choice = DRESSINGS[channel.key], texture = getDressingTexture(choice.particleShape);
+          const key = altKeyOf(channel), choice = DRESSINGS[key], texture = getDressingTexture(choice.particleShape);
           if (channel.material.map !== texture) { channel.material.map = texture; channel.material.needsUpdate = true; }
-          channel.material.opacity = (.68 + response * .30) * fade * (1 + overhead * .25) * mcMix[channel.key];
+          channel.material.color.setHex(choice.colour);
+          channel.material.opacity = (.68 + response * .30) * fade * (1 + overhead * .25) * altMixOf(channel);
           channel.material.size = .072 * choice.size * levelScale * (1 + overhead * .5);
         });
         petalLayers.forEach(layer => {
