@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-72</title>
+<title>CARE SHIFT - Phase 10-74</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -609,6 +609,62 @@ button{
   color:#65727b;
   line-height:1.4;
 }
+#balanceAnalysis{
+  margin-top:10px;
+  padding:9px 10px;
+  border-radius:12px;
+  background:#f4f7f9;
+  border:1px solid rgba(36,48,58,.10);
+}
+#balanceAnalysis summary{
+  cursor:pointer;
+  font-size:12px;
+  font-weight:900;
+}
+.balanceSummaryGrid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:6px;
+  margin-top:8px;
+}
+.balanceSummaryItem{
+  padding:7px;
+  border-radius:8px;
+  background:#fff;
+  font-size:9px;
+  line-height:1.35;
+}
+.balanceSummaryItem strong{
+  display:block;
+  margin-top:2px;
+  font-size:11px;
+}
+.balanceHistoryWrap{
+  margin-top:8px;
+  overflow-x:auto;
+}
+.balanceHistoryTable{
+  width:100%;
+  border-collapse:collapse;
+  font-size:8px;
+  white-space:nowrap;
+}
+.balanceHistoryTable th,
+.balanceHistoryTable td{
+  padding:4px 5px;
+  border-top:1px solid rgba(36,48,58,.10);
+  text-align:right;
+}
+.balanceHistoryTable th:first-child,
+.balanceHistoryTable td:first-child{
+  text-align:left;
+}
+.balanceHistoryNote{
+  margin-top:7px;
+  color:#65727b;
+  font-size:8px;
+  line-height:1.4;
+}
 #shiftReportActions{
   display:flex;
   gap:8px;
@@ -966,7 +1022,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-72 / スマホ期限上位2件・初見向け説明</div>
+  <div class="sub">Phase 10-74 / バランス分析初期化エラー修正</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -1074,6 +1130,11 @@ button{
       <div class="decisionDebriefTitle">今日の判断</div>
       <div id="decisionDebriefList">判断ログを集計しています。</div>
     </div>
+
+    <details id="balanceAnalysis">
+      <summary>バランス分析（直近10回）</summary>
+      <div id="balanceAnalysisBody">プレイ履歴を集計しています。</div>
+    </details>
 
     <div id="shiftReportActions">
       <button id="reportRestart">08:00から再プレイ</button>
@@ -3384,6 +3445,7 @@ try{
   const reportRoutine = document.getElementById("reportRoutine");
   const shiftReportComment = document.getElementById("shiftReportComment");
   const decisionDebriefList = document.getElementById("decisionDebriefList");
+  const balanceAnalysisBody = document.getElementById("balanceAnalysisBody");
   const reportRestart = document.getElementById("reportRestart");
   const reportClose = document.getElementById("reportClose");
   const respondButton = document.getElementById("respondButton");
@@ -3967,6 +4029,47 @@ try{
   resetSubtleChange();
 
   const decisionLog = [];
+
+  // バランス検証用：1プレイ内の負荷分布を記録。
+  // 履歴はlocalStorageに直近10回だけ保存する。
+  const BALANCE_HISTORY_KEY="careShiftBalanceHistoryV1";
+  let balanceMaxOpenCalls=0;
+  let balanceSimultaneousEvents=0;
+  let balanceWasMultiCall=false;
+  let balanceToiletCalls=0;
+  let balanceCalls0900to1000=0;
+  let balanceCalls1300to1500=0;
+
+  function resetBalanceRunCounters(){
+    balanceMaxOpenCalls=0;
+    balanceSimultaneousEvents=0;
+    balanceWasMultiCall=false;
+    balanceToiletCalls=0;
+    balanceCalls0900to1000=0;
+    balanceCalls1300to1500=0;
+  }
+
+  function readBalanceHistory(){
+    try{
+      const raw=localStorage.getItem(BALANCE_HISTORY_KEY);
+      const parsed=raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.slice(-10) : [];
+    }catch(_){
+      return [];
+    }
+  }
+
+  function writeBalanceHistory(history){
+    try{
+      localStorage.setItem(
+        BALANCE_HISTORY_KEY,
+        JSON.stringify(history.slice(-10))
+      );
+    }catch(_){}
+  }
+
+  // 変数宣言後に初期化する。letのTDZより前では呼ばない。
+  resetBalanceRunCounters();
 
   function logDecision(type,data={}){
     decisionLog.push({
@@ -6346,6 +6449,125 @@ try{
     shiftScore = Math.min(100, shiftScore + shiftBonusPoints);
   }
 
+  function buildBalanceRunRecord(){
+    const enabledRoutineTasks=routineTasks.filter(t=>t.enabled!==false);
+    const countDone=type=>
+      enabledRoutineTasks.filter(t=>t.type===type && t.done).length;
+    const countTotal=type=>
+      enabledRoutineTasks.filter(t=>t.type===type).length;
+
+    const preventiveCount=
+      decisionLog.filter(e=>e.type==="PREVENTIVE_TOILET").length;
+
+    const avgWaitExact=completedCareCount
+      ? totalWaitMinutes/completedCareCount
+      : 0;
+
+    return {
+      savedAt:Date.now(),
+      score:shiftScore,
+      rank:currentRank(),
+      toiletCalls:balanceToiletCalls,
+      simultaneousEvents:balanceSimultaneousEvents,
+      maxOpenCalls:balanceMaxOpenCalls,
+      avgWait:Number(avgWaitExact.toFixed(1)),
+      longWaits:longWaitCareCount,
+      hydrationDone:countDone("HYDRATION"),
+      hydrationTotal:countTotal("HYDRATION"),
+      lunchDone:countDone("LUNCH"),
+      lunchTotal:countTotal("LUNCH"),
+      bathDone:countDone("BATH"),
+      bathTotal:countTotal("BATH"),
+      dToiletDone:countDone("BED_TOILET"),
+      dToiletTotal:countTotal("BED_TOILET"),
+      preventiveCount,
+      nurseReported:subtleChangeReported ? 1 : 0,
+      calls0900to1000:balanceCalls0900to1000,
+      calls1300to1500:balanceCalls1300to1500
+    };
+  }
+
+  function saveBalanceRun(){
+    const history=readBalanceHistory();
+    history.push(buildBalanceRunRecord());
+    writeBalanceHistory(history);
+    return history.slice(-10);
+  }
+
+  function averageOf(history,key){
+    if(!history.length) return 0;
+    return history.reduce((sum,item)=>sum+(Number(item[key])||0),0)/history.length;
+  }
+
+  function renderBalanceAnalysis(history){
+    if(!balanceAnalysisBody) return;
+
+    if(!history.length){
+      balanceAnalysisBody.innerHTML=
+        "<div class='balanceHistoryNote'>まだ保存されたプレイ結果がありません。</div>";
+      return;
+    }
+
+    const avgScore=averageOf(history,"score");
+    const avgCalls=averageOf(history,"toiletCalls");
+    const avgWait=averageOf(history,"avgWait");
+    const avgSimultaneous=averageOf(history,"simultaneousEvents");
+    const avgMaxOpen=averageOf(history,"maxOpenCalls");
+    const avgLong=averageOf(history,"longWaits");
+    const avgPreventive=averageOf(history,"preventiveCount");
+    const avgAMCalls=averageOf(history,"calls0900to1000");
+    const avgPMCalls=averageOf(history,"calls1300to1500");
+    const reportRate=averageOf(history,"nurseReported")*100;
+    const aRate=history.filter(item=>item.rank==="A").length/history.length*100;
+
+    const latest=history[history.length-1];
+
+    balanceAnalysisBody.innerHTML=
+      "<div class='balanceSummaryGrid'>"+
+        "<div class='balanceSummaryItem'>保存回数<strong>"+history.length+"/10回</strong></div>"+
+        "<div class='balanceSummaryItem'>平均点<strong>"+avgScore.toFixed(1)+"点</strong></div>"+
+        "<div class='balanceSummaryItem'>A評価率<strong>"+Math.round(aRate)+"%</strong></div>"+
+        "<div class='balanceSummaryItem'>平均排泄コール<strong>"+avgCalls.toFixed(1)+"件</strong></div>"+
+        "<div class='balanceSummaryItem'>平均待機<strong>"+avgWait.toFixed(1)+"分</strong></div>"+
+        "<div class='balanceSummaryItem'>平均同時コール<strong>"+avgSimultaneous.toFixed(1)+"回</strong></div>"+
+        "<div class='balanceSummaryItem'>平均最大同時数<strong>"+avgMaxOpen.toFixed(1)+"件</strong></div>"+
+        "<div class='balanceSummaryItem'>30分以上待機<strong>"+avgLong.toFixed(1)+"件/回</strong></div>"+
+        "<div class='balanceSummaryItem'>平均事前誘導<strong>"+avgPreventive.toFixed(1)+"回</strong></div>"+
+        "<div class='balanceSummaryItem'>ナース報告率<strong>"+Math.round(reportRate)+"%</strong></div>"+
+        "<div class='balanceSummaryItem'>9〜10時コール<strong>"+avgAMCalls.toFixed(1)+"件/回</strong></div>"+
+        "<div class='balanceSummaryItem'>13〜15時コール<strong>"+avgPMCalls.toFixed(1)+"件/回</strong></div>"+
+      "</div>"+
+      "<div class='balanceHistoryWrap'>"+
+        "<table class='balanceHistoryTable'>"+
+          "<thead><tr>"+
+            "<th>回</th><th>点</th><th>排泄C</th><th>同時</th><th>最大</th><th>待機</th>"+
+            "<th>水</th><th>昼</th><th>浴</th><th>D排</th><th>事前</th>"+
+          "</tr></thead>"+
+          "<tbody>"+
+            history.map((item,index)=>
+              "<tr>"+
+                "<td>"+(index+1)+"</td>"+
+                "<td>"+item.score+"</td>"+
+                "<td>"+item.toiletCalls+"</td>"+
+                "<td>"+item.simultaneousEvents+"</td>"+
+                "<td>"+item.maxOpenCalls+"</td>"+
+                "<td>"+Number(item.avgWait||0).toFixed(1)+"</td>"+
+                "<td>"+item.hydrationDone+"/"+item.hydrationTotal+"</td>"+
+                "<td>"+item.lunchDone+"/"+item.lunchTotal+"</td>"+
+                "<td>"+item.bathDone+"/"+item.bathTotal+"</td>"+
+                "<td>"+item.dToiletDone+"/"+item.dToiletTotal+"</td>"+
+                "<td>"+item.preventiveCount+"</td>"+
+              "</tr>"
+            ).join("")+
+          "</tbody>"+
+        "</table>"+
+      "</div>"+
+      "<div class='balanceHistoryNote'>"+
+        "直近10プレイを端末内に保存し、11回目以降は最も古い記録から自動で入れ替えます。"+
+        "現在の最新結果："+latest.score+"点 / "+latest.rank+
+      "</div>";
+  }
+
   function showShiftReport(){
     if(shiftEnded) return;
 
@@ -6367,6 +6589,7 @@ try{
     }
 
     applyShiftBonuses();
+    const balanceHistory=saveBalanceRun();
     shiftEnded = true;
     timeRunning = false;
     nurseReportMarker.visible=false;
@@ -6400,6 +6623,7 @@ try{
       : "";
     shiftReportComment.textContent = reportComment() + bonusText;
     renderDecisionDebrief();
+    renderBalanceAnalysis(balanceHistory);
 
     shiftReport.classList.add("show");
   }
@@ -6851,6 +7075,25 @@ try{
     showPersistentCallBubble(call);
     updateResidentCallActions();
 
+    if(type==="TOILET"){
+      balanceToiletCalls++;
+      if(gameMinutes>=9*60 && gameMinutes<10*60){
+        balanceCalls0900to1000++;
+      }
+      if(gameMinutes>=13*60 && gameMinutes<15*60){
+        balanceCalls1300to1500++;
+      }
+    }
+
+    const openNow=totalOpenCalls();
+    balanceMaxOpenCalls=Math.max(balanceMaxOpenCalls,openNow);
+    if(openNow>=2 && !balanceWasMultiCall){
+      balanceSimultaneousEvents++;
+      balanceWasMultiCall=true;
+    }else if(openNow<2){
+      balanceWasMultiCall=false;
+    }
+
     logDecision("CALL_CREATED",{
       callId:call.id,
       resident:residents[residentIndex].name,
@@ -6900,6 +7143,9 @@ try{
 
     updateQueueUI();
     updateHeadCallMarkers();
+    if(totalOpenCalls()<2){
+      balanceWasMultiCall=false;
+    }
 
     if(advance){
       activateNextCall();
@@ -7542,6 +7788,7 @@ try{
     returnedHomeToday = false;
     pendingCalls.length = 0;
     decisionLog.length = 0;
+    resetBalanceRunCounters();
     resetSubtleChange();
     nextSingleCallCheckAt = 8 * 60 + 20;
     nextDoubleCallCheckAt = 8 * 60 + 30;
@@ -8470,6 +8717,7 @@ try{
         returnedHomeToday = false;
         resetResidentE();
         pendingCalls.length = 0;
+        resetBalanceRunCounters();
         nextSingleCallCheckAt = 8 * 60 + 20;
         nextDoubleCallCheckAt = 8 * 60 + 30;
         nextPositionCallCheckAt = 9 * 60;
