@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-90</title>
+<title>CARE SHIFT - Phase 10-92</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -586,7 +586,15 @@ button{
 #shiftReportScore{
   font-size:14px;
   font-weight:800;
-  margin-bottom:4px;
+  margin-bottom:2px;
+}
+#shiftReportBonusDetail{
+  min-height:14px;
+  font-size:9.5px;
+  line-height:1.35;
+  font-weight:700;
+  color:#71808a;
+  margin-bottom:5px;
 }
 #shiftReportPlayCount{
   font-size:10px;
@@ -1078,7 +1086,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-90 / E自立入浴復帰・入浴対象通知維持</div>
+  <div class="sub">Phase 10-92 / 加点理由表示・ナーストイレ待機安定化</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -1173,6 +1181,7 @@ button{
 
     <div id="shiftReportGrade">A</div>
     <div id="shiftReportScore">100点</div>
+    <div id="shiftReportBonusDetail">最終加点なし</div>
     <div id="shiftReportPlayCount">累計プレイ 0回</div>
 
     <div class="reportGrid">
@@ -2303,6 +2312,7 @@ try{
 
   let nurseActivity="IDLE";
   let nurseToiletUseTimer=0;
+  let nurseToiletWaitElapsed=0;
   let nextNurseToiletAt=8*60+30+Math.random()*60;
 
   // トイレ利用の排他制御。
@@ -2321,7 +2331,8 @@ try{
     if(
       toiletAccessOwner===null &&
       toiletAccessQueue.length &&
-      toiletAccessQueue[0]===actor
+      toiletAccessQueue[0]===actor &&
+      toiletEntryPhysicallyClearFor(actor)
     ){
       toiletAccessQueue.shift();
       toiletAccessOwner=actor;
@@ -2342,6 +2353,50 @@ try{
   function resetToiletAccess(){
     toiletAccessOwner=null;
     toiletAccessQueue.length=0;
+  }
+
+  function toiletActorStillActive(actor){
+    if(actor==="E"){
+      return (
+        eState==="TOILET_WAIT" ||
+        eState==="TOILET_GO" ||
+        eState==="TOILET_CURTAIN_CLOSE" ||
+        eState==="TOILET_USE" ||
+        eState==="TOILET_CURTAIN_OPEN" ||
+        eState==="TOILET_EXIT"
+      );
+    }
+    if(actor==="NURSE"){
+      return nurseActivity.startsWith("TOILET_");
+    }
+    if(actor==="STAFF"){
+      return careType==="TOILET" && careState!=="NONE";
+    }
+    return false;
+  }
+
+  function reconcileToiletAccess(){
+    // 経路失敗や状態遷移で残った古い所有権・待ち列を自動修復する。
+    if(
+      toiletAccessOwner &&
+      !toiletActorStillActive(toiletAccessOwner)
+    ){
+      toiletAccessOwner=null;
+    }
+
+    for(let i=toiletAccessQueue.length-1;i>=0;i--){
+      if(!toiletActorStillActive(toiletAccessQueue[i])){
+        toiletAccessQueue.splice(i,1);
+      }
+    }
+
+    if(toiletAccessOwner){
+      for(let i=toiletAccessQueue.length-1;i>=0;i--){
+        if(toiletAccessQueue[i]===toiletAccessOwner){
+          toiletAccessQueue.splice(i,1);
+        }
+      }
+    }
   }
 
   function ePhysicallyInsideToilet(){
@@ -2411,6 +2466,28 @@ try{
     nextNurseToiletAt=gameMinutes+50+Math.random()*50;
   }
 
+  function abandonNurseToiletWait(){
+    // 通常の順番待ちは行うが、異常状態で入口に固定され続けることは防ぐ。
+    releaseToiletAccess("NURSE");
+    nurseToiletWaitElapsed=0;
+    nurseActivity="TOILET_RETURN";
+
+    nurseMover.route=[];
+    nurseMover.routeIndex=0;
+    nurseMover.state="IDLE";
+
+    // 20〜40ゲーム分後に再試行。
+    nextNurseToiletAt=gameMinutes+20+Math.random()*20;
+
+    if(!setRoute(nurseMover,nurseStationTarget,"NURSE_TOILET_RETURN")){
+      nurse.position.copy(nurseStationTarget);
+      nurseMover.route=[];
+      nurseMover.routeIndex=0;
+      nurseMover.state="IDLE";
+      nurseActivity="IDLE";
+    }
+  }
+
   function playerToiletCareBusy(){
     return (
       toiletAccessOwner==="STAFF" ||
@@ -2436,6 +2513,7 @@ try{
     ) return false;
 
     nurseToiletUseTimer=0;
+    nurseToiletWaitElapsed=0;
 
     if(
       !requestToiletAccess("NURSE") ||
@@ -2471,6 +2549,14 @@ try{
     }
 
     if(nurseActivity==="TOILET_WAIT"){
+      nurseToiletWaitElapsed+=dt;
+
+      // Eの利用や職員介助は待つ。ただし18秒以上は異常待機として一度離脱する。
+      if(nurseToiletWaitElapsed>=18){
+        abandonNurseToiletWait();
+        return;
+      }
+
       const hasTurn=requestToiletAccess("NURSE");
       const physicallyClear=toiletEntryPhysicallyClearFor("NURSE");
 
@@ -2479,6 +2565,7 @@ try{
         return;
       }
 
+      nurseToiletWaitElapsed=0;
       nurseActivity="TOILET_GO";
       if(!setRoute(nurseMover,nurseToiletInsideTarget,"NURSE_TOILET_GO")){
         releaseToiletAccess("NURSE");
@@ -2495,6 +2582,7 @@ try{
         !toiletEntryPhysicallyClearFor("NURSE")
       ){
         nurseActivity="TOILET_WAIT";
+        nurseToiletWaitElapsed=0;
         nurseMover.route=[];
         nurseMover.routeIndex=0;
         nurseMover.state="IDLE";
@@ -2694,6 +2782,7 @@ try{
 
     nurseActivity="IDLE";
     nurseToiletUseTimer=0;
+    nurseToiletWaitElapsed=0;
     nextNurseToiletAt=8*60+30+Math.random()*60;
     resetToiletAccess();
 
@@ -4026,6 +4115,7 @@ try{
   const shiftReport = document.getElementById("shiftReport");
   const shiftReportGrade = document.getElementById("shiftReportGrade");
   const shiftReportScore = document.getElementById("shiftReportScore");
+  const shiftReportBonusDetail = document.getElementById("shiftReportBonusDetail");
   const shiftReportPlayCount = document.getElementById("shiftReportPlayCount");
   const reportCount = document.getElementById("reportCount");
   const reportAvgWait = document.getElementById("reportAvgWait");
@@ -4132,6 +4222,7 @@ try{
   let lastEvaluationText = "まだ対応実績はありません";
   let shiftBonusApplied = false;
   let shiftBonusPoints = 0;
+  let shiftBonusReasons = [];
   let shiftEnded = false;
   let shiftEndPending = false;
   // 定時業務：予定時間から30分以内が標準、60分を超えると未実施扱い
@@ -7246,6 +7337,7 @@ try{
     if(shiftBonusApplied) return;
     shiftBonusApplied = true;
     shiftBonusPoints = 0;
+    shiftBonusReasons = [];
 
     const enabledRoutineTasks = routineTasks.filter(t=>t.enabled!==false);
     const allRoutineDone = enabledRoutineTasks.length > 0 &&
@@ -7255,8 +7347,14 @@ try{
       ? totalWaitMinutes / completedCareCount
       : 0;
 
-    if(allRoutineDone) shiftBonusPoints += 3;
-    if(completedCareCount > 0 && avgWait < 20) shiftBonusPoints += 5;
+    if(allRoutineDone){
+      shiftBonusPoints += 3;
+      shiftBonusReasons.push("定時業務をすべて完了 +3");
+    }
+    if(completedCareCount > 0 && avgWait < 20){
+      shiftBonusPoints += 5;
+      shiftBonusReasons.push("コール平均20分未満 +5");
+    }
 
     shiftScore = Math.min(100, shiftScore + shiftBonusPoints);
   }
@@ -7437,7 +7535,15 @@ try{
       : 0;
 
     shiftReportGrade.textContent = currentRank();
-    shiftReportScore.textContent = shiftScore + "点";
+    shiftReportScore.textContent =
+      shiftScore + "点" +
+      "（最終加点 +" + shiftBonusPoints + "）";
+    if(shiftReportBonusDetail){
+      shiftReportBonusDetail.textContent =
+        shiftBonusReasons.length
+          ? shiftBonusReasons.join(" / ")
+          : "最終加点なし";
+    }
     if(shiftReportPlayCount){
       shiftReportPlayCount.textContent="累計プレイ "+completedPlayNumber+"回";
     }
@@ -7477,10 +7583,7 @@ try{
       }
     }
 
-    const bonusText = shiftBonusPoints > 0
-      ? " ボーナス +" + shiftBonusPoints + "点"
-      : "";
-    shiftReportComment.textContent = reportComment() + bonusText;
+    shiftReportComment.textContent = reportComment();
     renderDecisionDebrief();
     renderBalanceAnalysis(balanceHistory);
 
@@ -8782,6 +8885,7 @@ try{
     bathVoiceRepathTimer = 0;
     shiftBonusApplied = false;
     shiftBonusPoints = 0;
+    shiftBonusReasons = [];
 
     lastToiletCallAt.fill(-9999);
     toiletSuppressionRounds.fill(0);
@@ -9815,6 +9919,7 @@ try{
     // 「時間停止」は時計だけでなくシミュレーション全体を停止する。
     // 移動・誘導・カーテン・介助タイマー・定時業務進捗も停止対象。
     if(timeRunning){
+      reconcileToiletAccess();
       updateFollowEscort(dt);
       updateMover(playerMover,dt);
       residentMovers.forEach(m=>updateMover(m,dt));
