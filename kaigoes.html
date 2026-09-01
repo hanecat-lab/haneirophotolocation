@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-101</title>
+<title>CARE SHIFT - Phase 10-102</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -1258,7 +1258,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-101 / ナースB重なり・巡回停止フェイルセーフ</div>
+  <div class="sub">Phase 10-102 / 停止確認後巡回・固定巡回地点</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -2503,6 +2503,7 @@ try{
   let nursePatrolReadyGraceElapsed=0;
   let nursePatrolContactSafetyElapsed=0;
   let nursePatrolTargetElapsed=0;
+  let nursePatrolLockedTarget=null;
   let nursePatrolLastPosition=new THREE.Vector3();
 
   let nurseLunchRoundDone=false;
@@ -2719,6 +2720,43 @@ try{
     return nurse.position.distanceTo(
       residents[index].object.position
     )<=2.45;
+  }
+
+  function lockNursePatrolTarget(index){
+    if(index<0 || index>3){
+      nursePatrolLockedTarget=null;
+      return null;
+    }
+
+    if(!residentReadyForPatrol(index)){
+      nursePatrolLockedTarget=null;
+      return null;
+    }
+
+    // 利用者が完全停止した瞬間に一度だけ接近点を決定する。
+    // 以後、その巡回中は利用者座標を追跡しない。
+    nursePatrolLockedTarget=nursePatrolTargetFor(index).clone();
+    return nursePatrolLockedTarget;
+  }
+
+  function clearNursePatrolLockedTarget(){
+    nursePatrolLockedTarget=null;
+  }
+
+  function routeNurseToPatrolResident(index,label="NURSE_PATROL_RESIDENT"){
+    if(!residentReadyForPatrol(index)){
+      clearNursePatrolLockedTarget();
+      return false;
+    }
+
+    const target=
+      nursePatrolLockedTarget ||
+      lockNursePatrolTarget(index);
+
+    if(!target) return false;
+
+    nursePatrolState="TO_RESIDENT";
+    return setNursePatrolRoute(target,label);
   }
 
   function nurseToiletOccupied(){
@@ -2972,13 +3010,27 @@ try{
     return false;
   }
 
+  function residentStationaryForPatrol(index){
+    if(index<0 || index>3) return false;
+
+    const mover=residentMovers[index];
+    if(!mover) return false;
+
+    // mover.stateだけでなくrouteも確認。
+    // 介助終了直後の「帰還中」を巡回可能と誤判定しない。
+    return (
+      mover.state==="IDLE" &&
+      (!mover.route || mover.route.length===0)
+    );
+  }
+
   function residentReadyForPatrol(index){
     if(index<0 || index>3) return false;
     if(residentBusyForPatrol(index)) return false;
+    if(!residentStationaryForPatrol(index)) return false;
 
     const p=residents[index].object.position;
 
-    // トイレ/浴場の内部や退出直後は、まだ巡回再開しない。
     const inToilet=
       p.x>-20.2 && p.x<-13.8 &&
       p.z>6.0 && p.z<11.45;
@@ -2989,15 +3041,23 @@ try{
     if(inToilet || inBath) return false;
 
     if(index===3){
-      // Dは居室・ベッド周辺へ戻ったら再開可能。
+      // Dは居室・ベッド周辺で完全停止してから巡回。
       return (
         p.x>-3.5 && p.x<3.5 &&
         p.z>-12.2 && p.z<-7.8
       );
     }
 
-    // A〜Cは施設の通常生活エリアへ戻っていればよい。
-    return p.z<6.0;
+    // A〜Cは「帰還途中」ではなく、
+    // 談話室または各居室で完全停止した時だけ巡回可能。
+    const inLounge=
+      p.x>-6.5 && p.x<6.5 &&
+      p.z>-0.2 && p.z<6.0;
+
+    const inOwnRoom=
+      p.z>-12.2 && p.z<-3.8;
+
+    return inLounge || inOwnRoom;
   }
 
   function patrolTargetForCurrentResident(){
@@ -3056,11 +3116,25 @@ try{
       nursePatrolRetryIntent=null;
       nursePatrolState=intent.state;
 
-      if(setNursePatrolRoute(intent.target,intent.label)){
+      if(intent.state==="TO_RESIDENT"){
+        const index=patrolTargetForCurrentResident();
+
+        if(index!==null && residentReadyForPatrol(index)){
+          const locked=
+            nursePatrolLockedTarget ||
+            lockNursePatrolTarget(index);
+
+          if(locked && setNursePatrolRoute(locked,intent.label)){
+            return;
+          }
+        }else if(index!==null){
+          beginPatrolWaitForResident(index);
+          return;
+        }
+      }else if(setNursePatrolRoute(intent.target,intent.label)){
         return;
       }
 
-      // 同じ目的地で再失敗した場合は安全中継点を経由。
       nursePatrolRetryIntent=null;
     }
 
@@ -3082,6 +3156,7 @@ try{
     }
 
     nursePatrolWaitingForIndex=index;
+    clearNursePatrolLockedTarget();
     nursePatrolState="TO_LOUNGE";
     nursePatrolWait=0;
     nursePatrolContactShown=false;
@@ -3099,6 +3174,7 @@ try{
   }
 
   function beginPatrolReturn(){
+    clearNursePatrolLockedTarget();
     nursePatrolState="RETURN";
     nursePatrolWait=0;
     nursePatrolWaitingForIndex=null;
@@ -3126,6 +3202,7 @@ try{
     nursePatrolRetryCount=0;
     nursePatrolRetryIntent=null;
     nursePatrolTargetElapsed=0;
+    clearNursePatrolLockedTarget();
     nursePatrolStuckElapsed=0;
     nursePatrolReadyGraceElapsed=0;
     nurseActivity="IDLE";
@@ -3189,6 +3266,7 @@ try{
     nursePatrolRetryCount=0;
     nursePatrolRetryIntent=null;
     nursePatrolTargetElapsed=0;
+    clearNursePatrolLockedTarget();
     nursePatrolStuckElapsed=0;
     nursePatrolReadyGraceElapsed=0;
     nursePatrolLastPosition.copy(nurse.position);
@@ -3239,29 +3317,27 @@ try{
       nurseMover.route=[];
       nurseMover.routeIndex=0;
       nurseMover.state="IDLE";
+      clearNursePatrolLockedTarget();
 
-      if(
-        stuckIndex!==null &&
-        residentBusyForPatrol(stuckIndex)
-      ){
-        beginPatrolWaitForResident(stuckIndex);
-      }else if(stuckIndex!==null){
-        // 利用者が介助中でなければ、巡回を停止させずその対象を確認済みとして次へ。
-        nursePatrolIndex++;
-        if(nursePatrolIndex>=nursePatrolOrder.length){
-          beginPatrolReturn();
-        }else{
-          nursePatrolState="TO_RESIDENT";
-          setNursePatrolRoute(
-            nursePatrolTargetFor(
-              patrolTargetForCurrentResident()
-            ),
-            "NURSE_PATROL_WATCHDOG_NEXT"
-          );
-        }
-      }else{
+      if(stuckIndex===null){
         beginPatrolReturn();
+        return;
       }
+
+      // 利用者が介助中・帰還中・移動中なら確認済みにせず談話室待機へ。
+      if(!residentReadyForPatrol(stuckIndex)){
+        beginPatrolWaitForResident(stuckIndex);
+        return;
+      }
+
+      // 利用者は停止済みなのにナースだけ進めない場合は、
+      // 安全中継点を経由して同じ利用者への巡回を再試行する。
+      nursePatrolState="SAFE_WAYPOINT";
+      const waypoint=nearestNurseSafeWaypoint();
+      setNursePatrolRoute(
+        waypoint,
+        "NURSE_PATROL_WATCHDOG_SAFE"
+      );
       return;
     }
 
@@ -3284,14 +3360,14 @@ try{
         return;
       }
 
-      if(residentBusyForPatrol(targetIndex)){
+      if(!residentReadyForPatrol(targetIndex)){
         beginPatrolWaitForResident(targetIndex);
         return;
       }
 
-      nursePatrolState="TO_RESIDENT";
-      setNursePatrolRoute(
-        nursePatrolTargetFor(targetIndex),
+      clearNursePatrolLockedTarget();
+      routeNurseToPatrolResident(
+        targetIndex,
         "NURSE_PATROL_RESIDENT"
       );
       return;
@@ -3306,14 +3382,14 @@ try{
         return;
       }
 
-      if(residentBusyForPatrol(targetIndex)){
+      if(!residentReadyForPatrol(targetIndex)){
         beginPatrolWaitForResident(targetIndex);
         return;
       }
 
-      nursePatrolState="TO_RESIDENT";
-      setNursePatrolRoute(
-        nursePatrolTargetFor(targetIndex),
+      clearNursePatrolLockedTarget();
+      routeNurseToPatrolResident(
+        targetIndex,
         "NURSE_PATROL_RESIDENT"
       );
       return;
@@ -3327,31 +3403,44 @@ try{
         return;
       }
 
-      // 次の対象者自身が介助に入った場合のみ談話室へ退避。
-      if(residentBusyForPatrol(targetIndex)){
+      // 介助開始だけでなく、帰還・誘導などで対象者が動き始めた時点で中止。
+      // 廊下ですれ違っただけで会話が成立することを防ぐ。
+      if(!residentReadyForPatrol(targetIndex)){
         beginPatrolWaitForResident(targetIndex);
         return;
       }
 
-      // 接近できていればroute完了を待たず会話へ。
-      // まず移動ルートを明示的に解除し、利用者との重なりを防ぐ。
-      if(nurseNearPatrolResident(targetIndex)){
+      // 利用者が完全停止した状態を再確認してから会話開始。
+      if(
+        nurseNearPatrolResident(targetIndex) &&
+        residentStationaryForPatrol(targetIndex)
+      ){
         nurseMover.route=[];
         nurseMover.routeIndex=0;
         nurseMover.state="IDLE";
 
         nursePatrolState="CONTACT";
         nursePatrolWait=0;
+        nursePatrolContactSafetyElapsed=0;
         nursePatrolContactShown=true;
         showNurseResidentRoundContact(targetIndex);
         return;
       }
 
-      // routeだけ終了したのに利用者から遠い場合は「到着扱い」にしない。
-      // 目的地を再計算して再び歩かせる。
+      // ナース側の経路だけ終了した場合も、固定済み目的地を再利用する。
+      // 利用者の現在座標は追跡しない。
       if(nurseMover.state==="IDLE"){
+        const locked=
+          nursePatrolLockedTarget ||
+          lockNursePatrolTarget(targetIndex);
+
+        if(!locked){
+          beginPatrolWaitForResident(targetIndex);
+          return;
+        }
+
         setNursePatrolRoute(
-          nursePatrolTargetFor(targetIndex),
+          locked,
           "NURSE_PATROL_RESIDENT_REPATH"
         );
       }
@@ -3366,9 +3455,10 @@ try{
       // 「巡回済み」にせず、その利用者を未確認のまま保持する。
       if(
         currentIndex!==null &&
-        residentBusyForPatrol(currentIndex)
+        !residentReadyForPatrol(currentIndex)
       ){
         nursePatrolWait=0;
+        nursePatrolContactSafetyElapsed=0;
         nursePatrolContactShown=false;
         beginPatrolWaitForResident(currentIndex);
         return;
@@ -3386,6 +3476,7 @@ try{
       nursePatrolContactSafetyElapsed=0;
       nursePatrolContactShown=false;
       nursePatrolTargetElapsed=0;
+      clearNursePatrolLockedTarget();
       nursePatrolIndex++;
 
       if(nursePatrolIndex>=nursePatrolOrder.length){
@@ -3395,14 +3486,13 @@ try{
 
       const nextIndex=patrolTargetForCurrentResident();
 
-      if(residentBusyForPatrol(nextIndex)){
+      if(!residentReadyForPatrol(nextIndex)){
         beginPatrolWaitForResident(nextIndex);
         return;
       }
 
-      nursePatrolState="TO_RESIDENT";
-      setNursePatrolRoute(
-        nursePatrolTargetFor(nextIndex),
+      routeNurseToPatrolResident(
+        nextIndex,
         "NURSE_PATROL_RESIDENT"
       );
       return;
@@ -3451,24 +3541,15 @@ try{
         nursePatrolWait+=dt;
       }
 
-      const targetStillBusy =
-        waitingIndex!==null &&
-        residentBusyForPatrol(waitingIndex);
-
       const targetReady =
         waitingIndex!==null &&
         residentReadyForPatrol(waitingIndex);
 
-      if(targetStillBusy){
+      // 時間経過だけでは復帰しない。
+      // 「介助終了 + 帰還完了 + mover停止 + 生活場所内」の4条件が揃うまで待つ。
+      if(!targetReady){
         nursePatrolReadyGraceElapsed=0;
         return;
-      }
-
-      // 介助自体は終わっているのに、退出経路の端でready判定だけ満たさない場合は
-      // 最大8秒だけ待ってから巡回を再開する。ナースの永久待機を防ぐ。
-      if(!targetReady){
-        nursePatrolReadyGraceElapsed+=dt;
-        if(nursePatrolReadyGraceElapsed<8.0) return;
       }
 
       if(waitingIndex!==null){
@@ -3482,12 +3563,14 @@ try{
         nursePatrolReadyGraceElapsed=0;
         nursePatrolWaitingForIndex=null;
         nursePatrolTargetElapsed=0;
-        nursePatrolState="TO_RESIDENT";
+        clearNursePatrolLockedTarget();
 
-        setNursePatrolRoute(
-          nursePatrolTargetFor(waitingIndex),
+        if(!routeNurseToPatrolResident(
+          waitingIndex,
           "NURSE_PATROL_RESUME"
-        );
+        )){
+          beginPatrolWaitForResident(waitingIndex);
+        }
       }
       return;
     }
@@ -3713,6 +3796,7 @@ try{
     nursePatrolRetryCount=0;
     nursePatrolRetryIntent=null;
     nursePatrolTargetElapsed=0;
+    nursePatrolLockedTarget=null;
     nursePatrolStuckElapsed=0;
     nursePatrolReadyGraceElapsed=0;
     nursePatrolLastPosition.copy(nurse.position);
