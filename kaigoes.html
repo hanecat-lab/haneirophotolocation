@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-107</title>
+<title>CARE SHIFT - Phase 10-108</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -1258,7 +1258,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-107 / トイレ遠隔予約廃止・幽霊ロック修正</div>
+  <div class="sub">Phase 10-108 / トイレFIFO固定・ナース待機順保証</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -2567,18 +2567,18 @@ try{
   function requestToiletAccess(actor){
     if(toiletAccessOwner===actor) return true;
 
-    // 遠方からの予約は禁止。
-    // 実際に入口待機位置へ来た時点で初めて順番に入る。
-    if(!toiletActorAtWaitingPoint(actor)){
+    // 遠方予約は禁止。入口待機位置にいる者だけキューへ参加。
+    if(!ensureActorQueuedAtToilet(actor)){
       return false;
     }
 
-    if(!toiletAccessQueue.includes(actor)){
-      toiletAccessQueue.push(actor);
+    // 使用中なら待つ。後から来た者がownerを上書きしない。
+    if(toiletAccessOwner!==null){
+      return false;
     }
 
+    // 空いた瞬間は必ず先頭だけが取得。
     if(
-      toiletAccessOwner===null &&
       toiletAccessQueue.length &&
       toiletAccessQueue[0]===actor &&
       toiletEntryPhysicallyClearFor(actor)
@@ -2616,7 +2616,10 @@ try{
       );
     }
     if(actor==="NURSE"){
-      return nurseActivity.startsWith("TOILET_");
+      return (
+        nurseCtrl?.mode==="TOILET" ||
+        nurseActivity.startsWith("TOILET_")
+      );
     }
     if(actor==="STAFF"){
       return careType==="TOILET" && careState!=="NONE";
@@ -2683,6 +2686,34 @@ try{
     return "先の利用者";
   }
 
+  function toiletQueuePosition(actor){
+    if(toiletAccessOwner===actor) return 0;
+    const index=toiletAccessQueue.indexOf(actor);
+    return index>=0 ? index+1 : -1;
+  }
+
+  function toiletActorAheadOf(actor){
+    if(toiletAccessOwner && toiletAccessOwner!==actor){
+      return toiletAccessOwner;
+    }
+
+    const index=toiletAccessQueue.indexOf(actor);
+    if(index>0) return toiletAccessQueue[index-1];
+    if(index===0) return null;
+
+    return toiletAccessQueue.length ? toiletAccessQueue[0] : null;
+  }
+
+  function ensureActorQueuedAtToilet(actor){
+    if(toiletAccessOwner===actor) return true;
+    if(!toiletActorAtWaitingPoint(actor)) return false;
+
+    if(!toiletAccessQueue.includes(actor)){
+      toiletAccessQueue.push(actor);
+    }
+    return true;
+  }
+
   function toiletActorActuallyCommitted(actor){
     if(actor==="E"){
       return (
@@ -2736,10 +2767,16 @@ try{
       releaseToiletAccess(toiletAccessOwner);
     }
 
-    // 待ち列にも、入口にいない古い予約が残っていれば除去。
+    // 待ち列の修復は「入口にもいない＋該当行動でもない」時だけ。
+    // 入口前で正しく待っているナース/Eは絶対に削除しない。
     for(let i=toiletAccessQueue.length-1;i>=0;i--){
       const actor=toiletAccessQueue[i];
-      if(actor!=="STAFF" && !toiletActorActuallyCommitted(actor)){
+      if(actor==="STAFF") continue;
+
+      const physicallyWaiting=toiletActorAtWaitingPoint(actor);
+      const committed=toiletActorActuallyCommitted(actor);
+
+      if(!physicallyWaiting && !committed){
         toiletAccessQueue.splice(i,1);
       }
     }
@@ -4753,6 +4790,12 @@ try{
     if(nurseCtrl.phase==="TOILET_WAIT"){
       nurseCtrl.toiletWaitTimer+=dt;
 
+      // 待機位置に到着している限り、ナースの順番を保持する。
+      ensureActorQueuedAtToilet("NURSE");
+
+      // ownerが古い状態なら先に整合を取る。
+      reconcileToiletAccess();
+
       const hasTurn=requestToiletAccess("NURSE");
       const clear=toiletEntryPhysicallyClearFor("NURSE");
 
@@ -4766,17 +4809,47 @@ try{
         return;
       }
 
-      // 長時間固定はしない。一度詰所へ戻り、少し早めに再試行。
-      if(nurseCtrl.toiletWaitTimer>=18){
-        releaseToiletAccess("NURSE");
-        nextNurseToiletAt=gameMinutes+20+Math.random()*20;
-        nurseCtrl.toiletWaitTimer=0;
-        nurseCtrlBeginMove(
-          nurseStationTarget,
-          "TOILET_ABORT_RETURN",
-          "NURSE_CTRL_TOILET_ABORT_RETURN"
+      // Eや職員が実際に使用中、または自分より前に待っているなら
+      // 何秒経っても詰所へ戻らず、その場で正当に待つ。
+      const ahead=toiletActorAheadOf("NURSE");
+      const legitimateWait =
+        (
+          toiletAccessOwner &&
+          toiletAccessOwner!=="NURSE" &&
+          toiletActorActuallyCommitted(toiletAccessOwner)
+        ) ||
+        (
+          ahead &&
+          ahead!=="NURSE" &&
+          toiletActorActuallyCommitted(ahead)
         );
+
+      if(legitimateWait){
+        nurseCtrl.toiletWaitTimer=0;
+        return;
       }
+
+      // 誰も使用しておらず、自分が先頭なのに進めない場合だけ自己修復。
+      if(
+        nurseCtrl.toiletWaitTimer>=6 &&
+        toiletAccessOwner===null &&
+        toiletAccessQueue[0]==="NURSE"
+      ){
+        nurseCtrl.toiletWaitTimer=0;
+
+        // 物理的に空いていれば、その場で再取得。
+        if(toiletEntryPhysicallyClearFor("NURSE")){
+          toiletAccessQueue.shift();
+          toiletAccessOwner="NURSE";
+          nurseCtrlBeginMove(
+            nurseToiletInsideTarget,
+            "TOILET_CLOSE",
+            "NURSE_CTRL_TOILET_ENTER_REPAIR"
+          );
+          return;
+        }
+      }
+
       return;
     }
 
@@ -4849,6 +4922,8 @@ try{
       return;
     }
 
+    // 異常経路復旧用の旧フェイルセーフ。
+    // 正常な順番待ちではこの状態へ遷移しない。
     if(nurseCtrl.phase==="TOILET_ABORT_RETURN"){
       if(nurseCtrlAt(nurseStationTarget,0.7)){
         releaseToiletAccess("NURSE");
@@ -11691,9 +11766,19 @@ try{
       }else if(atCareEntrance){
         repairGhostToiletLockForStaff();
 
+        ensureActorQueuedAtToilet("STAFF");
+
+        const aheadBeforeClaim=toiletActorAheadOf("STAFF");
         const hasTurn=requestToiletAccess("STAFF");
         const physicallyClear=toiletEntryPhysicallyClearFor("STAFF");
-        occupiedByFacilityUser=!hasTurn || !physicallyClear;
+
+        occupiedByFacilityUser=
+          !hasTurn ||
+          !physicallyClear ||
+          (
+            aheadBeforeClaim!==null &&
+            aheadBeforeClaim!=="STAFF"
+          );
         occupiedByE=
           toiletAccessOwner==="E" ||
           ePhysicallyInsideToilet();
