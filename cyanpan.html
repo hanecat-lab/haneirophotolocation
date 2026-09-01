@@ -60896,6 +60896,15 @@ VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=
     const MAGIC_MESSAGE_DELAY_MS = 500;
     const MAGIC_MESSAGE_AT_MS = MAGIC_SCATTER_START_MS + MAGIC_MESSAGE_DELAY_MS;
     const MAGIC_MESSAGE_SOLO_MS = 5000;
+    // HEART SHIFTで旋風が完成した直後に短く溜め、タワー下部から頂上へ覚醒光を走らせる。
+    // 1杯は移動距離が短いため0.5秒、多段は0.8秒。既存の散開・メッセージ時刻は動かさない。
+    const MAGIC_AWAKENING_HOLD_START_MS = 28300;
+    const MAGIC_AWAKENING_HOLD_MS = 250;
+    function magicAwakeningTiming(levels = 1) {
+      const pulseStart = MAGIC_AWAKENING_HOLD_START_MS + MAGIC_AWAKENING_HOLD_MS;
+      const pulseDuration = levels <= 1 ? 500 : 800;
+      return { holdStart: MAGIC_AWAKENING_HOLD_START_MS, pulseStart, pulseDuration, pulseEnd: pulseStart + pulseDuration };
+    }
     const MAGIC_FINALE = {
       // 0/4/8/12秒に4種類を順次追加し、16秒からACT 1へ入る。
       preludeEnd: 16000,
@@ -63566,7 +63575,9 @@ VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=
       lightRig.add(key, key.target); lightRig.userData.keyLight = key;
       // BGM連動の色光。影を落とさないため、音楽ごとの色彩演出を加えても負荷を増やさない。
       const musicAura = new THREE.PointLight(config.celebrationColour, 0, 7.2 * scale, 2);
-      musicAura.castShadow = false; musicAura.position.set(-1.8 * scale, 2.1 * scale, 1.8 * scale); lightRig.add(musicAura); lightRig.userData.musicAura = musicAura;
+      musicAura.castShadow = false; musicAura.position.set(-1.8 * scale, 2.1 * scale, 1.8 * scale);
+      musicAura.userData.basePosition = musicAura.position.clone(); musicAura.userData.baseColour = musicAura.color.clone(); musicAura.userData.magicPulseActive = false;
+      lightRig.add(musicAura); lightRig.userData.musicAura = musicAura;
       // リムライト。タワーの真裏やや上から当てて、全グラスの縁にエッジを入れる。
       // 平行光なので距離減衰が無く、段数スケールの影響を受けない（どの段数でも同じ効き）。
       // 影は落とさないので追加コストはほぼ無い。部屋は全周回れるため、固定位置だと方位に
@@ -65096,6 +65107,35 @@ VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=
         }
         if (themeVisuals.backHalo && themeVisuals.backHalo.userData.baseColour) themeVisuals.backHalo.material.color.copy(themeVisuals.backHalo.userData.baseColour).lerp(musicVisualScratch.accent, musicVisual.light * .38 * qualityProfile.musicGain);
       }
+      // ACT 2→3の「タワー覚醒パルス」。BGM用の既存PointLightを一時的に再利用し、
+      // ライト数を増やさずタワー中心を下から上へ走らせる。区間外では必ず元へ戻す。
+      const musicAura = lightRig.userData.musicAura;
+      const awakeningLevels = tower?.userData?.levels || currentLevels || 1;
+      const awakeningTiming = magicAwakeningTiming(awakeningLevels);
+      const awakeningAge = magicChangeUntil ? performance.now() - magicChangeStartedAt : -1;
+      const awakeningActive = !!(musicAura && tower && awakeningAge >= awakeningTiming.pulseStart && awakeningAge < awakeningTiming.pulseEnd);
+      if (awakeningActive) {
+        const progress = THREE.MathUtils.clamp((awakeningAge - awakeningTiming.pulseStart) / awakeningTiming.pulseDuration, 0, 1);
+        const eased = progress * progress * (3 - 2 * progress);
+        const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+        const towerHeight = tower.userData.height || GLASS.rimY * glassShape().scale.y;
+        const world = updateThemeResponse.magicAwakeningWorld ||= new THREE.Vector3();
+        tower.getWorldPosition(world);
+        world.y += reducedMotion ? towerHeight : THREE.MathUtils.lerp(Math.max(.035, glassStack() * .08), towerHeight, eased);
+        musicAura.position.copy(world);
+        musicAura.color.setHex(0xfff1d2);
+        // 中盤の走光と頂上到達直前の小さな発光。既存Auraの上へ穏やかに足すだけに留める。
+        const travelGlow = Math.pow(Math.sin(Math.PI * progress), .62);
+        const apexFlash = Math.exp(-Math.pow((progress - .88) / .095, 2));
+        const baseAura = musicVisualResponse * 5.2;
+        musicAura.intensity = baseAura + (reducedMotion ? 2.8 * travelGlow : 4.2 * travelGlow) + 1.8 * apexFlash;
+        musicAura.userData.magicPulseActive = true;
+      } else if (musicAura?.userData.magicPulseActive) {
+        if (musicAura.userData.basePosition) musicAura.position.copy(musicAura.userData.basePosition);
+        musicAura.color.setHex(musicVisual.accent);
+        musicAura.intensity = musicVisualResponse * 5.2;
+        musicAura.userData.magicPulseActive = false;
+      }
       updateCameraFacingGlow();
       themeVisuals.party?.update(delta, musicVisualBeatPulse);
       const musicParticleResponse = Math.max(response, musicVisualBeatPulse * musicVisual.particle * activeQualityProfile().musicGain);
@@ -66183,6 +66223,7 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         ascend: MAGIC_FINALE.scatterStart / 1000,
         scatter: MAGIC_FINALE.scatterEnd / 1000,
       };
+      const MAGIC_AWAKENING = magicAwakeningTiming(levels);
       const MAGIC_SPIN_RATE = .40;
       // タワー外周(= radius * .862)の1.5倍を旋風の平均半径にする。
       // 実測で平均半径が目標の .959 倍だったぶんを補正して、狙いの1.5倍に合わせる。
@@ -66266,7 +66307,8 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         const shift = ramp(A.gather, A.shift, time);
         const vortex = ramp(A.shift - .6, A.shift + .8, time);
         const vortexDense = ramp(A.gather + 2.4, A.shift + .7, time);
-        const vortexRise = ramp(A.shift + .7, A.ascend, time);
+        // 覚醒光が頂上へ到達してから螺旋上昇を始める。散開開始時刻は従来どおり固定する。
+        const vortexRise = ramp(MAGIC_AWAKENING.pulseEnd / 1000, A.ascend, time);
         // 36.8〜38.8秒で画面端まで散開。メッセージは開始0.5秒後に外側の時間軸から出す。
         const vortexBurst = ramp(A.ascend, A.scatter, time);
         const heart = Math.min(1, heartIntro + gather * .10 + shift * .10);
@@ -66316,7 +66358,12 @@ function createCelebrationEffects(levels, towerHeight, placements) {
           magicChange.time += delta;
           // HEART SHIFTで速度を18%だけ上げる。向きは変えず、視線誘導を途切れさせない。
           const speedLift = THREE.MathUtils.clamp((magicChange.time - MAGIC_ACTS.gather) / (MAGIC_ACTS.shift - MAGIC_ACTS.gather), 0, 1) * .18;
-          magicChange.spin += delta * MAGIC_SPIN_RATE * (1 + speedLift);
+          // 覚醒光の直前だけ15%緩める。0.25秒の両端を滑らかにして、停止や処理落ちには見せない。
+          const ageMs = magicChange.time * 1000;
+          const holdIn = THREE.MathUtils.clamp((ageMs - MAGIC_AWAKENING.holdStart) / 70, 0, 1);
+          const holdOut = 1 - THREE.MathUtils.clamp((ageMs - (MAGIC_AWAKENING.pulseStart - 70)) / 70, 0, 1);
+          const holdAmount = Math.min(holdIn, holdOut);
+          magicChange.spin += delta * MAGIC_SPIN_RATE * (1 + speedLift) * (1 - holdAmount * .15);
         }
         const mcMix = magicChange ? magicChangeMix(magicChange.time) : null;
         if (mcMix) {
