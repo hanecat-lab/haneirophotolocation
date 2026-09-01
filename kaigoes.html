@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-106</title>
+<title>CARE SHIFT - Phase 10-107</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -1258,7 +1258,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-106 / ナース制御統合ステートマシン</div>
+  <div class="sub">Phase 10-107 / トイレ遠隔予約廃止・幽霊ロック修正</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -2530,8 +2530,48 @@ try{
   let toiletAccessOwner=null;
   const toiletAccessQueue=[];
 
+  function toiletActorAtWaitingPoint(actor){
+    if(actor==="NURSE"){
+      return (
+        nursePhysicallyInsideToilet() ||
+        nurse.position.distanceTo(nurseToiletWaitTarget)<=2.2
+      );
+    }
+
+    if(actor==="E"){
+      return (
+        ePhysicallyInsideToilet() ||
+        residentE.position.distanceTo(eToiletWaitTarget)<=2.2
+      );
+    }
+
+    if(actor==="STAFF"){
+      const resident =
+        careResidentIndex!==null && careResidentIndex>=0 && careResidentIndex<residents.length
+          ? residents[careResidentIndex]
+          : null;
+
+      return (
+        careType==="TOILET" &&
+        careState!=="NONE" &&
+        (
+          player.position.distanceTo(new THREE.Vector3(-15.35,0,5.35))<=2.6 ||
+          (resident && resident.object.position.distanceTo(new THREE.Vector3(-16.65,0,5.15))<=2.6)
+        )
+      );
+    }
+
+    return false;
+  }
+
   function requestToiletAccess(actor){
     if(toiletAccessOwner===actor) return true;
+
+    // 遠方からの予約は禁止。
+    // 実際に入口待機位置へ来た時点で初めて順番に入る。
+    if(!toiletActorAtWaitingPoint(actor)){
+      return false;
+    }
 
     if(!toiletAccessQueue.includes(actor)){
       toiletAccessQueue.push(actor);
@@ -2641,6 +2681,77 @@ try{
     if(actor==="NURSE") return "ナース";
     if(actor==="STAFF") return "職員・利用者";
     return "先の利用者";
+  }
+
+  function toiletActorActuallyCommitted(actor){
+    if(actor==="E"){
+      return (
+        ePhysicallyInsideToilet() ||
+        residentE.position.distanceTo(eToiletWaitTarget)<=2.6 ||
+        eState==="TOILET_GO" ||
+        eState==="TOILET_CURTAIN_CLOSE" ||
+        eState==="TOILET_USE" ||
+        eState==="TOILET_CURTAIN_OPEN" ||
+        eState==="TOILET_EXIT"
+      );
+    }
+
+    if(actor==="NURSE"){
+      return (
+        nursePhysicallyInsideToilet() ||
+        nurse.position.distanceTo(nurseToiletWaitTarget)<=2.6 ||
+        (
+          nurseCtrl.mode==="TOILET" &&
+          (
+            nurseCtrl.phase==="TOILET_CLOSE" ||
+            nurseCtrl.phase==="TOILET_USE" ||
+            nurseCtrl.phase==="TOILET_OPEN" ||
+            nurseCtrl.phase==="TOILET_RELEASE"
+          )
+        )
+      );
+    }
+
+    if(actor==="STAFF"){
+      return careType==="TOILET" && careState!=="NONE";
+    }
+
+    return false;
+  }
+
+  function repairGhostToiletLockForStaff(){
+    if(
+      careType!=="TOILET" ||
+      careState!=="FOLLOW_TO_CARE"
+    ) return;
+
+    const staffAtEntrance=toiletActorAtWaitingPoint("STAFF");
+    if(!staffAtEntrance) return;
+
+    if(
+      toiletAccessOwner &&
+      toiletAccessOwner!=="STAFF" &&
+      !toiletActorActuallyCommitted(toiletAccessOwner)
+    ){
+      releaseToiletAccess(toiletAccessOwner);
+    }
+
+    // 待ち列にも、入口にいない古い予約が残っていれば除去。
+    for(let i=toiletAccessQueue.length-1;i>=0;i--){
+      const actor=toiletAccessQueue[i];
+      if(actor!=="STAFF" && !toiletActorActuallyCommitted(actor)){
+        toiletAccessQueue.splice(i,1);
+      }
+    }
+
+    // 誰も使用していないのにカーテンだけ閉じている場合も解除。
+    if(
+      !ePhysicallyInsideToilet() &&
+      !nursePhysicallyInsideToilet() &&
+      toiletAccessOwner===null
+    ){
+      toiletCurtain.target=0;
+    }
   }
 
 
@@ -4630,22 +4741,11 @@ try{
 
   function nurseCtrlUpdateToilet(dt){
     if(nurseCtrl.phase==="TOILET_REQUEST"){
-      const hasTurn=requestToiletAccess("NURSE");
-      const clear=toiletEntryPhysicallyClearFor("NURSE");
-
-      if(!hasTurn || !clear){
-        nurseCtrlBeginMove(
-          nurseToiletWaitTarget,
-          "TOILET_WAIT",
-          "NURSE_CTRL_TOILET_WAIT"
-        );
-        return;
-      }
-
+      // ナースも遠くから予約しない。まず入口外の待機位置へ。
       nurseCtrlBeginMove(
-        nurseToiletInsideTarget,
-        "TOILET_CLOSE",
-        "NURSE_CTRL_TOILET_ENTER"
+        nurseToiletWaitTarget,
+        "TOILET_WAIT",
+        "NURSE_CTRL_TOILET_WAIT"
       );
       return;
     }
@@ -4985,18 +5085,10 @@ try{
     if(eLunchTime()) return;
     if(eToiletOccupied()) return;
 
-    // 先に待っているナース／職員がいれば、Eも入口外で順番を待つ。
-    if(
-      !requestToiletAccess("E") ||
-      !toiletEntryPhysicallyClearFor("E")
-    ){
-      eState="TOILET_WAIT";
-      setRoute(residentEMover,eToiletWaitTarget,"E_TOILET_WAIT");
-      return;
-    }
-
-    eState="TOILET_GO";
-    setRoute(residentEMover,eToiletInsideTarget,"E_TOILET_GO");
+    // 遠くからトイレを予約しない。
+    // まず入口外まで歩き、到着してからキューへ参加する。
+    eState="TOILET_WAIT";
+    setRoute(residentEMover,eToiletWaitTarget,"E_TOILET_WAIT");
   }
 
   function startEBath(){
@@ -5072,6 +5164,10 @@ try{
 
   function triggerEAnger(){
     if(!canTriggerEAnger()) return false;
+
+    // 不穏イベントへ切り替わる時点で、Eの施設利用予約を必ず破棄。
+    // TOILET_WAIT/GOからANGERへ変わってもトイレを占有し続けない。
+    releaseToiletAccess("E");
 
     eAngerTriggered=true;
     eAngerActive=true;
@@ -5266,16 +5362,18 @@ try{
     }
 
     if(eState==="TOILET_WAIT"){
+      // 入口外に着くまでは順番に参加しない。
+      if(residentE.position.distanceTo(eToiletWaitTarget)>0.9){
+        if(residentEMover.state==="IDLE"){
+          setRoute(residentEMover,eToiletWaitTarget,"E_TOILET_WAIT");
+        }
+        return;
+      }
+
       const hasTurn=requestToiletAccess("E");
       const physicallyClear=toiletEntryPhysicallyClearFor("E");
 
       if(!hasTurn || !physicallyClear){
-        if(
-          residentEMover.state==="IDLE" &&
-          residentE.position.distanceTo(eToiletWaitTarget)>0.8
-        ){
-          setRoute(residentEMover,eToiletWaitTarget,"E_TOILET_WAIT");
-        }
         return;
       }
 
@@ -11591,6 +11689,8 @@ try{
         occupiedByE=atCareEntrance && eBathOccupied();
         occupiedByFacilityUser=occupiedByE;
       }else if(atCareEntrance){
+        repairGhostToiletLockForStaff();
+
         const hasTurn=requestToiletAccess("STAFF");
         const physicallyClear=toiletEntryPhysicallyClearFor("STAFF");
         occupiedByFacilityUser=!hasTurn || !physicallyClear;
@@ -11678,16 +11778,24 @@ try{
     if(careState==="AUTO_ENTER"){
       const isBath = careType==="BATH";
 
-      if(
-        !isBath &&
-        (
+      if(!isBath){
+        repairGhostToiletLockForStaff();
+
+        if(
+          toiletAccessOwner!=="STAFF" &&
+          toiletActorAtWaitingPoint("STAFF")
+        ){
+          requestToiletAccess("STAFF");
+        }
+
+        if(
           toiletAccessOwner!=="STAFF" ||
           !toiletEntryPhysicallyClearFor("STAFF")
-        )
-      ){
-        careState="FOLLOW_TO_CARE";
-        careProgress.textContent="トイレの順番待ちに戻ります";
-        return;
+        ){
+          careState="FOLLOW_TO_CARE";
+          careProgress.textContent="トイレの順番待ちに戻ります";
+          return;
+        }
       }
 
       const targetStaff = isBath ? bathInsideStaffTarget : toiletInsideStaffTarget;
