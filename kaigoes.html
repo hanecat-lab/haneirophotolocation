@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-100</title>
+<title>CARE SHIFT - Phase 10-101</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -1258,7 +1258,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-100 / 巡回会話・介助競合デッドロック修正</div>
+  <div class="sub">Phase 10-101 / ナースB重なり・巡回停止フェイルセーフ</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -2501,6 +2501,8 @@ try{
   let nursePatrolRetryIntent=null;
   let nursePatrolStuckElapsed=0;
   let nursePatrolReadyGraceElapsed=0;
+  let nursePatrolContactSafetyElapsed=0;
+  let nursePatrolTargetElapsed=0;
   let nursePatrolLastPosition=new THREE.Vector3();
 
   let nurseLunchRoundDone=false;
@@ -2668,20 +2670,55 @@ try{
     if(!obj) return nurseStationTarget.clone();
 
     if(key===3){
-      return new THREE.Vector3(-1.0,0,-9.15);
+      return new THREE.Vector3(-1.65,0,-8.85);
     }
 
     const base=obj.position.clone();
     base.y=0;
 
+    // 利用者とナースが同一点へ入らないよう、1.9〜2.2m離れた接近点のみ使う。
     const candidates=[
-      new THREE.Vector3(base.x,0,base.z+1.35),
-      new THREE.Vector3(base.x+1.35,0,base.z),
-      new THREE.Vector3(base.x-1.35,0,base.z),
-      new THREE.Vector3(base.x,0,base.z-1.35)
+      new THREE.Vector3(base.x,0,base.z+1.9),
+      new THREE.Vector3(base.x+1.9,0,base.z),
+      new THREE.Vector3(base.x-1.9,0,base.z),
+      new THREE.Vector3(base.x,0,base.z-1.9),
+      new THREE.Vector3(base.x+1.55,0,base.z+1.55),
+      new THREE.Vector3(base.x-1.55,0,base.z+1.55)
     ];
 
-    return candidates.find(p=>!isBlockedPoint(p)) || base;
+    const clear=candidates.find(p=>{
+      if(isBlockedPoint(p)) return false;
+
+      // 他利用者の真上にも経路終点を置かない。
+      const overlapsResident=residents.some((r,index)=>
+        index!==key &&
+        r.object.position.distanceTo(p)<1.15
+      );
+      if(overlapsResident) return false;
+
+      if(residentE.position.distanceTo(p)<1.15) return false;
+      return true;
+    });
+
+    if(clear) return clear;
+
+    // 候補が全て塞がれても、利用者本人の座標へフォールバックしない。
+    // 廊下側へ離した安全点を使う。
+    const safe=new THREE.Vector3(
+      base.x,
+      0,
+      THREE.MathUtils.clamp(base.z+2.25,-9.0,5.2)
+    );
+    return isBlockedPoint(safe)
+      ? nursePatrolCorridorTarget.clone()
+      : safe;
+  }
+
+  function nurseNearPatrolResident(index){
+    if(index<0 || index>3) return false;
+    return nurse.position.distanceTo(
+      residents[index].object.position
+    )<=2.45;
   }
 
   function nurseToiletOccupied(){
@@ -3049,6 +3086,7 @@ try{
     nursePatrolWait=0;
     nursePatrolContactShown=false;
     nursePatrolReadyGraceElapsed=0;
+    nursePatrolContactSafetyElapsed=0;
 
     nurseMover.route=[];
     nurseMover.routeIndex=0;
@@ -3081,11 +3119,13 @@ try{
     nursePatrolIndex=0;
     nursePatrolWait=0;
     nursePatrolContactShown=false;
+    nursePatrolContactSafetyElapsed=0;
     nursePatrolState="IDLE";
     nursePatrolWaitingForIndex=null;
     nursePatrolRetryElapsed=0;
     nursePatrolRetryCount=0;
     nursePatrolRetryIntent=null;
+    nursePatrolTargetElapsed=0;
     nursePatrolStuckElapsed=0;
     nursePatrolReadyGraceElapsed=0;
     nurseActivity="IDLE";
@@ -3148,6 +3188,7 @@ try{
     nursePatrolRetryElapsed=0;
     nursePatrolRetryCount=0;
     nursePatrolRetryIntent=null;
+    nursePatrolTargetElapsed=0;
     nursePatrolStuckElapsed=0;
     nursePatrolReadyGraceElapsed=0;
     nursePatrolLastPosition.copy(nurse.position);
@@ -3178,6 +3219,51 @@ try{
     if(nurseActivity!=="PATROL") return;
 
     updateNursePatrolStuck(dt);
+
+    // 1人の巡回対象で長時間状態が進まない場合の最終安全弁。
+    // 介助中のWAIT_LOUNGEは対象が戻るまで待つため除外する。
+    if(
+      nursePatrolState==="TO_RESIDENT" ||
+      nursePatrolState==="CONTACT" ||
+      nursePatrolState==="RETRY_WAIT" ||
+      nursePatrolState==="SAFE_WAYPOINT"
+    ){
+      nursePatrolTargetElapsed+=dt;
+    }else{
+      nursePatrolTargetElapsed=0;
+    }
+
+    if(nursePatrolTargetElapsed>=14.0){
+      const stuckIndex=patrolTargetForCurrentResident();
+      nursePatrolTargetElapsed=0;
+      nurseMover.route=[];
+      nurseMover.routeIndex=0;
+      nurseMover.state="IDLE";
+
+      if(
+        stuckIndex!==null &&
+        residentBusyForPatrol(stuckIndex)
+      ){
+        beginPatrolWaitForResident(stuckIndex);
+      }else if(stuckIndex!==null){
+        // 利用者が介助中でなければ、巡回を停止させずその対象を確認済みとして次へ。
+        nursePatrolIndex++;
+        if(nursePatrolIndex>=nursePatrolOrder.length){
+          beginPatrolReturn();
+        }else{
+          nursePatrolState="TO_RESIDENT";
+          setNursePatrolRoute(
+            nursePatrolTargetFor(
+              patrolTargetForCurrentResident()
+            ),
+            "NURSE_PATROL_WATCHDOG_NEXT"
+          );
+        }
+      }else{
+        beginPatrolReturn();
+      }
+      return;
+    }
 
     if(nursePatrolState==="RETRY_WAIT"){
       nursePatrolRetryElapsed+=dt;
@@ -3247,12 +3333,28 @@ try{
         return;
       }
 
-      if(nurseMover.state!=="IDLE") return;
+      // 接近できていればroute完了を待たず会話へ。
+      // まず移動ルートを明示的に解除し、利用者との重なりを防ぐ。
+      if(nurseNearPatrolResident(targetIndex)){
+        nurseMover.route=[];
+        nurseMover.routeIndex=0;
+        nurseMover.state="IDLE";
 
-      nursePatrolState="CONTACT";
-      nursePatrolWait=0;
-      nursePatrolContactShown=true;
-      showNurseResidentRoundContact(targetIndex);
+        nursePatrolState="CONTACT";
+        nursePatrolWait=0;
+        nursePatrolContactShown=true;
+        showNurseResidentRoundContact(targetIndex);
+        return;
+      }
+
+      // routeだけ終了したのに利用者から遠い場合は「到着扱い」にしない。
+      // 目的地を再計算して再び歩かせる。
+      if(nurseMover.state==="IDLE"){
+        setNursePatrolRoute(
+          nursePatrolTargetFor(targetIndex),
+          "NURSE_PATROL_RESIDENT_REPATH"
+        );
+      }
       return;
     }
 
@@ -3273,10 +3375,17 @@ try{
       }
 
       nursePatrolWait+=dt;
-      if(nursePatrolWait<2.8) return;
+      nursePatrolContactSafetyElapsed+=dt;
+
+      if(
+        nursePatrolWait<2.8 &&
+        nursePatrolContactSafetyElapsed<4.0
+      ) return;
 
       nursePatrolWait=0;
+      nursePatrolContactSafetyElapsed=0;
       nursePatrolContactShown=false;
+      nursePatrolTargetElapsed=0;
       nursePatrolIndex++;
 
       if(nursePatrolIndex>=nursePatrolOrder.length){
@@ -3372,6 +3481,7 @@ try{
         nursePatrolWait=0;
         nursePatrolReadyGraceElapsed=0;
         nursePatrolWaitingForIndex=null;
+        nursePatrolTargetElapsed=0;
         nursePatrolState="TO_RESIDENT";
 
         setNursePatrolRoute(
@@ -3596,11 +3706,13 @@ try{
     nursePatrolIndex=0;
     nursePatrolWait=0;
     nursePatrolContactShown=false;
+    nursePatrolContactSafetyElapsed=0;
     nursePatrolState="IDLE";
     nursePatrolWaitingForIndex=null;
     nursePatrolRetryElapsed=0;
     nursePatrolRetryCount=0;
     nursePatrolRetryIntent=null;
+    nursePatrolTargetElapsed=0;
     nursePatrolStuckElapsed=0;
     nursePatrolReadyGraceElapsed=0;
     nursePatrolLastPosition.copy(nurse.position);
