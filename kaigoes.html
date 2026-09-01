@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-105</title>
+<title>CARE SHIFT - Phase 10-106</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -1258,7 +1258,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-105 / D退出2段階固定・汎用再探索分離</div>
+  <div class="sub">Phase 10-106 / ナース制御統合ステートマシン</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -3300,7 +3300,10 @@ try{
     nursePatrolReadyGraceElapsed=0;
     nurseActivity="IDLE";
 
-    scheduleNextNursePatrol();
+    nextNursePatrolAt =
+      nextNursePatrolAt < 12*60 ? 12*60 :
+      nextNursePatrolAt < 14*60 ? 14*60 :
+      Infinity;
   }
 
   function updateNursePatrolStuck(dt){
@@ -4028,32 +4031,839 @@ try{
     }
   }
 
-  function resetNursePatrol(){
+
+  // ================================================================
+  // Phase 10-106: Unified Nurse Controller
+  //
+  // ナースの移動を PATROL / E昼食巡回 / TOILET の別々の更新関数から切り離し、
+  // この1つの状態機械だけが nurseMover を操作する。
+  // ================================================================
+  const NURSE_CTRL_PATROL_TIMES=[10*60,12*60,14*60];
+
+  const nurseCtrl={
+    mode:"IDLE",               // IDLE / PATROL / E_LUNCH / TOILET
+    phase:"AT_STATION",
+    patrolSlot:0,
+    patrolCursor:0,
+    patrolCompleted:[false,false,false,false],
+    patrolWaitingFor:null,
+    patrolPendingAfterD:null,
+    contactTimer:0,
+    waitTimer:0,
+
+    eLunchDone:false,
+
+    toiletUseTimer:0,
+    toiletWaitTimer:0,
+
+    moveTarget:null,
+    moveArrivalPhase:null,
+    moveLabel:"",
+    moveRetryElapsed:0,
+    moveRetryCount:0,
+    moveStuckElapsed:0,
+    moveLastPosition:new THREE.Vector3()
+  };
+
+  function nurseCtrlStopMover(){
     nurseMover.route=[];
     nurseMover.routeIndex=0;
     nurseMover.state="IDLE";
+  }
+
+  function nurseCtrlSyncLegacyState(){
+    nursePatrolActive=nurseCtrl.mode==="PATROL";
+    nurseLunchRoundDone=nurseCtrl.eLunchDone;
+
+    if(nurseCtrl.mode==="IDLE"){
+      nurseActivity="IDLE";
+      nursePatrolState="IDLE";
+      nurseLunchRoundState="IDLE";
+      return;
+    }
+
+    if(nurseCtrl.mode==="PATROL"){
+      nurseActivity="PATROL";
+
+      if(nurseCtrl.phase==="PATROL_WAIT"){
+        nursePatrolState="WAIT_LOUNGE";
+      }else if(nurseCtrl.phase==="PATROL_CONTACT"){
+        nursePatrolState="CONTACT";
+      }else if(nurseCtrl.phase==="MOVE"){
+        nursePatrolState="TO_RESIDENT";
+      }else if(nurseCtrl.phase==="PATROL_RETURN"){
+        nursePatrolState="RETURN";
+      }else{
+        nursePatrolState=nurseCtrl.phase;
+      }
+      return;
+    }
+
+    if(nurseCtrl.mode==="E_LUNCH"){
+      nurseActivity="LUNCH_ROUND";
+      if(nurseCtrl.phase==="E_LOUNGE_CONTACT"){
+        nurseLunchRoundState="LOUNGE_CONTACT";
+      }else if(nurseCtrl.phase==="E_ROOM_CONTACT"){
+        nurseLunchRoundState="E_ROOM_CONTACT";
+      }else if(nurseCtrl.phase==="MOVE"){
+        nurseLunchRoundState="MOVING";
+      }else{
+        nurseLunchRoundState=nurseCtrl.phase;
+      }
+      return;
+    }
+
+    if(nurseCtrl.mode==="TOILET"){
+      if(nurseCtrl.phase==="TOILET_WAIT"){
+        nurseActivity="TOILET_WAIT";
+      }else if(
+        nurseCtrl.phase==="TOILET_CLOSE" ||
+        nurseCtrl.phase==="TOILET_USE" ||
+        nurseCtrl.phase==="TOILET_OPEN"
+      ){
+        nurseActivity=
+          nurseCtrl.phase==="TOILET_CLOSE" ? "TOILET_CURTAIN_CLOSE" :
+          nurseCtrl.phase==="TOILET_USE" ? "TOILET_USE" :
+          "TOILET_CURTAIN_OPEN";
+      }else if(nurseCtrl.phase==="TOILET_RETURN"){
+        nurseActivity="TOILET_RETURN";
+      }else{
+        nurseActivity="TOILET_GO";
+      }
+    }
+  }
+
+  function nurseCtrlAt(target,threshold=0.72){
+    return nurse.position.distanceTo(target)<=threshold;
+  }
+
+  function nurseCtrlBeginMove(target,arrivalPhase,label){
+    nurseCtrl.moveTarget=target.clone();
+    nurseCtrl.moveArrivalPhase=arrivalPhase;
+    nurseCtrl.moveLabel=label;
+    nurseCtrl.moveRetryElapsed=0;
+    nurseCtrl.moveRetryCount=0;
+    nurseCtrl.moveStuckElapsed=0;
+    nurseCtrl.moveLastPosition.copy(nurse.position);
+    nurseCtrl.phase="MOVE";
+
+    nurseCtrlStopMover();
+    setRoute(nurseMover,nurseCtrl.moveTarget,label);
+    nurseCtrlSyncLegacyState();
+  }
+
+  function nurseCtrlClearMove(){
+    nurseCtrl.moveTarget=null;
+    nurseCtrl.moveArrivalPhase=null;
+    nurseCtrl.moveLabel="";
+    nurseCtrl.moveRetryElapsed=0;
+    nurseCtrl.moveRetryCount=0;
+    nurseCtrl.moveStuckElapsed=0;
+  }
+
+  function nurseCtrlUpdateMove(dt){
+    const target=nurseCtrl.moveTarget;
+    if(!target){
+      nurseCtrl.phase="IDLE_RECOVER";
+      return true;
+    }
+
+    if(nurseCtrlAt(target,0.72)){
+      const arrival=nurseCtrl.moveArrivalPhase;
+      nurseCtrlStopMover();
+      nurseCtrlClearMove();
+      nurseCtrl.phase=arrival || "IDLE_RECOVER";
+      nurseCtrlSyncLegacyState();
+      return true;
+    }
+
+    const moved=nurse.position.distanceTo(nurseCtrl.moveLastPosition);
+    if(moved<0.02){
+      nurseCtrl.moveStuckElapsed+=dt;
+    }else{
+      nurseCtrl.moveStuckElapsed=0;
+      nurseCtrl.moveLastPosition.copy(nurse.position);
+    }
+
+    if(nurseMover.state==="IDLE"){
+      nurseCtrl.moveRetryElapsed+=dt;
+
+      if(nurseCtrl.moveRetryElapsed>=0.8){
+        nurseCtrl.moveRetryElapsed=0;
+        nurseCtrl.moveRetryCount++;
+        setRoute(
+          nurseMover,
+          target,
+          nurseCtrl.moveLabel || "NURSE_CTRL_MOVE"
+        );
+      }
+    }
+
+    // 経路が不安定でも別の行動系へ制御を渡さない。
+    // 6秒停止したら同じ目的地への経路だけを再構築する。
+    if(nurseCtrl.moveStuckElapsed>=6.0){
+      nurseCtrl.moveStuckElapsed=0;
+      nurseCtrl.moveRetryCount++;
+      nurseCtrlStopMover();
+      setRoute(
+        nurseMover,
+        target,
+        nurseCtrl.moveLabel || "NURSE_CTRL_REPATH"
+      );
+    }
+
+    // 12回以上連続で失敗した場合は、目的を失わず廊下の固定中継点を経由する。
+    if(nurseCtrl.moveRetryCount>=12){
+      nurseCtrl.moveRetryCount=0;
+
+      const originalTarget=target.clone();
+      const originalArrival=nurseCtrl.moveArrivalPhase;
+      const originalLabel=nurseCtrl.moveLabel;
+
+      const staging=
+        originalTarget.z < -4
+          ? new THREE.Vector3(
+              THREE.MathUtils.clamp(originalTarget.x,-10,10),
+              0,
+              -2.25
+            )
+          : nursePatrolCorridorTarget.clone();
+
+      if(!nurseCtrlAt(staging,0.9)){
+        nurseCtrlStopMover();
+        const pathOk=setRoute(
+          nurseMover,
+          staging,
+          "NURSE_CTRL_STAGING"
+        );
+
+        if(pathOk){
+          // staging到着はこの関数内で検出しにくいため、
+          // 元の目的地は保持し、次の再試行で直接戻す。
+          nurseCtrl.moveRetryCount=0;
+        }
+      }
+
+      nurseCtrl.moveTarget=originalTarget;
+      nurseCtrl.moveArrivalPhase=originalArrival;
+      nurseCtrl.moveLabel=originalLabel;
+    }
+
+    return false;
+  }
+
+  function nurseCtrlPatrolCurrent(){
+    while(nurseCtrl.patrolCursor<nursePatrolOrder.length){
+      const index=nursePatrolOrder[nurseCtrl.patrolCursor];
+      if(!nurseCtrl.patrolCompleted[index]) return index;
+      nurseCtrl.patrolCursor++;
+    }
+    return null;
+  }
+
+  function nurseCtrlPatrolCompleteResident(index){
+    if(index>=0 && index<=3){
+      nurseCtrl.patrolCompleted[index]=true;
+    }
+    nurseCtrl.patrolCursor++;
+    nurseCtrl.patrolWaitingFor=null;
+  }
+
+  function nurseCtrlPatrolTarget(index){
+    if(index===3){
+      return nurseDBedsideTarget.clone();
+    }
+
+    // 利用者が完全停止している生活場所を基準に固定地点を作る。
+    const base=nursePatrolBaseFor(index);
+    const candidates=[
+      new THREE.Vector3(base.x,0,base.z+1.9),
+      new THREE.Vector3(base.x+1.9,0,base.z),
+      new THREE.Vector3(base.x-1.9,0,base.z),
+      new THREE.Vector3(base.x,0,base.z-1.9)
+    ];
+
+    for(const point of candidates){
+      if(isBlockedPoint(point)) continue;
+      const path=findPath(nurse.position,point);
+      if(path.length) return point;
+    }
+
+    // 利用者本人へは絶対に重ならない。
+    if(index===0) return new THREE.Vector3(-5.0,0,-1.25);
+    if(index===1) return new THREE.Vector3(3.0,0,-1.25);
+    return new THREE.Vector3(2.0,0,-1.25);
+  }
+
+  function nurseCtrlStartPatrol(){
+    nurseCtrl.mode="PATROL";
+    nurseCtrl.phase="PATROL_START";
+    nurseCtrl.patrolCursor=0;
+    nurseCtrl.patrolCompleted=[false,false,false,false];
+    nurseCtrl.patrolWaitingFor=null;
+    nurseCtrl.patrolPendingAfterD=null;
+    nurseCtrl.contactTimer=0;
+    nurseCtrl.waitTimer=0;
+
+    nurseCtrlBeginMove(
+      nursePatrolCorridorTarget,
+      "PATROL_SELECT",
+      "NURSE_CTRL_PATROL_START"
+    );
+  }
+
+  function nurseCtrlFinishPatrol(){
+    nurseCtrl.mode="IDLE";
+    nurseCtrl.phase="AT_STATION";
+    nurseCtrl.patrolSlot=Math.min(
+      NURSE_CTRL_PATROL_TIMES.length,
+      nurseCtrl.patrolSlot+1
+    );
+    nextNursePatrolAt=
+      nurseCtrl.patrolSlot<NURSE_CTRL_PATROL_TIMES.length
+        ? NURSE_CTRL_PATROL_TIMES[nurseCtrl.patrolSlot]
+        : Infinity;
+
+    nurseCtrl.patrolCursor=0;
+    nurseCtrl.patrolCompleted=[false,false,false,false];
+    nurseCtrl.patrolWaitingFor=null;
+    nurseCtrl.patrolPendingAfterD=null;
+    nurseCtrl.contactTimer=0;
+    nurseCtrl.waitTimer=0;
+    nurseCtrlClearMove();
+    nurseCtrlSyncLegacyState();
+  }
+
+  function nurseCtrlSendPatrolToLounge(index){
+    nurseCtrl.patrolWaitingFor=index;
+    nurseCtrl.waitTimer=0;
+
+    nurseCtrlBeginMove(
+      nurseLunchLoungeTarget,
+      "PATROL_LOUNGE_CONTACT",
+      "NURSE_CTRL_PATROL_LOUNGE"
+    );
+  }
+
+  function nurseCtrlUpdatePatrol(dt){
+    if(nurseCtrl.phase==="PATROL_SELECT"){
+      const index=nurseCtrlPatrolCurrent();
+
+      if(index===null){
+        nurseCtrlBeginMove(
+          nurseStationTarget,
+          "PATROL_RETURN",
+          "NURSE_CTRL_PATROL_RETURN"
+        );
+        return;
+      }
+
+      if(!residentReadyForPatrol(index)){
+        nurseCtrlSendPatrolToLounge(index);
+        return;
+      }
+
+      nurseCtrlBeginMove(
+        nurseCtrlPatrolTarget(index),
+        "PATROL_ARRIVE",
+        "NURSE_CTRL_TO_RESIDENT"
+      );
+      return;
+    }
+
+    if(nurseCtrl.phase==="PATROL_ARRIVE"){
+      const index=nurseCtrlPatrolCurrent();
+
+      if(index===null){
+        nurseCtrlBeginMove(
+          nurseStationTarget,
+          "PATROL_RETURN",
+          "NURSE_CTRL_PATROL_RETURN"
+        );
+        return;
+      }
+
+      // 到着時点で利用者が動き始めた場合、すれ違い会話を発生させない。
+      if(!residentReadyForPatrol(index)){
+        nurseCtrlSendPatrolToLounge(index);
+        return;
+      }
+
+      const near=
+        index===3
+          ? nurseCtrlAt(nurseDBedsideTarget,0.9)
+          : nurse.position.distanceTo(residents[index].object.position)<=2.6;
+
+      if(!near){
+        nurseCtrlBeginMove(
+          nurseCtrlPatrolTarget(index),
+          "PATROL_ARRIVE",
+          "NURSE_CTRL_PATROL_REAPPROACH"
+        );
+        return;
+      }
+
+      nurseCtrl.phase="PATROL_CONTACT";
+      nurseCtrl.contactTimer=0;
+      showNurseResidentRoundContact(index);
+      nurseCtrlSyncLegacyState();
+      return;
+    }
+
+    if(nurseCtrl.phase==="PATROL_CONTACT"){
+      const index=nurseCtrlPatrolCurrent();
+
+      if(index===null){
+        nurseCtrl.phase="PATROL_SELECT";
+        return;
+      }
+
+      // 会話中に同じ利用者が誘導された場合も、巡回完了にしない。
+      if(!residentReadyForPatrol(index)){
+        nurseCtrlSendPatrolToLounge(index);
+        return;
+      }
+
+      nurseCtrl.contactTimer+=dt;
+      if(nurseCtrl.contactTimer<2.8) return;
+
+      nurseCtrl.contactTimer=0;
+      nurseCtrlPatrolCompleteResident(index);
+
+      // Dだけはベッドサイドから廊下へ完全退出してから次を判定。
+      if(index===3){
+        nurseCtrl.patrolPendingAfterD=nurseCtrlPatrolCurrent();
+        nurseCtrlBeginMove(
+          nurseDExitInsideTarget,
+          "PATROL_D_EXIT_CORRIDOR_START",
+          "NURSE_CTRL_D_EXIT_DOOR"
+        );
+        return;
+      }
+
+      nurseCtrl.phase="PATROL_SELECT";
+      return;
+    }
+
+    if(nurseCtrl.phase==="PATROL_D_EXIT_CORRIDOR_START"){
+      nurseCtrlBeginMove(
+        nurseDExitCorridorTarget,
+        "PATROL_AFTER_D",
+        "NURSE_CTRL_D_EXIT_CORRIDOR"
+      );
+      return;
+    }
+
+    if(nurseCtrl.phase==="PATROL_AFTER_D"){
+      nurseCtrl.patrolPendingAfterD=null;
+      nurseCtrl.phase="PATROL_SELECT";
+      return;
+    }
+
+    if(nurseCtrl.phase==="PATROL_LOUNGE_CONTACT"){
+      nurseCtrl.phase="PATROL_WAIT";
+      nurseCtrl.waitTimer=0;
+      nurseLunchRoundContactShown=false;
+      showNurseLoungeContact();
+      nurseCtrlSyncLegacyState();
+      return;
+    }
+
+    if(nurseCtrl.phase==="PATROL_WAIT"){
+      const index=nurseCtrl.patrolWaitingFor;
+
+      if(index===null){
+        nurseCtrl.phase="PATROL_SELECT";
+        return;
+      }
+
+      nurseCtrl.waitTimer+=dt;
+
+      // 対象者本人が「介助終了・帰還完了・完全停止」になった時だけ再開。
+      if(residentReadyForPatrol(index)){
+        nurseCtrl.waitTimer=0;
+        nurseCtrl.patrolWaitingFor=null;
+        nurseCtrlBeginMove(
+          nurseCtrlPatrolTarget(index),
+          "PATROL_ARRIVE",
+          "NURSE_CTRL_PATROL_RESUME"
+        );
+        return;
+      }
+
+      // 60秒の安全弁。
+      // 利用者側の経路異常で永久待機になった場合のみ、その利用者を保留して次へ進む。
+      if(
+        nurseCtrl.waitTimer>=60 &&
+        !residentBusyForPatrol(index)
+      ){
+        nurseCtrl.waitTimer=0;
+        nurseCtrl.patrolCompleted[index]=true;
+        nurseCtrl.patrolWaitingFor=null;
+        nurseCtrl.patrolCursor++;
+        nurseCtrl.phase="PATROL_SELECT";
+      }
+      return;
+    }
+
+    if(nurseCtrl.phase==="PATROL_RETURN"){
+      if(nurseCtrlAt(nurseStationTarget,0.7)){
+        nurseCtrlFinishPatrol();
+      }else{
+        nurseCtrlBeginMove(
+          nurseStationTarget,
+          "PATROL_RETURN",
+          "NURSE_CTRL_PATROL_RETURN"
+        );
+      }
+    }
+  }
+
+  function nurseCtrlStartELunchRound(){
+    nurseCtrl.mode="E_LUNCH";
+    nurseCtrl.contactTimer=0;
+    nurseCtrl.waitTimer=0;
+    nurseLunchRoundContactShown=false;
+
+    if(eBusyForLunchNurseRound()){
+      nurseCtrlBeginMove(
+        nurseLunchLoungeTarget,
+        "E_LOUNGE_CONTACT",
+        "NURSE_CTRL_E_LUNCH_LOUNGE"
+      );
+      return;
+    }
+
+    if(eInsideHomeRoom()){
+      nurseCtrlBeginMove(
+        nurseELunchRoomTarget,
+        "E_ROOM_CONTACT",
+        "NURSE_CTRL_E_LUNCH_ROOM"
+      );
+      return;
+    }
+
+    // Eが帰室途中なら追跡せず、司令塔はIDLEのまま次フレームで再判定。
+    nurseCtrl.mode="IDLE";
+    nurseCtrl.phase="AT_STATION";
+    nurseCtrlSyncLegacyState();
+  }
+
+  function nurseCtrlFinishELunchRound(){
+    nurseCtrl.eLunchDone=true;
+    nurseCtrl.mode="IDLE";
+    nurseCtrl.phase="AT_STATION";
+    nurseCtrl.contactTimer=0;
+    nurseCtrl.waitTimer=0;
+    nurseCtrlClearMove();
+    nurseCtrlSyncLegacyState();
+  }
+
+  function nurseCtrlUpdateELunch(dt){
+    if(nurseCtrl.phase==="E_ROOM_CONTACT"){
+      if(nurseCtrl.contactTimer===0){
+        showNurseReaction("様子を見に来ました",2.6);
+        showEReaction("うん、大丈夫",2.5);
+      }
+
+      nurseCtrl.contactTimer+=dt;
+      if(nurseCtrl.contactTimer>=2.8){
+        nurseCtrl.contactTimer=0;
+        nurseCtrlBeginMove(
+          nurseStationTarget,
+          "E_RETURN",
+          "NURSE_CTRL_E_LUNCH_RETURN"
+        );
+      }
+      return;
+    }
+
+    if(nurseCtrl.phase==="E_LOUNGE_CONTACT"){
+      if(nurseCtrl.contactTimer===0){
+        nurseLunchRoundContactShown=false;
+        showNurseLoungeContact();
+      }
+
+      nurseCtrl.contactTimer+=dt;
+      if(nurseCtrl.contactTimer>=3.5){
+        nurseCtrl.contactTimer=0;
+        nurseCtrlBeginMove(
+          nurseStationTarget,
+          "E_RETURN",
+          "NURSE_CTRL_E_LUNCH_RETURN"
+        );
+      }
+      return;
+    }
+
+    if(nurseCtrl.phase==="E_RETURN"){
+      if(nurseCtrlAt(nurseStationTarget,0.7)){
+        nurseCtrlFinishELunchRound();
+      }else{
+        nurseCtrlBeginMove(
+          nurseStationTarget,
+          "E_RETURN",
+          "NURSE_CTRL_E_LUNCH_RETURN"
+        );
+      }
+    }
+  }
+
+  function nurseCtrlStartToilet(){
+    nurseCtrl.mode="TOILET";
+    nurseCtrl.phase="TOILET_REQUEST";
+    nurseCtrl.toiletUseTimer=0;
+    nurseCtrl.toiletWaitTimer=0;
+    nurseCtrlSyncLegacyState();
+  }
+
+  function nurseCtrlFinishToilet(){
+    releaseToiletAccess("NURSE");
+    nurseCtrl.mode="IDLE";
+    nurseCtrl.phase="AT_STATION";
+    nurseCtrl.toiletUseTimer=0;
+    nurseCtrl.toiletWaitTimer=0;
+    nurseCtrlClearMove();
+    scheduleNextNurseToilet();
+    nurseCtrlSyncLegacyState();
+  }
+
+  function nurseCtrlUpdateToilet(dt){
+    if(nurseCtrl.phase==="TOILET_REQUEST"){
+      const hasTurn=requestToiletAccess("NURSE");
+      const clear=toiletEntryPhysicallyClearFor("NURSE");
+
+      if(!hasTurn || !clear){
+        nurseCtrlBeginMove(
+          nurseToiletWaitTarget,
+          "TOILET_WAIT",
+          "NURSE_CTRL_TOILET_WAIT"
+        );
+        return;
+      }
+
+      nurseCtrlBeginMove(
+        nurseToiletInsideTarget,
+        "TOILET_CLOSE",
+        "NURSE_CTRL_TOILET_ENTER"
+      );
+      return;
+    }
+
+    if(nurseCtrl.phase==="TOILET_WAIT"){
+      nurseCtrl.toiletWaitTimer+=dt;
+
+      const hasTurn=requestToiletAccess("NURSE");
+      const clear=toiletEntryPhysicallyClearFor("NURSE");
+
+      if(hasTurn && clear){
+        nurseCtrl.toiletWaitTimer=0;
+        nurseCtrlBeginMove(
+          nurseToiletInsideTarget,
+          "TOILET_CLOSE",
+          "NURSE_CTRL_TOILET_ENTER"
+        );
+        return;
+      }
+
+      // 長時間固定はしない。一度詰所へ戻り、少し早めに再試行。
+      if(nurseCtrl.toiletWaitTimer>=18){
+        releaseToiletAccess("NURSE");
+        nextNurseToiletAt=gameMinutes+20+Math.random()*20;
+        nurseCtrl.toiletWaitTimer=0;
+        nurseCtrlBeginMove(
+          nurseStationTarget,
+          "TOILET_ABORT_RETURN",
+          "NURSE_CTRL_TOILET_ABORT_RETURN"
+        );
+      }
+      return;
+    }
+
+    if(nurseCtrl.phase==="TOILET_CLOSE"){
+      // 入口直前で占有が変化した場合は外へ戻る。
+      if(
+        toiletAccessOwner!=="NURSE" ||
+        !toiletEntryPhysicallyClearFor("NURSE")
+      ){
+        releaseToiletAccess("NURSE");
+        nurseCtrlBeginMove(
+          nurseToiletWaitTarget,
+          "TOILET_WAIT",
+          "NURSE_CTRL_TOILET_REWAIT"
+        );
+        return;
+      }
+
+      toiletCurtain.target=1;
+      if(toiletCurtain.t>=0.98){
+        nurseCtrl.phase="TOILET_USE";
+        nurseCtrl.toiletUseTimer=0;
+        nurseCtrlSyncLegacyState();
+      }
+      return;
+    }
+
+    if(nurseCtrl.phase==="TOILET_USE"){
+      nurseCtrl.toiletUseTimer+=dt;
+      if(nurseCtrl.toiletUseTimer>=5.0){
+        nurseCtrl.toiletUseTimer=0;
+        toiletCurtain.target=0;
+        nurseCtrl.phase="TOILET_OPEN";
+        nurseCtrlSyncLegacyState();
+      }
+      return;
+    }
+
+    if(nurseCtrl.phase==="TOILET_OPEN"){
+      if(toiletCurtain.t<=0.02){
+        nurseCtrlBeginMove(
+          nurseToiletExitTarget,
+          "TOILET_RELEASE",
+          "NURSE_CTRL_TOILET_EXIT"
+        );
+      }
+      return;
+    }
+
+    if(nurseCtrl.phase==="TOILET_RELEASE"){
+      releaseToiletAccess("NURSE");
+      nurseCtrlBeginMove(
+        nurseStationTarget,
+        "TOILET_RETURN",
+        "NURSE_CTRL_TOILET_RETURN"
+      );
+      return;
+    }
+
+    if(nurseCtrl.phase==="TOILET_RETURN"){
+      if(nurseCtrlAt(nurseStationTarget,0.7)){
+        nurseCtrlFinishToilet();
+      }else{
+        nurseCtrlBeginMove(
+          nurseStationTarget,
+          "TOILET_RETURN",
+          "NURSE_CTRL_TOILET_RETURN"
+        );
+      }
+      return;
+    }
+
+    if(nurseCtrl.phase==="TOILET_ABORT_RETURN"){
+      if(nurseCtrlAt(nurseStationTarget,0.7)){
+        releaseToiletAccess("NURSE");
+        nurseCtrl.mode="IDLE";
+        nurseCtrl.phase="AT_STATION";
+        nurseCtrlClearMove();
+        nurseCtrlSyncLegacyState();
+      }else{
+        nurseCtrlBeginMove(
+          nurseStationTarget,
+          "TOILET_ABORT_RETURN",
+          "NURSE_CTRL_TOILET_ABORT_RETURN"
+        );
+      }
+    }
+  }
+
+  function nurseCtrlShouldStartELunch(){
+    if(nurseCtrl.eLunchDone || !eLunchTime()) return false;
+    return eBusyForLunchNurseRound() || eInsideHomeRoom();
+  }
+
+  function nurseCtrlShouldStartPatrol(){
+    if(nurseCtrl.patrolSlot>=NURSE_CTRL_PATROL_TIMES.length) return false;
+    return (
+      gameMinutes>=NURSE_CTRL_PATROL_TIMES[nurseCtrl.patrolSlot] &&
+      gameMinutes<15*60
+    );
+  }
+
+  function nurseCtrlShouldStartToilet(){
+    return (
+      gameMinutes>=nextNurseToiletAt &&
+      gameMinutes<14*60+50
+    );
+  }
+
+  function updateNurseController(dt){
+    // 報告中は完全に現在状態を保持する。完了後に同じ場所から続行。
+    if(nurseReportInProgress){
+      nurseCtrlStopMover();
+      nurseCtrlSyncLegacyState();
+      return;
+    }
+
+    if(nurseCtrl.phase==="MOVE"){
+      nurseCtrlUpdateMove(dt);
+      nurseCtrlSyncLegacyState();
+      return;
+    }
+
+    if(nurseCtrl.mode==="PATROL"){
+      nurseCtrlUpdatePatrol(dt);
+      nurseCtrlSyncLegacyState();
+      return;
+    }
+
+    if(nurseCtrl.mode==="E_LUNCH"){
+      nurseCtrlUpdateELunch(dt);
+      nurseCtrlSyncLegacyState();
+      return;
+    }
+
+    if(nurseCtrl.mode==="TOILET"){
+      nurseCtrlUpdateToilet(dt);
+      nurseCtrlSyncLegacyState();
+      return;
+    }
+
+    // IDLE時だけ新しい仕事を選ぶ。優先順位を1か所で決定する。
+    // E昼食巡回 > 定時ラウンド > ナース自身のトイレ
+    if(nurseCtrlShouldStartELunch()){
+      nurseCtrlStartELunchRound();
+    }else if(nurseCtrlShouldStartPatrol()){
+      nurseCtrlStartPatrol();
+    }else if(nurseCtrlShouldStartToilet()){
+      nurseCtrlStartToilet();
+    }
+
+    nurseCtrlSyncLegacyState();
+  }
+
+  function resetUnifiedNurseController(){
+    nurseCtrlStopMover();
+
+    nurseCtrl.mode="IDLE";
+    nurseCtrl.phase="AT_STATION";
+    nurseCtrl.patrolSlot=0;
+    nurseCtrl.patrolCursor=0;
+    nurseCtrl.patrolCompleted=[false,false,false,false];
+    nurseCtrl.patrolWaitingFor=null;
+    nurseCtrl.patrolPendingAfterD=null;
+    nurseCtrl.contactTimer=0;
+    nurseCtrl.waitTimer=0;
+    nurseCtrl.eLunchDone=false;
+    nurseCtrl.toiletUseTimer=0;
+    nurseCtrl.toiletWaitTimer=0;
+    nurseCtrlClearMove();
+
     nurse.position.copy(nurseStationTarget);
     nurse.rotation.set(0,0,0);
 
-    nextNursePatrolAt=10*60;
+    nextNursePatrolAt=NURSE_CTRL_PATROL_TIMES[0];
+    nextNurseToiletAt=8*60+30+Math.random()*60;
+
+    releaseToiletAccess("NURSE");
+    toiletCurtain.target=0;
+
     nursePatrolActive=false;
     nursePatrolIndex=0;
     nursePatrolCompleted=[false,false,false,false];
-    nursePatrolWait=0;
-    nursePatrolContactShown=false;
-    nursePatrolContactSafetyElapsed=0;
     nursePatrolState="IDLE";
     nursePatrolWaitingForIndex=null;
     nursePatrolPendingNextIndex=null;
     nursePatrolDExitStage="NONE";
-    nursePatrolRetryElapsed=0;
-    nursePatrolRetryCount=0;
-    nursePatrolRetryIntent=null;
-    nursePatrolTargetElapsed=0;
-    nursePatrolLockedTarget=null;
-    nursePatrolStuckElapsed=0;
-    nursePatrolReadyGraceElapsed=0;
-    nursePatrolLastPosition.copy(nurse.position);
 
     nurseLunchRoundDone=false;
     nurseLunchRoundState="IDLE";
@@ -4061,14 +4871,13 @@ try{
     nurseLunchRoundContactShown=false;
 
     nurseActivity="IDLE";
-    nurseToiletUseTimer=0;
-    nurseToiletWaitElapsed=0;
-    nextNurseToiletAt=8*60+30+Math.random()*60;
-    resetToiletAccess();
-
-    // 再プレイ時にナースのトイレ利用でカーテンが残らないようにする。
-    toiletCurtain.target=0;
+    nurseCtrlSyncLegacyState();
   }
+
+  function resetNursePatrol(){
+    resetUnifiedNurseController();
+  }
+
 
   // Eは他利用者の標準的な歩行速度（約4.3）の0.6倍。
   const residentEMover=makeMover(residentE,2.58);
@@ -6008,23 +6817,37 @@ try{
   }
 
   function nurseAvailableForReport(){
-    if(nurseActivity==="IDLE") return true;
+    // ナースが物理的に停止していて職員が近づける状態なら、
+    // 巡回待機・帰還途中の停止中でも報告を受けられる。
+    if(nurseMover.state!=="IDLE") return false;
 
-    // 通常巡回で談話室待機中は、ナースはその場に滞在しているため報告可能。
+    if(nurseCtrl.mode==="TOILET"){
+      // トイレ内部・カーテン操作中は報告不可。
+      if(
+        nurseCtrl.phase==="TOILET_CLOSE" ||
+        nurseCtrl.phase==="TOILET_USE" ||
+        nurseCtrl.phase==="TOILET_OPEN" ||
+        nursePhysicallyInsideToilet()
+      ){
+        return false;
+      }
+    }
+
+    // 利用者との短い巡回会話中だけは会話を優先。
     if(
-      nurseActivity==="PATROL" &&
-      nursePatrolState==="WAIT_LOUNGE" &&
-      nurseMover.state==="IDLE"
-    ) return true;
+      nurseCtrl.mode==="PATROL" &&
+      nurseCtrl.phase==="PATROL_CONTACT"
+    ) return false;
 
-    // E昼食巡回で談話室に滞在中も同様に報告可能。
     if(
-      nurseActivity==="LUNCH_ROUND" &&
-      nurseLunchRoundState==="LOUNGE_CONTACT" &&
-      nurseMover.state==="IDLE"
-    ) return true;
+      nurseCtrl.mode==="E_LUNCH" &&
+      (
+        nurseCtrl.phase==="E_ROOM_CONTACT" ||
+        nurseCtrl.phase==="E_LOUNGE_CONTACT"
+      )
+    ) return false;
 
-    return false;
+    return true;
   }
 
   function refreshNurseReportButton(){
@@ -11198,9 +12021,7 @@ try{
       updateMover(residentEMover,dt);
       updateMover(nurseMover,dt);
       updateResidentE(dt);
-      updateNurseLunchERound(dt);
-      updateNurseToilet(dt);
-      updateNursePatrol(dt);
+      updateNurseController(dt);
       updateEReaction(dt);
 
       if(eAngerMarker.visible){
