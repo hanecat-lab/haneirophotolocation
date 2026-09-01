@@ -60909,6 +60909,8 @@ VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=
     const MAGIC_SUBTEXT_AT_MS = 35600;
     const MAGIC_MESSAGE_AT_MS = 37300;
     const MAGIC_MESSAGE_SOLO_MS = 8000;
+    // 最終画面の縁光はBGMとは切り離し、7.2秒で4〜8%だけ呼吸させる。
+    const MAGIC_RIM_BREATH_MS = 7200;
     // HEART SHIFTで旋風が完成した直後に短く溜め、上部だけを一瞬ほのかに明るくする。
     // 大きなリングや移動光は使わず、収束そのものを主役にする。
     const MAGIC_AWAKENING_HOLD_START_MS = 28300;
@@ -65097,7 +65099,16 @@ VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=
       // リムライトは水平な平行光なので、床（N·L=0）にも奥の壁（背面向き）にも乗らない。
       // 上げてもグラスの輪郭だけが光る＝周囲を明るくせずにタワーだけ持ち上げられる唯一の光源。
       const rimLight = lightRig.userData.rimLight;
-      if (rimLight) rimLight.intensity = rimLight.userData.baseIntensity * (1 + stageLight * 1.2);
+      const magicRimAge = anniversarySequence === 'magic' && anniversaryStartsAt > 0 && magicChangeStartedAt > 0
+        ? performance.now() - magicChangeStartedAt : -1;
+      const magicRimActive = magicRimAge >= MAGIC_FINALE.messageCompleteAt;
+      const magicRimReveal = magicRimActive
+        ? THREE.MathUtils.clamp((magicRimAge - MAGIC_FINALE.messageCompleteAt) / 1200, 0, 1) : 0;
+      // 4〜8%の範囲をゆっくり往復する。水平なリム光だけを触るため、正面・床・背景は暗いまま。
+      const magicRimLift = magicRimReveal * (.06 + Math.sin(
+        (magicRimAge - MAGIC_FINALE.messageCompleteAt) / MAGIC_RIM_BREATH_MS * Math.PI * 2
+      ) * .02);
+      if (rimLight) rimLight.intensity = rimLight.userData.baseIntensity * (1 + stageLight * 1.2) * (1 + magicRimLift);
       const topSpotLight = lightRig.userData.topSpotLight;
       if (topSpotLight) topSpotLight.intensity = topSpotLight.userData.baseIntensity * (1 + stageLight * .6);
       // ACT 2→3では、既存の上部スポットを180msだけ最大6%持ち上げる。
@@ -65139,6 +65150,8 @@ VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=
         }
         if (themeVisuals.backHalo && themeVisuals.backHalo.userData.baseColour) themeVisuals.backHalo.material.color.copy(themeVisuals.backHalo.userData.baseColour).lerp(musicVisualScratch.accent, musicVisual.light * .38 * qualityProfile.musicGain);
       }
+      // 最終画面の縁光は音楽に反応させない。音楽同期処理後に基準色へ戻して独立させる。
+      if (magicRimActive && rimLight?.userData.baseColour) rimLight.color.copy(rimLight.userData.baseColour);
       updateCameraFacingGlow();
       themeVisuals.party?.update(delta, musicVisualBeatPulse);
       const musicParticleResponse = Math.max(response, musicVisualBeatPulse * musicVisual.particle * activeQualityProfile().musicGain);
@@ -66044,11 +66057,14 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         });
         petalGeometry.setAttribute('aPetalSpin', new THREE.BufferAttribute(spins, 1)); petalGeometry.setAttribute('aPetalFlutter', new THREE.BufferAttribute(flutters, 1)); petalGeometry.setAttribute('aPetalPhase', new THREE.BufferAttribute(petalPhases, 4));
         const petalMaterial = new THREE.PointsMaterial({ color: variant.color, map: getDressingTexture('sakura'), size: .072 * particleSizeMul * variant.size, transparent: true, opacity: variant.opacity, depthWrite: false, blending: THREE.NormalBlending, sizeAttenuation: true });
-        petalMaterial.userData.petalUniforms = { uPetalTime: { value: 0 }, uPetalRadius: { value: radius }, uPetalTowerHeight: { value: towerHeight }, uPetalResponse: { value: 0 } };
+        petalMaterial.userData.petalUniforms = {
+          uPetalTime: { value: 0 }, uPetalRadius: { value: radius }, uPetalTowerHeight: { value: towerHeight },
+          uPetalResponse: { value: 0 }, uPetalMagicMix: { value: 0 }, uPetalMagicJoin: { value: 1 }
+        };
         petalMaterial.onBeforeCompile = shader => {
           Object.assign(shader.uniforms, petalMaterial.userData.petalUniforms);
           shader.vertexShader = shader.vertexShader
-            .replace('#include <common>', '#include <common>\nattribute float aPetalSpin;\nattribute float aPetalFlutter;\nattribute vec4 aPetalPhase;\nuniform float uPetalTime;\nuniform float uPetalRadius;\nuniform float uPetalTowerHeight;\nuniform float uPetalResponse;\nvarying float vPetalSpin;\nvarying float vPetalFlutter;')
+            .replace('#include <common>', '#include <common>\nattribute float aPetalSpin;\nattribute float aPetalFlutter;\nattribute vec4 aPetalPhase;\nuniform float uPetalTime;\nuniform float uPetalRadius;\nuniform float uPetalTowerHeight;\nuniform float uPetalResponse;\nuniform float uPetalMagicMix;\nuniform float uPetalMagicJoin;\nvarying float vPetalSpin;\nvarying float vPetalFlutter;')
             .replace('#include <begin_vertex>', `#include <begin_vertex>
               vPetalSpin = aPetalSpin; vPetalFlutter = aPetalFlutter;
               // 音量で急加速させず、ゆっくりした一方向の周回を主体にする。
@@ -66059,16 +66075,18 @@ function createCelebrationEffects(levels, towerHeight, placements) {
               float petalWindPulse = pow(max(0., sin(uPetalTime * .14 + aPetalPhase.x * 2.8)), 3.);
               float petalFlutter = sin(uPetalTime * (.58 + aPetalPhase.w * .48) + aPetalPhase.x * 5.4) * .10 + sin(uPetalTime * .31 + aPetalPhase.x * 8.1) * .055;
               float petalRadial = uPetalRadius * 2. * aPetalPhase.y * (1. + sin(uPetalTime * .56 + aPetalPhase.x) * .045);
-              petalRadial *= .94 + petalGust * .035 + petalWindPulse * .025;
+              petalRadial *= (.94 + petalGust * .035 + petalWindPulse * .025) * mix(1., mix(1.2036, 1.02, uPetalMagicJoin), uPetalMagicMix);
               petalRadial = max(uPetalRadius * .98, petalRadial);
-              float petalAngle = aPetalPhase.x + uPetalTime * petalSpeed * aPetalPhase.w + petalGust * .10 + petalWindPulse * .06 + sin(uPetalTime * .34 + aPetalPhase.x) * .04;
-              transformed = vec3(cos(petalAngle) * petalRadial, .11 + uPetalTowerHeight * (1. - petalDescent) + sin(uPetalTime * .36 + aPetalPhase.x * 3.3) * .13 + petalFlutter, sin(petalAngle) * petalRadial);
+              float petalOrbit = mix(uPetalTime * petalSpeed * aPetalPhase.w, uPetalTime * .40, uPetalMagicMix);
+              float petalAngle = aPetalPhase.x + petalOrbit + petalGust * .10 + petalWindPulse * .06 + sin(uPetalTime * .34 + aPetalPhase.x) * .04;
+              float magicPetalLift = uPetalMagicMix * uPetalTowerHeight * (.025 + (1. - uPetalMagicJoin) * .055);
+              transformed = vec3(cos(petalAngle) * petalRadial, .11 + uPetalTowerHeight * (1. - petalDescent) + sin(uPetalTime * .36 + aPetalPhase.x * 3.3) * .13 + petalFlutter + magicPetalLift, sin(petalAngle) * petalRadial);
             `);
           shader.fragmentShader = shader.fragmentShader
             .replace('#include <common>', '#include <common>\nuniform float uPetalTime;\nvarying float vPetalSpin;\nvarying float vPetalFlutter;')
             .replace('#include <map_particle_fragment>', '#ifdef USE_MAP\n  float petalAngle = vPetalSpin + sin(uPetalTime * vPetalFlutter * .46 + vPetalSpin * 1.73) * .58 + sin(uPetalTime * .20 + vPetalSpin * 4.17) * .20;\n  float petalC = cos(petalAngle), petalS = sin(petalAngle);\n  vec2 petalUv = gl_PointCoord - .5;\n  petalUv = mat2(petalC, -petalS, petalS, petalC) * petalUv + .5;\n  diffuseColor *= texture2D(map, petalUv);\n#endif');
         };
-        petalMaterial.customProgramCacheKey = () => 'sakura-petal-gpu-motion-v4'; petalMaterial.needsUpdate = true;
+        petalMaterial.customProgramCacheKey = () => 'sakura-petal-gpu-motion-v5'; petalMaterial.needsUpdate = true;
         const layer = new THREE.Points(petalGeometry, petalMaterial); layer.visible = false;
         layer.userData = { ownGeometry: true, ownMaterial: true, indices, variant }; return layer;
       });
@@ -66232,6 +66250,15 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       };
       const MAGIC_AWAKENING = magicAwakeningTiming();
       const MAGIC_SPIN_RATE = .40;
+      // PRELUDEは全種類を同じ向きで回し、速度・半径・高さの微差だけで層を分ける。
+      // joinSec中は少し外側・上側から軌道へ入り、「突然出現」ではなく引き寄せられた動きにする。
+      const MAGIC_SYMBOL_JOIN_SEC = .60;
+      const MAGIC_SYMBOL_TUNING = {
+        heart:  { speed: 1,    radius: .94, height: 0 },
+        star:   { speed: 1.05, radius: 1,   height: .045 },
+        bubble: { speed: .95,  radius: 1.08, height: 0 },
+        sakura: { speed: 1,    radius: 1.02, height: .025 },
+      };
       // メッセージ完成後は音楽から切り離し、約52秒で一周する一定の余韻速度へ落とす。
       const MAGIC_AFTERGLOW_SPIN_RATE = .12;
       // タワー外周(= radius * .862)の1.5倍を旋風の平均半径にする。
@@ -66264,6 +66291,7 @@ function createCelebrationEffects(levels, towerHeight, placements) {
       // 方位角によって画面横方向への寄与が変わるので、X軸とZ軸の両方を見て
       // 「横に一番効く向き」を基準にする。粒ごとではなくフレームに1回だけ呼ぶこと。
       const vortexEdgeProbe = new THREE.Vector3();
+      const burstCameraLocal = new THREE.Vector3();
       const projectLocalNdcX = (x, y, z) => {
         vortexEdgeProbe.set(x, y, z); tower.localToWorld(vortexEdgeProbe); vortexEdgeProbe.project(camera);
         return Number.isFinite(vortexEdgeProbe.x) ? Math.abs(vortexEdgeProbe.x) : 0;
@@ -66303,7 +66331,7 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         return vortexApexSmoothedY;
       };
       const startMagicChange = () => {
-        magicChange = { time: 0, release: 0, spin: 0 }; magicExit = 1;
+        magicChange = { time: 0, release: 0, spin: 0, symbolSpins: { star: 0, bubble: 0 } }; magicExit = 1;
         magicAfterglowSpin = 0;
         vortexApexSmoothedY = null; vortexApexLastMagicTime = -1;
         // ハート・泡を選んでいると settlement は 0.11/秒 で減衰し切っている。
@@ -66327,6 +66355,11 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         const starIntro = ramp(A.star, A.bubble, time);
         const bubbleIntro = ramp(A.bubble, A.sakura, time);
         const sakuraIntro = ramp(A.sakura, A.preludeEnd, time);
+        // 不透明度は従来どおり4秒かけて増やす一方、軌道への合流だけは最初の0.6秒で完了する。
+        const heartJoin = ramp(A.heart, A.heart + MAGIC_SYMBOL_JOIN_SEC, time);
+        const starJoin = ramp(A.star, A.star + MAGIC_SYMBOL_JOIN_SEC, time);
+        const bubbleJoin = ramp(A.bubble, A.bubble + MAGIC_SYMBOL_JOIN_SEC, time);
+        const sakuraJoin = ramp(A.sakura, A.sakura + MAGIC_SYMBOL_JOIN_SEC, time);
         // ACT 1: 4種類が揃った状態で密度を最大まで高める。
         const gather = ramp(A.preludeEnd, A.gather, time);
         const shift = ramp(A.gather, A.shift, time);
@@ -66349,7 +66382,7 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         const burstFade = 1 - glitterLift * .92;
         return {
           heart: Math.min(1, heart) * burstFade,
-          star, bubble, sakura, release,
+          star, bubble, sakura, release, heartJoin, starJoin, bubbleJoin, sakuraJoin,
           population: .14 + ramp(0, A.preludeEnd, time) * .46 + gather * .40,
           speedLift: shift * .18,
           vortex, vortexDense, vortexRise, coreConverge, corePulse, vortexBurst, glitterLift,
@@ -66398,6 +66431,9 @@ function createCelebrationEffects(levels, towerHeight, placements) {
           const afterglowEase = THREE.MathUtils.clamp((magicChange.time - MAGIC_ACTS.settle) / 1.2, 0, 1);
           const spinRate = THREE.MathUtils.lerp(showSpinRate, MAGIC_AFTERGLOW_SPIN_RATE, afterglowEase);
           magicChange.spin += delta * spinRate;
+          // 同じ回転方向を保ち、星だけ+5%、リングだけ-5%。ACT 2でハートへ戻す際は描画側で補間する。
+          magicChange.symbolSpins.star += delta * spinRate * MAGIC_SYMBOL_TUNING.star.speed;
+          magicChange.symbolSpins.bubble += delta * spinRate * MAGIC_SYMBOL_TUNING.bubble.speed;
         }
         const mcMix = magicChange ? magicChangeMix(magicChange.time) : null;
         const magicAfterglowActive = !magicChange && anniversarySequence === 'magic' && anniversaryStartsAt > 0;
@@ -66463,12 +66499,27 @@ function createCelebrationEffects(levels, towerHeight, placements) {
         const innerRadius = radius * (activeDressing() ? .98 : .45);
         // 位置計算をmotion指定で呼べるようにし、MAGIC CHANGE中は主Points(ハート)と
         // 副Points(泡)へ別々の軌道を書く。通常時は従来どおり主Pointsのみ1回走る。
-        const writePositions = (kind, target, phaseShift, vortexBlend = 0, rise = 0, core = 0, pulse = 0, burst = 0, lift = 0) => {
+        const writePositions = (kind, target, phaseShift, vortexBlend = 0, rise = 0, core = 0, pulse = 0, burst = 0, lift = 0, depth = 0, symbolKey = null, symbolJoin = 1, spinOverride = null) => {
         // 投影を伴うので粒ごとには呼ばない。上昇フェーズのときだけ1回求める。
         const apexY = rise > .001 || core > .001 || burst > .001 || lift > .001 ? vortexApexY() : 0;
         const edgeRadius = burst > .001 || lift > .001 ? vortexEdgeRadius(apexY) : 0;
+        // 既存レイヤーをカメラ方向へ前後にずらす。個数は変えず、投影サイズと重なりだけで奥行きを作る。
+        const depthProgress = Math.max(burst, lift);
+        const depthEase = depthProgress * depthProgress * (3 - 2 * depthProgress);
+        let depthOffsetX = 0, depthOffsetZ = 0;
+        if (depth && depthProgress > .001 && tower && camera) {
+          camera.updateMatrixWorld();
+          burstCameraLocal.copy(camera.position);
+          tower.worldToLocal(burstCameraLocal);
+          const cameraPlanarDistance = Math.hypot(burstCameraLocal.x, burstCameraLocal.z);
+          if (cameraPlanarDistance > 1e-5) {
+            const depthDistance = edgeRadius * .14 * depth;
+            depthOffsetX = burstCameraLocal.x / cameraPlanarDistance * depthDistance;
+            depthOffsetZ = burstCameraLocal.z / cameraPlanarDistance * depthDistance;
+          }
+        }
         // MAGIC CHANGE 中は揺れをやめ、全粒を同じ角速度で回す（剛体のような一方向の回転）。
-        const rigidSpin = magicChange ? magicChange.spin : (magicAfterglowActive ? magicAfterglowSpin : null);
+        const rigidSpin = spinOverride ?? (magicChange ? magicChange.spin : (magicAfterglowActive ? magicAfterglowSpin : null));
         for (let i = 0; i < activeParticleCount; i++) {
           const at = i * 4, out = i * 3;
           const phase = phases[at] + phaseShift + (rigidSpin !== null ? rigidSpin : elapsed * speed * phases[at + 3]);
@@ -66488,6 +66539,12 @@ function createCelebrationEffects(levels, towerHeight, placements) {
             y = .11 + towerHeight * (1 - descent) + Math.sin(elapsed * .72 + phases[at] * 3.3) * .13 + flutter;
             radial *= .88 + gust * .11 + windPulse * .07;
             driftAngle = phase + gust * .43 + windPulse * .35 + Math.sin(elapsed * .58 + phases[at]) * .16;
+          }
+          if (symbolKey && MAGIC_SYMBOL_TUNING[symbolKey]) {
+            const tuning = MAGIC_SYMBOL_TUNING[symbolKey];
+            const joinEase = symbolJoin * symbolJoin * (3 - 2 * symbolJoin);
+            radial *= THREE.MathUtils.lerp(tuning.radius * 1.18, tuning.radius, joinEase);
+            y += towerHeight * (tuning.height + (1 - joinEase) * .055);
           }
           radial = Math.max(innerRadius, radial);
           if (vortexBlend > .001) {
@@ -66545,33 +66602,43 @@ function createCelebrationEffects(levels, towerHeight, placements) {
             delta2 = Math.atan2(Math.sin(delta2), Math.cos(delta2));
             driftAngle += delta2 * vortexBlend;
           }
-          target.array[out] = Math.cos(driftAngle) * radial;
+          target.array[out] = Math.cos(driftAngle) * radial + depthOffsetX * depthEase;
           target.array[out + 1] = y;
-          target.array[out + 2] = Math.sin(driftAngle) * radial;
+          target.array[out + 2] = Math.sin(driftAngle) * radial + depthOffsetZ * depthEase;
         }
         target.needsUpdate = true;
         };
         if (showMain) writePositions(mcMix ? 'orbit' : motion, position, 0,
           mcMix ? mcMix.vortex : 0, mcMix ? mcMix.vortexRise : 0, mcMix ? mcMix.coreConverge : 0,
-          mcMix ? mcMix.corePulse : 0, mcMix ? mcMix.vortexBurst : 0, mcMix ? mcMix.glitterLift : 0);
+          mcMix ? mcMix.corePulse : 0, mcMix ? mcMix.vortexBurst : 0, mcMix ? mcMix.glitterLift : 0,
+          0, mcMix ? 'heart' : null, mcMix ? mcMix.heartJoin : 1, magicChange?.spin ?? null);
         // 副Pointsは位相を半周ずらし、主Pointsと同じ場所に重ならないようにする。
         altChannels.forEach((channel, index) => {
           if (!altShow[index]) return;
           const key = altKeyOf(channel);
           const asHeart = key === 'pearl';
-          writePositions(DRESSINGS[key].motion, channel.geometry.attributes.position, channel.phaseShift,
+          const originalSpin = magicChange?.symbolSpins?.[channel.key] ?? magicChange?.spin ?? null;
+          const channelSpin = asHeart && magicChange
+            ? THREE.MathUtils.lerp(originalSpin, magicChange.spin, denseHearts) : originalSpin;
+          const symbolKey = asHeart ? 'heart' : channel.key;
+          const symbolJoin = asHeart ? 1 : mcMix[`${channel.key}Join`];
+          // 円形パーティクルは通常時の浮上挙動を残し、MAGIC CHANGE中だけリングとして旋回させる。
+          const magicMotion = channel.key === 'bubble' && !asHeart ? 'orbit' : DRESSINGS[key].motion;
+          writePositions(magicMotion, channel.geometry.attributes.position, channel.phaseShift,
             asHeart ? mcMix.vortex : 0, asHeart ? mcMix.vortexRise : 0, asHeart ? mcMix.coreConverge : 0,
-            asHeart ? mcMix.corePulse : 0, asHeart ? mcMix.vortexBurst : 0, asHeart ? mcMix.glitterLift : 0);
+            asHeart ? mcMix.corePulse : 0, asHeart ? mcMix.vortexBurst : 0, asHeart ? mcMix.glitterLift : 0,
+            asHeart ? (index === 0 ? 1 : -1) : 0, symbolKey, symbolJoin, channelSpin);
         });
         if (burstBonusCount > 0) {
           writePositions('orbit', burstHeartGeometry.attributes.position, Math.PI * .31,
-            mcMix.vortex, mcMix.vortexRise, mcMix.coreConverge, mcMix.corePulse, mcMix.vortexBurst, mcMix.glitterLift);
+            mcMix.vortex, mcMix.vortexRise, mcMix.coreConverge, mcMix.corePulse, mcMix.vortexBurst, mcMix.glitterLift, .35);
         }
         // 俯瞰時（真上に近い視点）だけ粒子を軽く持ち上げる。
         const polar = controls ? controls.getPolarAngle() : Math.PI / 4;
         const overhead = THREE.MathUtils.clamp(1 - polar / (Math.PI / 3), 0, 1);
         const magicSizeScale = mcMix ? (1 + mcMix.corePulse * .08) * (1 - mcMix.glitterLift * .58) : 1;
         const magicOpacityScale = mcMix ? 1 + mcMix.corePulse * .12 : 1;
+        const burstDepthProgress = mcMix ? Math.max(mcMix.vortexBurst, mcMix.glitterLift) : 0;
         particles.visible = showMain;
         particleMaterial.opacity = Math.min(1, (.68 + response * .30) * fade * (1 + overhead * .25) * (mcMix ? mcMix.heart : magicExit) * magicOpacityScale);
         particleMaterial.size = .072 * particleSizeMul * (1 + overhead * .5) * magicSizeScale;
@@ -66582,16 +66649,20 @@ function createCelebrationEffects(levels, towerHeight, placements) {
           const key = altKeyOf(channel), choice = DRESSINGS[key], texture = getDressingTexture(choice.particleShape);
           if (channel.material.map !== texture) { channel.material.map = texture; channel.material.needsUpdate = true; }
           channel.material.color.setHex(choice.colour).lerp(magicGlitterColour, Math.min(.72, (mcMix?.corePulse || 0) * .28 + (mcMix?.glitterLift || 0) * .72));
-          channel.material.opacity = Math.min(1, (.68 + response * .30) * fade * (1 + overhead * .25) * altMixOf(channel) * magicOpacityScale);
-          channel.material.size = .072 * choice.size * levelScale * (1 + overhead * .5) * magicSizeScale;
+          // 前層は大きく透明度を下げ、奥層は小さく暗くする。中間の主Pointsは従来値を維持。
+          const depthSizeScale = THREE.MathUtils.lerp(1, index === 0 ? 1.16 : .72, burstDepthProgress);
+          const depthOpacityScale = THREE.MathUtils.lerp(1, index === 0 ? 1.08 : .56, burstDepthProgress);
+          if (index === 1) channel.material.color.multiplyScalar(THREE.MathUtils.lerp(1, .68, burstDepthProgress));
+          channel.material.opacity = Math.min(1, (.68 + response * .30) * fade * (1 + overhead * .25) * altMixOf(channel) * magicOpacityScale * depthOpacityScale);
+          channel.material.size = .072 * choice.size * levelScale * (1 + overhead * .5) * magicSizeScale * depthSizeScale;
         });
         burstHeartPoints.visible = burstBonusCount > 0;
         if (burstBonusCount > 0) {
           const heartChoice = DRESSINGS.pearl, heartTexture = getDressingTexture(heartChoice.particleShape);
           if (burstHeartMaterial.map !== heartTexture) { burstHeartMaterial.map = heartTexture; burstHeartMaterial.needsUpdate = true; }
           burstHeartMaterial.color.setHex(heartChoice.colour).lerp(magicGlitterColour, Math.min(.72, mcMix.glitterLift * .72));
-          burstHeartMaterial.opacity = Math.min(1, (.68 + response * .30) * fade * (1 + overhead * .25) * mcMix.heart * mcMix.vortexBurst * magicOpacityScale);
-          burstHeartMaterial.size = .072 * heartChoice.size * levelScale * (1 + overhead * .5) * magicSizeScale;
+          burstHeartMaterial.opacity = Math.min(1, (.68 + response * .30) * fade * (1 + overhead * .25) * mcMix.heart * mcMix.vortexBurst * magicOpacityScale * THREE.MathUtils.lerp(1, .88, burstDepthProgress));
+          burstHeartMaterial.size = .072 * heartChoice.size * levelScale * (1 + overhead * .5) * magicSizeScale * THREE.MathUtils.lerp(1, 1.08, burstDepthProgress);
         }
         // 全レイヤーで共通の音量追従値。1フレームに一度だけ平滑化する。
         if (isSakura) {
@@ -66607,6 +66678,8 @@ function createCelebrationEffects(levels, towerHeight, placements) {
           if (petalUniforms) {
             petalUniforms.uPetalTime.value = elapsed;
             petalUniforms.uPetalResponse.value = sakuraMusicResponse;
+            petalUniforms.uPetalMagicMix.value = mcMix ? 1 : 0;
+            petalUniforms.uPetalMagicJoin.value = mcMix ? mcMix.sakuraJoin : 1;
           }
           layer.material.opacity = variant.opacity * (.78 + response * .22) * fade * (mcMix ? mcMix.sakura : 1);
           layer.material.size = .072 * particleSizeMul * variant.size * (1 + overhead * .38);
