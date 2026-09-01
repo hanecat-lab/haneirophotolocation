@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-103</title>
+<title>CARE SHIFT - Phase 10-105</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -1258,7 +1258,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-103 / 巡回済み固定・D往復ループ修正</div>
+  <div class="sub">Phase 10-105 / D退出2段階固定・汎用再探索分離</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -2479,6 +2479,11 @@ try{
   // Eの現在位置は追跡せず、居室の固定ポイントへ向かう。
   const nurseELunchRoomTarget=new THREE.Vector3(-16.0,0,-4.85);
   const nurseLunchLoungeTarget=new THREE.Vector3(-2.8,0,2.65);
+  const nurseDRoomEntranceTarget=new THREE.Vector3(0,0,-5.25);
+  const nurseDBedsideTarget=new THREE.Vector3(-1.55,0,-8.75);
+  const nurseDExitInsideTarget=new THREE.Vector3(0,0,-4.55);
+  const nurseDExitCorridorTarget=new THREE.Vector3(0,0,-2.35);
+
 
   // ナースのトイレ利用。
   // 初回も2時間以内、その後も前回利用から概ね50〜100分で次回を設定する。
@@ -2497,6 +2502,8 @@ try{
   // 巡回は index を失わず、介助中の対象者だけ談話室で待って再開する。
   let nursePatrolState="IDLE";
   let nursePatrolWaitingForIndex=null;
+  let nursePatrolPendingNextIndex=null;
+  let nursePatrolDExitStage="NONE";
   let nursePatrolRetryElapsed=0;
   let nursePatrolRetryCount=0;
   let nursePatrolRetryIntent=null;
@@ -2669,7 +2676,7 @@ try{
 
   function nursePatrolBaseFor(index){
     if(index===3){
-      return homeTargets[3].clone();
+      return nurseDBedsideTarget.clone();
     }
 
     const residentPos=residents[index].object.position;
@@ -2688,11 +2695,9 @@ try{
 
   function nursePatrolCandidateTargets(index){
     if(index===3){
-      return [
-        new THREE.Vector3(-1.65,0,-8.85),
-        new THREE.Vector3(1.65,0,-8.85),
-        new THREE.Vector3(0,0,-7.95)
-      ];
+      // Dは固定ベッドサイドだけを目的地にする。
+      // 候補切替による「入口→ベッド→入口→ベッド」の往復を作らない。
+      return [nurseDBedsideTarget.clone()];
     }
 
     const base=nursePatrolBaseFor(index);
@@ -2733,11 +2738,16 @@ try{
     if(index===0) return new THREE.Vector3(-5.0,0,-1.2);
     if(index===1) return new THREE.Vector3(3.2,0,-1.2);
     if(index===2) return new THREE.Vector3(2.2,0,-1.2);
-    return new THREE.Vector3(0,0,-4.3);
+    return nurseDBedsideTarget.clone();
   }
 
   function nurseNearPatrolResident(index){
     if(index<0 || index>3) return false;
+
+    if(index===3){
+      return nurse.position.distanceTo(nurseDBedsideTarget)<=0.75;
+    }
+
     return nurse.position.distanceTo(
       residents[index].object.position
     )<=2.45;
@@ -2777,7 +2787,23 @@ try{
     if(!target) return false;
 
     nursePatrolState="TO_RESIDENT";
-    return setNursePatrolRoute(target,label);
+
+    if(setNursePatrolRoute(target,label)){
+      return true;
+    }
+
+    // Dだけはベッドサイドへ直接経路が取れなければ、
+    // いったん居室入口へ向かい、その後同じD巡回を再試行する。
+    if(index===3){
+      nursePatrolRetryIntent=null;
+      nursePatrolState="SAFE_WAYPOINT";
+      return setNursePatrolRoute(
+        nurseDRoomEntranceTarget,
+        "NURSE_PATROL_D_ENTRANCE"
+      );
+    }
+
+    return false;
   }
 
   function nurseToiletOccupied(){
@@ -3154,7 +3180,9 @@ try{
       return new THREE.Vector3(2.0,0,-1.25);
     }
     if(targetIndex===3){
-      return new THREE.Vector3(0,0,-4.2);
+      // Dへ向かう前の安全点は居室入口。
+      // D会話後の退出はEXIT_D専用状態で管理する。
+      return nurseDRoomEntranceTarget.clone();
     }
 
     return nursePatrolCorridorTarget.clone();
@@ -3261,6 +3289,8 @@ try{
     nursePatrolContactSafetyElapsed=0;
     nursePatrolState="IDLE";
     nursePatrolWaitingForIndex=null;
+    nursePatrolPendingNextIndex=null;
+    nursePatrolDExitStage="NONE";
     nursePatrolRetryElapsed=0;
     nursePatrolRetryCount=0;
     nursePatrolRetryIntent=null;
@@ -3326,6 +3356,8 @@ try{
     nursePatrolContactShown=false;
     nursePatrolState="TO_CORRIDOR";
     nursePatrolWaitingForIndex=null;
+    nursePatrolPendingNextIndex=null;
+    nursePatrolDExitStage="NONE";
     nursePatrolRetryElapsed=0;
     nursePatrolRetryCount=0;
     nursePatrolRetryIntent=null;
@@ -3548,6 +3580,29 @@ try{
 
       const nextIndex=movePatrolToNextResident();
 
+      // Dだけは会話完了後に必ず廊下へ完全退出してから次の判断へ。
+      // ここで巡回済みDを確定しているため、退出中にDへ戻る分岐は発生しない。
+      if(currentIndex===3){
+        nursePatrolPendingNextIndex=nextIndex;
+        nursePatrolState="EXIT_D";
+        nursePatrolDExitStage="TO_DOOR";
+        nursePatrolRetryElapsed=0;
+        clearNursePatrolLockedTarget();
+
+        nurseMover.route=[];
+        nurseMover.routeIndex=0;
+        nurseMover.state="IDLE";
+
+        // D退出は汎用巡回ルーターを使わない。
+        // 失敗時にRETRY_WAIT/SAFE_WAYPOINTへ落ちてDへ戻る競合を完全に切る。
+        setRoute(
+          nurseMover,
+          nurseDExitInsideTarget,
+          "NURSE_PATROL_D_EXIT_DOOR"
+        );
+        return;
+      }
+
       if(nextIndex===null) return;
 
       if(!residentReadyForPatrol(nextIndex)){
@@ -3561,6 +3616,108 @@ try{
       );
       return;
     }
+
+    if(nursePatrolState==="EXIT_D"){
+      // D対応後は、他の巡回ロジックを一切通さず、
+      // ①居室入口内側 → ②廊下中央 の2段階で必ず退出する。
+      // この間、B/Cの介助判定・安全中継点・巡回再探索は実行しない。
+
+      if(nursePatrolDExitStage==="TO_DOOR"){
+        if(
+          nurse.position.distanceTo(nurseDExitInsideTarget)<=0.65
+        ){
+          nurseMover.route=[];
+          nurseMover.routeIndex=0;
+          nurseMover.state="IDLE";
+          nursePatrolDExitStage="TO_CORRIDOR";
+          nursePatrolRetryElapsed=0;
+
+          setRoute(
+            nurseMover,
+            nurseDExitCorridorTarget,
+            "NURSE_PATROL_D_EXIT_CORRIDOR"
+          );
+          return;
+        }
+
+        if(nurseMover.state==="IDLE"){
+          nursePatrolRetryElapsed+=dt;
+          if(nursePatrolRetryElapsed>=0.8){
+            nursePatrolRetryElapsed=0;
+            setRoute(
+              nurseMover,
+              nurseDExitInsideTarget,
+              "NURSE_PATROL_D_EXIT_DOOR"
+            );
+          }
+        }
+        return;
+      }
+
+      if(nursePatrolDExitStage==="TO_CORRIDOR"){
+        if(
+          nurse.position.distanceTo(nurseDExitCorridorTarget)<=0.75
+        ){
+          nurseMover.route=[];
+          nurseMover.routeIndex=0;
+          nurseMover.state="IDLE";
+          nursePatrolDExitStage="DONE";
+        }else{
+          if(nurseMover.state==="IDLE"){
+            nursePatrolRetryElapsed+=dt;
+            if(nursePatrolRetryElapsed>=0.8){
+              nursePatrolRetryElapsed=0;
+              setRoute(
+                nurseMover,
+                nurseDExitCorridorTarget,
+                "NURSE_PATROL_D_EXIT_CORRIDOR"
+              );
+            }
+          }
+          return;
+        }
+      }
+
+      if(nursePatrolDExitStage==="DONE"){
+        nursePatrolRetryElapsed=0;
+        nursePatrolDExitStage="NONE";
+
+        const nextIndex=nursePatrolPendingNextIndex;
+        nursePatrolPendingNextIndex=null;
+
+        if(nextIndex===null){
+          beginPatrolReturn();
+          return;
+        }
+
+        // B/Cなど次の対象の状態判定は、廊下へ完全退出してから初めて行う。
+        if(!residentReadyForPatrol(nextIndex)){
+          beginPatrolWaitForResident(nextIndex);
+          return;
+        }
+
+        clearNursePatrolLockedTarget();
+        routeNurseToPatrolResident(
+          nextIndex,
+          "NURSE_PATROL_AFTER_D"
+        );
+        return;
+      }
+
+      // 想定外状態でもDへ戻らず、廊下退出から再開。
+      nursePatrolDExitStage="TO_CORRIDOR";
+      nursePatrolRetryElapsed=0;
+      nurseMover.route=[];
+      nurseMover.routeIndex=0;
+      nurseMover.state="IDLE";
+      setRoute(
+        nurseMover,
+        nurseDExitCorridorTarget,
+        "NURSE_PATROL_D_EXIT_CORRIDOR"
+      );
+      return;
+    }
+
 
     if(nursePatrolState==="TO_LOUNGE"){
       if(nurseMover.state!=="IDLE") return;
@@ -3887,6 +4044,8 @@ try{
     nursePatrolContactSafetyElapsed=0;
     nursePatrolState="IDLE";
     nursePatrolWaitingForIndex=null;
+    nursePatrolPendingNextIndex=null;
+    nursePatrolDExitStage="NONE";
     nursePatrolRetryElapsed=0;
     nursePatrolRetryCount=0;
     nursePatrolRetryIntent=null;
