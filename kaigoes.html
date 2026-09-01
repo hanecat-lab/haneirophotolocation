@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-102</title>
+<title>CARE SHIFT - Phase 10-103</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -1258,7 +1258,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-102 / 停止確認後巡回・固定巡回地点</div>
+  <div class="sub">Phase 10-103 / 巡回済み固定・D往復ループ修正</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -2490,6 +2490,7 @@ try{
   let nextNursePatrolAt=10*60;
   let nursePatrolActive=false;
   let nursePatrolIndex=0;
+  let nursePatrolCompleted=[false,false,false,false];
   let nursePatrolWait=0;
   let nursePatrolContactShown=false;
 
@@ -2666,53 +2667,73 @@ try{
     );
   }
 
-  function nursePatrolTargetFor(key){
-    const obj=key==="E" ? residentE : residents[key]?.object;
-    if(!obj) return nurseStationTarget.clone();
-
-    if(key===3){
-      return new THREE.Vector3(-1.65,0,-8.85);
+  function nursePatrolBaseFor(index){
+    if(index===3){
+      return homeTargets[3].clone();
     }
 
-    const base=obj.position.clone();
+    const residentPos=residents[index].object.position;
+    const loungeBase=loungeTargets[index];
+    const homeBase=homeTargets[index];
+
+    // 「今どこを歩いているか」ではなく、
+    // 完全停止した生活場所（談話室/居室）の固定座標を基準にする。
+    const loungeDistance=residentPos.distanceTo(loungeBase);
+    const homeDistance=residentPos.distanceTo(homeBase);
+
+    return loungeDistance<=homeDistance
+      ? loungeBase.clone()
+      : homeBase.clone();
+  }
+
+  function nursePatrolCandidateTargets(index){
+    if(index===3){
+      return [
+        new THREE.Vector3(-1.65,0,-8.85),
+        new THREE.Vector3(1.65,0,-8.85),
+        new THREE.Vector3(0,0,-7.95)
+      ];
+    }
+
+    const base=nursePatrolBaseFor(index);
     base.y=0;
 
-    // 利用者とナースが同一点へ入らないよう、1.9〜2.2m離れた接近点のみ使う。
-    const candidates=[
+    return [
       new THREE.Vector3(base.x,0,base.z+1.9),
       new THREE.Vector3(base.x+1.9,0,base.z),
       new THREE.Vector3(base.x-1.9,0,base.z),
       new THREE.Vector3(base.x,0,base.z-1.9),
-      new THREE.Vector3(base.x+1.55,0,base.z+1.55),
-      new THREE.Vector3(base.x-1.55,0,base.z+1.55)
+      new THREE.Vector3(base.x+1.45,0,base.z+1.45),
+      new THREE.Vector3(base.x-1.45,0,base.z+1.45)
     ];
+  }
 
-    const clear=candidates.find(p=>{
-      if(isBlockedPoint(p)) return false;
+  function nursePatrolTargetFor(index){
+    if(index<0 || index>3) return nurseStationTarget.clone();
 
-      // 他利用者の真上にも経路終点を置かない。
-      const overlapsResident=residents.some((r,index)=>
-        index!==key &&
-        r.object.position.distanceTo(p)<1.15
+    const candidates=nursePatrolCandidateTargets(index);
+
+    // 現在のナース位置から実際に経路が取れる候補を優先。
+    for(const p of candidates){
+      if(isBlockedPoint(p)) continue;
+
+      const overlapsResident=residents.some((r,residentIndex)=>
+        residentIndex!==index &&
+        r.object.position.distanceTo(p)<1.05
       );
-      if(overlapsResident) return false;
+      if(overlapsResident) continue;
+      if(residentE.position.distanceTo(p)<1.05) continue;
 
-      if(residentE.position.distanceTo(p)<1.15) return false;
-      return true;
-    });
+      const path=findPath(nurse.position,p);
+      if(path.length) return p;
+    }
 
-    if(clear) return clear;
-
-    // 候補が全て塞がれても、利用者本人の座標へフォールバックしない。
-    // 廊下側へ離した安全点を使う。
-    const safe=new THREE.Vector3(
-      base.x,
-      0,
-      THREE.MathUtils.clamp(base.z+2.25,-9.0,5.2)
-    );
-    return isBlockedPoint(safe)
-      ? nursePatrolCorridorTarget.clone()
-      : safe;
+    // 利用者本人の位置には絶対フォールバックしない。
+    // 対象に応じた廊下中継点を使う。
+    if(index===0) return new THREE.Vector3(-5.0,0,-1.2);
+    if(index===1) return new THREE.Vector3(3.2,0,-1.2);
+    if(index===2) return new THREE.Vector3(2.2,0,-1.2);
+    return new THREE.Vector3(0,0,-4.3);
   }
 
   function nurseNearPatrolResident(index){
@@ -3061,12 +3082,39 @@ try{
   }
 
   function patrolTargetForCurrentResident(){
-    if(
-      nursePatrolIndex<0 ||
-      nursePatrolIndex>=nursePatrolOrder.length
-    ) return null;
+    while(
+      nursePatrolIndex>=0 &&
+      nursePatrolIndex<nursePatrolOrder.length
+    ){
+      const residentIndex=nursePatrolOrder[nursePatrolIndex];
 
-    return nursePatrolOrder[nursePatrolIndex];
+      if(!nursePatrolCompleted[residentIndex]){
+        return residentIndex;
+      }
+
+      nursePatrolIndex++;
+    }
+
+    return null;
+  }
+
+  function markPatrolResidentCompleted(index){
+    if(index>=0 && index<=3){
+      nursePatrolCompleted[index]=true;
+    }
+  }
+
+  function movePatrolToNextResident(){
+    nursePatrolIndex++;
+
+    const nextIndex=patrolTargetForCurrentResident();
+
+    if(nextIndex===null){
+      beginPatrolReturn();
+      return null;
+    }
+
+    return nextIndex;
   }
 
   function setNursePatrolRoute(target,label){
@@ -3094,17 +3142,22 @@ try{
   }
 
   function nearestNurseSafeWaypoint(){
-    const points=[
-      nursePatrolCorridorTarget,
-      new THREE.Vector3(-4.5,0,-1.25),
-      new THREE.Vector3(2.0,0,-1.25),
-      new THREE.Vector3(0,0,1.6),
-      nurseLunchLoungeTarget
-    ];
+    const targetIndex=patrolTargetForCurrentResident();
 
-    return points
-      .map(p=>({p,d:p.distanceTo(nurse.position)}))
-      .sort((a,b)=>a.d-b.d)[0].p.clone();
+    // 「今いる場所に一番近い点」ではなく、
+    // 次の巡回対象へ向かう側の中継点を選ぶ。
+    // D居室⇄廊下の往復ループを防ぐ。
+    if(targetIndex===0){
+      return new THREE.Vector3(-4.5,0,-1.25);
+    }
+    if(targetIndex===1 || targetIndex===2){
+      return new THREE.Vector3(2.0,0,-1.25);
+    }
+    if(targetIndex===3){
+      return new THREE.Vector3(0,0,-4.2);
+    }
+
+    return nursePatrolCorridorTarget.clone();
   }
 
   function retryNursePatrolRoute(){
@@ -3147,10 +3200,19 @@ try{
   }
 
   function beginPatrolWaitForResident(index){
+    if(index<0 || index>3) return;
+
+    // すでに確認済みの利用者を再び待機対象にしない。
+    if(nursePatrolCompleted[index]){
+      const nextIndex=patrolTargetForCurrentResident();
+      if(nextIndex===null){
+        beginPatrolReturn();
+      }
+      return;
+    }
+
     const patrolPosition=nursePatrolOrder.indexOf(index);
 
-    // 待機対象と巡回進捗を常に同じ利用者へ固定する。
-    // 会話中に介助が始まった場合でもindexが次へ進まないようにする。
     if(patrolPosition>=0){
       nursePatrolIndex=patrolPosition;
     }
@@ -3193,6 +3255,7 @@ try{
   function finishNursePatrol(){
     nursePatrolActive=false;
     nursePatrolIndex=0;
+    nursePatrolCompleted=[false,false,false,false];
     nursePatrolWait=0;
     nursePatrolContactShown=false;
     nursePatrolContactSafetyElapsed=0;
@@ -3258,6 +3321,7 @@ try{
     nursePatrolActive=true;
     nurseActivity="PATROL";
     nursePatrolIndex=0;
+    nursePatrolCompleted=[false,false,false,false];
     nursePatrolWait=0;
     nursePatrolContactShown=false;
     nursePatrolState="TO_CORRIDOR";
@@ -3477,14 +3541,14 @@ try{
       nursePatrolContactShown=false;
       nursePatrolTargetElapsed=0;
       clearNursePatrolLockedTarget();
-      nursePatrolIndex++;
 
-      if(nursePatrolIndex>=nursePatrolOrder.length){
-        beginPatrolReturn();
-        return;
+      if(currentIndex!==null){
+        markPatrolResidentCompleted(currentIndex);
       }
 
-      const nextIndex=patrolTargetForCurrentResident();
+      const nextIndex=movePatrolToNextResident();
+
+      if(nextIndex===null) return;
 
       if(!residentReadyForPatrol(nextIndex)){
         beginPatrolWaitForResident(nextIndex);
@@ -3511,6 +3575,31 @@ try{
     if(nursePatrolState==="WAIT_LOUNGE"){
       const waitingIndex=nursePatrolWaitingForIndex;
 
+      if(
+        waitingIndex!==null &&
+        nursePatrolCompleted[waitingIndex]
+      ){
+        nursePatrolWaitingForIndex=null;
+        clearNursePatrolLockedTarget();
+
+        const nextIndex=patrolTargetForCurrentResident();
+        if(nextIndex===null){
+          beginPatrolReturn();
+          return;
+        }
+
+        if(!residentReadyForPatrol(nextIndex)){
+          beginPatrolWaitForResident(nextIndex);
+          return;
+        }
+
+        routeNurseToPatrolResident(
+          nextIndex,
+          "NURSE_PATROL_RECOVER_NEXT"
+        );
+        return;
+      }
+
       // 状態競合で待機対象を失った場合は、その場に固定せず
       // 現在の巡回対象へ復帰する。
       if(waitingIndex===null){
@@ -3521,13 +3610,18 @@ try{
           return;
         }
 
-        nursePatrolState="TO_RESIDENT";
         nursePatrolWait=0;
         nursePatrolContactShown=false;
         nursePatrolReadyGraceElapsed=0;
+        clearNursePatrolLockedTarget();
 
-        setNursePatrolRoute(
-          nursePatrolTargetFor(currentIndex),
+        if(!residentReadyForPatrol(currentIndex)){
+          beginPatrolWaitForResident(currentIndex);
+          return;
+        }
+
+        routeNurseToPatrolResident(
+          currentIndex,
           "NURSE_PATROL_RECOVER"
         );
         return;
@@ -3787,6 +3881,7 @@ try{
     nextNursePatrolAt=10*60;
     nursePatrolActive=false;
     nursePatrolIndex=0;
+    nursePatrolCompleted=[false,false,false,false];
     nursePatrolWait=0;
     nursePatrolContactShown=false;
     nursePatrolContactSafetyElapsed=0;
