@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>CARE SHIFT - Phase 10-99</title>
+<title>CARE SHIFT - Phase 10-100</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
 #app{position:fixed;inset:0}
@@ -1258,7 +1258,7 @@ button{
   <div class="title">CARE SHIFT</div>
   <div id="hudScoreRank">100点 / ランク A</div>
   <div id="callTray" aria-live="polite"></div>
-  <div class="sub">Phase 10-99 / ナース談話室待機・報告復帰修正</div>
+  <div class="sub">Phase 10-100 / 巡回会話・介助競合デッドロック修正</div>
 </div>
 <div id="clockBadge"><span id="clockText">08:00</span></div>
 <div id="routineReminder" aria-live="polite"></div>
@@ -2498,6 +2498,7 @@ try{
   let nursePatrolWaitingForIndex=null;
   let nursePatrolRetryElapsed=0;
   let nursePatrolRetryCount=0;
+  let nursePatrolRetryIntent=null;
   let nursePatrolStuckElapsed=0;
   let nursePatrolReadyGraceElapsed=0;
   let nursePatrolLastPosition=new THREE.Vector3();
@@ -2974,15 +2975,23 @@ try{
   function setNursePatrolRoute(target,label){
     nursePatrolRetryElapsed=0;
 
+    const intendedState=nursePatrolState;
     const ok=setRoute(nurseMover,target,label);
+
     if(ok){
       nursePatrolRetryCount=0;
+      nursePatrolRetryIntent=null;
       nursePatrolStuckElapsed=0;
       nursePatrolLastPosition.copy(nurse.position);
       return true;
     }
 
     nursePatrolRetryCount++;
+    nursePatrolRetryIntent={
+      state:intendedState,
+      target:target.clone(),
+      label
+    };
     nursePatrolState="RETRY_WAIT";
     return false;
   }
@@ -3002,33 +3011,24 @@ try{
   }
 
   function retryNursePatrolRoute(){
-    const currentIndex=patrolTargetForCurrentResident();
+    // setRoute失敗前の目的地と状態を優先して再試行する。
+    // RETRY_WAITへ遷移したことで「談話室へ行く」「利用者へ戻る」
+    // という目的を失わないようにする。
+    if(nursePatrolRetryIntent){
+      const intent=nursePatrolRetryIntent;
+      nursePatrolRetryIntent=null;
+      nursePatrolState=intent.state;
 
-    if(nursePatrolState==="RETURN"){
-      setNursePatrolRoute(
-        nurseStationTarget,
-        "NURSE_PATROL_RETURN"
-      );
-      return;
-    }
+      if(setNursePatrolRoute(intent.target,intent.label)){
+        return;
+      }
 
-    if(nursePatrolState==="TO_RESIDENT" && currentIndex!==null){
-      setNursePatrolRoute(
-        nursePatrolTargetFor(currentIndex),
-        "NURSE_PATROL_RESIDENT"
-      );
-      return;
-    }
-
-    if(nursePatrolState==="TO_LOUNGE"){
-      setNursePatrolRoute(
-        nurseLunchLoungeTarget,
-        "NURSE_PATROL_LOUNGE"
-      );
-      return;
+      // 同じ目的地で再失敗した場合は安全中継点を経由。
+      nursePatrolRetryIntent=null;
     }
 
     const waypoint=nearestNurseSafeWaypoint();
+    nursePatrolState="SAFE_WAYPOINT";
     setNursePatrolRoute(
       waypoint,
       "NURSE_PATROL_SAFE_WAYPOINT"
@@ -3036,6 +3036,14 @@ try{
   }
 
   function beginPatrolWaitForResident(index){
+    const patrolPosition=nursePatrolOrder.indexOf(index);
+
+    // 待機対象と巡回進捗を常に同じ利用者へ固定する。
+    // 会話中に介助が始まった場合でもindexが次へ進まないようにする。
+    if(patrolPosition>=0){
+      nursePatrolIndex=patrolPosition;
+    }
+
     nursePatrolWaitingForIndex=index;
     nursePatrolState="TO_LOUNGE";
     nursePatrolWait=0;
@@ -3077,6 +3085,7 @@ try{
     nursePatrolWaitingForIndex=null;
     nursePatrolRetryElapsed=0;
     nursePatrolRetryCount=0;
+    nursePatrolRetryIntent=null;
     nursePatrolStuckElapsed=0;
     nursePatrolReadyGraceElapsed=0;
     nurseActivity="IDLE";
@@ -3138,6 +3147,7 @@ try{
     nursePatrolWaitingForIndex=null;
     nursePatrolRetryElapsed=0;
     nursePatrolRetryCount=0;
+    nursePatrolRetryIntent=null;
     nursePatrolStuckElapsed=0;
     nursePatrolReadyGraceElapsed=0;
     nursePatrolLastPosition.copy(nurse.position);
@@ -3247,6 +3257,21 @@ try{
     }
 
     if(nursePatrolState==="CONTACT"){
+      const currentIndex=patrolTargetForCurrentResident();
+
+      // ナースが話しかけた直後に職員が同じ利用者の
+      // トイレ誘導・入浴介助を開始した場合は、
+      // 「巡回済み」にせず、その利用者を未確認のまま保持する。
+      if(
+        currentIndex!==null &&
+        residentBusyForPatrol(currentIndex)
+      ){
+        nursePatrolWait=0;
+        nursePatrolContactShown=false;
+        beginPatrolWaitForResident(currentIndex);
+        return;
+      }
+
       nursePatrolWait+=dt;
       if(nursePatrolWait<2.8) return;
 
@@ -3287,6 +3312,28 @@ try{
     if(nursePatrolState==="WAIT_LOUNGE"){
       const waitingIndex=nursePatrolWaitingForIndex;
 
+      // 状態競合で待機対象を失った場合は、その場に固定せず
+      // 現在の巡回対象へ復帰する。
+      if(waitingIndex===null){
+        const currentIndex=patrolTargetForCurrentResident();
+
+        if(currentIndex===null){
+          beginPatrolReturn();
+          return;
+        }
+
+        nursePatrolState="TO_RESIDENT";
+        nursePatrolWait=0;
+        nursePatrolContactShown=false;
+        nursePatrolReadyGraceElapsed=0;
+
+        setNursePatrolRoute(
+          nursePatrolTargetFor(currentIndex),
+          "NURSE_PATROL_RECOVER"
+        );
+        return;
+      }
+
       // 最初に談話室の利用者と短く接した後、その場で対象者の帰還を待つ。
       if(!nursePatrolContactShown){
         nursePatrolContactShown=true;
@@ -3316,6 +3363,11 @@ try{
       }
 
       if(waitingIndex!==null){
+        const patrolPosition=nursePatrolOrder.indexOf(waitingIndex);
+        if(patrolPosition>=0){
+          nursePatrolIndex=patrolPosition;
+        }
+
         nursePatrolContactShown=false;
         nursePatrolWait=0;
         nursePatrolReadyGraceElapsed=0;
@@ -3548,6 +3600,7 @@ try{
     nursePatrolWaitingForIndex=null;
     nursePatrolRetryElapsed=0;
     nursePatrolRetryCount=0;
+    nursePatrolRetryIntent=null;
     nursePatrolStuckElapsed=0;
     nursePatrolReadyGraceElapsed=0;
     nursePatrolLastPosition.copy(nurse.position);
