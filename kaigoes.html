@@ -5768,6 +5768,33 @@ try{
     return gameMinutes>=shiftEndMinutes();
   }
 
+  // --- 記録が間に合うかどうかに関わる時刻 ---
+  //
+  // このゲームは時間が高速進行する（通常2ゲーム分/実秒、誘導中1、介助中0.5）。
+  // 座標と移動速度から、排泄コール発生〜記録完了までは実測で 29〜45ゲーム分：
+  //   応答＋誘導 9分 / 入室〜退室 4分 / 帰室 11〜27分 / 記録 5分
+  // 記録エントリは利用者が居室へ着くまで生成されないため先回りして書けない。
+  //
+  // 予防：間に合わない時刻には記録の生じる介助を発生させない。
+  const RECORD_ESCORT_MARGIN = 45;
+
+  // 安全網：それでも締切間際に生じた記録は、書く時間が無いので減点しない。
+  // 詰所への移動と記入1件ぶんの実時間に相当する。
+  const RECORD_WRITE_MARGIN = 15;
+
+  // 誘導を伴う排泄介助（コール／事前トイレ誘導）を発生させてよい最終時刻。
+  // ベーシックモードには記録が無いので従来どおり勤務終了まで発生させる。
+  function recordableEscortCutoff(){
+    return practicalModeEnabled()
+      ? shiftEndMinutes() - RECORD_ESCORT_MARGIN
+      : shiftEndMinutes();
+  }
+
+  // この時刻より後に生じた記録は、締切までに書くことが物理的に不可能。
+  function recordWriteFeasibleUntil(){
+    return shiftEndMinutes() - RECORD_WRITE_MARGIN;
+  }
+
   function playerAtRecordStation(){
     const dx=Math.abs(player.position.x-nurseStationTarget.x);
     const dz=Math.abs(player.position.z-nurseStationTarget.z);
@@ -5797,7 +5824,10 @@ try{
     document.body.classList.remove("record-work-active");
   }
 
-  function addUnrecordedCare(residentIndex,source="排泄介助"){
+  // createdAt は「介助が終わった時刻」。帰還待ちから遅れて確定した記録でも
+  // 元の介助時刻を保つ。減点の免除判定がこの値を見るため、
+  // 確定した瞬間の時刻を使うと古い記録まで免除されてしまう。
+  function addUnrecordedCare(residentIndex,source="排泄介助",createdAt=gameMinutes){
     if(!practicalModeEnabled()) return;
     if(!Number.isInteger(residentIndex) || residentIndex<0 || residentIndex>3) return;
 
@@ -5805,7 +5835,7 @@ try{
       id:++careRecordSerial,
       residentIndex,
       source,
-      createdAt:gameMinutes
+      createdAt
     };
     unrecordedCareEntries.push(entry);
     careRecordTotalCreated++;
@@ -5829,6 +5859,7 @@ try{
       residentIndex,
       source,
       target:target.clone(),
+      queuedAt:gameMinutes,
       deadline:gameMinutes + CARE_RECORD_RETURN_DEADLINE
     });
   }
@@ -5850,7 +5881,7 @@ try{
 
       if(returned || overdue){
         pendingRecordReturns.splice(i,1);
-        addUnrecordedCare(pending.residentIndex,pending.source);
+        addUnrecordedCare(pending.residentIndex,pending.source,pending.queuedAt);
       }
     }
   }
@@ -5858,7 +5889,7 @@ try{
   function finalizePendingCareRecords(){
     while(pendingRecordReturns.length){
       const pending=pendingRecordReturns.shift();
-      addUnrecordedCare(pending.residentIndex,pending.source);
+      addUnrecordedCare(pending.residentIndex,pending.source,pending.queuedAt);
     }
   }
 
@@ -8622,7 +8653,8 @@ try{
       totalOpenCalls()===0 &&
       !eAngerActive &&
       gameMinutes>=8*60+15 &&
-      gameMinutes<shiftEndMinutes()
+      // 事前トイレ誘導も記録を生むので、コールと同じ最終時刻で止める。
+      gameMinutes<recordableEscortCutoff()
     );
   }
 
@@ -9661,11 +9693,14 @@ try{
 
   function currentRank(){
     const enabledRoutineTasks = routineTasks.filter(t=>t.enabled!==false);
+    // 減点と同じ基準で、書く時間が無かった記録はSの判定からも外す。
+    // ここを揃えないと「減点はされないがSも取れない」状態が残る。
+    const feasibleUntil=recordWriteFeasibleUntil();
     const recordsComplete=
       !practicalModeEnabled() ||
       (
-        unrecordedCareEntries.length===0 &&
-        pendingRecordReturns.length===0
+        unrecordedCareEntries.every(entry=>entry.createdAt>feasibleUntil) &&
+        pendingRecordReturns.every(pending=>pending.queuedAt>feasibleUntil)
       );
     const allRoutineDone =
       enabledRoutineTasks.length > 0 &&
@@ -9910,7 +9945,22 @@ try{
     careRecordEndPenaltyApplied=true;
     finalizePendingCareRecords();
 
-    const missing=unrecordedCareEntries.length;
+    // 安全網：締切間際に生じた記録は、詰所へ戻って書く時間が無い。
+    // 予防（recordableEscortCutoff）を抜けた経路があっても
+    // 理不尽な減点にならないよう、ここで減点対象から外す。
+    const feasibleUntil=recordWriteFeasibleUntil();
+    const tooLate=unrecordedCareEntries.filter(
+      entry=>entry.createdAt>feasibleUntil
+    ).length;
+    const missing=unrecordedCareEntries.length-tooLate;
+
+    if(tooLate){
+      logDecision("CARE_RECORDS_EXEMPT_LATE",{
+        exempt:tooLate,
+        feasibleUntil
+      });
+    }
+
     if(!missing) return;
 
     const penalty=-Math.min(5,missing);
@@ -9919,6 +9969,7 @@ try{
       "勤務終了時の未記録 "+missing+"件 / "+penalty+"点";
     logDecision("CARE_RECORDS_UNFINISHED_END",{
       missing,
+      exemptLate:tooLate,
       penalty
     });
   }
@@ -10000,11 +10051,18 @@ try{
     reportCount.textContent = completedCareCount + "件";
     if(reportMode) reportMode.textContent=selectedModeLabel();
     if(reportRecords){
+      // 未記録のうち、締切間際で書く時間が無かった分は減点していない。
+      // 内訳を出さないと減点との食い違いが不可解に見える。
+      const feasibleUntil=recordWriteFeasibleUntil();
+      const exemptLate=unrecordedCareEntries.filter(
+        entry=>entry.createdAt>feasibleUntil
+      ).length;
+      const penalized=unrecordedCareEntries.length-exemptLate;
+
       reportRecords.textContent=practicalModeEnabled()
         ? "完了 "+careRecordTotalCompleted+"/"+careRecordTotalCreated+
-          (unrecordedCareEntries.length
-            ? "（未記録"+unrecordedCareEntries.length+"件）"
-            : "")
+          (penalized ? "（未記録"+penalized+"件）" : "")+
+          (exemptLate ? "（締切間際"+exemptLate+"件・減点なし）" : "")
         : "対象外";
     }
     if(reportBathWorkflow){
@@ -11132,7 +11190,8 @@ try{
     scheduleNextSingleCheck();
 
     if(totalOpenCalls() >= MAX_OPEN_CALLS) return;
-    if(gameMinutes >= shiftEndMinutes()) return;
+    // 記録まで終わらない時刻には排泄コールを出さない。
+    if(gameMinutes >= recordableEscortCutoff()) return;
 
     const baseChance = singleMissStreak >= 2
       ? THIRD_ROUND_CHANCE
@@ -11177,7 +11236,8 @@ try{
     scheduleNextDoubleCheck();
 
     if(MAX_OPEN_CALLS - totalOpenCalls() < 2) return;
-    if(gameMinutes >= shiftEndMinutes()) return;
+    // 記録まで終わらない時刻には排泄コールを出さない。
+    if(gameMinutes >= recordableEscortCutoff()) return;
 
     const baseChance = doubleMissStreak >= 2
       ? THIRD_ROUND_CHANCE
