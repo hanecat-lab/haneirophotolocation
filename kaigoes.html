@@ -4404,8 +4404,13 @@ try{
     moveRetryElapsed:0,
     moveRetryCount:0,
     moveStuckElapsed:0,
+    moveAbortElapsed:0,
     moveLastPosition:new THREE.Vector3()
   };
+
+  // 同じ移動目標に対してこの秒数だけ到着できなければ、
+  // その仕事自体を諦めて詰所へ戻る（最終遮断器）。
+  const NURSE_CTRL_MOVE_ABORT_SECONDS = 90;
 
   function nurseCtrlStopMover(){
     nurseMover.route=[];
@@ -4501,6 +4506,7 @@ try{
     nurseCtrl.moveRetryElapsed=0;
     nurseCtrl.moveRetryCount=0;
     nurseCtrl.moveStuckElapsed=0;
+    nurseCtrl.moveAbortElapsed=0;
     nurseCtrl.moveLastPosition.copy(nurse.position);
     nurseCtrl.phase="MOVE";
 
@@ -4517,6 +4523,55 @@ try{
     nurseCtrl.moveRetryElapsed=0;
     nurseCtrl.moveRetryCount=0;
     nurseCtrl.moveStuckElapsed=0;
+    nurseCtrl.moveAbortElapsed=0;
+  }
+
+  // 到達不能な目標に対する最終遮断器。
+  // 現在の仕事を諦め、トイレ資源を返して詰所へ戻す。
+  // これがないと nurseCtrlUpdateMove の staging フォールバックが
+  // 約9.6秒周期で永久に再突入し続ける。
+  function nurseCtrlAbortCurrentMode(){
+    const abortedMode=nurseCtrl.mode;
+    const abortedPhase=nurseCtrl.phase;
+
+    releaseToiletAccess("NURSE");
+
+    if(abortedMode==="PATROL"){
+      // 到達できなかった対象は保留にして次の利用者へ進める。
+      const index=
+        nurseCtrl.patrolWaitingFor!==null
+          ? nurseCtrl.patrolWaitingFor
+          : nurseCtrlPatrolCurrent();
+      if(index!==null) nurseCtrlPatrolCompleteResident(index);
+    }else if(abortedMode==="TOILET"){
+      scheduleNextNurseToilet();
+    }else if(abortedMode==="E_LUNCH"){
+      nurseCtrl.eLunchDone=true;
+    }
+
+    nurseCtrl.patrolWaitingFor=null;
+    nurseCtrl.contactTimer=0;
+    nurseCtrl.waitTimer=0;
+    nurseCtrlStopMover();
+    nurseCtrlClearMove();
+
+    // 詰所へ戻れるなら普通に歩いて帰る。
+    // 詰所への経路すら作れない場合だけ、最後の手段として位置を戻す。
+    if(setRoute(nurseMover,nurseStationTarget,"NURSE_CTRL_ABORT_RETURN")){
+      nurseCtrl.mode="IDLE";
+      nurseCtrl.phase="AT_STATION";
+    }else{
+      nurse.position.copy(nurseStationTarget);
+      nurse.rotation.set(0,0,0);
+      nurseCtrl.mode="IDLE";
+      nurseCtrl.phase="AT_STATION";
+    }
+
+    logDecision("NURSE_CTRL_MOVE_ABORT",{
+      mode:abortedMode,
+      phase:abortedPhase
+    });
+    nurseCtrlSyncLegacyState();
   }
 
   function nurseCtrlUpdateMove(dt){
@@ -4574,6 +4629,13 @@ try{
     }else{
       nurseCtrl.moveStuckElapsed=0;
       nurseCtrl.moveLastPosition.copy(nurse.position);
+    }
+
+    // 同じ目標へ到着できないまま上限を超えたら仕事ごと諦める。
+    nurseCtrl.moveAbortElapsed+=dt;
+    if(nurseCtrl.moveAbortElapsed>=NURSE_CTRL_MOVE_ABORT_SECONDS){
+      nurseCtrlAbortCurrentMode();
+      return true;
     }
 
     if(nurseMover.state==="IDLE"){
@@ -4903,12 +4965,18 @@ try{
         return;
       }
 
-      // 60秒の安全弁。
-      // 利用者側の経路異常で永久待機になった場合のみ、その利用者を保留して次へ進む。
-      if(
-        nurseCtrl.waitTimer>=60 &&
-        !residentBusyForPatrol(index)
-      ){
+      // 安全弁。
+      // 利用者側の経路異常なら60秒で保留して次へ進む。
+      //
+      // 対象者が職員の介助中（residentBusyForPatrol）の場合は
+      // 「正当な待機」だが、以前はここに上限がなく無制限に待っていた。
+      // updateNurseController は mode==="IDLE" の時しか次の仕事を選ばないため、
+      // ここで止まると E昼食巡回・ナース自身のトイレが当日実行されなくなる。
+      // 介助が長引く場合も180秒で切り上げ、その利用者だけ保留にする。
+      const patrolWaitLimit =
+        residentBusyForPatrol(index) ? 180 : 60;
+
+      if(nurseCtrl.waitTimer>=patrolWaitLimit){
         nurseCtrl.waitTimer=0;
         nurseCtrl.patrolCompleted[index]=true;
         nurseCtrl.patrolWaitingFor=null;
@@ -6976,6 +7044,12 @@ try{
     });
   }
 
+  // 帰還を待つ記録は、帰還が成立しなくても必ず記録対象へ落とす。
+  // 経路生成の失敗や再ルートで利用者が目標へ着かない場合、
+  // 期限なしでは pendingRecordReturns が永久に残り、
+  // 勤務終了レポート（updateDeferredShiftEnd）が出せなくなるため。
+  const CARE_RECORD_RETURN_DEADLINE = 30;
+
   function queueCareRecordAfterReturn(residentIndex,target,source="排泄介助"){
     if(!practicalModeEnabled()) return;
     if(!Number.isInteger(residentIndex) || residentIndex<0 || residentIndex>3) return;
@@ -6983,6 +7057,7 @@ try{
       residentIndex,
       source,
       target:target.clone(),
+      deadline:gameMinutes + CARE_RECORD_RETURN_DEADLINE,
       endGraceEligible:shiftEndRecordGrace && gameMinutes>=15*60
     });
   }
@@ -6993,11 +7068,16 @@ try{
       const pending=pendingRecordReturns[i];
       const mover=residentMovers[pending.residentIndex];
       const resident=residents[pending.residentIndex];
-      if(
+      const returned =
         mover &&
         mover.state==="IDLE" &&
-        resident.object.position.distanceTo(pending.target)<=0.9
-      ){
+        resident.object.position.distanceTo(pending.target)<=0.9;
+
+      // 期限切れは「帰還できなかった」とみなして記録対象へ回す。
+      const overdue =
+        !Number.isFinite(pending.deadline) || gameMinutes>=pending.deadline;
+
+      if(returned || overdue){
         pendingRecordReturns.splice(i,1);
         addUnrecordedCare(
           pending.residentIndex,
@@ -13482,7 +13562,9 @@ try{
                     )
               );
 
-        setRoute(
+        // 経路が作れないと利用者はその場で IDLE のまま止まる。
+        // 帰還を待つ記録がその場合に取り残されないよう、成否を持ち回る。
+        const returnRouteOk = setRoute(
           residentMover,
           finalReturnTarget,
           "RETURN_AFTER_CARE"
@@ -13513,13 +13595,20 @@ try{
           finishingResidentIndex>=0 &&
           finishingResidentIndex<=3
         ){
-          queueCareRecordAfterReturn(
-            finishingResidentIndex,
-            finalReturnTarget,
-            preventiveToiletInProgress
-              ? "事前トイレ誘導"
-              : "排泄介助"
-          );
+          const recordSource = preventiveToiletInProgress
+            ? "事前トイレ誘導"
+            : "排泄介助";
+
+          if(returnRouteOk){
+            queueCareRecordAfterReturn(
+              finishingResidentIndex,
+              finalReturnTarget,
+              recordSource
+            );
+          }else{
+            // 帰還できないので待たずに記録対象へ入れる。
+            addUnrecordedCare(finishingResidentIndex,recordSource);
+          }
         }
 
         careProgress.textContent =
