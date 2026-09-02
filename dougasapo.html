@@ -1053,12 +1053,13 @@
         else state.params = { ...move.defaults };
         state.progress = 0;
         state.scenicMotionRate = 1;
-        if (move.scenic) { drag.targetRadius = Math.max(drag.targetRadius, 16); drag.radius = Math.max(drag.radius, 16); }
         if (state.captureMode === 'smartphone' && move.coverScene && (move.coverScene === 'architecture' || sceneVariants[move.coverScene]) && state.activeScene !== move.coverScene) setActiveScene(move.coverScene, { silent: true });
         if (state.captureMode === 'smartphone') { const phoneEntry = Object.entries(PHONE_LENSES).find(([, lens]) => lens.focal === Number(state.params.focal)); if (phoneEntry) state.phoneLens = phoneEntry[0]; }
         if (!options.keepPlaying) state.playing = false;
         syncUI();
         updateMotionPath();
+        // 動線を求めた後で、それが収まる距離までトップビューを引く。
+        if (topFrame) { const fitted = clamp(Math.max(15, topFrame.radius * 1.9 + 3), 7, 24); drag.targetRadius = fitted; drag.radius = fitted; }
         updateScene(0);
       }
       function syncUI() {
@@ -1466,6 +1467,8 @@
         velocityAzimuth: 0, velocityElevation: 0, velocityRadius: 0
       };
       let lastUiUpdate = 0;
+      // scenic系ショットで、描画した動線が収まるトップビュー画角。非scenicでは null。
+      let topFrame = null;
       function initScene() {
         if (!window.THREE) { el.sceneFallback.classList.add('show'); return; }
         try {
@@ -1765,11 +1768,11 @@
         if (move.coverShot) {
           const THREE = window.THREE;
           const coverFrames = {
-            doorframe: { position: [[-.06,1.45,3.45],[-1.28,1.45,1.92]], target: [[0,1.28,0],[-1.57,1.50,.86]] },
-            pillar: { position: [[-.12,1.45,3.52],[1.76,1.45,.68]], target: [[0,1.28,0],[1.08,1.50,.46]] },
+            doorframe: { position: [[-.97,1.45,2.31],[-1.28,1.45,1.92]], target: [[0,1.28,0],[-1.57,1.50,.86]] },
+            pillar: { position: [[1.48,1.45,1.10],[1.76,1.45,.68]], target: [[0,1.28,0],[1.08,1.50,.46]] },
             product: { position: [[-1.22,1.72,3.42],[-1.03,1.66,2.82]], target: [[-.74,1.47,.72],[-.28,1.50,.48]] },
-            wall: { position: [[-1.18,1.55,3.92],[1.48,1.55,1.92]], target: [[.12,1.44,-.25],[1.93,1.55,1.22]] },
-            fabric: { position: [[-.92,1.52,3.58],[1.72,1.42,.84]], target: [[.12,1.44,-.25],[1.72,1.22,.32]] }
+            wall: { position: [[1.12,1.55,2.19],[1.48,1.55,1.92]], target: [[.12,1.44,-.25],[1.93,1.55,1.22]] },
+            fabric: { position: [[1.37,1.52,1.20],[1.72,1.42,.84]], target: [[.12,1.44,-.25],[1.72,1.22,.32]] }
           };
           const frame = coverFrames[move.coverShot];
           if (frame) {
@@ -1884,7 +1887,7 @@
           const base = new THREE.Vector3(0,0,-1).applyAxisAngle(new THREE.Vector3(0,1,0), angle); target.copy(position).add(base.multiplyScalar(5)); target.y = h + .03;
         }
         if (move.id === 'tilt-up') { target.set(0, THREE.MathUtils.lerp(.45, 4.35, u), -1.1); }
-        if (move.id === 'truck-left' || move.id === 'truck-right') { const sign = move.id === 'truck-left' ? 1 : -1; position.x = THREE.MathUtils.lerp(-2.8 * sign, 2.8 * sign, u); target.set(0, 1.05, -1.1); }
+        if (move.id === 'truck-left' || move.id === 'truck-right') { const sign = move.id === 'truck-left' ? -1 : 1; position.x = THREE.MathUtils.lerp(-2.8 * sign, 2.8 * sign, u); target.set(0, 1.05, -1.1); }
         if (move.id === 'pedestal-up') { position.y = THREE.MathUtils.lerp(Math.max(.35, h - .75), h + 1.35, u); target.set(0, 1.05, -1.1); }
         if (move.id === 'crane-rise') { position.y = THREE.MathUtils.lerp(.55, h + 3.5, u); position.z = THREE.MathUtils.lerp(d + 1.1, d - 1.4, u); target.set(0, THREE.MathUtils.lerp(.9, 1.8, u), -1.1); }
         if (move.id === 'arc-push') { const angle = THREE.MathUtils.lerp(-.72, .52, u); const radius = THREE.MathUtils.lerp(d, 1.25, u); position.set(Math.cos(angle) * radius, h, Math.sin(angle) * radius); target.set(0, 1.05, -1.1); }
@@ -1957,6 +1960,20 @@
           const to = from.clone().addScaledVector(direction.normalize(), combLength);
           combVertices.push(from.x, from.y, from.z, to.x, to.y, to.z);
         });
+        // scenic系はカメラ位置が原点から離れるため、固定のトップビュー画角では画面外に出る。
+        // カメラ位置の軌跡と、それが見ている先（遠すぎる分は9mで打ち切る）を囲む球を画角の基準にする。
+        if (move.scenic || move.autoAxis) {
+          const looked = points.map((point, index) => {
+            const toGaze = gazePoints[index].clone().sub(point);
+            const length = Math.min(9, toGaze.length());
+            return toGaze.lengthSq() < 1e-6 ? point.clone() : point.clone().addScaledVector(toGaze.normalize(), length);
+          });
+          const framed = points.concat(looked);
+          const focus = framed.reduce((sum, point) => sum.add(point), new THREE.Vector3()).divideScalar(framed.length);
+          focus.y = Math.min(1.6, focus.y);
+          let radius = 0; framed.forEach(point => { radius = Math.max(radius, point.distanceTo(focus)); });
+          topFrame = { focus, radius };
+        } else topFrame = null;
         gazeComb.geometry.dispose(); gazeComb.geometry = new THREE.BufferGeometry();
         gazeComb.geometry.setAttribute('position', new THREE.Float32BufferAttribute(combVertices, 3));
         while (pathMarkers.children.length) pathMarkers.remove(pathMarkers.children[0]);
@@ -2099,15 +2116,16 @@
           drag.velocityAzimuth *= .86; drag.velocityElevation *= .86; drag.velocityRadius *= .82;
         }
         drag.targetElevation = Math.max(.42, Math.min(1.48, drag.targetElevation));
-        drag.targetRadius = Math.max(7, Math.min(18, drag.targetRadius));
+        drag.targetRadius = Math.max(7, Math.min(26, drag.targetRadius));
         const smoothing = 1 - Math.exp(-Math.max(.001, dt) * 14);
         drag.azimuth += (drag.targetAzimuth - drag.azimuth) * smoothing;
         drag.elevation += (drag.targetElevation - drag.elevation) * smoothing;
         drag.radius += (drag.targetRadius - drag.radius) * smoothing;
-        const scenicTopOffset = currentMove().scenic ? 9.0 : 0;
-        topCamera.position.set(Math.cos(drag.azimuth)*drag.radius*Math.cos(drag.elevation), drag.radius*Math.sin(drag.elevation), Math.sin(drag.azimuth)*drag.radius*Math.cos(drag.elevation) + scenicTopOffset);
-        const scenicFocusZ = currentMove().scenic ? 3.2 : 0;
-        const topFocus = state.activeScene === 'architecture' ? new THREE.Vector3(0, .65, scenicFocusZ) : subjectTarget.clone().setY(Math.min(1.05, subjectTarget.y));
+        // scenic系は動線から求めた注視点、それ以外は従来どおり被写体を中心にする。
+        const topFocus = topFrame ? topFrame.focus.clone() : state.activeScene === 'architecture' ? new THREE.Vector3(0, .65, 0) : subjectTarget.clone().setY(Math.min(1.05, subjectTarget.y));
+        // scenic系だけ動線の中心を旋回中心にする。それ以外は従来どおり原点まわりを旋回する。
+        const orbitX = topFrame ? topFocus.x : 0; const orbitZ = topFrame ? topFocus.z : 0;
+        topCamera.position.set(orbitX + Math.cos(drag.azimuth)*drag.radius*Math.cos(drag.elevation), drag.radius*Math.sin(drag.elevation), orbitZ + Math.sin(drag.azimuth)*drag.radius*Math.cos(drag.elevation));
         topCamera.lookAt(topFocus);
         topWipeCamera.position.copy(topCamera.position);
         topWipeCamera.quaternion.copy(topCamera.quaternion);
