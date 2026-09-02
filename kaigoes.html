@@ -5790,11 +5790,7 @@ try{
     document.body.classList.remove("record-work-active");
   }
 
-  function addUnrecordedCare(
-    residentIndex,
-    source="排泄介助",
-    endGraceEligible=(shiftEndRecordGrace && gameMinutes>=shiftEndMinutes())
-  ){
+  function addUnrecordedCare(residentIndex,source="排泄介助"){
     if(!practicalModeEnabled()) return;
     if(!Number.isInteger(residentIndex) || residentIndex<0 || residentIndex>3) return;
 
@@ -5802,8 +5798,7 @@ try{
       id:++careRecordSerial,
       residentIndex,
       source,
-      createdAt:gameMinutes,
-      endGraceEligible:!!endGraceEligible
+      createdAt:gameMinutes
     };
     unrecordedCareEntries.push(entry);
     careRecordTotalCreated++;
@@ -5827,8 +5822,7 @@ try{
       residentIndex,
       source,
       target:target.clone(),
-      deadline:gameMinutes + CARE_RECORD_RETURN_DEADLINE,
-      endGraceEligible:shiftEndRecordGrace && gameMinutes>=shiftEndMinutes()
+      deadline:gameMinutes + CARE_RECORD_RETURN_DEADLINE
     });
   }
 
@@ -5849,11 +5843,7 @@ try{
 
       if(returned || overdue){
         pendingRecordReturns.splice(i,1);
-        addUnrecordedCare(
-          pending.residentIndex,
-          pending.source,
-          pending.endGraceEligible
-        );
+        addUnrecordedCare(pending.residentIndex,pending.source);
       }
     }
   }
@@ -5861,20 +5851,8 @@ try{
   function finalizePendingCareRecords(){
     while(pendingRecordReturns.length){
       const pending=pendingRecordReturns.shift();
-      addUnrecordedCare(
-        pending.residentIndex,
-        pending.source,
-        pending.endGraceEligible
-      );
+      addUnrecordedCare(pending.residentIndex,pending.source);
     }
-  }
-
-  function endGraceRecordEntries(){
-    return unrecordedCareEntries.filter(entry=>entry.endGraceEligible);
-  }
-
-  function endGracePendingReturns(){
-    return pendingRecordReturns.filter(pending=>pending.endGraceEligible);
   }
 
   function beginCareRecordWork(){
@@ -5888,9 +5866,7 @@ try{
       nurseReportInProgress
     ) return;
 
-    const availableEntries=shiftEndRecordGrace
-      ? endGraceRecordEntries()
-      : unrecordedCareEntries;
+    const availableEntries=unrecordedCareEntries;
     if(!availableEntries.length) return;
     const availableIds=new Set(availableEntries.map(entry=>entry.id));
     const remainingBatchIds=recordWorkBatchIds.slice(recordWorkCompletedInBatch);
@@ -6009,9 +5985,7 @@ try{
 
     recordInterruptButton.style.display="none";
     recordActionButton.disabled=false;
-    const availableEntries=shiftEndRecordGrace
-      ? endGraceRecordEntries()
-      : unrecordedCareEntries;
+    const availableEntries=unrecordedCareEntries;
 
     if(
       availableEntries.length &&
@@ -6048,7 +6022,6 @@ try{
   });
   let shiftEnded = false;
   let shiftEndPending = false;
-  let shiftEndRecordGrace = false;
   // 定時業務：予定時間から30分以内が標準、60分を超えると未実施扱い
   // 定時介助は利用者ごとに独立して管理する
   // 計画業務は利用者ごとに管理
@@ -9180,12 +9153,12 @@ try{
   }
 
   function updateDeferredShiftEnd(){
+    // 記録は勤務終了を待たせない。書けていない分は未記録として減点する。
     if(
       !shiftEndPending ||
       careState !== "NONE" ||
       routineWorkActive ||
       bathWorkflowWorkActive ||
-      recordWorkActive ||
       nurseReportInProgress
     ) return;
 
@@ -9198,26 +9171,6 @@ try{
       }
       shiftEndBathCleaningGrace=false;
       logDecision("BATH_CLEANING_END_GRACE_COMPLETED");
-    }
-
-    if(shiftEndRecordGrace){
-      const pendingGrace=endGracePendingReturns().length;
-      if(pendingGrace){
-        compactTarget.textContent=
-          "15:00終了：利用者の帰還後に排泄記録を行います";
-        return;
-      }
-
-      const recordGrace=endGraceRecordEntries().length;
-      if(recordGrace){
-        compactTarget.textContent=playerAtRecordStation()
-          ? "15:00終了：排泄記録 "+recordGrace+"件を完了してください"
-          : "15:00終了：詰所へ戻り、排泄記録 "+recordGrace+"件を完了してください";
-        return;
-      }
-
-      shiftEndRecordGrace=false;
-      logDecision("CARE_RECORD_END_GRACE_COMPLETED");
     }
 
     // 介助対象だった利用者が居室へ戻り切ったら終了レポート
@@ -11286,6 +11239,7 @@ try{
 
     if(!returnedHomeToday && gameMinutes >= shiftEndMinutes()){
       returnedHomeToday = true;
+      const endLabel = formatTime(shiftEndMinutes());
       sendResidentsHome();
 
       // 入浴準備には終了猶予を付けない。清掃は15時前に開始済みの場合だけ継続可能。
@@ -11306,41 +11260,23 @@ try{
         });
       }
 
-      const lateRecordCare=
-        practicalModeEnabled() &&
-        (
-          (careType==="TOILET" && careState!=="NONE") ||
-          (
-            routineWorkActive &&
-            routineWorkTask?.type==="BED_TOILET"
-          ) ||
-          pendingRecordReturns.length>0
-        );
-
-      if(lateRecordCare){
-        shiftEndRecordGrace=true;
-        // 15時前に介助が終わり、帰還だけが続いていた記録も猶予対象にする。
-        pendingRecordReturns.forEach(pending=>{
-          pending.endGraceEligible=true;
-        });
-        logDecision("CARE_RECORD_END_GRACE_STARTED");
+      // 記録は締切で打ち切る。書きかけの記録作業も中断し、
+      // 未記録分は applyCareRecordEndPenalty で減点する。
+      if(recordWorkActive){
+        interruptCareRecordWork(endLabel+"終了のため記録を中断しました");
       }
 
       if(
         (careState !== "NONE" && careResidentIndex !== null) ||
         routineWorkActive ||
-        recordWorkActive ||
         nurseReportInProgress ||
-        shiftEndRecordGrace ||
         shiftEndBathCleaningGrace
       ){
-        // 15:00直前に開始済みの介助と、そこから生じた記録は最後まで完了させる。
+        // 締切直前に開始済みの介助と浴場清掃だけは最後まで完了させる。
         shiftEndPending = true;
         compactTarget.textContent = shiftEndBathCleaningGrace
-          ? "15:00終了：開始済みの浴場清掃を完了してください"
-          : lateRecordCare
-            ? "15:00終了：介助後の排泄記録まで完了してください"
-            : "15:00終了：現在の介助を完了してください";
+          ? endLabel+"終了：開始済みの浴場清掃を完了してください"
+          : endLabel+"終了：現在の介助を完了してください";
       }else{
         showShiftReport();
       }
@@ -11490,7 +11426,6 @@ try{
     timeRunning = true;
     pauseBtn.textContent = "時間停止";
     shiftEndPending = false;
-    shiftEndRecordGrace = false;
 
     toiletCurtain.target = 0;
     toiletCurtain.t = 0;
