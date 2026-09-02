@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>CARE SHIFT - Phase 10-119</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#dfe4e8;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif}
@@ -955,9 +955,12 @@ button{
   .callTrayItem{
     flex:1 1 0;
     min-width:0;
-    padding:5px 6px;
+    /* 時間制限のあるナースコール応答が主要操作なので、
+       #curtainButton 等と同じ最低タップ高さを確保する。 */
+    min-height:44px;
+    padding:6px 6px;
     border-radius:7px;
-    font-size:8.5px;
+    font-size:10px;
     gap:4px;
   }
   .callTrayItem .callMain{
@@ -970,7 +973,7 @@ button{
     white-space:nowrap;
   }
   .callTrayItem .callWait{
-    font-size:8px;
+    font-size:9px;
     padding:0;
   }
   #callTrayMore{
@@ -1424,6 +1427,7 @@ body.record-work-active #detailToggle{display:none !important}
       <div class="reportItem">対応件数<strong id="reportCount">0件</strong></div>
       <div class="reportItem">平均待機<strong id="reportAvgWait">0分</strong></div>
       <div class="reportItem">最長待機<strong id="reportMaxWait">0分</strong></div>
+      <div class="reportItem">長時間待機<strong id="reportLongWait">0件</strong></div>
       <div class="reportItem">定時業務<strong id="reportRoutine">0/8</strong></div>
       <div class="reportItem">利用者E対応<strong id="reportEResponse">未発生</strong></div>
       <div class="reportItem">蓄積コール平均<strong id="reportAccumAvgWait">—</strong></div>
@@ -1456,15 +1460,45 @@ body.record-work-active #detailToggle{display:none !important}
 <script type="module">
 const errorEl=document.getElementById("error");
 
+// three.js は外部CDNからの単一取得だった。
+// CDN障害・広告ブロッカー・社内フィルタのいずれかで完全に遊べなくなるため、
+// 複数のCDNを順に試す。
+// どちらも npm のパスをそのまま公開するミラーなので、
+// 同じバージョン・同じファイルが取得できる。
+const THREE_SOURCES=[
+  "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+  "https://unpkg.com/three@0.165.0/build/three.module.js"
+];
+
+async function loadThree(){
+  let lastError=null;
+  for(const url of THREE_SOURCES){
+    try{
+      return await import(/* @vite-ignore */ url);
+    }catch(err){
+      lastError=err;
+    }
+  }
+  throw lastError || new Error("three.js を読み込めませんでした");
+}
+
 try{
-  const THREE=await import("https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js");
+  const THREE=await loadThree();
 
   const scene=new THREE.Scene();
   scene.background=new THREE.Color(0xe7ebee);
 
   const aspect=innerWidth/innerHeight;
   const isMobile = innerWidth < 700;
-  const viewSize= isMobile ? 47 : 36;
+
+  // 初期化と resize で別々の定数を持っていたため、一度リサイズすると
+  // 視野が跳ねていた（デスクトップ 36→32 / モバイル 47→48）。
+  // モバイルは URL バーの開閉でも resize が発火するので実害が大きい。
+  function viewSizeFor(width){
+    return width < 700 ? 47 : 36;
+  }
+
+  const viewSize= viewSizeFor(innerWidth);
   const camera=new THREE.OrthographicCamera(
     -viewSize*aspect/2,viewSize*aspect/2,
     viewSize/2,-viewSize/2,
@@ -1488,6 +1522,26 @@ try{
   renderer.shadowMap.type=THREE.PCFSoftShadowMap;
   renderer.outputColorSpace=THREE.SRGBColorSpace;
   document.getElementById("app").appendChild(renderer.domElement);
+
+  // モバイルでタブを離れる・GPUメモリが逼迫すると
+  // WebGLコンテキストが失われる。既定のままだと以後の render が
+  // 無音で失敗し、キャンバスが黒いまま復帰できない。
+  let contextLost=false;
+
+  renderer.domElement.addEventListener("webglcontextlost",event=>{
+    // 既定動作を止めることで復帰イベントを受け取れるようにする。
+    event.preventDefault();
+    contextLost=true;
+    errorEl.style.display="grid";
+    errorEl.textContent="3D描画が中断されました。復帰を待っています…";
+  },false);
+
+  renderer.domElement.addEventListener("webglcontextrestored",()=>{
+    contextLost=false;
+    errorEl.style.display="none";
+    errorEl.textContent="";
+    resize();
+  },false);
 
   scene.add(new THREE.HemisphereLight(0xffffff,0xa5adb2,2.5));
   const sun=new THREE.DirectionalLight(0xffffff,2.8);
@@ -4824,6 +4878,23 @@ try{
       new THREE.Vector3(base.x,0,base.z-1.9)
     ];
 
+    // isBlockedPoint は静的な家具しか見ないため、
+    // 他の利用者・Eが立っている点を別途除外する。
+    const occupiedByOther = point =>
+      residents.some((r,residentIndex)=>
+        residentIndex!==index &&
+        r.object.position.distanceTo(point)<1.05
+      ) ||
+      residentE.position.distanceTo(point)<1.05;
+
+    for(const point of candidates){
+      if(isBlockedPoint(point) || occupiedByOther(point)) continue;
+      const path=findPath(nurse.position,point);
+      if(path.length) return point;
+    }
+
+    // 全候補が塞がっている場合は、静的判定だけで再度探す。
+    // 立ち位置の重なりより、巡回自体が止まらないことを優先する。
     for(const point of candidates){
       if(isBlockedPoint(point)) continue;
       const path=findPath(nurse.position,point);
@@ -6917,6 +6988,10 @@ try{
   const preventiveToiletButton = document.getElementById("preventiveToiletButton");
   const nurseReportButton = document.getElementById("nurseReportButton");
   const careStateDebug = document.getElementById("careStateDebug");
+  // 毎フレーム参照するUI。getElementById を毎フレーム呼ばないようキャッシュする。
+  const facilityStatusEl = document.getElementById("facilityStatus");
+  const scoreStatusEl = document.getElementById("scoreStatus");
+  const hudScoreRankEl = document.getElementById("hudScoreRank");
   const responseDistance = 2.45;
 
   function closeDetails(){
@@ -7082,6 +7157,7 @@ try{
     careRecordTotalCreated=0;
     careRecordTotalCompleted=0;
     careRecordEndPenaltyApplied=false;
+    playRecordSaveFailed=false;
     recordWorkActive=false;
     recordWorkProgressSeconds=0;
     recordWorkBatchIds=[];
@@ -7494,7 +7570,7 @@ try{
 
   function chooseBathTargets(){
     // A〜Dの4人から、その日の入浴対象は必ず2人だけ。
-    const order = residents.map((_,i)=>i).sort(()=>Math.random()-0.5);
+    const order = shuffled(residents.map((_,i)=>i));
     bathTargetIndices = order.slice(0,2);
 
     routineTasks.forEach(task=>{
@@ -8413,6 +8489,10 @@ try{
     };
   }
 
+  // localStorage への保存が失敗しても従来は握り潰されており、
+  // レポート上のプレイ回数だけ進んでリロードで巻き戻っていた。
+  let playRecordSaveFailed=false;
+
   function readPlayRecordStore(){
     try{
       const raw=localStorage.getItem(PLAY_RECORDS_STORAGE_KEY);
@@ -8446,7 +8526,8 @@ try{
     const store=readPlayRecordStore();
     const next=store.modes[normalizedMode].completedPlayCount+1;
     store.modes[normalizedMode].completedPlayCount=next;
-    writePlayRecordStore(store);
+    // 保存できていない場合を呼び出し側が検出できるようにする。
+    playRecordSaveFailed=!writePlayRecordStore(store);
     return next;
   }
 
@@ -8479,7 +8560,7 @@ try{
       : GAME_MODE_BASIC;
     const store=readPlayRecordStore();
     store.modes[normalizedMode].history=history.slice(-10);
-    writePlayRecordStore(store);
+    return writePlayRecordStore(store);
   }
 
   function setHistoryTransferStatus(message,isError=false){
@@ -10120,6 +10201,9 @@ try{
     // プレイヤー自身が利用者の近くへ行った時だけ専用ボタンを表示する。
   }
 
+  let routineStatusSignature = "";
+  let routineChecklistSignature = "";
+
   function updateRoutineUI(){
     updateRoutineTasks();
 
@@ -10205,7 +10289,7 @@ try{
         );
     });
 
-    routineStatus.innerHTML =
+    const routineStatusHtml =
       "<strong>定時業務</strong><br>" + rows.join("<br>") +
       (practicalModeEnabled()
         ? "<br><span style='font-size:10px;color:#287787;'>浴場工程："+
@@ -10224,6 +10308,11 @@ try{
       ).join(" / ") +
       "</span>";
 
+    if(routineStatusHtml !== routineStatusSignature){
+      routineStatusSignature = routineStatusHtml;
+      routineStatus.innerHTML = routineStatusHtml;
+    }
+
     const checklistGroups = [
       ["水分", "HYDRATION"],
       ["昼食", "LUNCH"],
@@ -10231,7 +10320,7 @@ try{
       ["排泄D", "BED_TOILET"]
     ];
 
-    routineChecklist.innerHTML =
+    const routineChecklistHtml =
       "<strong>チェック</strong><br>" +
       checklistGroups.map(([label,type])=>{
         const marks = residents.map((r,i)=>{
@@ -10260,6 +10349,11 @@ try{
       (practicalModeEnabled()
         ? "<br>浴場清掃："+(bathCleaningDone ? "✓完了" : "□未完了")
         : "");
+
+    if(routineChecklistHtml !== routineChecklistSignature){
+      routineChecklistSignature = routineChecklistHtml;
+      routineChecklist.innerHTML = routineChecklistHtml;
+    }
 
     updateExternalChecklist();
 
@@ -11170,7 +11264,9 @@ try{
   function saveBalanceRun(playNumber){
     const history=readBalanceHistory(selectedGameMode);
     history.push(buildBalanceRunRecord(playNumber));
-    writeBalanceHistory(history,selectedGameMode);
+    if(!writeBalanceHistory(history,selectedGameMode)){
+      playRecordSaveFailed=true;
+    }
     return history.slice(-10);
   }
 
@@ -11351,8 +11447,17 @@ try{
           : "最終加点なし";
     }
     if(shiftReportPlayCount){
+      // 保存に失敗している場合は、リロードで巻き戻ることを明示する。
       shiftReportPlayCount.textContent=
-        selectedModeLabel()+" 累計プレイ "+completedPlayNumber+"回";
+        selectedModeLabel()+" 累計プレイ "+completedPlayNumber+"回"+
+        (playRecordSaveFailed ? "（保存できませんでした）" : "");
+      shiftReportPlayCount.style.color=playRecordSaveFailed ? "#a32620" : "";
+    }
+    if(playRecordSaveFailed){
+      setHistoryTransferStatus(
+        "記録を保存できませんでした。ブラウザの保存容量やプライベートモードを確認してください。",
+        true
+      );
     }
     reportCount.textContent = completedCareCount + "件";
     if(reportMode) reportMode.textContent=selectedModeLabel();
@@ -11419,9 +11524,11 @@ try{
     shiftReport.classList.add("show");
   }
 
+  let scoreStatusSignature = "";
+
   function updateScoreUI(){
-    const el = document.getElementById("scoreStatus");
-    const titleRank = document.getElementById("hudScoreRank");
+    const el = scoreStatusEl;
+    const titleRank = hudScoreRankEl;
 
     const avgWait = completedCareCount
       ? Math.round(totalWaitMinutes / completedCareCount)
@@ -11430,15 +11537,20 @@ try{
     const rank = currentRank();
 
     if(titleRank){
-      titleRank.textContent = shiftScore + "点 / ランク " + rank;
+      const rankText = shiftScore + "点 / ランク " + rank;
+      if(titleRank.textContent !== rankText) titleRank.textContent = rankText;
     }
 
     if(!el) return;
 
-    el.innerHTML =
+    const html =
       '対応評価：<strong>' + shiftScore + '点 / ' + rank + '</strong><br>' +
       '対応 ' + completedCareCount + '件 / 平均待機 ' + avgWait + '分<br>' +
       '<span style="font-size:10px;">直近：' + lastEvaluationText + '</span>';
+    if(html !== scoreStatusSignature){
+      scoreStatusSignature = html;
+      el.innerHTML = html;
+    }
   }
 
   function priorityFor(type){
@@ -11593,6 +11705,17 @@ try{
 
   let callTraySignature = "";
 
+  // #callTray は aria-live="polite" なので、同じ内容でも代入すれば
+  // DOM変更として扱われスクリーンリーダーが読み上げ続ける。
+  // 値が変わった時だけ書き込む。
+  function setTextIfChanged(el,value){
+    if(el && el.textContent!==value) el.textContent=value;
+  }
+
+  function setAttrIfChanged(el,name,value){
+    if(el && el.getAttribute(name)!==value) el.setAttribute(name,value);
+  }
+
   function updateCallTray(){
     const calls = allOpenCalls().sort((a,b)=>{
       const pa = effectivePriority(a);
@@ -11685,12 +11808,14 @@ try{
         const waitMinutes=eAngerStartedAt>=0
           ? Math.max(0,Math.floor(gameMinutes-eAngerStartedAt))
           : 0;
-        eItem.querySelector(".eAlertMain").textContent =
-          eState==="ANGER_FOLLOW"
-            ? "E　誘導中"
-            : "E　訴えあり";
-        eItem.querySelector(".eAlertWait").textContent =
-          eState==="ANGER_FOLLOW" ? "対応中" : waitMinutes+"分";
+        setTextIfChanged(
+          eItem.querySelector(".eAlertMain"),
+          eState==="ANGER_FOLLOW" ? "E　誘導中" : "E　訴えあり"
+        );
+        setTextIfChanged(
+          eItem.querySelector(".eAlertWait"),
+          eState==="ANGER_FOLLOW" ? "対応中" : waitMinutes+"分"
+        );
       }
     }
 
@@ -11705,21 +11830,29 @@ try{
       const selected = activeCall && activeCall.id===call.id;
       const responding = selected && careState!=="NONE";
 
-      button.className =
+      const nextClass =
         "callTrayItem " + callTrayClass(call) +
         (selected ? " selected" : "") +
         (responding ? " responding" : "");
+      if(button.className !== nextClass) button.className = nextClass;
 
-      button.querySelector(".callIcon").textContent =
-        call.type==="POSITION" ? "◆" : "🔘";
+      setTextIfChanged(
+        button.querySelector(".callIcon"),
+        call.type==="POSITION" ? "◆" : "🔘"
+      );
 
-      button.querySelector(".callLabel").textContent =
-        resident.name.replace("利用者","") + " " + callTypeLabel(call.type);
+      setTextIfChanged(
+        button.querySelector(".callLabel"),
+        resident.name.replace("利用者","") + " " + callTypeLabel(call.type)
+      );
 
-      button.querySelector(".callWait").textContent =
-        responding ? "対応中" : waitMinutes + "分";
+      setTextIfChanged(
+        button.querySelector(".callWait"),
+        responding ? "対応中" : waitMinutes + "分"
+      );
 
-      button.setAttribute(
+      setAttrIfChanged(
+        button,
         "aria-label",
         resident.name + " " + callTypeLabel(call.type) +
         (responding
@@ -11730,7 +11863,7 @@ try{
 
     const more = callTray.querySelector("#callTrayMore");
     if(more){
-      more.textContent = "＋" + (calls.length-2) + "件";
+      setTextIfChanged(more, "＋" + (calls.length-2) + "件");
     }
 
     callTray.style.display = "flex";
@@ -12025,9 +12158,9 @@ try{
     const candidates = toiletEligibleResidents();
     if(candidates.length < 2) return;
 
-    const shuffled = [...candidates].sort(()=>Math.random()-0.5);
-    const first = shuffled[0];
-    const second = shuffled[1];
+    const picks = shuffled(candidates);
+    const first = picks[0];
+    const second = picks[1];
 
     if(startNurseCall(first, "排泄希望", "TOILET")){
       lastToiletCallAt[first] = gameMinutes;
@@ -12038,8 +12171,13 @@ try{
   }
 
 
+  // 毎フレーム innerHTML を組み立て直していた箇所は、
+  // updateCallTray と同じくシグネチャ比較で書き換えを抑える。
+  let facilityStatusSignature = "";
+
   function updateFacilityStatus(){
-    const el = document.getElementById("facilityStatus");
+    const el = facilityStatusEl;
+    if(!el) return;
     const allCalls = [];
     if(activeCall) allCalls.push(activeCall);
     pendingCalls.forEach(c=>allCalls.push(c));
@@ -12050,10 +12188,14 @@ try{
       const singleChanceNow = singleMissStreak >= 2 ? 70 : 30;
       const doubleChanceNow = doubleMissStreak >= 2 ? 70 : 15;
 
-      el.innerHTML =
+      const idleHtml =
         "施設状況：<strong>安定</strong><br>" +
         "通常：約" + singleUntil + "分後 " + singleChanceNow + "% / " +
         "同時：約" + doubleUntil + "分後 " + doubleChanceNow + "%";
+      if(idleHtml !== facilityStatusSignature){
+        facilityStatusSignature = idleHtml;
+        el.innerHTML = idleHtml;
+      }
       return;
     }
 
@@ -12064,12 +12206,16 @@ try{
     if(longWait >= 1) state = "要注意";
     if(longWait >= 2 || highPriority >= 2) state = "逼迫";
 
-    el.innerHTML =
+    const busyHtml =
       '施設状況：<strong>' + state + '</strong><br>' +
       '対応中 ' + (activeCall ? 1 : 0) +
       ' / 待機 ' + pendingCalls.length +
       ' / 高優先度 ' + highPriority +
       ' / 長時間待機 ' + longWait;
+    if(busyHtml !== facilityStatusSignature){
+      facilityStatusSignature = busyHtml;
+      el.innerHTML = busyHtml;
+    }
   }
 
   function getHighestPriorityPendingCall(){
@@ -12455,6 +12601,19 @@ try{
     }
   }
 
+  // sort(()=>Math.random()-0.5) は比較関数が非一貫のため
+  // 一様分布にならない（実装依存の偏りが出る）。
+  // 入浴対象や同時コールの抽選はバランス記録の統計に直結するので
+  // Fisher-Yates で正しくシャッフルする。
+  function shuffled(list){
+    const out=[...list];
+    for(let i=out.length-1;i>0;i--){
+      const j=Math.floor(Math.random()*(i+1));
+      const tmp=out[i]; out[i]=out[j]; out[j]=tmp;
+    }
+    return out;
+  }
+
   function randomInt(min,max){
     return min + Math.floor(Math.random() * (max - min + 1));
   }
@@ -12544,9 +12703,9 @@ try{
       return;
     }
 
-    const shuffled = [...hits].sort(()=>Math.random()-0.5);
-    const first = shuffled[0];
-    const second = shuffled[1];
+    const picks = shuffled(hits);
+    const first = picks[0];
+    const second = picks[1];
 
     const firstCreated = startNurseCall(first, "排泄希望", "TOILET");
     const secondCreated = startNurseCall(second, "排泄希望", "TOILET");
@@ -12714,6 +12873,10 @@ try{
     activeHeadMarker.visible = false;
     pendingHeadMarkers.forEach(m=>m.visible=false);
     priorityDiamondMarker.visible = false;
+
+    // トイレ資源は職員・ナース・Eで共有するため、
+    // 個々のリセットに任せずここで明示的に解放する。
+    resetToiletAccess();
 
     // Eが怒り対応・誘導中でも、再プレイ時は必ず自立状態から再初期化する。
     resetResidentE();
@@ -13901,7 +14064,8 @@ try{
       evaluateSchedule();
       updateClockUI();
       updateQueueUI();
-      updateFacilityStatus();
+      // updateFacilityStatus() は時間停止中も含めて毎フレーム
+      // 後段で1回呼ぶ。ここで呼ぶと1フレームに2回実行される。
     }
 
     // 「時間停止」は時計だけでなくシミュレーション全体を停止する。
@@ -14031,18 +14195,20 @@ try{
 
     if(playerMover.state==="IDLE") marker.visible=false;
 
-    renderer.render(scene,camera);
+    if(!contextLost) renderer.render(scene,camera);
   }
   animate();
 
   function resize(){
     const a=innerWidth/innerHeight;
-    const currentViewSize = innerWidth < 700 ? 48 : 32;
+    const currentViewSize = viewSizeFor(innerWidth);
     camera.left=-currentViewSize*a/2;
     camera.right=currentViewSize*a/2;
     camera.top=currentViewSize/2;
     camera.bottom=-currentViewSize/2;
     camera.updateProjectionMatrix();
+    // DPR の異なるディスプレイへ移した時のためにここでも適用する。
+    renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));
     renderer.setSize(innerWidth,innerHeight);
     applyCameraFocus();
   }
@@ -14051,7 +14217,29 @@ try{
 }catch(err){
   console.error(err);
   errorEl.style.display="grid";
-  errorEl.innerHTML="<div><strong>3Dの読み込みに失敗しました。</strong><br><br>"+String(err.message||err)+"</div>";
+  errorEl.textContent="";
+
+  const box=document.createElement("div");
+
+  const title=document.createElement("strong");
+  title.textContent="3Dの読み込みに失敗しました。";
+  box.append(title);
+
+  const detail=document.createElement("p");
+  detail.style.cssText="font-size:12px;opacity:.75;margin:12px 0;";
+  detail.textContent="通信環境を確認して、もう一度お試しください。";
+  box.append(detail);
+
+  const retry=document.createElement("button");
+  retry.type="button";
+  retry.textContent="再読み込み";
+  retry.style.cssText=
+    "min-height:44px;padding:10px 20px;border:0;border-radius:10px;"+
+    "background:#1f7bc0;color:#fff;font-weight:700;cursor:pointer;";
+  retry.addEventListener("click",()=>location.reload());
+  box.append(retry);
+
+  errorEl.append(box);
 }
 </script>
 </body>
