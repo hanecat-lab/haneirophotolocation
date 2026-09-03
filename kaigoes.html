@@ -327,13 +327,15 @@ body.bath-care-active #routineActionButton{
   box-shadow:0 6px 18px rgba(0,0,0,.14);
 }
 #detailDrawer.open{display:block}
-#visualTextSizeControls button{
+#visualTextSizeControls button,
+#soundControls button{
   flex:1;
   min-height:32px;
   padding:5px 6px;
   font-size:10px;
 }
-#visualTextSizeControls button.active{
+#visualTextSizeControls button.active,
+#soundControls button.active{
   outline:3px solid rgba(53,108,140,.28);
   background:#356c8c;
 }
@@ -1348,6 +1350,14 @@ body.record-work-active #detailToggle{display:none !important}
         <button type="button" data-text-scale="1.55">特大</button>
       </div>
     </div>
+    <div class="section" style="background:#fff7e8;">
+      <strong>サウンド</strong><br>
+      <span style="font-size:10px;">ナースコール音</span>
+      <div id="soundControls" style="display:flex;gap:5px;margin-top:6px;">
+        <button type="button" data-sound="on">オン</button>
+        <button type="button" data-sound="off">オフ</button>
+      </div>
+    </div>
     <div id="routineStatus" class="section" style="background:#eef6ff;">定時業務：なし</div>
     <div id="bathWorkflowStatus" class="section" style="background:#eef9fb;">入浴工程：対象外</div>
     <div id="recordStatus" class="section" style="background:#eef7ee;">プレイモード：選択してください</div>
@@ -1766,6 +1776,108 @@ try{
 
   const worldLabelSprites=[];
   let visualTextScale=1;
+
+  // ================================================================
+  // ナースコール音
+  // 単一HTMLの配布形態を崩さないため、音声ファイルを置かず
+  // Web Audio API で合成する。追加取得もCDN依存も無い。
+  // 音の失敗はゲーム進行を止めない（全て try/catch で握る）。
+  // ================================================================
+  const SOUND_STORAGE_KEY="careShiftSoundEnabled";
+  const SOUND_GAIN=0.18;
+  const soundControls=document.getElementById("soundControls");
+
+  let audioCtx=null;
+  let soundEnabled=readSoundEnabled();
+
+  function readSoundEnabled(){
+    try{
+      const raw=localStorage.getItem(SOUND_STORAGE_KEY);
+      // 未設定なら既定でオン。
+      return raw===null ? true : raw==="1";
+    }catch(_){
+      return true;
+    }
+  }
+
+  function writeSoundEnabled(value){
+    try{
+      localStorage.setItem(SOUND_STORAGE_KEY, value ? "1" : "0");
+    }catch(_){
+      // 保存できなくても、そのセッション中の設定は有効。
+    }
+  }
+
+  // iOS/Safari は user gesture の中でしか AudioContext を開始できない。
+  // 起動時のモード選択タップと、画面の初回タップから呼ぶ。
+  function unlockAudio(){
+    try{
+      if(!audioCtx){
+        const Ctx=window.AudioContext || window.webkitAudioContext;
+        if(!Ctx) return;            // 非対応環境では音無しで通常動作
+        audioCtx=new Ctx();
+      }
+      if(audioCtx.state==="suspended") audioCtx.resume().catch(()=>{});
+    }catch(_){
+      audioCtx=null;
+    }
+  }
+
+  // 1音。at=開始遅延(秒), dur=長さ(秒)
+  function playTone(freq,at,dur,gain=SOUND_GAIN){
+    if(!audioCtx) return;
+
+    const start=audioCtx.currentTime+at;
+    const osc=audioCtx.createOscillator();
+    const amp=audioCtx.createGain();
+
+    // 三角波は正弦波より少し芯があり、チャイムらしく聞こえる。
+    osc.type="triangle";
+    osc.frequency.setValueAtTime(freq,start);
+
+    // 立ち上がりを一瞬だけ持たせてクリックノイズを防ぎ、指数減衰させる。
+    amp.gain.setValueAtTime(0.0001,start);
+    amp.gain.exponentialRampToValueAtTime(gain,start+0.012);
+    amp.gain.exponentialRampToValueAtTime(0.0001,start+dur);
+
+    osc.connect(amp);
+    amp.connect(audioCtx.destination);
+
+    osc.onended=()=>{
+      try{ osc.disconnect(); amp.disconnect(); }catch(_){}
+    };
+
+    osc.start(start);
+    osc.stop(start+dur+0.02);
+  }
+
+  // ナースコール：施設のチャイム風「ピンポーン」（E5→C5の下降2音）
+  function playNurseCallChime(){
+    if(!soundEnabled) return;
+    try{
+      playTone(659.25,0,0.45);
+      playTone(523.25,0.32,0.55);
+    }catch(_){}
+  }
+
+  // 利用者Eの訴え：低く短い同音2連。コールと明確に区別する。
+  function playResidentEChime(){
+    if(!soundEnabled) return;
+    try{
+      playTone(392.00,0,0.18,SOUND_GAIN*0.85);
+      playTone(392.00,0.22,0.22,SOUND_GAIN*0.85);
+    }catch(_){}
+  }
+
+  function refreshSoundControls(){
+    if(!soundControls) return;
+    soundControls.querySelectorAll("[data-sound]").forEach(btn=>{
+      btn.classList.toggle(
+        "active",
+        (btn.dataset.sound==="on")===soundEnabled
+      );
+    });
+  }
 
   function applyVisualTextScale(scale){
     visualTextScale=Math.max(1,Math.min(1.55,Number(scale)||1));
@@ -5347,6 +5459,8 @@ try{
     }
   },{passive:false});
 
+  renderer.domElement.addEventListener("pointerdown",()=>unlockAudio(),{once:true});
+
   renderer.domElement.addEventListener("pointerdown",(e)=>{
     activeCanvasPointers.add(e.pointerId);
 
@@ -5668,6 +5782,20 @@ try{
   });
   applyVisualTextScale(1);
 
+  soundControls?.addEventListener("click",event=>{
+    const btn=event.target.closest("[data-sound]");
+    if(!btn) return;
+    soundEnabled=btn.dataset.sound==="on";
+    writeSoundEnabled(soundEnabled);
+    refreshSoundControls();
+    // オンにした操作自体をジェスチャとして使い、その場で試聴させる。
+    if(soundEnabled){
+      unlockAudio();
+      playNurseCallChime();
+    }
+  });
+  refreshSoundControls();
+
   detailToggle.addEventListener("click",()=>{
     const open = detailDrawer.classList.toggle("open");
     detailToggle.textContent = open ? "閉じる" : "詳細";
@@ -5694,6 +5822,10 @@ try{
   modeSelectOverlay.addEventListener("click",event=>{
     const button=event.target.closest("[data-game-mode]");
     if(!button) return;
+
+    // iOS はユーザー操作の中でしか音を開始できない。
+    // 起動時のモード選択は必ず通るので、ここで解除しておく。
+    unlockAudio();
     selectedGameMode=
       button.dataset.gameMode===GAME_MODE_PRACTICAL
         ? GAME_MODE_PRACTICAL
