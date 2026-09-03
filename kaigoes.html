@@ -8337,6 +8337,66 @@ try{
     })[0];
   }
 
+  // プレイヤーの近くにいる利用者について、入浴の声掛けができない理由を返す。
+  // 実施できる場合と、近くに入浴対象がいない場合は null。
+  //
+  // availableBathTasks() は使えない。あれは「弾いた結果」しか返さないが、
+  // ここで知りたいのは「なぜ弾かれたか」なので、全BATHタスクから探す。
+  function bathBlockReasonNear(){
+    const nearTasks=routineTasks.filter(task=>
+      task.type==="BATH" && playerNearRoutineResident(task)
+    );
+    if(!nearTasks.length) return null;
+
+    const task=[...nearTasks].sort((a,b)=>{
+      const ra=bathResidentForIndex(a.residentIndex).object.position;
+      const rb=bathResidentForIndex(b.residentIndex).object.position;
+      return Math.hypot(player.position.x-ra.x,player.position.z-ra.z)
+           - Math.hypot(player.position.x-rb.x,player.position.z-rb.z);
+    })[0];
+
+    // 実施中は updateCompactHUD の別分岐が担当する。
+    if(task.inProgress) return null;
+
+    const name=bathResidentName(task.residentIndex)+" 入浴 — ";
+
+    if(task.enabled===false) return name+"本日の入浴対象ではありません";
+    if(task.done) return name+"本日はすでに完了しています";
+    if(task.missed) return name+"期限を過ぎたため実施できません";
+
+    if(!bathWindowOpen(task)){
+      // 状態の呼び方は既存の taskState と揃える（予定／午後待ち／期限超過）。
+      const state=taskState(task);
+      if(gameMinutes<task.due){
+        return name+state+"（"+formatTime(task.due)+"から）";
+      }
+      if(gameMinutes>task.windowEnd && gameMinutes<task.secondWindowStart){
+        return name+state+"（"+formatTime(task.secondWindowStart)+"から）";
+      }
+      return name+state;
+    }
+
+    if(task.residentIndex===E_BATH_INDEX){
+      if(eAssistedBathActive) return null;
+      if(eAngerActive) return name+"訴えへの対応が先です";
+      if(eToiletOccupied()) return name+"トイレを使用中です";
+      if(eState!=="WANDER") return name+"落ち着くまで待ってください";
+    }
+
+    if(hasToiletCareWaiting()) return name+"排泄介助を優先してください";
+
+    if(
+      practicalModeEnabled() &&
+      task.residentIndex>=0 &&
+      task.residentIndex<=3 &&
+      !bathPreparationReady
+    ){
+      return name+"浴場の準備がまだです。先に浴場で準備してください";
+    }
+
+    return null;   // 実施できる（声掛けボタンが出る）
+  }
+
   function routineTaskWindowOpen(task){
     if(!task || task.enabled===false || task.done || task.missed) return false;
 
@@ -10961,6 +11021,11 @@ try{
       return;
     }
 
+    // compactTarget は毎フレーム この関数が最後に上書きする。
+    // 他所から書いたメッセージは約26msで消えるため、
+    // 入浴できない理由もこのチェーンの中で出す必要がある。
+    const bathBlockReason=bathBlockReasonNear();
+
     if(nurseReportInProgress){
       const remain=Math.max(
         0,
@@ -11010,6 +11075,10 @@ try{
         (playerNearRoutineResident(activeRoutineTask)
           ? " → 実施できます"
           : " → 対象者の近くへ");
+    }else if(bathBlockReason){
+      // 利用者のそばで入浴を試している最中は、記録の催促より
+      // 目の前の「なぜできないか」を優先して出す。
+      compactTarget.textContent = bathBlockReason;
     }else if(practicalModeEnabled() && unrecordedCareEntries.length){
       compactTarget.textContent = playerAtRecordStation()
         ? "未記録"+unrecordedCareEntries.length+"件 → 排泄記録を実施できます"
@@ -11696,8 +11765,27 @@ try{
     cancelCurrentTravel("移動をキャンセルしました。別の対応を選べます");
   });
 
+  // 押した時の一時的な理由表示。compactTarget は毎フレーム
+  // updateCompactHUD に上書きされる（実測26ms）ので、
+  // 既存の careProgress（1.8秒表示）の作法に合わせる。
+  function showBathVoiceNotice(text){
+    careProgress.classList.add("show");
+    careProgress.textContent=text;
+    setTimeout(()=>{
+      if(careState==="NONE") careProgress.classList.remove("show");
+    },1800);
+  }
+
   function beginBathVoiceFlow(){
-    if(careState!=="NONE" || hasToiletCareWaiting()) return;
+    if(careState!=="NONE"){
+      showBathVoiceNotice("別の介助中です。完了か中断のあとに入浴へ移れます");
+      return;
+    }
+
+    if(hasToiletCareWaiting()){
+      showBathVoiceNotice("排泄介助を優先してください");
+      return;
+    }
 
     if(recordWorkActive){
       interruptCareRecordWork("入浴介助へ切り替えました");
@@ -11743,15 +11831,21 @@ try{
     if(!task){
       bathVoiceTravel = false;
       updateExternalChecklist();
+      // 近くの利用者について理由が分かるならそれを、
+      // 分からなければ総括的な理由を出す。
+      showBathVoiceNotice(
+        bathBlockReasonNear() || "今すぐ入浴を実施できる利用者がいません"
+      );
       return;
     }
 
     const resident = bathResidentForIndex(task.residentIndex);
 
     if(!playerNearRoutineResident(task)){
-      compactTarget.textContent =
+      showBathVoiceNotice(
         bathResidentName(task.residentIndex) +
-        "の近くまで移動して声掛けしてください";
+        "の近くまで移動して声掛けしてください"
+      );
       return;
     }
 
@@ -11761,14 +11855,9 @@ try{
       task.residentIndex<=3 &&
       !bathPreparationReady
     ){
-      compactTarget.textContent=
-        "浴場の準備がまだです。先に浴場へ行って準備してください";
-      careProgress.classList.add("show");
-      careProgress.textContent=
-        "準備がまだです。浴場で入浴準備を完了してから誘導してください";
-      setTimeout(()=>{
-        if(careState==="NONE") careProgress.classList.remove("show");
-      },1800);
+      showBathVoiceNotice(
+        "準備がまだです。浴場で入浴準備を完了してから誘導してください"
+      );
       selectedBathTask=null;
       return;
     }
