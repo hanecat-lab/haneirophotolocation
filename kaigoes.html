@@ -5927,7 +5927,6 @@ try{
   // 利用者・ナースの移動ステートとは分離し、帰還完了後に記録だけを積む。
   // ================================================================
   const unrecordedCareEntries=[];
-  const pendingRecordReturns=[];
   let careRecordSerial=0;
   let careRecordTotalCreated=0;
   let careRecordTotalCompleted=0;
@@ -5997,7 +5996,6 @@ try{
 
   function resetCareRecordSystem(){
     unrecordedCareEntries.length=0;
-    pendingRecordReturns.length=0;
     careRecordSerial=0;
     careRecordTotalCreated=0;
     careRecordTotalCompleted=0;
@@ -6013,10 +6011,7 @@ try{
     document.body.classList.remove("record-work-active");
   }
 
-  // createdAt は「介助が終わった時刻」。帰還待ちから遅れて確定した記録でも
-  // 元の介助時刻を保つ。減点の免除判定がこの値を見るため、
-  // 確定した瞬間の時刻を使うと古い記録まで免除されてしまう。
-  function addUnrecordedCare(residentIndex,source="排泄介助",createdAt=gameMinutes){
+  function addUnrecordedCare(residentIndex,source="排泄介助"){
     if(!practicalModeEnabled()) return;
     if(!Number.isInteger(residentIndex) || residentIndex<0 || residentIndex>3) return;
 
@@ -6024,7 +6019,7 @@ try{
       id:++careRecordSerial,
       residentIndex,
       source,
-      createdAt
+      createdAt:gameMinutes
     };
     unrecordedCareEntries.push(entry);
     careRecordTotalCreated++;
@@ -6033,53 +6028,6 @@ try{
       resident:residents[residentIndex].name,
       source
     });
-  }
-
-  // 帰還を待つ記録は、帰還が成立しなくても必ず記録対象へ落とす。
-  // 経路生成の失敗や再ルートで利用者が目標へ着かない場合、
-  // 期限なしでは pendingRecordReturns が永久に残り、
-  // 勤務終了レポート（updateDeferredShiftEnd）が出せなくなるため。
-  const CARE_RECORD_RETURN_DEADLINE = 30;
-
-  function queueCareRecordAfterReturn(residentIndex,target,source="排泄介助"){
-    if(!practicalModeEnabled()) return;
-    if(!Number.isInteger(residentIndex) || residentIndex<0 || residentIndex>3) return;
-    pendingRecordReturns.push({
-      residentIndex,
-      source,
-      target:target.clone(),
-      queuedAt:gameMinutes,
-      deadline:gameMinutes + CARE_RECORD_RETURN_DEADLINE
-    });
-  }
-
-  function updatePendingCareRecords(){
-    if(!practicalModeEnabled()) return;
-    for(let i=pendingRecordReturns.length-1;i>=0;i--){
-      const pending=pendingRecordReturns[i];
-      const mover=residentMovers[pending.residentIndex];
-      const resident=residents[pending.residentIndex];
-      const returned =
-        mover &&
-        mover.state==="IDLE" &&
-        resident.object.position.distanceTo(pending.target)<=0.9;
-
-      // 期限切れは「帰還できなかった」とみなして記録対象へ回す。
-      const overdue =
-        !Number.isFinite(pending.deadline) || gameMinutes>=pending.deadline;
-
-      if(returned || overdue){
-        pendingRecordReturns.splice(i,1);
-        addUnrecordedCare(pending.residentIndex,pending.source,pending.queuedAt);
-      }
-    }
-  }
-
-  function finalizePendingCareRecords(){
-    while(pendingRecordReturns.length){
-      const pending=pendingRecordReturns.shift();
-      addUnrecordedCare(pending.residentIndex,pending.source,pending.queuedAt);
-    }
   }
 
   function beginCareRecordWork(){
@@ -10048,10 +9996,7 @@ try{
     const feasibleUntil=recordWriteFeasibleUntil();
     const recordsComplete=
       !practicalModeEnabled() ||
-      (
-        unrecordedCareEntries.every(entry=>entry.createdAt>feasibleUntil) &&
-        pendingRecordReturns.every(pending=>pending.queuedAt>feasibleUntil)
-      );
+      unrecordedCareEntries.every(entry=>entry.createdAt>feasibleUntil);
     const allRoutineDone =
       enabledRoutineTasks.length > 0 &&
       enabledRoutineTasks.every(t=>t.done) &&
@@ -10282,7 +10227,6 @@ try{
   function applyCareRecordEndPenalty(){
     if(!practicalModeEnabled() || careRecordEndPenaltyApplied) return;
     careRecordEndPenaltyApplied=true;
-    finalizePendingCareRecords();
 
     // 安全網：締切間際に生じた記録は、詰所へ戻って書く時間が無い。
     // 予防（recordableEscortCutoff）を抜けた経路があっても
@@ -12738,9 +12682,7 @@ try{
                     )
               );
 
-        // 経路が作れないと利用者はその場で IDLE のまま止まる。
-        // 帰還を待つ記録がその場合に取り残されないよう、成否を持ち回る。
-        const returnRouteOk = setRoute(
+        setRoute(
           residentMover,
           finalReturnTarget,
           "RETURN_AFTER_CARE"
@@ -12771,20 +12713,12 @@ try{
           finishingResidentIndex>=0 &&
           finishingResidentIndex<=3
         ){
-          const recordSource = preventiveToiletInProgress
-            ? "事前トイレ誘導"
-            : "排泄介助";
-
-          if(returnRouteOk){
-            queueCareRecordAfterReturn(
-              finishingResidentIndex,
-              finalReturnTarget,
-              recordSource
-            );
-          }else{
-            // 帰還できないので待たずに記録対象へ入れる。
-            addUnrecordedCare(finishingResidentIndex,recordSource);
-          }
+          // カーテンを開けた時点で記録できるようにする。
+          // 職員はここで自由行動に戻れるので、利用者の帰室を待たせない。
+          addUnrecordedCare(
+            finishingResidentIndex,
+            preventiveToiletInProgress ? "事前トイレ誘導" : "排泄介助"
+          );
         }
 
         careProgress.textContent =
@@ -12997,7 +12931,6 @@ try{
       residentMovers.forEach(m=>updateMover(m,dt));
       updateMover(residentEMover,dt);
       updateMover(nurseMover,dt);
-      updatePendingCareRecords();
       updateResidentE(dt);
       updateNurseController(dt);
       updateNurseReportProgress(dt);
