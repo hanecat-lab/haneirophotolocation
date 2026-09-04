@@ -1337,6 +1337,7 @@ body.record-work-active #detailToggle{display:none !important}
 </head>
 <body>
 <div id="app"></div>
+<audio id="bgmAudio" src="assets/bgm-kaigoes.mp3" loop preload="auto" style="display:none;"></audio>
 <div id="modeSelectOverlay" class="show" aria-modal="true" role="dialog">
   <div id="modeSelectCard">
     <h2>プレイモード</h2>
@@ -1845,6 +1846,20 @@ try{
   let audioCtx=null;
   let soundEnabled=readSoundEnabled();
 
+  // 「コール音が鳴らない」の実機診断用。ロジックには一切影響しない記録のみ。
+  // ?audiodebug=1 のときだけ画面に表示する。
+  const audioDebugInfo={
+    unlockAudioCalls:0,
+    unlockAudioLastAt:null,
+    unlockAudioLastError:null,
+    playToneCalls:0,
+    playToneLastAt:null,
+    playToneLastError:null,
+    chimeCalls:0,
+    chimeLastAt:null,
+    hasAudioContextApi:!!(window.AudioContext || window.webkitAudioContext)
+  };
+
   function readSoundEnabled(){
     try{
       const raw=localStorage.getItem(SOUND_STORAGE_KEY);
@@ -1866,6 +1881,8 @@ try{
   // iOS/Safari は user gesture の中でしか AudioContext を開始できない。
   // 起動時のモード選択タップと、画面の初回タップから呼ぶ。
   function unlockAudio(){
+    audioDebugInfo.unlockAudioCalls++;
+    audioDebugInfo.unlockAudioLastAt=Date.now();
     try{
       if(!audioCtx){
         const Ctx=window.AudioContext || window.webkitAudioContext;
@@ -1873,14 +1890,22 @@ try{
         audioCtx=new Ctx();
       }
       if(audioCtx.state==="suspended") audioCtx.resume().catch(()=>{});
-    }catch(_){
+    }catch(err){
       audioCtx=null;
+      audioDebugInfo.unlockAudioLastError=String(err);
     }
   }
 
   // 1音。at=開始遅延(秒), dur=長さ(秒)
   function playTone(freq,at,dur,gain=SOUND_GAIN){
+    audioDebugInfo.playToneCalls++;
+    audioDebugInfo.playToneLastAt=Date.now();
     if(!audioCtx) return;
+
+    // 省電力のため無音状態が続くと suspended に戻るブラウザがある。
+    // unlockAudio() 済みでもここで毎回復帰を試みないと、鳴らそうとした
+    // まさにその瞬間が無音になり得る。
+    if(audioCtx.state==="suspended") audioCtx.resume().catch(()=>{});
 
     const start=audioCtx.currentTime+at;
     const osc=audioCtx.createOscillator();
@@ -1909,10 +1934,14 @@ try{
   // ナースコール：施設のチャイム風「ピンポーン」（E5→C5の下降2音）
   function playNurseCallChime(){
     if(!soundEnabled) return;
+    audioDebugInfo.chimeCalls++;
+    audioDebugInfo.chimeLastAt=Date.now();
     try{
       playTone(659.25,0,0.45);
       playTone(523.25,0.32,0.55);
-    }catch(_){}
+    }catch(err){
+      audioDebugInfo.playToneLastError=String(err);
+    }
   }
 
   // 利用者Eの訴え：低く短い同音2連。コールと明確に区別する。
@@ -1932,6 +1961,112 @@ try{
         (btn.dataset.sound==="on")===soundEnabled
       );
     });
+  }
+
+  // 実機で「コール音が鳴らない」を切り分けるための診断表示。
+  // ?audiodebug=1 のときだけ有効。通常プレイには一切影響しない。
+  function setupAudioDebugOverlay(){
+    let params;
+    try{ params=new URLSearchParams(window.location.search); }catch(_){ return; }
+    if(params.get("audiodebug")!=="1") return;
+
+    const pre=document.createElement("pre");
+    pre.style.cssText=
+      "position:fixed;left:4px;bottom:4px;z-index:99999;margin:0;"+
+      "padding:6px 8px;font-size:11px;line-height:1.4;"+
+      "background:rgba(0,0,0,0.75);color:#0f0;white-space:pre-wrap;"+
+      "max-width:70vw;pointer-events:none;";
+    document.body.appendChild(pre);
+
+    setInterval(()=>{
+      const ctxState=audioCtx ? audioCtx.state : "(no audioCtx)";
+      pre.textContent=
+        "[audiodebug]\n"+
+        "hasAudioContextApi: "+audioDebugInfo.hasAudioContextApi+"\n"+
+        "soundEnabled: "+soundEnabled+"\n"+
+        "audioCtx.state: "+ctxState+"\n"+
+        "unlockAudio calls: "+audioDebugInfo.unlockAudioCalls+
+          " lastAt: "+audioDebugInfo.unlockAudioLastAt+"\n"+
+        "unlockAudio lastError: "+audioDebugInfo.unlockAudioLastError+"\n"+
+        "playTone calls: "+audioDebugInfo.playToneCalls+
+          " lastAt: "+audioDebugInfo.playToneLastAt+"\n"+
+        "playTone lastError: "+audioDebugInfo.playToneLastError+"\n"+
+        "chime calls: "+audioDebugInfo.chimeCalls+
+          " lastAt: "+audioDebugInfo.chimeLastAt;
+    },500);
+  }
+  setupAudioDebugOverlay();
+
+  // ================================================================
+  // BGM
+  // ループ再生される音楽ファイル。効果音（playTone系）と違い
+  // 合成では作れないため、単一HTMLの原則を崩さない範囲で
+  // 唯一の例外として同じリポジトリ内の assets/ に音声ファイルを置く
+  // （three.js の CDN 依存と同様、既にこのアプリが許容している外部化）。
+  //
+  // コール発生中はダッキング（音量を下げる）して、
+  // コール音や介助中の会話表示の邪魔にならないようにする。
+  // ================================================================
+  const bgmAudio=document.getElementById("bgmAudio");
+  const BGM_VOLUME_NORMAL=0.35;
+  const BGM_VOLUME_DUCKED=0.12;
+  // 急に音量が変わるとノイズっぽく聞こえるため、1秒程度かけて滑らかに寄せる。
+  const BGM_FADE_PER_SECOND=0.8;
+
+  let bgmStarted=false;
+  let bgmSourceNode=null;
+  if(bgmAudio) bgmAudio.volume=BGM_VOLUME_NORMAL;
+
+  // iOS/Safari は「<audio>要素の再生」と「AudioContextの合成音」を
+  // 別々の音声セッションとして扱い、前者が再生中だと後者（コール音）が
+  // 無音化されることがある。BGMのaudio要素をコール音と同じAudioContextの
+  // グラフに接続し、同一セッションにまとめて無音化を防ぐ。
+  // （.volume によるダッキングは要素→グラフの入口で適用されるため、
+  //   接続後も既存の音量制御はそのまま機能する）
+  function connectBgmToAudioGraph(){
+    if(!bgmAudio || !audioCtx || bgmSourceNode) return;
+    try{
+      bgmSourceNode=audioCtx.createMediaElementSource(bgmAudio);
+      bgmSourceNode.connect(audioCtx.destination);
+    }catch(_){
+      // 接続できなくても要素単体の再生は継続する。
+    }
+  }
+
+  // iOS/Safari はユーザー操作の中でしか再生を開始できない。
+  // 効果音の unlockAudio() と同じジェスチャ（モード選択タップ／
+  // 画面の初回タップ）から呼ぶ。
+  function startBgm(){
+    if(!bgmAudio || !soundEnabled || bgmStarted) return;
+    connectBgmToAudioGraph();
+    bgmStarted=true;
+    bgmAudio.play().catch(()=>{
+      // 自動再生ポリシーで拒否された場合は、次のジェスチャで再試行する。
+      bgmStarted=false;
+    });
+  }
+
+  function stopBgm(){
+    if(!bgmAudio) return;
+    bgmStarted=false;
+    bgmAudio.pause();
+  }
+
+  // 毎フレーム呼ぶ。コールが1件でも開いていれば音量を絞る。
+  function updateBgmVolume(dt){
+    if(!bgmAudio || !soundEnabled) return;
+
+    const target = totalOpenCalls()>0 ? BGM_VOLUME_DUCKED : BGM_VOLUME_NORMAL;
+    const current = bgmAudio.volume;
+    if(Math.abs(target-current)<0.002){
+      bgmAudio.volume=target;
+      return;
+    }
+
+    const step=BGM_FADE_PER_SECOND*dt;
+    bgmAudio.volume = current<target
+      ? Math.min(target,current+step)
+      : Math.max(target,current-step);
   }
 
   function applyVisualTextScale(scale){
@@ -5515,7 +5650,7 @@ try{
     }
   },{passive:false});
 
-  renderer.domElement.addEventListener("pointerdown",()=>unlockAudio(),{once:true});
+  renderer.domElement.addEventListener("pointerdown",()=>{unlockAudio();startBgm();},{once:true});
 
   renderer.domElement.addEventListener("pointerdown",(e)=>{
     activeCanvasPointers.add(e.pointerId);
@@ -5854,6 +5989,9 @@ try{
     if(soundEnabled){
       unlockAudio();
       playNurseCallChime();
+      startBgm();
+    }else{
+      stopBgm();
     }
   });
   refreshSoundControls();
@@ -5888,6 +6026,7 @@ try{
     // iOS はユーザー操作の中でしか音を開始できない。
     // 起動時のモード選択は必ず通るので、ここで解除しておく。
     unlockAudio();
+    startBgm();
     selectedGameMode=
       button.dataset.gameMode===GAME_MODE_PRACTICAL
         ? GAME_MODE_PRACTICAL
@@ -13002,6 +13141,10 @@ try{
   function animate(){
     requestAnimationFrame(animate);
     const dt=Math.min(clock.getDelta(),0.05);
+
+    // BGMの音量調整は時間停止中も続ける。音楽はシミュレーションの
+    // 一部ではないので、一時停止でフェードが止まるのは不自然なため。
+    updateBgmVolume(dt);
 
     if(timeRunning){
       gameMinutes += dt * currentMinutesPerRealSecond();
