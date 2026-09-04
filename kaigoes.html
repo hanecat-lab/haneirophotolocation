@@ -1290,6 +1290,10 @@ button{
 }
 #dayBriefCard h2{margin:0;font-size:22px}
 #dayBriefRange{margin-top:3px;font-size:12px;color:#6a7780;font-weight:700}
+#dayBriefNote{
+  margin-top:10px;padding:8px 10px;border-radius:10px;
+  background:#fdf3e3;color:#7a5a1a;font-size:11px;font-weight:750;line-height:1.4
+}
 .dayBriefGroup{margin-top:14px}
 .dayBriefGroupTitle{
   font-size:11px;font-weight:900;letter-spacing:.06em;color:#5b6a74;
@@ -1351,6 +1355,7 @@ body.record-work-active #detailToggle{display:none !important}
   <div id="dayBriefCard">
     <h2 id="dayBriefTitle">本日の予定</h2>
     <div id="dayBriefRange"></div>
+    <div id="dayBriefNote" style="display:none;"></div>
     <div id="dayBriefBody"></div>
     <button id="dayBriefStart" type="button">勤務を開始する</button>
   </div>
@@ -5608,6 +5613,12 @@ try{
     // 入浴などの誘導中：1分/秒
     if(careState==="FOLLOW_TO_CARE") return 1;
 
+    // 利用者Eを居室へ誘導中：1分/秒。
+    // 誘導中は対応ボタンが消え、他のコールに一切対応できなくなるのに
+    // 時間だけ通常速度（2分/秒）で進むと、同時に開いているコールの
+    // 待機減点が他の介助中より速く積み上がってしまっていた。
+    if(eState==="ANGER_FOLLOW") return 1;
+
     // 入浴等の実介助工程：0.5分/秒
     if(
       careState==="AUTO_ENTER" ||
@@ -5959,12 +5970,13 @@ try{
   // --- 記録が間に合うかどうかに関わる時刻 ---
   //
   // このゲームは時間が高速進行する（通常2ゲーム分/実秒、誘導中1、介助中0.5）。
-  // 座標と移動速度から、排泄コール発生〜記録完了までは実測で 29〜45ゲーム分：
-  //   応答＋誘導 9分 / 入室〜退室 4分 / 帰室 11〜27分 / 記録 5分
-  // 記録エントリは利用者が居室へ着くまで生成されないため先回りして書けない。
+  // 記録はカーテンを開けた時点で作られる（利用者の帰室を待たない）ので、
+  // 排泄コール発生〜記録完了までの内訳は約22ゲーム分：
+  //   応答＋誘導 9分 / 入室〜退室 4分 / 詰所へ移動 4分 / 記入 5分
   //
   // 予防：間に合わない時刻には記録の生じる介助を発生させない。
-  const RECORD_ESCORT_MARGIN = 45;
+  // 35分あれば13分の余裕がある。
+  const RECORD_ESCORT_MARGIN = 35;
 
   // 安全網：それでも締切間際に生じた記録は、書く時間が無いので減点しない。
   // 詰所への移動と記入1件ぶんの実時間に相当する。
@@ -6354,6 +6366,69 @@ try{
     });
   }
 
+  // 本日の特記事項＋適応難易度。
+  //
+  // 文言だけを飾りにすると「コール発生率がやや高め」のような
+  // 実装の伴わない嘘の告知になる（過去に一度それをやりかけて外した）。
+  // ここでは逆に、直近の実績から難易度の階層を先に決め、
+  // その階層に合った文言を選ぶ。文言は必ず実際の値と一致する。
+  //
+  // 階層は3つ、コール発生確率への倍率は 0.90〜1.15 に収める。
+  // 一度に大きく振れると「理不尽な難易度」に転じるため、上げ幅は
+  // 控えめにし、直近3回の実績だけを見る（1回の当たり外れで暴れない）。
+  const DAY_DIFFICULTY_TIERS = {
+    calm:{
+      multiplier:0.90,
+      texts:[
+        "最近は大変だったようです。本日はいつもよりゆったりめの一日になりそうです。",
+        "無理せずいきましょう。本日はコール対応がやや少なめになりそうです。",
+        "少し落ち着いて取り組める一日になりそうです。"
+      ]
+    },
+    neutral:{
+      multiplier:1.00,
+      texts:[
+        "今日は利用者の皆さんも穏やかに過ごされています。",
+        "今朝は少し肌寒く、水分補給のタイミングを意識しましょう。",
+        "本日はレクリエーションの声かけが多めの予定です。",
+        "詰所のナースも今日は特に注意深く見守っています。",
+        "利用者の皆さんは今朝、機嫌よく過ごされています。",
+        "今日は面会にいらっしゃるご家族が多い一日です。"
+      ]
+    },
+    busy:{
+      multiplier:1.15,
+      texts:[
+        "最近の対応が手際よく、本日はナースコールがやや多めになりそうです。",
+        "頼れる働きぶりが続いています。本日は少し忙しい一日になるかもしれません。",
+        "最近絶好調ですね。今日はコール対応の場面が増えそうです。"
+      ]
+    }
+  };
+
+  let dailyBriefNote = DAY_DIFFICULTY_TIERS.neutral.texts[0];
+  let dailyCallDifficultyMultiplier = 1;
+
+  // 直近3回（このモードで保存された分だけ）の実績から階層を決める。
+  // 2回未満しかなければ傾向を判断できないので neutral のまま。
+  function dailyDifficultyTierFromHistory(){
+    const recent = readBalanceHistory(selectedGameMode).slice(-3);
+    if(recent.length < 2) return "neutral";
+
+    const avgScore = recent.reduce((sum,item)=>sum+(Number(item.score)||0),0) / recent.length;
+    const avgWait = recent.reduce((sum,item)=>sum+(Number(item.avgWait)||0),0) / recent.length;
+
+    if(avgScore >= 97 && avgWait < 16) return "busy";
+    if(avgScore < 80) return "calm";
+    return "neutral";
+  }
+
+  function pickDailyBriefNote(){
+    const tier = DAY_DIFFICULTY_TIERS[dailyDifficultyTierFromHistory()];
+    dailyCallDifficultyMultiplier = tier.multiplier;
+    dailyBriefNote = tier.texts[Math.floor(Math.random()*tier.texts.length)];
+  }
+
   function chooseBathTargets(){
     // A〜Dの4人から、その日の入浴対象は必ず2人だけ。
     const order = shuffled(residents.map((_,i)=>i));
@@ -6394,6 +6469,7 @@ try{
   const dayBriefRange=document.getElementById("dayBriefRange");
   const dayBriefBody=document.getElementById("dayBriefBody");
   const dayBriefStart=document.getElementById("dayBriefStart");
+  const dayBriefNote=document.getElementById("dayBriefNote");
 
   function briefResidentNames(type){
     return routineTasks
@@ -6465,6 +6541,10 @@ try{
     }
 
     dayBriefRange.textContent="08:00 〜 "+formatTime(end)+"　"+selectedModeLabel();
+    if(dayBriefNote){
+      dayBriefNote.textContent=dailyBriefNote;
+      dayBriefNote.style.display=dailyBriefNote ? "block" : "none";
+    }
     dayBriefBody.innerHTML=
       "<div class='dayBriefGroup'>"+
         "<div class='dayBriefGroupTitle'>時間が決まっている業務</div>"+
@@ -6493,6 +6573,11 @@ try{
     pauseBtn.classList.remove("paused");
   });
 
+  // pickDailyBriefNote() はここでは呼ばない。直近実績（readBalanceHistory）を
+  // 参照するが、その定義は本ファイルの後方にあり、モジュール初期化のこの時点では
+  // まだ TDZ で参照できない。表示は resetDay ハンドラ側の呼び出しだけで行われ、
+  // そちらは常にモード選択のクリック後＝モジュール初期化完了後に実行されるため、
+  // ここで呼ばなくても実害はない（宣言時の既定値 neutral がそれまでの間使われる）。
   chooseBathTargets();
 
   let activeRoutineTask = null;
@@ -10154,6 +10239,42 @@ try{
     const latest=history[history.length-1];
     const practicalHistory=selectedGameMode===GAME_MODE_PRACTICAL;
 
+    // 今回の順位。スコアが天井（100点）で並ぶと差がつかないため、
+    // 同点は同順位（競技順位）にして「上位に並んでいる」ことだけ示す。
+    const latestRank=1+history.filter(item=>item.score>latest.score).length;
+
+    // 伸びしろ。得点が天井で並んでいても avgWait 等は毎回変わるため、
+    // 自分の直近平均より悪化している指標があれば1つだけ示す。
+    // 履歴が今回だけ、またはどの指標も平均以下なら「特になし」とする。
+    const priorHistory=history.slice(0,-1);
+    let growthPoint="";
+    if(priorHistory.length){
+      const priorAvgWait=averageOf(priorHistory,"avgWait");
+      const priorAvgLong=averageOf(priorHistory,"longWaits");
+      const priorMaxWaitList=priorHistory
+        .map(item=>Number(item.maxWait))
+        .filter(Number.isFinite);
+      const priorAvgMaxWait=priorMaxWaitList.length
+        ? priorMaxWaitList.reduce((sum,v)=>sum+v,0)/priorMaxWaitList.length
+        : 0;
+      const latestMaxWait=Number.isFinite(Number(latest.maxWait))
+        ? Number(latest.maxWait) : 0;
+
+      // (今回-平均)/平均 が最大の指標を選ぶ。平均が0の指標は対象外にする
+      // （0で割ると常に「悪化」扱いになってしまうため）。
+      const candidates=[
+        {label:"平均待機",unit:"分",diff:Number(latest.avgWait||0)-priorAvgWait,base:priorAvgWait},
+        {label:"最長待機",unit:"分",diff:latestMaxWait-priorAvgMaxWait,base:priorAvgMaxWait},
+        {label:"30分以上待機",unit:"件",diff:(latest.longWaits||0)-priorAvgLong,base:priorAvgLong}
+      ].filter(c=>c.base>0 && c.diff>0);
+
+      if(candidates.length){
+        candidates.sort((a,b)=>(b.diff/b.base)-(a.diff/a.base));
+        const top=candidates[0];
+        growthPoint=top.label+"が直近平均より+"+top.diff.toFixed(1)+top.unit;
+      }
+    }
+
     balanceAnalysisBody.innerHTML=
       "<div class='balanceSummaryGrid'>"+
         "<div class='balanceSummaryItem'>対象モード<strong>"+selectedModeLabel()+"</strong></div>"+
@@ -10163,6 +10284,8 @@ try{
         // ここには「表から読み取れないもの」だけを置く。
         "<div class='balanceSummaryItem'>平均点<strong>"+avgScore.toFixed(1)+"点</strong></div>"+
         "<div class='balanceSummaryItem'>S・A評価率<strong>"+Math.round(saRate)+"%</strong></div>"+
+        "<div class='balanceSummaryItem'>今回の順位<strong>"+latestRank+"/"+history.length+"位</strong></div>"+
+        "<div class='balanceSummaryItem'>伸びしろ<strong>"+(growthPoint||"特になし")+"</strong></div>"+
         "<div class='balanceSummaryItem'>30分以上待機<strong>"+avgLong.toFixed(1)+"件/回</strong></div>"+
         "<div class='balanceSummaryItem'>ナース報告率<strong>"+Math.round(reportRate)+"%</strong></div>"+
         "<div class='balanceSummaryItem'>09:00〜10:00 コール<strong>"+avgAMCalls.toFixed(1)+"件/回</strong></div>"+
@@ -11491,9 +11614,11 @@ try{
     // 記録まで終わらない時刻には排泄コールを出さない。
     if(gameMinutes >= recordableEscortCutoff()) return;
 
+    // THIRD_ROUND_CHANCE（連続空振り後の救済）は難易度倍率の対象外にする。
+    // 適応難易度と救済策を重ねると、どちらが効いているか分からなくなるため。
     const baseChance = singleMissStreak >= 2
       ? THIRD_ROUND_CHANCE
-      : SINGLE_CALL_CHANCE;
+      : SINGLE_CALL_CHANCE * dailyCallDifficultyMultiplier;
 
     const candidates = toiletEligibleResidents();
     if(!candidates.length){
@@ -11539,7 +11664,7 @@ try{
 
     const baseChance = doubleMissStreak >= 2
       ? THIRD_ROUND_CHANCE
-      : DOUBLE_CALL_CHANCE;
+      : DOUBLE_CALL_CHANCE * dailyCallDifficultyMultiplier;
 
     const candidates = toiletEligibleResidents();
     if(candidates.length < 2){
@@ -11593,7 +11718,7 @@ try{
 
     if(duplicate) return;
 
-    if(Math.random() < POSITION_CALL_CHANCE){
+    if(Math.random() < POSITION_CALL_CHANCE * dailyCallDifficultyMultiplier){
       startNurseCall(
         dIndex,
         "体の向きを変えてほしい",
@@ -11785,6 +11910,7 @@ try{
       }
     });
     chooseBathTargets();
+    pickDailyBriefNote();
     resetBathWorkflow();
 
     selectedBathTask = null;
