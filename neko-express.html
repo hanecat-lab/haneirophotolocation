@@ -86,6 +86,8 @@
   var RUN_MUL        = 1.7;   // 走行時の前進速度 = beltSpeed * RUN_MUL
                               // 1.7 は「完璧に走ってもベルト位置がじりじりとしか戻らない」値。
                               // 2.0 だと常に最前で張り付き、位置の駆け引きが消える。
+  var JUMP_FWD_MUL   = 1.25;  // ジャンプ中の前進速度 = beltSpeed * JUMP_FWD_MUL
+                              // 1 を超える分だけ「少し前へ跳ぶ」。走る入力を離すと前進はゼロになる
   var JUMP_VY        = -12.0;
   var GRAVITY        = 0.55;
   var CROUCH_FRAMES  = 34;
@@ -130,23 +132,35 @@
 
   function speedForStation(s) { return 2.0 + s * 0.45; }
 
-  // 走行で稼げる純前進量(px/frame)。ジャンプ・しゃがみ中は 0 なので後退する。
+  // 走行で稼げる純前進量(px/frame)。
   function netForward() { return beltSpeed * (RUN_MUL - 1); }
 
-  // 障害物とすれ違うのに要するフレーム数。
-  // 回避動作中(ジャンプ・しゃがみ)は猫も後方へ流されるため、
-  // 相対速度は beltSpeed が打ち消し合って APPROACH だけになる。ここが一番きつい。
-  function dangerFrames(spec) {
-    return Math.ceil((HIT_W + spec.w) / APPROACH);
+  // 回避動作中の純前進量。ジャンプは少し前へ出る(正)、しゃがみは流される(負)。
+  function netJump()   { return beltSpeed * (JUMP_FWD_MUL - 1); }
+  function netCrouch() { return -beltSpeed; }
+
+  function airFrames() { return Math.ceil((-JUMP_VY * 2) / GRAVITY); }
+
+  // 障害物とすれ違うのに要するフレーム数。しゃがみ中は catNet = -beltSpeed で
+  // 打ち消し合い APPROACH だけになる。ここが一番きつい。
+  // 障害物は毎フレーム beltSpeed + APPROACH だけ左へ、猫は catNet だけ右へ動くので、
+  // 両者の間隔は (beltSpeed + APPROACH + catNet) ずつ縮む。
+  function dangerFrames(spec, catNet) {
+    return Math.ceil((HIT_W + spec.w) / (beltSpeed + APPROACH + catNet));
   }
 
   // この速度で成立する最小の障害物間隔(フレーム)。
-  // ジャンプで失う位置を、次の障害物までに走って取り戻せることを保証する。
+  // 回避動作で失った位置を、次の障害物までに走って取り戻せることを保証する。
+  // ジャンプは前へ出るので損をしない。基準になるのは失点の大きいしゃがみ。
+  function actionCostFrames(actFrames, actNet) {
+    var lost = -actNet * actFrames;                   // 動作中に後退する距離(負なら前進)
+    if (lost <= 0) return actFrames;
+    return actFrames + lost / netForward();           // 取り戻すのに要るフレームを足す
+  }
   function minGapFrames() {
-    var airFrames = Math.ceil((-JUMP_VY * 2) / GRAVITY);
-    var lost = airFrames * beltSpeed;                 // 滞空中に後退する距離
-    var recoverFrames = lost / netForward();          // 取り戻すのに要るフレーム
-    return Math.ceil(airFrames + recoverFrames + 12);
+    var jumpCost = actionCostFrames(airFrames(), netJump());
+    var crouchCost = actionCostFrames(CROUCH_FRAMES, netCrouch());
+    return Math.ceil(Math.max(jumpCost, crouchCost) + 12);
   }
 
   // --- 入力 -------------------------------------------------------------
@@ -224,12 +238,17 @@
     if (state === 'playing') {
       beltPhase = (beltPhase + beltSpeed) % 40;
 
-      // 位置: ベルトは常に後方へ押す。走っている間だけ前へ戻せる。
-      var canRun = running && !isJumping && crouchTimer === 0 && stumbleTimer === 0;
-      catX += (canRun ? beltSpeed * RUN_MUL : 0) - beltSpeed;
+      // 位置: ベルトは常に後方へ押す。走る入力を保持している間だけ前へ戻せる。
+      // ジャンプ中も走る入力を保持していれば少し前へ跳ぶ（後方へは流されない）。
+      var forward = 0;
+      if (running && stumbleTimer === 0) {
+        if (isJumping) forward = beltSpeed * JUMP_FWD_MUL;
+        else if (crouchTimer === 0) forward = beltSpeed * RUN_MUL;
+      }
+      catX += forward - beltSpeed;
       if (catX > POS_FRONT) catX = POS_FRONT;
 
-      if (canRun) runPhase += 0.35;
+      if (forward > 0 && !isJumping) runPhase += 0.35;
 
       if (isJumping) {
         vy += GRAVITY;
