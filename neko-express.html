@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>NEKO EXPRESS - ランニングマシン通勤</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #0d1220;
+    color: #e8eefc;
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 6px;
+    overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .wrap { width: 100%; max-width: 820px; display: flex; flex-direction: column; align-items: center; }
+  .title {
+    font-size: 18px; font-weight: 800; letter-spacing: 0.18em;
+    color: #cfe0ff; margin: 2px 0 6px;
+  }
+  canvas {
+    width: 100%; max-width: 800px; height: auto; max-height: 58vh;
+    border: 2px solid #35507f; border-radius: 10px;
+    background: #dfe8f7; display: block; cursor: pointer;
+  }
+  .pad { display: flex; gap: 8px; width: 100%; max-width: 800px; margin-top: 8px; }
+  .pad button {
+    flex: 1; padding: 16px 4px; font-size: 15px; font-weight: 700;
+    border: none; border-radius: 12px; color: #fff;
+    background: #3a4d75; box-shadow: 0 3px 0 #22304d;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  }
+  .pad button:active { transform: translateY(2px); box-shadow: 0 1px 0 #22304d; }
+  #btnRun { flex: 1.6; background: #2f7d4f; box-shadow: 0 3px 0 #1c5233; }
+  #btnRun.on { background: #45b273; }
+  .hint { font-size: 11px; color: #8fa4c8; margin: 8px 4px 0; text-align: center; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="title">NEKO EXPRESS</div>
+  <canvas id="game" width="800" height="460"></canvas>
+  <div class="pad">
+    <button id="btnRun">走る（長押し）</button>
+    <button id="btnJump">ジャンプ</button>
+    <button id="btnCrouch">しゃがむ</button>
+  </div>
+  <p class="hint">
+    ベルトは常に後ろへ流れます。走って位置を保ち、荷物はジャンプ、吊り革はしゃがんで avoid。<br>
+    キーボード: →/D=走る（長押し）  ↑/W/Space=ジャンプ  ↓/S=しゃがむ ／ 画面の長押しでも走れます
+  </p>
+</div>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var DEBUG = /[?&]debug=1/.test(location.search);
+
+  // 古い Safari 向け: roundRect が無い環境では角丸なしで代替する
+  if (!ctx.roundRect) {
+    CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h) {
+      this.rect(x, y, w, h);
+      return this;
+    };
+  }
+
+  // --- ベルトの座標系 ---------------------------------------------------
+  var GROUND_Y   = 340;   // ベルト上面
+  var BELT_LEFT  = 110;   // ベルトの後端（見た目）
+  var BELT_RIGHT = 700;   // ベルトの前端（見た目）
+  var POS_BACK   = 165;   // ここまで下がったら脱落
+  var POS_FRONT  = 620;   // コンソールに当たってこれ以上前へは行けない
+  var WARN_ZONE  = 110;   // 後端からこの距離に入ったら警告
+
+  // --- バランス定数 -----------------------------------------------------
+  var RUN_MUL        = 1.7;   // 走行時の前進速度 = beltSpeed * RUN_MUL
+                              // 1.7 は「完璧に走ってもベルト位置がじりじりとしか戻らない」値。
+                              // 2.0 だと常に最前で張り付き、位置の駆け引きが消える。
+  var JUMP_VY        = -12.0;
+  var GRAVITY        = 0.55;
+  var CROUCH_FRAMES  = 34;
+  var STUMBLE_FRAMES = 50;    // 衝突後に走れないフレーム数
+  var KNOCK_MUL      = 80;    // 衝突で後退する距離 = beltSpeed * KNOCK_MUL
+                              // （速度に比例させないと、速い区間で衝突が無害になる）
+  var STATION_DIST   = 1400;  // 1駅ぶんの距離
+  var STATION_COUNT  = 5;     // 5駅走ると終点
+  var ARRIVE_NOTICE  = 420;   // 終点手前でアナウンスを出す距離
+
+  var CAT_W = 46, CAT_H_STAND = 78, CAT_H_CROUCH = 38;
+  var HIT_W = 34;             // 当たり判定は見た目より細くして理不尽を減らす
+
+  // 障害物: low = ベルト上の荷物(ジャンプで回避) / high = 吊り革(しゃがんで回避)
+  var OBS = {
+    low:  { bottom: 0,  top: 46,  w: 32 },
+    high: { bottom: 46, top: 150, w: 30 }
+  };
+
+  var APPROACH = 3;           // 障害物の接近速度 = beltSpeed + APPROACH
+
+  // --- 状態 -------------------------------------------------------------
+  var state = 'start';   // 'start' | 'playing' | 'over' | 'clear'
+  var catX, jumpY, vy, isJumping, crouchTimer, stumbleTimer;
+  var beltSpeed, distance, station, obstacles, spawnTimer, runPhase, beltPhase;
+  var damageFlash, noticeShown, confetti, bestDistance = 0;
+  var running = false;   // 走る入力が押されているか
+
+  try { bestDistance = parseInt(localStorage.getItem('nekoExpressBest') || '0', 10) || 0; } catch (e) {}
+
+  function reset() {
+    catX = 470;
+    jumpY = 0; vy = 0; isJumping = false;
+    crouchTimer = 0; stumbleTimer = 0;
+    beltSpeed = 2.0;
+    distance = 0; station = 0;
+    obstacles = []; spawnTimer = 90;
+    runPhase = 0; beltPhase = 0;
+    damageFlash = 0; noticeShown = false;
+    confetti = [];
+  }
+
+  function speedForStation(s) { return 2.0 + s * 0.45; }
+
+  // 走行で稼げる純前進量(px/frame)。ジャンプ・しゃがみ中は 0 なので後退する。
+  function netForward() { return beltSpeed * (RUN_MUL - 1); }
+
+  // 障害物とすれ違うのに要するフレーム数。
+  // 回避動作中(ジャンプ・しゃがみ)は猫も後方へ流されるため、
+  // 相対速度は beltSpeed が打ち消し合って APPROACH だけになる。ここが一番きつい。
+  function dangerFrames(spec) {
+    return Math.ceil((HIT_W + spec.w) / APPROACH);
+  }
+
+  // この速度で成立する最小の障害物間隔(フレーム)。
+  // ジャンプで失う位置を、次の障害物までに走って取り戻せることを保証する。
+  function minGapFrames() {
+    var airFrames = Math.ceil((-JUMP_VY * 2) / GRAVITY);
+    var lost = airFrames * beltSpeed;                 // 滞空中に後退する距離
+    var recoverFrames = lost / netForward();          // 取り戻すのに要るフレーム
+    return Math.ceil(airFrames + recoverFrames + 12);
+  }
+
+  // --- 入力 -------------------------------------------------------------
+  function startRun() { running = true; btnRun.classList.add('on'); }
+  function stopRun()  { running = false; btnRun.classList.remove('on'); }
+
+  function doJump() {
+    if (state !== 'playing') { primaryAction(); return; }
+    if (isJumping || crouchTimer > 0) return;
+    isJumping = true; vy = JUMP_VY;
+  }
+  function doCrouch() {
+    if (state !== 'playing') { primaryAction(); return; }
+    if (isJumping || crouchTimer > 0) return;
+    crouchTimer = CROUCH_FRAMES;
+  }
+  function primaryAction() {
+    if (state === 'playing') return;
+    reset();
+    state = 'playing';
+  }
+
+  var btnRun = document.getElementById('btnRun');
+  var btnJump = document.getElementById('btnJump');
+  var btnCrouch = document.getElementById('btnCrouch');
+
+  function bindHold(el, down, up) {
+    el.addEventListener('mousedown', function (e) { e.preventDefault(); down(); });
+    el.addEventListener('mouseup', up);
+    el.addEventListener('mouseleave', up);
+    el.addEventListener('touchstart', function (e) { e.preventDefault(); down(); }, { passive: false });
+    el.addEventListener('touchend', function (e) { e.preventDefault(); up(); }, { passive: false });
+    el.addEventListener('touchcancel', up);
+  }
+  function bindTap(el, fn) {
+    el.addEventListener('mousedown', function (e) { e.preventDefault(); fn(); });
+    el.addEventListener('touchstart', function (e) { e.preventDefault(); fn(); }, { passive: false });
+  }
+
+  bindHold(btnRun, function () { primaryAction(); startRun(); }, stopRun);
+  bindTap(btnJump, doJump);
+  bindTap(btnCrouch, doCrouch);
+  bindHold(canvas, function () { primaryAction(); startRun(); }, stopRun);
+
+  window.addEventListener('keydown', function (e) {
+    if (e.repeat) {
+      if (e.code === 'ArrowRight' || e.code === 'KeyD') e.preventDefault();
+      return;
+    }
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+      e.preventDefault(); primaryAction(); startRun();
+    } else if (e.code === 'ArrowUp' || e.code === 'KeyW' || e.code === 'Space') {
+      e.preventDefault(); doJump();
+    } else if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+      e.preventDefault(); doCrouch();
+    } else if (e.code === 'Enter') {
+      e.preventDefault(); primaryAction();
+    }
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') stopRun();
+  });
+  window.addEventListener('blur', stopRun);
+
+  // --- 更新 -------------------------------------------------------------
+  function catHeight() { return crouchTimer > 0 ? CAT_H_CROUCH : CAT_H_STAND; }
+
+  function spawnObstacle() {
+    var isHigh = Math.random() < 0.45;
+    var spec = isHigh ? OBS.high : OBS.low;
+    obstacles.push({ x: canvas.width + 60, type: isHigh ? 'high' : 'low', w: spec.w });
+  }
+
+  function update() {
+    if (state === 'playing') {
+      beltPhase = (beltPhase + beltSpeed) % 40;
+
+      // 位置: ベルトは常に後方へ押す。走っている間だけ前へ戻せる。
+      var canRun = running && !isJumping && crouchTimer === 0 && stumbleTimer === 0;
+      catX += (canRun ? beltSpeed * RUN_MUL : 0) - beltSpeed;
+      if (catX > POS_FRONT) catX = POS_FRONT;
+
+      if (canRun) runPhase += 0.35;
+
+      if (isJumping) {
+        vy += GRAVITY;
+        jumpY -= vy;
+        if (jumpY <= 0) { jumpY = 0; vy = 0; isJumping = false; }
+      }
+      if (crouchTimer > 0) crouchTimer--;
+      if (stumbleTimer > 0) stumbleTimer--;
+      if (damageFlash > 0) damageFlash--;
+
+      // 進行と駅
+      distance += beltSpeed;
+      var nextStation = Math.min(STATION_COUNT, Math.floor(distance / STATION_DIST));
+      if (nextStation > station) {
+        station = nextStation;
+        beltSpeed = speedForStation(station);
+      }
+      if (!noticeShown && distance >= STATION_COUNT * STATION_DIST - ARRIVE_NOTICE) {
+        noticeShown = true;
+      }
+
+      // 障害物の生成
+      var goalDist = STATION_COUNT * STATION_DIST;
+      spawnTimer--;
+      if (spawnTimer <= 0 && distance < goalDist - ARRIVE_NOTICE) {
+        spawnObstacle();
+        var gap = minGapFrames();
+        spawnTimer = gap + Math.floor(Math.random() * 40) - Math.min(20, station * 5);
+        if (spawnTimer < gap) spawnTimer = gap;
+      }
+
+      // 障害物の移動と当たり判定
+      var closing = beltSpeed + APPROACH;
+      for (var i = obstacles.length - 1; i >= 0; i--) {
+        var o = obstacles[i];
+        o.x -= closing;
+        if (o.x < -100) { obstacles.splice(i, 1); continue; }
+
+        var spec = OBS[o.type];
+        var catL = catX - HIT_W / 2, catR = catX + HIT_W / 2;
+        var obsL = o.x - o.w / 2, obsR = o.x + o.w / 2;
+        if (obsR > catL && obsL < catR) {
+          var catBottom = jumpY, catTop = jumpY + catHeight();
+          if (catTop > spec.bottom && catBottom < spec.top && !o.hit) {
+            o.hit = true;
+            catX -= beltSpeed * KNOCK_MUL;
+            stumbleTimer = STUMBLE_FRAMES;
+            damageFlash = 18;
+            if (isJumping) { isJumping = false; jumpY = 0; vy = 0; }
+            crouchTimer = 0;
+          }
+        }
+      }
+
+      // 終了判定
+      if (catX <= POS_BACK) {
+        state = 'over';
+        stopRun();
+        if (distance > bestDistance) {
+          bestDistance = Math.floor(distance);
+          try { localStorage.setItem('nekoExpressBest', String(bestDistance)); } catch (e) {}
+        }
+      } else if (distance >= goalDist) {
+        state = 'clear';
+        stopRun();
+        triggerConfetti();
+        if (distance > bestDistance) {
+          bestDistance = Math.floor(distance);
+          try { localStorage.setItem('nekoExpressBest', String(bestDistance)); } catch (e) {}
+        }
+      }
+    }
+
+    for (var j = confetti.length - 1; j >= 0; j--) {
+      var c = confetti[j];
+      c.x += c.vx; c.y += c.vy; c.vy += 0.18; c.rot += c.vrot; c.alpha -= 0.006;
+      if (c.alpha <= 0 || c.y > canvas.height + 40) confetti.splice(j, 1);
+    }
+  }
+
+  function triggerConfetti() {
+    var colors = ['#ff5c8a', '#ffd447', '#4cd4b0', '#6aa9ff', '#ffffff', '#ff9a3c'];
+    [180, 400, 620].forEach(function (px) {
+      for (var i = 0; i < 90; i++) {
+        var a = Math.random() * Math.PI - Math.PI / 2;
+        var s = Math.random() * 11 + 3;
+        confetti.push({
+          x: px, y: 150,
+          vx: Math.cos(a) * s * (Math.random() - 0.5) * 2,
+          vy: Math.sin(a) * s - 4,
+          w: Math.random() * 9 + 4, h: Math.random() * 5 + 3,
+          color: colors[Math.floor(Math.random() * colors.length)],
+          alpha: 1, rot: Math.random() * 6.28, vrot: (Math.random() - 0.5) * 0.3
+        });
+      }
+    });
+  }
+
+  // --- 描画 -------------------------------------------------------------
+  function drawBackground() {
+    var g = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    g.addColorStop(0, '#e8f0fb');
+    g.addColorStop(1, '#c7d6ec');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 車窓風の流れる背景（ベルトと同じ速度で流す = 光学的流れの手がかり）
+    ctx.fillStyle = 'rgba(120,150,195,0.30)';
+    for (var i = -1; i < 9; i++) {
+      var bx = ((i * 110) - (beltPhase * 2.2) % 110 + 880) % 880 - 80;
+      var bh = 60 + ((i * 37) % 5) * 22;
+      ctx.fillRect(bx, GROUND_Y - 120 - bh, 74, bh);
+    }
+    ctx.fillStyle = 'rgba(90,120,165,0.25)';
+    ctx.fillRect(0, GROUND_Y - 120, canvas.width, 6);
+  }
+
+  function drawTreadmill() {
+    // 台座
+    ctx.fillStyle = '#8b98ad';
+    ctx.fillRect(BELT_LEFT - 18, GROUND_Y + 44, BELT_RIGHT - BELT_LEFT + 36, 26);
+    // ベルト面
+    ctx.fillStyle = '#2b3346';
+    ctx.fillRect(BELT_LEFT, GROUND_Y, BELT_RIGHT - BELT_LEFT, 46);
+
+    // 距離マーカー（流れが目で見えるようにする）
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(BELT_LEFT, GROUND_Y, BELT_RIGHT - BELT_LEFT, 46);
+    ctx.clip();
+    ctx.fillStyle = 'rgba(255,255,255,0.30)';
+    for (var m = -1; m < 18; m++) {
+      var mx = BELT_LEFT + m * 40 - beltPhase;
+      ctx.fillRect(mx, GROUND_Y + 8, 16, 30);
+    }
+    ctx.restore();
+
+    // 後端の危険帯（薄い帯 = 警告ゾーン、濃い帯 = 脱落ライン）
+    ctx.fillStyle = 'rgba(226,66,66,0.20)';
+    ctx.fillRect(BELT_LEFT, GROUND_Y, POS_BACK + WARN_ZONE - BELT_LEFT, 46);
+    ctx.fillStyle = 'rgba(226,66,66,0.60)';
+    ctx.fillRect(BELT_LEFT, GROUND_Y, POS_BACK - BELT_LEFT, 46);
+
+    // 前方コンソール
+    ctx.fillStyle = '#9fb0c6';
+    ctx.fillRect(BELT_RIGHT, GROUND_Y - 96, 30, 142);
+    ctx.fillStyle = '#1b2436';
+    ctx.fillRect(BELT_RIGHT + 4, GROUND_Y - 88, 22, 40);
+    ctx.fillStyle = '#63e08f';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(beltSpeed.toFixed(1), BELT_RIGHT + 15, GROUND_Y - 62);
+  }
+
+  function drawCat(x, y, h) {
+    // y はベルト面からの高さ、h は現在の全高
+    var baseY = GROUND_Y - y;
+    var crouching = h < CAT_H_STAND;
+    var swing = Math.sin(runPhase) * (crouching ? 4 : 12);
+
+    ctx.save();
+    ctx.translate(x, baseY);
+
+    // しっぽ
+    ctx.strokeStyle = '#f2f4f8';
+    ctx.lineWidth = 9;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-16, -h * 0.55);
+    ctx.quadraticCurveTo(-46, -h * 0.9 - swing * 0.4, -34, -h * 1.15);
+    ctx.stroke();
+
+    // 脚
+    ctx.strokeStyle = '#2b3040';
+    ctx.lineWidth = 8;
+    ctx.beginPath();
+    ctx.moveTo(-4, -h * 0.42);
+    ctx.lineTo(-4 + swing, 0);
+    ctx.moveTo(4, -h * 0.42);
+    ctx.lineTo(4 - swing, 0);
+    ctx.stroke();
+
+    // 胴（スーツ）
+    ctx.fillStyle = '#333a4c';
+    ctx.beginPath();
+    ctx.roundRect(-15, -h * 0.9, 30, h * 0.5, 8);
+    ctx.fill();
+    // シャツ
+    ctx.fillStyle = '#e9eef7';
+    ctx.beginPath();
+    ctx.moveTo(0, -h * 0.88);
+    ctx.lineTo(6, -h * 0.6);
+    ctx.lineTo(-6, -h * 0.6);
+    ctx.closePath();
+    ctx.fill();
+    // ネクタイ
+    ctx.fillStyle = '#4a7c59';
+    ctx.fillRect(-2, -h * 0.82, 4, h * 0.2);
+
+    // 腕
+    ctx.strokeStyle = '#333a4c';
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.moveTo(0, -h * 0.82);
+    ctx.lineTo(12 - swing * 0.6, -h * 0.62);
+    ctx.stroke();
+
+    // 頭
+    ctx.fillStyle = '#f2f4f8';
+    ctx.beginPath();
+    ctx.ellipse(3, -h * 1.02, 15, 13, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // 耳
+    ctx.fillStyle = '#2b3040';
+    ctx.beginPath();
+    ctx.moveTo(-9, -h * 1.11); ctx.lineTo(-4, -h * 1.26); ctx.lineTo(1, -h * 1.10); ctx.closePath();
+    ctx.moveTo(9, -h * 1.11); ctx.lineTo(14, -h * 1.24); ctx.lineTo(16, -h * 1.06); ctx.closePath();
+    ctx.fill();
+    // 目
+    ctx.fillStyle = '#d9b23a';
+    ctx.beginPath();
+    ctx.ellipse(9, -h * 1.05, 3.4, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // ハット
+    ctx.fillStyle = '#6b4c34';
+    ctx.beginPath();
+    ctx.ellipse(3, -h * 1.16, 21, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.roundRect(-7, -h * 1.32, 21, 18, 5);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function drawObstacles() {
+    obstacles.forEach(function (o) {
+      var spec = OBS[o.type];
+      if (o.type === 'low') {
+        ctx.fillStyle = o.hit ? '#a06060' : '#7a5a3a';
+        ctx.beginPath();
+        ctx.roundRect(o.x - spec.w / 2, GROUND_Y - spec.top, spec.w, spec.top, 5);
+        ctx.fill();
+        ctx.fillStyle = '#d8c39a';
+        ctx.fillRect(o.x - spec.w / 2, GROUND_Y - spec.top * 0.62, spec.w, 5);
+      } else {
+        // 吊り革
+        ctx.strokeStyle = '#8a94a8';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.moveTo(o.x, GROUND_Y - spec.top - 40);
+        ctx.lineTo(o.x, GROUND_Y - spec.bottom - 24);
+        ctx.stroke();
+        ctx.strokeStyle = o.hit ? '#c06060' : '#3f4a60';
+        ctx.lineWidth = 7;
+        ctx.beginPath();
+        ctx.ellipse(o.x, GROUND_Y - spec.bottom - 13, 14, 13, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    });
+  }
+
+  function drawPositionGauge() {
+    var gx = BELT_LEFT, gy = GROUND_Y + 86, gw = BELT_RIGHT - BELT_LEFT, gh = 16;
+    ctx.fillStyle = 'rgba(30,42,66,0.20)';
+    ctx.beginPath(); ctx.roundRect(gx, gy, gw, gh, 8); ctx.fill();
+
+    // 危険域
+    var dangerW = POS_BACK + WARN_ZONE - BELT_LEFT;
+    ctx.fillStyle = 'rgba(226,66,66,0.35)';
+    ctx.beginPath(); ctx.roundRect(gx, gy, dangerW, gh, 8); ctx.fill();
+
+    // 現在位置
+    var t = (catX - BELT_LEFT) / (BELT_RIGHT - BELT_LEFT);
+    t = Math.max(0, Math.min(1, t));
+    var px = gx + t * gw;
+    ctx.fillStyle = (catX - POS_BACK < WARN_ZONE) ? '#e24242' : '#2f7d4f';
+    ctx.beginPath(); ctx.arc(px, gy + gh / 2, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#1b2436';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('後', gx + 4, gy - 5);
+    ctx.textAlign = 'right';
+    ctx.fillText('前', gx + gw - 4, gy - 5);
+  }
+
+  function drawHud() {
+    ctx.fillStyle = '#1b2436';
+    ctx.font = 'bold 17px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('距離 ' + Math.floor(distance) + ' m', 16, 30);
+    ctx.textAlign = 'right';
+    ctx.fillText('第 ' + Math.min(station + 1, STATION_COUNT) + ' 区間 / ' + STATION_COUNT, canvas.width - 16, 30);
+    ctx.font = '12px sans-serif';
+    ctx.fillStyle = '#4a5a78';
+    ctx.fillText('BEST ' + bestDistance + ' m', canvas.width - 16, 50);
+
+    if (catX - POS_BACK < WARN_ZONE && state === 'playing') {
+      var pulse = 0.35 + 0.25 * Math.sin(Date.now() / 90);
+      ctx.fillStyle = 'rgba(226,66,66,' + pulse.toFixed(3) + ')';
+      ctx.fillRect(0, 0, 26, canvas.height);
+      ctx.fillStyle = '#c62828';
+      ctx.font = 'bold 22px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('後ろに流されています！ 走れ！', canvas.width / 2, 92);
+    }
+
+    if (damageFlash > 0) {
+      ctx.fillStyle = 'rgba(226,66,66,' + (damageFlash / 60).toFixed(3) + ')';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    if (noticeShown && state === 'playing') {
+      drawAnnounce('まもなく到着します', '#e8811f');
+    }
+  }
+
+  function drawAnnounce(text, color) {
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 34px sans-serif';
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = '#ffffff';
+    ctx.strokeText(text, canvas.width / 2, 145);
+    ctx.fillStyle = color;
+    ctx.fillText(text, canvas.width / 2, 145);
+    ctx.restore();
+  }
+
+  function drawConfetti() {
+    confetti.forEach(function (c) {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, c.alpha);
+      ctx.translate(c.x, c.y);
+      ctx.rotate(c.rot);
+      ctx.fillStyle = c.color;
+      ctx.fillRect(-c.w / 2, -c.h / 2, c.w, c.h);
+      ctx.restore();
+    });
+  }
+
+  function drawOverlay(title, sub, color) {
+    ctx.fillStyle = 'rgba(12,18,32,0.62)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = color;
+    ctx.font = 'bold 40px sans-serif';
+    ctx.fillText(title, canvas.width / 2, 190);
+    ctx.fillStyle = '#e8eefc';
+    ctx.font = '18px sans-serif';
+    sub.split('\n').forEach(function (line, i) {
+      ctx.fillText(line, canvas.width / 2, 236 + i * 30);
+    });
+  }
+
+  function drawDebug() {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.72)';
+    ctx.fillRect(8, canvas.height - 118, 250, 110);
+    ctx.fillStyle = '#7dffb0';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'left';
+    var lines = [
+      'state=' + state + ' running=' + running,
+      'catX=' + catX.toFixed(1) + ' (back=' + POS_BACK + ')',
+      'jumpY=' + jumpY.toFixed(1) + ' crouch=' + crouchTimer,
+      'stumble=' + stumbleTimer + ' beltSpeed=' + beltSpeed.toFixed(2),
+      'net=' + netForward().toFixed(2) + ' minGap=' + minGapFrames(),
+      'dist=' + distance.toFixed(0) + ' obs=' + obstacles.length + ' spawn=' + spawnTimer
+    ];
+    lines.forEach(function (l, i) { ctx.fillText(l, 14, canvas.height - 98 + i * 16); });
+    ctx.restore();
+  }
+
+  function draw() {
+    drawBackground();
+    drawTreadmill();
+
+    if (state === 'start') {
+      drawCat(470, 0, CAT_H_STAND);
+      drawPositionGauge();
+      drawOverlay('NEKO EXPRESS', 'ベルトは常に後ろへ流れます\n「走る」を長押しして位置を保ち、終点まで走りきる\n\n長押し / Enter でスタート', '#ffd447');
+    } else {
+      drawObstacles();
+      drawCat(catX, jumpY, catHeight());
+      drawPositionGauge();
+      drawHud();
+      drawConfetti();
+
+      if (state === 'over') {
+        drawOverlay('ベルトから落ちた', '走行距離 ' + Math.floor(distance) + ' m / BEST ' + bestDistance + ' m\n\n長押し / Enter でもう一度', '#ff7b7b');
+      } else if (state === 'clear') {
+        drawOverlay('到着しました', '終点まで ' + Math.floor(distance) + ' m 完走\n\n長押し / Enter でもう一度', '#7dffb0');
+      }
+    }
+
+    if (DEBUG) drawDebug();
+  }
+
+  function loop() {
+    update();
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  reset();
+  loop();
+
+  // 診断用: ?debug=1 のときだけ内部状態と入力を外へ出す（実機/自動検証で読むため）
+  if (DEBUG) {
+    window.NEKO = {
+      snapshot: function () {
+        return {
+          state: state, catX: catX, jumpY: jumpY,
+          crouch: crouchTimer, stumble: stumbleTimer, running: running,
+          beltSpeed: beltSpeed, distance: distance, station: station,
+          minGap: minGapFrames(),
+          obstacles: obstacles.map(function (o) { return { x: o.x, type: o.type, hit: !!o.hit }; })
+        };
+      },
+      run: function (on) { if (on) { startRun(); } else { stopRun(); } },
+      jump: doJump,
+      crouch: doCrouch,
+      start: primaryAction,
+      consts: { POS_BACK: POS_BACK, POS_FRONT: POS_FRONT, WARN_ZONE: WARN_ZONE, CAT_W: CAT_W, OBS: OBS }
+    };
+  }
+})();
+</script>
+</body>
+</html>
