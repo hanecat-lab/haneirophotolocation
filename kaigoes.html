@@ -6360,21 +6360,67 @@ try{
     });
   }
 
-  // 本日の特記事項。純粋な雰囲気づけの一言で、難易度や判定には一切影響しない。
-  // 実際の難易度調整（コール発生率など）を示唆する文言は、実装が伴うまで使わない。
-  const DAY_BRIEF_NOTES = [
-    "今日は利用者の皆さんも穏やかに過ごされています。",
-    "今朝は少し肌寒く、水分補給のタイミングを意識しましょう。",
-    "本日はレクリエーションの声かけが多めの予定です。",
-    "詰所のナースも今日は特に注意深く見守っています。",
-    "利用者の皆さんは今朝、機嫌よく過ごされています。",
-    "今日は面会にいらっしゃるご家族が多い一日です。"
-  ];
-  let dailyBriefNote = DAY_BRIEF_NOTES[0];
+  // 本日の特記事項＋適応難易度。
+  //
+  // 文言だけを飾りにすると「コール発生率がやや高め」のような
+  // 実装の伴わない嘘の告知になる（過去に一度それをやりかけて外した）。
+  // ここでは逆に、直近の実績から難易度の階層を先に決め、
+  // その階層に合った文言を選ぶ。文言は必ず実際の値と一致する。
+  //
+  // 階層は3つ、コール発生確率への倍率は 0.90〜1.15 に収める。
+  // 一度に大きく振れると「理不尽な難易度」に転じるため、上げ幅は
+  // 控えめにし、直近3回の実績だけを見る（1回の当たり外れで暴れない）。
+  const DAY_DIFFICULTY_TIERS = {
+    calm:{
+      multiplier:0.90,
+      texts:[
+        "最近は大変だったようです。本日はいつもよりゆったりめの一日になりそうです。",
+        "無理せずいきましょう。本日はコール対応がやや少なめになりそうです。",
+        "少し落ち着いて取り組める一日になりそうです。"
+      ]
+    },
+    neutral:{
+      multiplier:1.00,
+      texts:[
+        "今日は利用者の皆さんも穏やかに過ごされています。",
+        "今朝は少し肌寒く、水分補給のタイミングを意識しましょう。",
+        "本日はレクリエーションの声かけが多めの予定です。",
+        "詰所のナースも今日は特に注意深く見守っています。",
+        "利用者の皆さんは今朝、機嫌よく過ごされています。",
+        "今日は面会にいらっしゃるご家族が多い一日です。"
+      ]
+    },
+    busy:{
+      multiplier:1.15,
+      texts:[
+        "最近の対応が手際よく、本日はナースコールがやや多めになりそうです。",
+        "頼れる働きぶりが続いています。本日は少し忙しい一日になるかもしれません。",
+        "最近絶好調ですね。今日はコール対応の場面が増えそうです。"
+      ]
+    }
+  };
+
+  let dailyBriefNote = DAY_DIFFICULTY_TIERS.neutral.texts[0];
+  let dailyCallDifficultyMultiplier = 1;
+
+  // 直近3回（このモードで保存された分だけ）の実績から階層を決める。
+  // 2回未満しかなければ傾向を判断できないので neutral のまま。
+  function dailyDifficultyTierFromHistory(){
+    const recent = readBalanceHistory(selectedGameMode).slice(-3);
+    if(recent.length < 2) return "neutral";
+
+    const avgScore = recent.reduce((sum,item)=>sum+(Number(item.score)||0),0) / recent.length;
+    const avgWait = recent.reduce((sum,item)=>sum+(Number(item.avgWait)||0),0) / recent.length;
+
+    if(avgScore >= 97 && avgWait < 16) return "busy";
+    if(avgScore < 80) return "calm";
+    return "neutral";
+  }
 
   function pickDailyBriefNote(){
-    dailyBriefNote =
-      DAY_BRIEF_NOTES[Math.floor(Math.random()*DAY_BRIEF_NOTES.length)];
+    const tier = DAY_DIFFICULTY_TIERS[dailyDifficultyTierFromHistory()];
+    dailyCallDifficultyMultiplier = tier.multiplier;
+    dailyBriefNote = tier.texts[Math.floor(Math.random()*tier.texts.length)];
   }
 
   function chooseBathTargets(){
@@ -6521,8 +6567,12 @@ try{
     pauseBtn.classList.remove("paused");
   });
 
+  // pickDailyBriefNote() はここでは呼ばない。直近実績（readBalanceHistory）を
+  // 参照するが、その定義は本ファイルの後方にあり、モジュール初期化のこの時点では
+  // まだ TDZ で参照できない。表示は resetDay ハンドラ側の呼び出しだけで行われ、
+  // そちらは常にモード選択のクリック後＝モジュール初期化完了後に実行されるため、
+  // ここで呼ばなくても実害はない（宣言時の既定値 neutral がそれまでの間使われる）。
   chooseBathTargets();
-  pickDailyBriefNote();
 
   let activeRoutineTask = null;
   let routineWorkTask = null; // 実施開始した個別業務を完了まで固定
@@ -11558,9 +11608,11 @@ try{
     // 記録まで終わらない時刻には排泄コールを出さない。
     if(gameMinutes >= recordableEscortCutoff()) return;
 
+    // THIRD_ROUND_CHANCE（連続空振り後の救済）は難易度倍率の対象外にする。
+    // 適応難易度と救済策を重ねると、どちらが効いているか分からなくなるため。
     const baseChance = singleMissStreak >= 2
       ? THIRD_ROUND_CHANCE
-      : SINGLE_CALL_CHANCE;
+      : SINGLE_CALL_CHANCE * dailyCallDifficultyMultiplier;
 
     const candidates = toiletEligibleResidents();
     if(!candidates.length){
@@ -11606,7 +11658,7 @@ try{
 
     const baseChance = doubleMissStreak >= 2
       ? THIRD_ROUND_CHANCE
-      : DOUBLE_CALL_CHANCE;
+      : DOUBLE_CALL_CHANCE * dailyCallDifficultyMultiplier;
 
     const candidates = toiletEligibleResidents();
     if(candidates.length < 2){
@@ -11660,7 +11712,7 @@ try{
 
     if(duplicate) return;
 
-    if(Math.random() < POSITION_CALL_CHANCE){
+    if(Math.random() < POSITION_CALL_CHANCE * dailyCallDifficultyMultiplier){
       startNurseCall(
         dIndex,
         "体の向きを変えてほしい",
