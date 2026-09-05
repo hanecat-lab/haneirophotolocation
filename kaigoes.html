@@ -1841,7 +1841,7 @@ try{
   // ================================================================
   // 実機での動作確認時に「最新コードを読み込めているか」を
   // 切り分けるための識別子。音声関連の修正をpushするたびに更新する。
-  const AUDIO_BUILD_ID="audiofix-9";
+  const AUDIO_BUILD_ID="audiofix-10";
 
   const SOUND_STORAGE_KEY="careShiftSoundEnabled";
   // 0.35から15%引き上げ。
@@ -1996,12 +1996,13 @@ try{
       "padding:8px 12px;font-size:12px;background:#c0392b;color:#fff;"+
       "border:none;border-radius:6px;";
     testBtn.addEventListener("click",()=>{
-      const wasBgmPlaying=typeof bgmAudio!=="undefined" && bgmAudio && !bgmAudio.paused;
-      if(wasBgmPlaying) bgmAudio.pause();
+      const hadGainNode=typeof bgmGainNode!=="undefined" && !!bgmGainNode;
+      const prevGain=hadGainNode ? bgmGainNode.gain.value : null;
+      if(hadGainNode) bgmGainNode.gain.value=0;
       unlockAudio();
       playNurseCallChime();
-      if(wasBgmPlaying){
-        setTimeout(()=>{ bgmAudio.play().catch(()=>{}); },1200);
+      if(hadGainNode){
+        setTimeout(()=>{ bgmGainNode.gain.value=prevGain; },1200);
       }
     });
     document.body.appendChild(testBtn);
@@ -2009,12 +2010,12 @@ try{
     setInterval(()=>{
       const ctxState=audioCtx ? audioCtx.state : "(no audioCtx)";
       const sampleRate=audioCtx ? audioCtx.sampleRate : "(no audioCtx)";
-      const bgmConnected=typeof bgmSourceNode!=="undefined" && !!bgmSourceNode;
-      const bgmPaused=(typeof bgmAudio!=="undefined" && bgmAudio) ? bgmAudio.paused : "(no bgmAudio)";
-      const bgmCurrentTime=(typeof bgmAudio!=="undefined" && bgmAudio) ? bgmAudio.currentTime.toFixed(2) : "(no bgmAudio)";
-      const bgmReadyState=(typeof bgmAudio!=="undefined" && bgmAudio) ? bgmAudio.readyState : "(no bgmAudio)";
-      const bgmVolume=(typeof bgmAudio!=="undefined" && bgmAudio) ? bgmAudio.volume.toFixed(3) : "(no bgmAudio)";
       const bgmGain=(typeof bgmGainNode!=="undefined" && bgmGainNode) ? bgmGainNode.gain.value.toFixed(3) : "(no bgmGainNode)";
+      const bgmBufferState=(typeof bgmBuffer!=="undefined" && bgmBuffer)
+        ? "loaded duration="+bgmBuffer.duration.toFixed(2)+"s"
+        : (typeof bgmBufferLoading!=="undefined" && bgmBufferLoading ? "loading" : "not loaded");
+      const bgmActiveCount=(typeof bgmActiveSources!=="undefined") ? bgmActiveSources.length : "(n/a)";
+      const bgmPlaying=(typeof bgmPlaybackActive!=="undefined") ? bgmPlaybackActive : "(n/a)";
       const openCalls=(typeof totalOpenCalls==="function") ? totalOpenCalls() : "(n/a)";
       const chimeDuckActive=(typeof bgmChimeDuckUntil!=="undefined") ? (Date.now()<bgmChimeDuckUntil) : "(n/a)";
       pre.textContent=
@@ -2030,11 +2031,9 @@ try{
         "playTone lastError: "+audioDebugInfo.playToneLastError+"\n"+
         "chime calls: "+audioDebugInfo.chimeCalls+
           " lastAt: "+audioDebugInfo.chimeLastAt+"\n"+
-        "bgmSourceNode connected: "+bgmConnected+"\n"+
-        "bgmAudio.paused: "+bgmPaused+
-          " currentTime: "+bgmCurrentTime+
-          " readyState: "+bgmReadyState+"\n"+
-        "bgmAudio.volume: "+bgmVolume+
+        "bgmPlaybackActive: "+bgmPlaying+
+          " bgmBuffer: "+bgmBufferState+"\n"+
+        "bgmActiveSources: "+bgmActiveCount+
           " bgmGainNode.gain: "+bgmGain+"\n"+
         "totalOpenCalls: "+openCalls+
           " chimeDuckActive: "+chimeDuckActive;
@@ -2062,49 +2061,106 @@ try{
   const BGM_VOLUME_CHIME_DUCK=0.02;
   // 急に音量が変わるとノイズっぽく聞こえるため、1秒程度かけて滑らかに寄せる。
   const BGM_FADE_PER_SECOND=0.8;
+  // ループの継ぎ目を1.5秒かけてクロスフェードする。
+  const BGM_CROSSFADE_SEC=1.5;
 
-  let bgmStarted=false;
-  let bgmSourceNode=null;
   let bgmGainNode=null;
   let bgmChimeDuckUntil=0;
+  let bgmPlaybackActive=false;
+  let bgmBuffer=null;
+  let bgmBufferLoading=false;
+  let bgmLoopGeneration=0;
+  const bgmActiveSources=[];
 
   // iOS/Safari は「<audio>要素の再生」と「AudioContextの合成音」を
   // 別々の音声セッションとして扱い、前者が再生中だと後者（コール音）が
-  // 無音化されることがある。BGMのaudio要素をコール音と同じAudioContextの
-  // グラフに接続し、同一セッションにまとめて無音化を防ぐ。
-  // 実機確認の結果、Safari/WebKitはcreateMediaElementSourceで接続した
-  // 要素の.volumeプロパティを無視する（常に1.0扱いになり、ダッキングが
-  // 全く効かなかった）ため、音量制御はGainNodeで行う。
-  function connectBgmToAudioGraph(){
-    if(!bgmAudio || !audioCtx || bgmSourceNode) return;
-    try{
-      bgmSourceNode=audioCtx.createMediaElementSource(bgmAudio);
-      bgmGainNode=audioCtx.createGain();
-      bgmGainNode.gain.value=BGM_VOLUME_NORMAL;
-      bgmSourceNode.connect(bgmGainNode);
-      bgmGainNode.connect(audioCtx.destination);
-    }catch(_){
-      // 接続できなくても要素単体の再生は継続する。
-    }
+  // 無音化されることがある。実機確認の結果、Safari/WebKitは
+  // createMediaElementSourceで接続した要素の.volumeも無視する
+  // （常に1.0扱いになり、ダッキングが全く効かなかった）。
+  // このためBGMは<audio>要素を直接再生せず、同じ音源をデコードした
+  // AudioBufferをAudioContext上でGainNode経由で再生する。
+  // ループの継ぎ目のクロスフェードも、この方式でないと作れない。
+  function ensureBgmGainNode(){
+    if(bgmGainNode || !audioCtx) return;
+    bgmGainNode=audioCtx.createGain();
+    bgmGainNode.gain.value=BGM_VOLUME_NORMAL;
+    bgmGainNode.connect(audioCtx.destination);
+  }
+
+  function loadBgmBuffer(){
+    if(bgmBuffer || bgmBufferLoading || !audioCtx || !bgmAudio || !bgmAudio.src) return;
+    bgmBufferLoading=true;
+    fetch(bgmAudio.src)
+      .then(res=>res.arrayBuffer())
+      .then(data=>audioCtx.decodeAudioData(data))
+      .then(buffer=>{
+        bgmBuffer=buffer;
+        bgmBufferLoading=false;
+        if(bgmPlaybackActive){
+          scheduleBgmLoop(audioCtx.currentTime+0.05,bgmLoopGeneration);
+        }
+      })
+      .catch(()=>{
+        // 読み込み・デコードに失敗してもゲーム進行は止めない。
+        bgmBufferLoading=false;
+      });
+  }
+
+  // 1周分を再生予約し、終了のBGM_CROSSFADE_SEC秒前に次の1周を
+  // 重ねて開始することでクロスフェードループにする。
+  function scheduleBgmLoop(startTime,generation){
+    if(!bgmBuffer || !bgmGainNode || generation!==bgmLoopGeneration) return;
+
+    const duration=bgmBuffer.duration;
+    const fade=Math.min(BGM_CROSSFADE_SEC,duration/2);
+
+    const source=audioCtx.createBufferSource();
+    source.buffer=bgmBuffer;
+    const fadeGain=audioCtx.createGain();
+    source.connect(fadeGain);
+    fadeGain.connect(bgmGainNode);
+
+    fadeGain.gain.setValueAtTime(0,startTime);
+    fadeGain.gain.linearRampToValueAtTime(1,startTime+fade);
+    fadeGain.gain.setValueAtTime(1,startTime+duration-fade);
+    fadeGain.gain.linearRampToValueAtTime(0,startTime+duration);
+
+    source.start(startTime);
+    source.stop(startTime+duration+0.05);
+    bgmActiveSources.push(source);
+    source.onended=()=>{
+      const idx=bgmActiveSources.indexOf(source);
+      if(idx>=0) bgmActiveSources.splice(idx,1);
+      try{ source.disconnect(); fadeGain.disconnect(); }catch(_){}
+    };
+
+    const nextStart=startTime+duration-fade;
+    const delayMs=Math.max(0,(nextStart-audioCtx.currentTime-0.5)*1000);
+    setTimeout(()=>{ scheduleBgmLoop(nextStart,generation); },delayMs);
   }
 
   // iOS/Safari はユーザー操作の中でしか再生を開始できない。
   // 効果音の unlockAudio() と同じジェスチャ（モード選択タップ／
   // 画面の初回タップ）から呼ぶ。
   function startBgm(){
-    if(!bgmAudio || !soundEnabled || bgmStarted) return;
-    connectBgmToAudioGraph();
-    bgmStarted=true;
-    bgmAudio.play().catch(()=>{
-      // 自動再生ポリシーで拒否された場合は、次のジェスチャで再試行する。
-      bgmStarted=false;
-    });
+    if(!bgmAudio || !soundEnabled || bgmPlaybackActive || !audioCtx) return;
+    ensureBgmGainNode();
+    bgmPlaybackActive=true;
+    bgmLoopGeneration++;
+    if(bgmBuffer){
+      scheduleBgmLoop(audioCtx.currentTime+0.05,bgmLoopGeneration);
+    }else{
+      loadBgmBuffer();
+    }
   }
 
   function stopBgm(){
-    if(!bgmAudio) return;
-    bgmStarted=false;
-    bgmAudio.pause();
+    bgmPlaybackActive=false;
+    bgmLoopGeneration++;
+    bgmActiveSources.forEach(source=>{
+      try{ source.stop(); }catch(_){}
+    });
+    bgmActiveSources.length=0;
   }
 
   // 毎フレーム呼ぶ。コールが1件でも開いていれば音量を絞る。
