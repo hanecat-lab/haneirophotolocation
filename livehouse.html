@@ -296,7 +296,10 @@
       camera.position.add(move);controls.target.add(move);controls.update();markCameraCustom();
     }
     let lookPointerId=null,lookYaw=0,lookPolar=Math.PI/2,lookDistance=4,lastLookX=0,lastLookY=0;
+    let cameraGesture='idle',pinchStartSpan=0,pinchStartDistance=0;
+    const touchPointers=new Map();
     const lookAnchor=new THREE.Vector3(),lookTargetAnchor=new THREE.Vector3();
+    const pinchTargetAnchor=new THREE.Vector3(),pinchDirection=new THREE.Vector3();
     function readLookDirection(){
       const direction=controls.target.clone().sub(camera.position);
       lookDistance=THREE.MathUtils.clamp(direction.length(),.65,28);direction.normalize();
@@ -309,27 +312,80 @@
       controls.target.copy(lookAnchor).add(direction.multiplyScalar(lookDistance));
       camera.lookAt(controls.target);markCameraCustom();
     }
-    renderer.domElement.addEventListener('pointerdown',e=>{
-      if(cameraMode!=='fps'||e.button!==0)return;
+    function capturePointer(id){try{renderer.domElement.setPointerCapture(id)}catch(_){}}
+    function releasePointer(id){try{if(renderer.domElement.hasPointerCapture(id))renderer.domElement.releasePointerCapture(id)}catch(_){}}
+    function beginLook(e){
       lookAnchor.copy(camera.position);lookTargetAnchor.copy(controls.target);
       controls.enableDamping=false;controls.update();camera.position.copy(lookAnchor);controls.target.copy(lookTargetAnchor);camera.lookAt(controls.target);
-      readLookDirection();lookPointerId=e.pointerId;lastLookX=e.clientX;lastLookY=e.clientY;controls.enabled=false;
-      renderer.domElement.setPointerCapture(e.pointerId);renderer.domElement.style.cursor='grabbing';
+      readLookDirection();lookPointerId=e.pointerId;lastLookX=e.clientX;lastLookY=e.clientY;cameraGesture='look';controls.enabled=false;
+      capturePointer(e.pointerId);renderer.domElement.style.cursor='grabbing';
+    }
+    function touchPair(){return [...touchPointers.values()].slice(0,2)}
+    function touchSpan(){const p=touchPair();return p.length<2?0:Math.hypot(p[1].x-p[0].x,p[1].y-p[0].y)}
+    function beginPinch(){
+      if(touchPointers.size<2)return;
+      // 2本目が触れた時点の画角を基準にし、1本指の視点振りを即座に終了する。
+      lookPointerId=null;cameraGesture='pinch';controls.enabled=false;controls.enableDamping=false;
+      pinchStartSpan=Math.max(12,touchSpan());
+      pinchTargetAnchor.copy(controls.target);
+      pinchDirection.copy(camera.position).sub(controls.target);
+      pinchStartDistance=THREE.MathUtils.clamp(pinchDirection.length(),controls.minDistance,controls.maxDistance);
+      if(pinchDirection.lengthSq()<1e-8)pinchDirection.set(0,0,1);else pinchDirection.normalize();
+      renderer.domElement.style.cursor='';
+    }
+    function applyPinch(){
+      const span=touchSpan();if(span<4)return;
+      // 指を広げると接近、閉じると後退。焦点距離の設定値は変えない。
+      const distance=THREE.MathUtils.clamp(pinchStartDistance*pinchStartSpan/span,controls.minDistance,controls.maxDistance);
+      controls.target.copy(pinchTargetAnchor);
+      camera.position.copy(pinchTargetAnchor).addScaledVector(pinchDirection,distance);
+      camera.lookAt(controls.target);markCameraCustom();
+    }
+    renderer.domElement.addEventListener('pointerdown',e=>{
+      if(cameraMode!=='fps')return;
+      if(e.pointerType==='touch'){
+        touchPointers.set(e.pointerId,{x:e.clientX,y:e.clientY});capturePointer(e.pointerId);
+        if(touchPointers.size===1)beginLook(e);else if(touchPointers.size===2)beginPinch();
+        e.preventDefault();return;
+      }
+      if(e.button!==0)return;
+      beginLook(e);
     });
     renderer.domElement.addEventListener('pointermove',e=>{
-      if(e.pointerId!==lookPointerId||cameraMode!=='fps')return;
+      if(cameraMode!=='fps')return;
+      if(e.pointerType==='touch'){
+        if(!touchPointers.has(e.pointerId))return;
+        touchPointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+        if(cameraGesture==='pinch'&&touchPointers.size>=2)applyPinch();
+        else if(cameraGesture==='look'&&e.pointerId===lookPointerId){
+          const dx=e.clientX-lastLookX,dy=e.clientY-lastLookY;lastLookX=e.clientX;lastLookY=e.clientY;
+          lookYaw+=dx*.004;lookPolar=THREE.MathUtils.clamp(lookPolar+dy*.004,controls.minPolarAngle,controls.maxPolarAngle);applyLookDirection();
+        }
+        e.preventDefault();return;
+      }
+      if(e.pointerId!==lookPointerId||cameraGesture!=='look')return;
       const dx=e.clientX-lastLookX,dy=e.clientY-lastLookY;lastLookX=e.clientX;lastLookY=e.clientY;
       lookYaw+=dx*.004;lookPolar=THREE.MathUtils.clamp(lookPolar+dy*.004,controls.minPolarAngle,controls.maxPolarAngle);
       applyLookDirection();e.preventDefault();
     });
-    function finishLook(e){
-      if(e.pointerId!==lookPointerId)return;
-      lookPointerId=null;camera.position.copy(lookAnchor);camera.lookAt(controls.target);
+    function finishCameraGesture(){
+      lookPointerId=null;cameraGesture='idle';camera.lookAt(controls.target);
       controls.enabled=true;controls.update();controls.enableDamping=true;renderer.domElement.style.cursor='';
-      if(renderer.domElement.hasPointerCapture(e.pointerId))renderer.domElement.releasePointerCapture(e.pointerId);
       saveSettings();
     }
-    renderer.domElement.addEventListener('pointerup',finishLook);renderer.domElement.addEventListener('pointercancel',finishLook);
+    function finishPointer(e){
+      if(e.pointerType==='touch'){
+        if(!touchPointers.has(e.pointerId))return;
+        touchPointers.delete(e.pointerId);releasePointer(e.pointerId);
+        // ピンチ後に1本だけ残った指では視点を急に動かさず、全て離すまで待つ。
+        if(cameraGesture==='pinch'&&touchPointers.size===1)cameraGesture='pinch-wait';
+        if(touchPointers.size===0)finishCameraGesture();
+        e.preventDefault();return;
+      }
+      if(e.pointerId!==lookPointerId)return;
+      releasePointer(e.pointerId);finishCameraGesture();
+    }
+    renderer.domElement.addEventListener('pointerup',finishPointer);renderer.domElement.addEventListener('pointercancel',finishPointer);
 
     const material=new THREE.MeshStandardMaterial({color:'#d6d7d2',roughness:.76,metalness:.015});
     // 新アイドルの顔・首・手足を同一の肌材質に統一。標準体型の材質は変更しない。
