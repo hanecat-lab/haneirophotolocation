@@ -1818,10 +1818,12 @@
     const SWATCHES=['#fff4e0','#ffcc88','#ff2a2a','#ff7fca','#2a7fff','#8a2aff','#2aff8a','#ffcc44'];
 
     /* --- 卓の状態 -------------------------------------------------------- */
+    const LIGHTING_FRAME_VERSION=1;
+    const LIGHTING_STATE_VERSION=2;
     const board={
       sceneId:'band', bright:70, tilt:-25, soft:62, frontFill:58, blackout:false, smoke:false, rainbow:false,beamStyle:'diffuse',
       group:'all', color:'#fff4e0',
-      subjectSpot:{on:true,level:45},
+      subjectSpot:{on:true,level:45,policy:'follow'},
       show:{mode:'blinder',speed:1,level:80,fade:.55,spread:70,loop:true,keepSpot:true,playing:false},
       chase:{mode:'front-back',speed:1.2,fade:0.6,loop:true,playing:false},
       blink:{mode:'all',speed:1.8,playing:false},
@@ -1947,39 +1949,31 @@
       if(mode==='blackout-hit')return amount*showBlackoutPulse(t);
       return 1;
     }
-    // 0〜1。マスター明るさ・灯体レベル・ブラックアウト・チェイス・ブリンクをすべて含む
-    function levelAt(i,t){
-      const s=board.fixtures[i];
-      if(!s.on||board.blackout) return 0;
-      const frontScale=RIG[i].role==='foh'?board.frontFill/100:1;
-      // ステージ中央の逆光ムービング2灯は、他灯より実効出力を10%抑える。
-      const centralBackScale=RIG[i].type==='moving'&&RIG[i].role==='stage'?.9:1;
-      const sequence=board.show.playing?showLevelAt(i,t):chaseMul(i,t)*blinkMul(i,t);
-      return (board.bright/100)*frontScale*centralBackScale*(s.level/100)*sequence;
-    }
-    // 独立フォロースポット。チェイス／ブリンクは通さず、マスターとブラックアウトだけに従う。
+    /* --- フレーム単位の照明合成 ----------------------------------------
+       すべての描画・測光は、この関数が返す同一フレームを参照する。
+       明るさは同じ優先層内でHTP、色と照準は優先度＋開始時刻によるLTP。
+       消灯マスク、ブラックアウト、マスターは最後に適用する。 */
     const SUBJECT_SPOT_LUX=110;
-    function subjectSpotLux(){
-      const showAllowsSpot=!board.show.playing||board.show.keepSpot;
-      return board.subjectSpot.on&&!board.blackout&&showAllowsSpot
-        ?SUBJECT_SPOT_LUX*(board.bright/100)*(board.subjectSpot.level/100):0;
-    }
+    const LAYER_PRIORITY=Object.freeze({base:10,movement:20,accent:30,subjectSpot:40,safety:100});
     const _c=new THREE.Color();
-    function colorAt(i,t){
-      const f=RIG[i],base=board.rainbow
+    function baseColorAt(i,t){
+      return board.rainbow
         ?_c.setHSL(((t*.18)+orderIdx[i]/N*.3)%1,.85,.6).clone()
         :new THREE.Color(board.fixtures[i].color);
-      if(board.show.playing&&board.show.mode==='wash-white'){
+    }
+    function showColorOverrideAt(i,t){
+      const f=RIG[i];
+      if(!board.show.playing)return null;
+      if(board.show.mode==='wash-white'){
         const accent=f.type==='moving'||(f.role==='foh'&&f.col>=2&&f.col<=3);
         if(accent&&showWhitePulse(t)>.08)return new THREE.Color('#fff8e8');
       }
-      if(board.show.playing&&board.show.mode==='blackout-hit'&&showBlackoutPulse(t)>.01)return new THREE.Color('#fff8ee');
-      return base;
+      if(board.show.mode==='blackout-hit'&&showBlackoutPulse(t)>.01)return new THREE.Color('#fff8ee');
+      return null;
     }
-
-    function showAimOf(i,t){
-      const f=RIG[i],base=aimOf(f);
-      if(!board.show.playing||f.type!=='moving')return base;
+    function showAimOverrideAt(i,t){
+      const f=RIG[i];
+      if(!board.show.playing||f.type!=='moving')return null;
       const spread=board.show.spread/100,e=showElapsed(t);
       if(board.show.mode==='fan'){
         const open=board.show.loop ? .5-.5*Math.cos(e*Math.PI*.55) : THREE.MathUtils.clamp(e*.55,0,1);
@@ -1989,23 +1983,93 @@
         const opposite=f.pos.x<0?1:-1,sweep=Math.sin(e*1.15+f.row*.8)*.38*spread;
         return V3(opposite*(1.05+1.05*spread)+sweep,.42,-.58);
       }
-      return base;
+      return null;
     }
+    function baseFixtureRequest(i,t){
+      const f=RIG[i],s=board.fixtures[i];
+      const frontScale=f.role==='foh'?board.frontFill/100:1;
+      // ステージ中央の逆光ムービング2灯は、他灯より実効出力を10%抑える。
+      const centralBackScale=f.type==='moving'&&f.role==='stage'?.9:1;
+      return{layer:'base',priority:LAYER_PRIORITY.base,startedAt:0,replacesLevel:false,
+        level:frontScale*centralBackScale*(s.level/100),forceOff:false,
+        enabled:!!s.on,color:baseColorAt(i,t),aim:aimOf(f)};
+    }
+    function movementFixtureRequest(i,t,base){
+      if(!board.chase.playing&&!board.blink.playing)return null;
+      const multiplier=chaseMul(i,t)*blinkMul(i,t);
+      return{layer:'movement',priority:LAYER_PRIORITY.movement,startedAt:0,replacesLevel:true,
+        level:base.level*multiplier,forceOff:multiplier<=1e-7,color:null,aim:null};
+    }
+    function accentFixtureRequest(i,t,base){
+      if(!board.show.playing)return null;
+      const multiplier=showLevelAt(i,t);
+      return{layer:'accent',priority:LAYER_PRIORITY.accent,startedAt:showStart,replacesLevel:true,
+        level:base.level*multiplier,forceOff:multiplier<=1e-7,
+        color:showColorOverrideAt(i,t),aim:showAimOverrideAt(i,t)};
+    }
+    function activeLevelRequests(requests){
+      const replacements=requests.filter(r=>r&&r.replacesLevel);
+      const candidates=replacements.length?replacements:requests.filter(r=>r&&Number.isFinite(r.level));
+      const priority=candidates.reduce((p,r)=>Math.max(p,r.priority),-Infinity);
+      return candidates.filter(r=>r.priority===priority);
+    }
+    function htpLevel(requests){
+      return requests.reduce((level,r)=>Math.max(level,Number.isFinite(r.level)?Math.max(0,r.level):0),0);
+    }
+    function ltpValue(requests,key,fallback){
+      let chosen=null;
+      for(const r of requests){
+        if(!r||r[key]===null||r[key]===undefined)continue;
+        if(!chosen||r.priority>chosen.priority||(r.priority===chosen.priority&&r.startedAt>=chosen.startedAt))chosen=r;
+      }
+      const value=chosen?chosen[key]:fallback;
+      return value&&typeof value.clone==='function'?value.clone():value;
+    }
+    function composeLightingFrame(t){
+      const master=THREE.MathUtils.clamp(board.bright/100,0,1),blackout=!!board.blackout;
+      const fixtures=RIG.map((f,i)=>{
+        const base=baseFixtureRequest(i,t),movement=movementFixtureRequest(i,t,base),accent=accentFixtureRequest(i,t,base);
+        const requests=[base,movement,accent].filter(Boolean),levelRequests=activeLevelRequests(requests);
+        const offMask=levelRequests.some(r=>r.forceOff),manualOff=!base.enabled;
+        const preMaster=offMask?0:htpLevel(levelRequests);
+        const level=manualOff||blackout?0:THREE.MathUtils.clamp(preMaster*master,0,1);
+        return{id:f.id,level,preMaster,color:ltpValue(requests,'color',base.color),
+          aim:ltpValue(requests,'aim',base.aim),forceOff:offMask||manualOff||blackout,
+          sourceLayer:levelRequests[0]?.layer||'base'};
+      });
+      const requestedPolicy=['maintain','follow','off'].includes(board.subjectSpot.policy)?board.subjectSpot.policy:'follow';
+      const followOn=board.show.playing?board.show.keepSpot:board.subjectSpot.on;
+      const spotEnabled=requestedPolicy==='maintain'||(requestedPolicy==='follow'&&followOn);
+      const spotLevel=THREE.MathUtils.clamp(board.subjectSpot.level/100,0,1);
+      const subjectLux=spotEnabled&&!blackout?SUBJECT_SPOT_LUX*spotLevel*master:0;
+      const blinderRaw=board.show.playing&&board.show.mode==='blinder'
+        ?showBlinderPulse(t)*(board.show.level/100):0;
+      const blinderLevel=blackout?0:THREE.MathUtils.clamp(blinderRaw*master,0,1);
+      return{version:LIGHTING_FRAME_VERSION,time:t,fixtures,
+        subjectSpot:{policy:requestedPolicy,enabled:spotEnabled&&!blackout,level:spotLevel,lux:subjectLux,sourceLayer:'subjectSpot'},
+        blinder:{level:blinderLevel,sourceLayer:'accent'},
+        safety:{master,blackout,outputCap:1}};
+    }
+    // 既存APIは合成済みフレームを読む互換ラッパーとして残す。
+    function levelAt(i,t){return composeLightingFrame(t).fixtures[i].level}
+    function colorAt(i,t){return composeLightingFrame(t).fixtures[i].color.clone()}
+    function showAimOf(i,t){return composeLightingFrame(t).fixtures[i].aim.clone()}
+    function subjectSpotLux(t=0){return composeLightingFrame(t).subjectSpot.lux}
 
     /* --- 被写体面の照度 --------------------------------------------------
        コーン内かどうかを角度で判定し、逆二乗で距離減衰させる。単位は lx。 */
-    function luxOf(i,t){
-      const f=RIG[i], lv=levelAt(i,t);
+    function luxOf(i,t,frame=null){
+      const f=RIG[i],state=(frame||composeLightingFrame(t)).fixtures[i],lv=state.level;
       if(lv<=0) return 0;
       const toSub=SUBJECT.clone().sub(f.pos), d=Math.max(0.5,toSub.length());
-      const axis=showAimOf(i,t).sub(f.pos).normalize();
+      const axis=state.aim.clone().sub(f.pos).normalize();
       const ang=Math.acos(THREE.MathUtils.clamp(toSub.normalize().dot(axis),-1,1));
       const cone=CONE[f.type], pen=THREE.MathUtils.lerp(0.25,0.9,board.soft/100);
       const beam=1-THREE.MathUtils.smoothstep(ang,cone*(1-pen),cone);
       if(beam<=0) return 0;
       return FIX_LUX[f.type]*lv*beam*(REF_DIST*REF_DIST)/(d*d);
     }
-    function stageLux(t){let s=subjectSpotLux();for(let i=0;i<N;i++)s+=luxOf(i,t);return s}
+    function stageLux(t){const frame=composeLightingFrame(t);let s=frame.subjectSpot.lux;for(let i=0;i<N;i++)s+=luxOf(i,t,frame);return s}
 
     // 写真の見た目に合わせた顔面スポット測光。
     // 舞台総照度だけでは、強いバックライトで顔が暗いのに「オーバー」と判定されるため、
@@ -2348,9 +2412,7 @@
       subjectSpotCoreMat.color.copy(SUBJECT_SPOT_COLOR).multiplyScalar((board.smoke?.035:.0006)*lux);
       faceBeamToCamera(subjectSpotGear);
     }
-    function updateBlinders(t){
-      const pulse=board.show.playing&&board.show.mode==='blinder'&&!board.blackout
-        ?showBlinderPulse(t)*(board.bright/100)*(board.show.level/100):0;
+    function updateBlinders(t,pulse=composeLightingFrame(t).blinder.level){
       for(const g of blinderGear){
         const on=pulse>.001;g.light.visible=on;g.light.intensity=on?1550*pulse:0;
         g.beam.visible=on;g.core.visible=on;g.flare.visible=on;
@@ -2367,12 +2429,13 @@
       }
     }
     function updateScene(t){
+      const frame=composeLightingFrame(t);
       // ブラックアウトでは補助環境光も止め、顔や会場だけが残光しないようにする。
-      hemi.intensity=board.blackout?0:.05;
+      hemi.intensity=frame.safety.blackout?0:.05;
       const contrib=[];
       for(let i=0;i<N;i++){
-        const f=RIG[i], lv=levelAt(i,t), col=colorAt(i,t), aim=showAimOf(i,t), g=gear[i];
-        const lux=luxOf(i,t);
+        const f=RIG[i],state=frame.fixtures[i],lv=state.level,col=state.color,aim=state.aim,g=gear[i];
+        const lux=luxOf(i,t,frame);
         // 筐体・レンズ・ビーム・床のプール。照明の狙いと光柱の終点は分離する。
         // 実光源は aim で人物を照らし、可視光柱は beamEnd の床／天井まで通す。
         const beamEnd=beamEndOf(f,aim), dir=beamEnd.clone().sub(f.pos), len=Math.max(0.4,dir.length());
@@ -2421,7 +2484,7 @@
           g.poolMat.color.copy(col).multiplyScalar(aimLux*0.198);  // 床の拡散反射を10%抑制
         }
       }
-      const followLux=subjectSpotLux();updateSubjectSpot(t,followLux);updateBlinders(t);
+      const followLux=frame.subjectSpot.lux;updateSubjectSpot(t,followLux);updateBlinders(t,frame.blinder.level);
       const meter=faceExposureOf(contrib),hazeOn=board.smoke&&!board.blackout;
       if(followLux>0){
         _meterNormal.copy(camera.position).sub(SUBJECT);if(_meterNormal.lengthSq()<1e-6)_meterNormal.set(0,.15,1);
@@ -2625,6 +2688,7 @@
     function collectSettings(){
       const cameraState=cameraMode==='map'&&mapReturnState?mapReturnState:{preset:cameraPresetId,position:camera.position.toArray(),target:controls.target.toArray()};
       return{
+        lightingStateVersion:LIGHTING_STATE_VERSION,
         bodyId,pose,showGlasses,showSunglasses,showCatEars,
         mannequinColor:document.querySelector('#mannequinColor').value,
         costumeColor:document.querySelector('#costumeColor').value,
@@ -2677,7 +2741,9 @@
         group:GROUPS[src.group]?src.group:'all',color:src.color||'#fff4e0'});
       Object.assign(board.chase,src.chase||{});Object.assign(board.blink,src.blink||{});
       Object.assign(board.subjectSpot,src.subjectSpot||{});
+      if(!['maintain','follow','off'].includes(board.subjectSpot.policy))board.subjectSpot.policy='follow';
       Object.assign(board.show,src.show||{});
+      if(board.show.playing&&!['silhouette','blackout-hit'].includes(board.show.mode))board.show.keepSpot=true;
       if(Array.isArray(src.fixtures))src.fixtures.forEach((s,i)=>{if(board.fixtures[i])Object.assign(board.fixtures[i],s)});
       rebuildOrder();syncBoardUI();saveSettings();refresh();
     }
@@ -2853,6 +2919,8 @@
       showResume=null;
     }
     function startLightingShow(){
+      // 通常4パターンは必ずスポット維持で開始。シルエットと暗転ヒットだけは消灯を初期値にする。
+      board.show.keepSpot=!['silhouette','blackout-hit'].includes(board.show.mode);
       showResume={chase:board.chase.playing,blink:board.blink.playing};
       board.chase.playing=false;board.blink.playing=false;board.show.playing=true;showStart=clock;
     }
@@ -3015,7 +3083,7 @@
     requestAnimationFrame(loop);
 
     // 数値検証用。表示に依存せずチェイス／露出／照度を読み出せる
-    window.__livehouse={RIG,board,levelAt,luxOf,stageLux,subjectSpotLux,showLevelAt,showAimOf,showBlinderPulse,showWhitePulse,showBlackoutPulse,evCamOf,evSceneOf,getExpo:()=>expo,CHALLENGES,updateScene,
+    window.__livehouse={RIG,board,composeLightingFrame,levelAt,luxOf,stageLux,subjectSpotLux,showLevelAt,showAimOf,showBlinderPulse,showWhitePulse,showBlackoutPulse,evCamOf,evSceneOf,getExpo:()=>expo,CHALLENGES,updateScene,
       setClock(t){clock=t;updateScene(t)},setBody:(id)=>setBody(id),getBodyId:()=>bodyId,BODIES,camera,CAMERA_PRESETS,
       stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,updateVenueCutaway,faceExposureOf,selectRenderLights,
       setPose:(n)=>document.querySelector('[data-pose="'+n+'"]').click(),render(){renderer.render(scene,camera)},applyBoard,toneExposure(){return renderer.toneMappingExposure},triangles(){return renderer.info.render.triangles},lightStats(){return{spots:spots.filter(l=>l.visible&&l.intensity>0).length,shadows:spots.filter(l=>l.castShadow).length}}};
