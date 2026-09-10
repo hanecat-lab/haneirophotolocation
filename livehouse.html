@@ -95,7 +95,7 @@
     <div id="scene" class="scene"></div>
     <header class="bar"><div class="mark">◒</div><div class="title"><p>LIGHTING SKETCHBOOK</p><h1>Livehouse</h1></div><span class="badge" id="sceneBadge">バンド</span></header>
     <div class="readout">📷 <strong id="expoBadge">計算中</strong></div>
-    <div class="position-map-legend">⌖ 黄色＝撮影位置　矢印＝撮影方向</div>
+    <div class="position-map-legend">⌖ 黄色マーカーをドラッグ＝撮影位置　空き部分を左右ドラッグ＝レンズ方向</div>
     <nav class="camera-nudge" aria-label="画面内のカメラ移動">
       <button type="button" data-pan="up" aria-label="画面を上へ移動">↑</button>
       <button type="button" data-pan="left" aria-label="画面を左へ移動">←</button>
@@ -477,6 +477,30 @@
     }
     renderer.domElement.addEventListener('pointerup',finishPointer);renderer.domElement.addEventListener('pointercancel',finishPointer);
 
+    // 俯瞰ビュー編集操作。黄色マーカー付近から開始=位置移動、それ以外=左右ドラッグでヨーのみ変更。
+    renderer.domElement.addEventListener('pointerdown',e=>{
+      if(cameraMode!=='map'||mapEditPointerId!==null)return;
+      if(e.pointerType!=='touch'&&e.button!==0)return;
+      mapEditPointerId=e.pointerId;mapEditLastX=e.clientX;
+      const state=mapShootingVectors();mapEditStartYaw=state?.yaw||0;
+      mapEditGesture=mapPointerNearMarker(e,e.pointerType==='touch'?52:40)?'move':'yaw';
+      capturePointer(e.pointerId);renderer.domElement.style.cursor=mapEditGesture==='move'?'grabbing':'ew-resize';
+      if(mapEditGesture==='move')moveMapShootingPosition(e);
+      e.preventDefault();
+    });
+    renderer.domElement.addEventListener('pointermove',e=>{
+      if(cameraMode!=='map'||e.pointerId!==mapEditPointerId)return;
+      if(mapEditGesture==='move')moveMapShootingPosition(e);
+      else if(mapEditGesture==='yaw')rotateMapShootingYaw(e.clientX-mapEditLastX);
+      e.preventDefault();
+    });
+    function finishMapEdit(e){
+      if(e.pointerId!==mapEditPointerId)return;
+      releasePointer(e.pointerId);mapEditPointerId=null;mapEditGesture='idle';renderer.domElement.style.cursor='';
+      saveSettings();e.preventDefault();
+    }
+    renderer.domElement.addEventListener('pointerup',finishMapEdit);renderer.domElement.addEventListener('pointercancel',finishMapEdit);
+
     const material=new THREE.MeshStandardMaterial({color:'#d6d7d2',roughness:.76,metalness:.015});
     // 新アイドルの顔・首・手足を同一の肌材質に統一。標準体型の材質は変更しない。
     const idolSkinMaterial=new THREE.MeshStandardMaterial({color:'#f1dfd6',roughness:.82,metalness:0});
@@ -558,6 +582,63 @@
       const onStage=Math.abs(x)<=STAGE_W/2&&z>=STAGE_Z-STAGE_D/2&&z<=STAGE_FRONT;
       return onStage?.035:-STAGE_HEIGHT+.035;
     }
+    // 俯瞰編集: 俯瞰カメラは固定し、mapReturnState内の「実際の撮影カメラ」だけを移動・回転する。
+    const mapEditRaycaster=new THREE.Raycaster();
+    const mapEditPointer=new THREE.Vector2();
+    const mapEditPlane=new THREE.Plane(new THREE.Vector3(0,1,0),0);
+    const mapEditHit=new THREE.Vector3();
+    let mapEditGesture='idle',mapEditPointerId=null,mapEditLastX=0,mapEditStartYaw=0;
+    const MAP_X_LIMIT=10,MAP_Z_MIN=-4.5,MAP_Z_MAX=18;
+    function mapShootingVectors(){
+      if(!mapReturnState)return null;
+      const position=new THREE.Vector3().fromArray(mapReturnState.position);
+      const target=new THREE.Vector3().fromArray(mapReturnState.target);
+      const delta=target.clone().sub(position);
+      const horizontal=Math.max(.05,Math.hypot(delta.x,delta.z));
+      return {position,target,delta,horizontal,yaw:Math.atan2(delta.x,-delta.z)};
+    }
+    function syncMapShootingMarker(){
+      if(cameraMode!=='map'||!mapReturnState)return;
+      const state=mapShootingVectors();if(!state)return;
+      positionMarker.position.set(state.position.x,shootingFloorY(state.position.x,state.position.z),state.position.z);
+      const forward=new THREE.Vector3(state.delta.x,0,state.delta.z);if(forward.lengthSq()<1e-8)forward.set(0,0,-1);else forward.normalize();
+      positionArrow.setDirection(forward);
+      updateShootingFrustum();
+    }
+    function mapPointerNdc(e){
+      const r=renderer.domElement.getBoundingClientRect();
+      mapEditPointer.set(((e.clientX-r.left)/Math.max(1,r.width))*2-1,-((e.clientY-r.top)/Math.max(1,r.height))*2+1);
+      return r;
+    }
+    function mapPointerWorld(e){
+      mapPointerNdc(e);mapEditRaycaster.setFromCamera(mapEditPointer,camera);
+      return mapEditRaycaster.ray.intersectPlane(mapEditPlane,mapEditHit)?mapEditHit:null;
+    }
+    function mapPointerNearMarker(e,radiusPx=42){
+      if(!mapReturnState)return false;
+      const r=renderer.domElement.getBoundingClientRect();
+      const world=new THREE.Vector3().fromArray(mapReturnState.position);world.y=shootingFloorY(world.x,world.z)+.08;world.project(camera);
+      const sx=r.left+(world.x*.5+.5)*r.width,sy=r.top+(-world.y*.5+.5)*r.height;
+      return Math.hypot(e.clientX-sx,e.clientY-sy)<=radiusPx;
+    }
+    function moveMapShootingPosition(e){
+      if(!mapReturnState)return;
+      const hit=mapPointerWorld(e);if(!hit)return;
+      const state=mapShootingVectors(),nx=THREE.MathUtils.clamp(hit.x,-MAP_X_LIMIT,MAP_X_LIMIT),nz=THREE.MathUtils.clamp(hit.z,MAP_Z_MIN,MAP_Z_MAX);
+      const dx=nx-state.position.x,dz=nz-state.position.z;
+      state.position.x=nx;state.position.z=nz;state.target.x+=dx;state.target.z+=dz;
+      mapReturnState.position=state.position.toArray();mapReturnState.target=state.target.toArray();mapReturnState.preset='custom';cameraPresetId='custom';
+      syncMapShootingMarker();
+    }
+    function rotateMapShootingYaw(deltaX){
+      if(!mapReturnState)return;
+      const state=mapShootingVectors();
+      const yaw=mapEditStartYaw+deltaX*.006;
+      const target=state.position.clone();
+      target.x+=Math.sin(yaw)*state.horizontal;target.z-=Math.cos(yaw)*state.horizontal;target.y+=state.delta.y;
+      mapReturnState.target=target.toArray();mapReturnState.preset='custom';cameraPresetId='custom';
+      syncMapShootingMarker();
+    }
     function syncPositionMapUI(){
       const shell=document.querySelector('.shell'),button=document.querySelector('#positionMapToggle');
       if(shell)shell.classList.toggle('map-view',cameraMode==='map');
@@ -568,14 +649,12 @@
       controls.update();
       shootingAspect=camera.aspect;
       mapReturnState={preset:cameraPresetId,position:camera.position.toArray(),target:controls.target.toArray(),aspect:shootingAspect};
-      const look=controls.target.clone().sub(camera.position);look.y=0;if(look.lengthSq()<1e-6)look.set(0,0,-1);else look.normalize();
-      positionMarker.position.set(camera.position.x,shootingFloorY(camera.position.x,camera.position.z),camera.position.z);
-      positionArrow.setDirection(look);positionMarker.visible=true;
+      positionMarker.visible=true;
       const minX=Math.min(-STAGE_W/2,camera.position.x),maxX=Math.max(STAGE_W/2,camera.position.x);
       const minZ=Math.min(STAGE_Z-STAGE_D/2,camera.position.z),maxZ=Math.max(STAGE_FRONT,camera.position.z);
       const mapX=(minX+maxX)/2,mapZ=(minZ+maxZ)/2,mapHeight=Math.max(24,(maxZ-minZ)*1.75,(maxX-minX)*1.45);
       cameraMode='map';controls.enabled=false;camera.up.set(0,0,-1);
-      camera.position.set(mapX,mapHeight,mapZ);controls.target.set(mapX,-.2,mapZ);applyPhysicalLens(35);controls.update();syncPositionMapUI();updateShootingFrustum();
+      camera.position.set(mapX,mapHeight,mapZ);controls.target.set(mapX,-.2,mapZ);applyPhysicalLens(35);controls.update();syncPositionMapUI();syncMapShootingMarker();
     }
     function exitPositionMap(restore=true){
       const saved=mapReturnState;
@@ -4227,7 +4306,16 @@
       const tag=e.target&&e.target.tagName;
       if(tag==='INPUT'||tag==='SELECT'||tag==='TEXTAREA'||e.metaKey||e.ctrlKey||e.altKey)return;
       if(cameraMode==='map'){
-        if(e.key==='Escape'){e.preventDefault();exitPositionMap(true);}
+        if(e.key==='Escape'){e.preventDefault();exitPositionMap(true);return;}
+        if(!mapReturnState)return;
+        const step=e.shiftKey?.50:.20,state=mapShootingVectors();
+        if(e.key==='ArrowLeft'||e.key==='ArrowRight'||e.key==='ArrowUp'||e.key==='ArrowDown'){
+          e.preventDefault();const dx=e.key==='ArrowLeft'?-step:e.key==='ArrowRight'?step:0,dz=e.key==='ArrowUp'?-step:e.key==='ArrowDown'?step:0;
+          state.position.x=THREE.MathUtils.clamp(state.position.x+dx,-MAP_X_LIMIT,MAP_X_LIMIT);state.position.z=THREE.MathUtils.clamp(state.position.z+dz,MAP_Z_MIN,MAP_Z_MAX);
+          state.target.x+=state.position.x-new THREE.Vector3().fromArray(mapReturnState.position).x;state.target.z+=state.position.z-new THREE.Vector3().fromArray(mapReturnState.position).z;
+          mapReturnState.position=state.position.toArray();mapReturnState.target=state.target.toArray();mapReturnState.preset='custom';cameraPresetId='custom';syncMapShootingMarker();saveSettings();return;
+        }
+        const k=e.key.toLowerCase();if(k==='a'||k==='d'){e.preventDefault();mapEditStartYaw=state.yaw;rotateMapShootingYaw(k==='a'?-8:8);saveSettings();}
         return;
       }
       const key=e.key.length===1?e.key.toLowerCase():e.key;
@@ -4396,7 +4484,7 @@
     // 数値検証用。表示に依存せずチェイス／露出／照度を読み出せる
     window.__livehouse={RIG,board,smallModel:{state:smallModelState,get displayed(){return smallModelDisplayed},show:showSmallModel,apply:applySmallModelAdjustment},laserSheet:{meshes:laserSheetMeshes.map(v=>v.mesh),materials:laserSheetMeshes.map(v=>v.mat),update:updateLaserSheet},composeLightingFrame,activeShowSlots,showRunComplete,levelAt,luxOf,stageLux,subjectSpotLux,faceFillLux,showLevelAt,showAimOf,showBlinderPulse,showWhitePulse,showBlackoutPulse,evCamOf,evSceneOf,getExpo:()=>expo,CHALLENGES,updateScene,
       setClock(t){clock=t;updateScene(t)},setBody:(id)=>setBody(id),getBodyId:()=>bodyId,BODIES,validateLowPolyModel,camera,CAMERA_PRESETS,
-      stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,updateVenueCutaway,faceExposureOf,selectRenderLights,
+      stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,syncMapShootingMarker,moveMapShootingPosition,rotateMapShootingYaw,updateVenueCutaway,faceExposureOf,selectRenderLights,
       timeline:{capture:captureTimelineStep,add:addTimelineStep,start:startTimeline,stop:stopTimeline,advance:advanceTimeline,setBpm:setTimelineBpm,sanitize:sanitizeTimelineStep},
       setPose:(n)=>document.querySelector('[data-pose="'+n+'"]').click(),render(){renderer.render(scene,camera)},applyBoard,toneExposure(){return renderer.toneMappingExposure},triangles(){return renderer.info.render.triangles},lightStats(){return{spots:spots.filter(l=>l.visible&&l.intensity>0).length,shadows:spots.filter(l=>l.castShadow).length}}};
   </script>
