@@ -2817,6 +2817,13 @@
     const SHADOW_IS_MOBILE=/iPhone|iPad|iPod|Android|Mobile/i.test(navigator.userAgent||'')||matchMedia('(max-width:720px)').matches;
     const SHADOW_MAP_SIZE=SHADOW_IS_MOBILE?512:1024;
     const SHADOW_BUDGET=Object.freeze({off:0,natural:1,accent:SHADOW_IS_MOBILE?1:2});
+    // 実照明の光量とShadowMapの見た目を分離する。影モードはlight.intensityへ倍率を掛けない。
+    const SHADOW_STYLE=Object.freeze({
+      off:Object.freeze({intensity:0,regularRadius:1.8,subjectGlbRadius:2.0,subjectDefaultRadius:1.0}),
+      natural:Object.freeze({intensity:.52,regularRadius:1.8,subjectGlbRadius:2.0,subjectDefaultRadius:1.0}),
+      accent:Object.freeze({intensity:.78,regularRadius:1.1,subjectGlbRadius:1.5,subjectDefaultRadius:1.0})
+    });
+    function currentShadowStyle(){return SHADOW_STYLE[board?.shadow?.mode]||SHADOW_STYLE.natural}
     const TONE_K=1.2;                                           // 適正露出のとき画面が中庸になるよう決めた係数
 
     const SCENES=[
@@ -3362,7 +3369,7 @@
     });
     const spots=Array.from({length:REAL_LIGHTS},()=>{
       const l=new THREE.SpotLight('#ffffff',0,0,0.3,0.5,2), t=new THREE.Object3D();
-      l.castShadow=false;l.shadow.mapSize.set(SHADOW_MAP_SIZE,SHADOW_MAP_SIZE);l.shadow.bias=-.00065;l.shadow.normalBias=.008;l.shadow.radius=1.4;l.shadow.camera.near=.35;l.shadow.camera.far=20;
+      l.castShadow=false;l.shadow.intensity=0;l.shadow.mapSize.set(SHADOW_MAP_SIZE,SHADOW_MAP_SIZE);l.shadow.bias=-.00065;l.shadow.normalBias=.008;l.shadow.radius=1.4;l.shadow.camera.near=.35;l.shadow.camera.far=20;
       l.target=t; scene.add(l,t); return l;
     });
     // 客席側上部から演者へ向ける独立フォロースポット。30灯のチェイス状態とは別系統。
@@ -3370,7 +3377,7 @@
     const subjectSpotTarget=new THREE.Object3D();subjectSpotTarget.position.copy(currentSubjectSpotAim());scene.add(subjectSpotTarget);
     const subjectSpotLight=new THREE.SpotLight(SUBJECT_SPOT_COLOR,0,0,SUBJECT_SPOT_CONE,.68,2);
     subjectSpotLight.position.copy(SUBJECT_SPOT_POS);subjectSpotLight.target=subjectSpotTarget;
-    subjectSpotLight.castShadow=true;subjectSpotLight.shadow.mapSize.set(SHADOW_MAP_SIZE,SHADOW_MAP_SIZE);subjectSpotLight.shadow.bias=-.0012;
+    subjectSpotLight.castShadow=true;subjectSpotLight.shadow.intensity=SHADOW_STYLE.natural.intensity;subjectSpotLight.shadow.mapSize.set(SHADOW_MAP_SIZE,SHADOW_MAP_SIZE);subjectSpotLight.shadow.bias=-.0012;
     subjectSpotLight.shadow.normalBias=0;subjectSpotLight.shadow.radius=1;
     scene.add(subjectSpotLight);
     const subjectSpotBeamMat=makeBeamMaterial(.937),subjectSpotBeam=new THREE.Mesh(beamGeo,subjectSpotBeamMat);
@@ -3535,7 +3542,7 @@
       g.beam.quaternion.copy(_beamQ);g.core.quaternion.copy(_beamQ);
     }
     function updateSubjectSpot(t,lux){
-      const on=lux>.001,aim=currentSubjectSpotAim(),source=currentSubjectSpotSource();
+      const on=lux>.001,aim=currentSubjectSpotAim(),source=currentSubjectSpotSource(),shadowStyle=currentShadowStyle();
       subjectSpotTarget.position.copy(aim);subjectSpotTarget.updateMatrixWorld(true);
       subjectSpotLight.position.copy(source);subjectSpotLight.updateMatrixWorld(true);
       // GLBでは自己影の段差を弱める。前髪・鼻・マイクの自然な影は残しつつ、
@@ -3543,14 +3550,16 @@
       if(isExternalSubject()){
         subjectSpotLight.shadow.bias=-.00035;
         subjectSpotLight.shadow.normalBias=.010;
-        subjectSpotLight.shadow.radius=2.0;
+        subjectSpotLight.shadow.radius=shadowStyle.subjectGlbRadius;
       }else{
         subjectSpotLight.shadow.bias=-.0012;
         subjectSpotLight.shadow.normalBias=0;
-        subjectSpotLight.shadow.radius=1;
+        subjectSpotLight.shadow.radius=shadowStyle.subjectDefaultRadius;
       }
       subjectSpotLight.castShadow=on&&!board.blackout&&board.shadow.mode!=='off';
+      subjectSpotLight.shadow.intensity=subjectSpotLight.castShadow?shadowStyle.intensity:0;
       if(subjectSpotLight.castShadow)fitShadowCameraToCasters(subjectSpotLight);
+      // 実光量は影モードに連動させない。Shadow intensityだけを別系統で変更する。
       subjectSpotLight.visible=on;subjectSpotLight.intensity=on?lux*source.distanceTo(aim)**2:0;
       subjectSpotBeam.visible=on;subjectSpotCore.visible=on;
       if(!on)return;
@@ -3864,19 +3873,21 @@
       faceBounce.intensity=board.blackout?0:meter.bounce;
       faceBounceTarget.updateMatrixWorld();
 
-      const renderSelection=selectRenderLights(contrib),shadowSelection=selectShadowSlots(renderSelection.lights);
+      const renderSelection=selectRenderLights(contrib),shadowSelection=selectShadowSlots(renderSelection.lights),shadowStyle=currentShadowStyle();
       // 顔用6灯＋背景用2灯を、実光源の上限8灯へ割り当てる。影はShadow Budget内の主光だけに限定する。
       const pen=THREE.MathUtils.lerp(0.15,0.85,board.soft/100);
       spots.forEach((l,k)=>{
         const c=renderSelection.lights[k],casts=shadowSelection.slots.has(k);
         l.castShadow=casts;
-        if(!c||c.renderLux<=0.01){l.intensity=0;l.visible=false;l.castShadow=false;return}
+        l.shadow.intensity=casts?shadowStyle.intensity:0;
+        if(!c||c.renderLux<=0.01){l.intensity=0;l.visible=false;l.castShadow=false;l.shadow.intensity=0;return}
         const f=RIG[c.i], d=Math.max(0.5,c.background?c.aim.distanceTo(f.pos):SUBJECT.distanceTo(f.pos));
         l.visible=true; l.position.copy(f.pos); l.target.position.copy(c.aim); l.target.updateMatrixWorld();
         l.color.copy(c.col); l.angle=CONE[f.type]; l.penumbra=pen; l.decay=2; l.distance=0;
         if(casts)fitShadowCameraToCasters(l);
-        l.shadow.bias=isExternalSubject()?-.00035:-.0009;l.shadow.normalBias=isExternalSubject()?.010:.004;l.shadow.radius=board.shadow.mode==='accent'?1.0:1.6;
+        l.shadow.bias=isExternalSubject()?-.00035:-.0009;l.shadow.normalBias=isExternalSubject()?.010:.004;l.shadow.radius=shadowStyle.regularRadius;
         // E = I/d²。顔用は被写体点、背景用は灯体の狙い位置で所定照度になる光度[cd]を与える。
+        // 実光量は影モードOFF/自然/強調で同一。影の差はshadow.intensity/radiusだけで作る。
         l.intensity=c.renderLux*d*d;
       });
       const realShadowLux=shadowSelection.realShadowLux+(subjectSpotLight.castShadow?followLux:0);
@@ -4387,7 +4398,7 @@
       const shadowHint=q('#shadowModeHint');if(shadowHint){
         const budget=SHADOW_BUDGET[board.shadow.mode]??1;
         shadowHint.textContent=board.shadow.mode==='off'?'リアルシャドウと接地影を停止します。':
-          (board.shadow.mode==='accent'?'主光を強調し、接地影を少し濃くします。':'主光の影＋薄い接地影で自然な立体感を作ります。')+
+          (board.shadow.mode==='accent'?'実照明の明るさは変えず、リアルシャドウのコントラストを高めます。':'実照明の明るさは変えず、柔らかいリアルシャドウと薄い接地影を表示します。')+
           ' '+(SHADOW_IS_MOBILE?'モバイルは実照明最大1灯・512px。':'PCは実照明最大'+budget+'灯・1024px。')+' フェイスフィルは影なしです。';
       }
       setToggle('laserSheetToggle',board.laserSheet.on,'レーザーシート');
