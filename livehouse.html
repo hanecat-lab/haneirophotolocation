@@ -10,6 +10,9 @@
     /* --- livehouse 固有 ------------------------------------------------- */
     #bodies{grid-template-columns:repeat(5,1fr)}
     #smallModels{grid-template-columns:repeat(3,1fr)}
+    .small-model-launcher{margin-top:12px;padding:10px;border:1px solid rgba(224,168,58,.38);background:rgba(224,168,58,.055);border-radius:8px}
+    .small-model-launcher .label{margin-bottom:8px}.small-model-launcher .mode{min-height:42px}
+    .small-model-launcher .mode.active{border-color:rgba(224,168,58,.9);background:rgba(224,168,58,.16);color:#ffe3a8}
     .tabs{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin:14px 0 4px}
     .tab{min-height:38px;background:#111616;border:1px solid var(--line);color:#cbd5d1;font:700 12px ui-monospace,SFMono-Regular,monospace;letter-spacing:.06em}
     .tab.active{background:#e7e1d5;color:#171b1d}
@@ -134,10 +137,14 @@
             </div>
           </details>
           <div class="slider hidden" id="costumeColorRow"><div><span>衣装の色</span><strong id="v-costumeColor">#f2e9f4</strong></div><input type="color" id="costumeColor" value="#f2e9f4" /></div>
+          <div class="small-model-launcher">
+            <div class="label"><span>小型モデル表示</span><small>SUB MODEL</small></div>
+            <div class="two" id="smallModels"><button class="mode active" data-small-model="off">OFF</button><button class="mode" data-small-model="catbw">黒白猫</button><button class="mode" data-small-model="catbrown">茶猫</button></div>
+            <div class="hint" style="margin-top:7px">黒白猫・茶猫はメイン被写体と同時に表示できます。</div>
+            <div class="hint hidden" id="smallModelStatus"><strong>黒白猫</strong><span>小型モデルを読み込み中です。</span></div>
+          </div>
         </section>
-        <section class="section"><div class="label"><span>小型モデル</span><small>SUB MODEL</small></div>
-          <div class="two" id="smallModels"><button class="mode active" data-small-model="off">OFF</button><button class="mode" data-small-model="catbw">黒白猫</button><button class="mode" data-small-model="catbrown">茶猫</button></div>
-          <div class="hint hidden" id="smallModelStatus"><strong>黒白猫</strong><span>小型モデルを読み込み中です。</span></div>
+        <section class="section">
           <details class="glb-adjust hidden" id="smallModelAdjust">
             <summary>小型モデル調整</summary>
             <div class="glb-adjust-body">
@@ -332,8 +339,15 @@
       stageright:{position:[-3.05,.72,4.35],target:[0,1.10,-.05]}
     };
     const FOCAL_LENGTHS=[24,28,35,50,70,85,105,135,200];
-    let cameraPresetId='audience',focalLength=50,cameraMode='fps',mapReturnState=null;
-    camera.setFocalLength(focalLength);
+    const SENSOR_HEIGHT_MM=24; // 35mmフルサイズの縦寸法。焦点距離→垂直FOV換算を固定する。
+    const focalToVerticalFov=mm=>THREE.MathUtils.radToDeg(2*Math.atan(SENSOR_HEIGHT_MM/(2*Math.max(.001,Number(mm)||50))));
+    function applyPhysicalLens(mm,targetCamera=camera){
+      targetCamera.fov=focalToVerticalFov(mm);
+      targetCamera.zoom=1;
+      targetCamera.updateProjectionMatrix();
+    }
+    let cameraPresetId='audience',focalLength=50,cameraMode='fps',mapReturnState=null,shootingAspect=1;
+    applyPhysicalLens(focalLength);
     function applyCameraPreset(id){
       const preset=CAMERA_PRESETS[id];if(!preset)return;
       if(cameraMode==='map')exitPositionMap(false);
@@ -343,7 +357,9 @@
     function applyFocalLength(mm){
       const requested=Number(mm)||50;
       focalLength=FOCAL_LENGTHS.reduce((best,v)=>Math.abs(v-requested)<Math.abs(best-requested)?v:best,FOCAL_LENGTHS[0]);
-      camera.setFocalLength(cameraMode==='map'?35:focalLength);camera.updateProjectionMatrix();
+      // 撮影画面は常にフルサイズ縦24mm基準でFOVを算出。俯瞰カメラ自体は固定画角のままにする。
+      if(cameraMode!=='map')applyPhysicalLens(focalLength);
+      updateShootingFrustum();
       const out=document.querySelector('#v-focal');if(out)out.textContent=Math.round(focalLength)+'mm';
       const slider=document.querySelector('#focalR');if(slider)slider.value=FOCAL_LENGTHS.indexOf(focalLength);
     }
@@ -511,6 +527,33 @@
     const positionArrow=new THREE.ArrowHelper(new THREE.Vector3(0,0,-1),new THREE.Vector3(0,.035,0),.82,'#ffd65c',.22,.12);positionMarker.add(positionArrow);
     positionArrow.line.material.depthTest=false;positionArrow.line.material.transparent=true;positionArrow.line.material.opacity=.92;positionArrow.line.renderOrder=20;
     positionArrow.cone.material.depthTest=false;positionArrow.cone.material.transparent=true;positionArrow.cone.material.opacity=.92;positionArrow.cone.renderOrder=20;
+    // 俯瞰ビュー用の撮影视錐台。撮影時の焦点距離とアスペクト比から水平FOVを再現する。
+    const shootingFrustumMat=new THREE.LineBasicMaterial({color:'#ffd65c',transparent:true,opacity:.72,depthTest:false,depthWrite:false});
+    const shootingFrustumGeo=new THREE.BufferGeometry();
+    const shootingFrustum=new THREE.LineSegments(shootingFrustumGeo,shootingFrustumMat);shootingFrustum.name='ShootingFrustum';shootingFrustum.visible=false;shootingFrustum.renderOrder=19;scene.add(shootingFrustum);
+    function shootingLookState(){
+      if(cameraMode==='map'&&mapReturnState){
+        const p=new THREE.Vector3().fromArray(mapReturnState.position),t=new THREE.Vector3().fromArray(mapReturnState.target);
+        return {position:p,target:t};
+      }
+      return {position:camera.position.clone(),target:controls.target.clone()};
+    }
+    function updateShootingFrustum(){
+      if(!shootingFrustum)return;
+      if(cameraMode!=='map'||!mapReturnState){shootingFrustum.visible=false;return}
+      const state=shootingLookState(),origin=state.position.clone();
+      origin.y=shootingFloorY(origin.x,origin.z)+.045;
+      const forward=state.target.clone().sub(state.position);forward.y=0;
+      if(forward.lengthSq()<1e-8)forward.set(0,0,-1);else forward.normalize();
+      const right=new THREE.Vector3(-forward.z,0,forward.x).normalize();
+      const vFov=THREE.MathUtils.degToRad(focalToVerticalFov(focalLength));
+      const hFov=2*Math.atan(Math.tan(vFov/2)*Math.max(.2,shootingAspect));
+      const length=5.2,halfWidth=Math.min(12,length*Math.tan(hFov/2));
+      const farCenter=origin.clone().addScaledVector(forward,length);
+      const left=farCenter.clone().addScaledVector(right,-halfWidth),rightPt=farCenter.clone().addScaledVector(right,halfWidth);
+      const pts=[origin,left,origin,rightPt,left,rightPt];
+      shootingFrustum.geometry.setFromPoints(pts);shootingFrustum.geometry.computeBoundingSphere();shootingFrustum.visible=true;
+    }
     function shootingFloorY(x,z){
       const onStage=Math.abs(x)<=STAGE_W/2&&z>=STAGE_Z-STAGE_D/2&&z<=STAGE_FRONT;
       return onStage?.035:-STAGE_HEIGHT+.035;
@@ -523,7 +566,8 @@
     function enterPositionMap(){
       if(cameraMode==='map')return;
       controls.update();
-      mapReturnState={preset:cameraPresetId,position:camera.position.toArray(),target:controls.target.toArray()};
+      shootingAspect=camera.aspect;
+      mapReturnState={preset:cameraPresetId,position:camera.position.toArray(),target:controls.target.toArray(),aspect:shootingAspect};
       const look=controls.target.clone().sub(camera.position);look.y=0;if(look.lengthSq()<1e-6)look.set(0,0,-1);else look.normalize();
       positionMarker.position.set(camera.position.x,shootingFloorY(camera.position.x,camera.position.z),camera.position.z);
       positionArrow.setDirection(look);positionMarker.visible=true;
@@ -531,13 +575,13 @@
       const minZ=Math.min(STAGE_Z-STAGE_D/2,camera.position.z),maxZ=Math.max(STAGE_FRONT,camera.position.z);
       const mapX=(minX+maxX)/2,mapZ=(minZ+maxZ)/2,mapHeight=Math.max(24,(maxZ-minZ)*1.75,(maxX-minX)*1.45);
       cameraMode='map';controls.enabled=false;camera.up.set(0,0,-1);
-      camera.position.set(mapX,mapHeight,mapZ);controls.target.set(mapX,-.2,mapZ);camera.setFocalLength(35);camera.updateProjectionMatrix();controls.update();syncPositionMapUI();
+      camera.position.set(mapX,mapHeight,mapZ);controls.target.set(mapX,-.2,mapZ);applyPhysicalLens(35);controls.update();syncPositionMapUI();updateShootingFrustum();
     }
     function exitPositionMap(restore=true){
       const saved=mapReturnState;
       cameraMode='fps';controls.enabled=true;camera.up.set(0,1,0);
       if(restore&&saved){camera.position.fromArray(saved.position);controls.target.fromArray(saved.target);cameraPresetId=saved.preset;}
-      camera.setFocalLength(focalLength);camera.updateProjectionMatrix();controls.update();positionMarker.visible=false;mapReturnState=null;syncPositionMapUI();
+      applyPhysicalLens(focalLength);controls.update();positionMarker.visible=false;shootingFrustum.visible=false;mapReturnState=null;syncPositionMapUI();
       if(restore)saveSettings();
     }
     function updatePositionMarker(now){
@@ -4304,7 +4348,10 @@
 
     function resize(){
       const w=host.clientWidth,h=host.clientHeight;
-      camera.aspect=w/h; camera.updateProjectionMatrix(); renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.setSize(w,h);
+      camera.aspect=w/h;
+      if(cameraMode==='map')applyPhysicalLens(35);else{shootingAspect=camera.aspect;applyPhysicalLens(focalLength)}
+      updateShootingFrustum();
+      renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.setSize(w,h);
     }
     addEventListener('resize',()=>{scheduleChromeVisualViewportSync();resize()}); resize();
     scheduleChromeVisualViewportSync();
