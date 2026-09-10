@@ -2495,7 +2495,7 @@
         EXTERNAL_SUBJECT_STAGE_Y+externalSubjectAdjust.yOffset-EXTERNAL_SUBJECT_STAGE_Y*ratio,
         externalSubjectAdjust.z);
       wrapper.updateMatrixWorld(true);
-      const box=new THREE.Box3().setFromObject(wrapper);meta.height=box.max.y-box.min.y;meta.scale=meta.baseScale*ratio;meta.groundY=box.min.y;
+      const box=new THREE.Box3().setFromObject(wrapper);meta.height=box.max.y-box.min.y;meta.scale=meta.baseScale*ratio;meta.groundY=box.min.y;meta.shadowBox=box.clone();
       syncSubjectReferencePoints(wrapper);syncExternalAdjustUI();
     }
 
@@ -2621,7 +2621,7 @@
         EXTERNAL_SUBJECT_STAGE_Y+smallModelState.yOffset-EXTERNAL_SUBJECT_STAGE_Y*ratio,
         anchor.z+rel.z);
       wrapper.updateMatrixWorld(true);
-      const box=new THREE.Box3().setFromObject(wrapper);meta.height=box.max.y-box.min.y;meta.groundY=box.min.y;
+      const box=new THREE.Box3().setFromObject(wrapper);meta.height=box.max.y-box.min.y;meta.groundY=box.min.y;meta.shadowBox=box.clone();
       syncSmallModelUI();
     }
     function prepareSmallModel(root,id,config){
@@ -2741,33 +2741,36 @@
       const onStage=Math.abs(x)<=STAGE_W/2+.05&&z>=STAGE_Z-STAGE_D/2-.05&&z<=STAGE_FRONT+.05;
       return onStage?.014:-STAGE_HEIGHT+.014;
     }
-    function updateOneContactShadow(mesh,wrapper,isSmall,shadowLux,source){
+    function updateOneContactShadow(mesh,wrapper,isSmall,sceneLux,realShadowLux){
       if(!wrapper||board.shadow.mode==='off'||board.blackout||cameraMode==='map'){mesh.visible=false;return}
       const meta=isSmall?wrapper.userData?.smallModel:wrapper.userData?.externalSubject;
       if(!meta){mesh.visible=false;return}
       const height=Math.max(.05,Number(meta.height)||Number(meta.baseHeight)||.4),ratio=height/Math.max(.001,Number(meta.baseHeight)||height);
       const worldWidth=Math.max(.06,(Number(meta.baseWidth)||height*.45)*ratio),worldDepth=Math.max(.05,(Number(meta.baseDepth)||height*.30)*ratio);
       const floorY=shadowFloorY(wrapper.position.x,wrapper.position.z),groundY=Number.isFinite(meta.groundY)?meta.groundY:floorY;
-      const gap=Math.max(0,groundY-floorY),presence=THREE.MathUtils.clamp(shadowLux/45,0,1);
-      if(presence<=.002){mesh.visible=false;return}
-      const baseOpacity=board.shadow.mode==='accent'?(isSmall?.17:.20):(isSmall?.105:.125);
-      const smokeFade=board.smoke?.72:1,brightFade=1-.23*THREE.MathUtils.clamp((shadowLux-70)/520,0,1),gapFade=Math.exp(-gap*.62);
-      const opacity=baseOpacity*presence*smokeFade*brightFade*gapFade;
+      const gap=Math.max(0,groundY-floorY);
+      // Contact Shadowは方向のある影ではなく、リアルShadowMapで不足する接地感だけを補う。
+      const visibility=THREE.MathUtils.smoothstep(Math.max(0,sceneLux||0),2,35);
+      const realCoverage=THREE.MathUtils.smoothstep(Math.max(0,realShadowLux||0),12,90);
+      const assist=1-.82*realCoverage;
+      if(visibility<=.002||assist<=.002){mesh.visible=false;return}
+      const baseOpacity=board.shadow.mode==='accent'?(isSmall?.11:.14):(isSmall?.08:.10);
+      const smokeFade=board.smoke?.70:1,gapFade=Math.exp(-1.5*gap);
+      const opacity=baseOpacity*visibility*assist*smokeFade*gapFade;
       if(opacity<.003){mesh.visible=false;return}
       const footprintW=isSmall?Math.min(worldWidth,height*.95):Math.min(worldWidth,height*.42);
       const footprintD=isSmall?Math.min(worldDepth,height*.90):Math.min(worldDepth,height*.34);
       const growW=Math.min(1.1,gap*.28),growD=Math.min(1.35,gap*.36);
-      let ox=0,oz=0;
-      if(source){const ax=wrapper.position.x-source.x,az=wrapper.position.z-source.z,len=Math.hypot(ax,az);if(len>1e-4){const push=Math.min(.32,.018*height+gap*.11);ox=ax/len*push;oz=az/len*push}}
-      mesh.position.set(wrapper.position.x+ox,floorY,wrapper.position.z+oz);
+      // 方向成分はリアルShadowMapへ任せ、Contact Shadowは常にモデル直下へ置く。
+      mesh.position.set(wrapper.position.x,floorY,wrapper.position.z);
       mesh.rotation.set(-Math.PI/2,0,wrapper.rotation.y||0);
       mesh.scale.set(Math.max(.13,footprintW+growW),Math.max(.10,footprintD+growD),1);
       mesh.material.opacity=opacity;mesh.visible=true;
     }
-    function updateContactShadows(shadowLux,dominantSource){
+    function updateContactShadows(sceneLux,realShadowLux){
       const mainWrapper=isExternalSubject()&&model?.userData?.externalSubject?model:null;
-      updateOneContactShadow(mainContactShadow,mainWrapper,false,shadowLux,dominantSource);
-      updateOneContactShadow(smallContactShadow,smallModelDisplayed,true,shadowLux,dominantSource);
+      updateOneContactShadow(mainContactShadow,mainWrapper,false,sceneLux,realShadowLux);
+      updateOneContactShadow(smallContactShadow,smallModelDisplayed,true,sceneLux,realShadowLux);
     }
 
     function syncHeadAccessories(){
@@ -3547,6 +3550,7 @@
         subjectSpotLight.shadow.radius=1;
       }
       subjectSpotLight.castShadow=on&&!board.blackout&&board.shadow.mode!=='off';
+      if(subjectSpotLight.castShadow)fitShadowCameraToCasters(subjectSpotLight);
       subjectSpotLight.visible=on;subjectSpotLight.intensity=on?lux*source.distanceTo(aim)**2:0;
       subjectSpotBeam.visible=on;subjectSpotCore.visible=on;
       if(!on)return;
@@ -3577,17 +3581,164 @@
         faceBeamToCamera(g);
       }
     }
-    function shadowCandidateScore(c){
-      if(!c||c.lux<=.01)return -1;
-      const f=RIG[c.i],dx=SUBJECT.x-f.pos.x,dy=SUBJECT.y-f.pos.y,dz=SUBJECT.z-f.pos.z,d=Math.max(.001,Math.hypot(dx,dy,dz));
-      const horizontal=Math.hypot(dx,dz)/d,angleQuality=.35+.65*horizontal;
-      return c.lux*angleQuality*(c.background?.48:1);
+    /* --- Shadow Light selection / STEP 1 ---------------------------------
+       照度だけでなく、床へ作る予測影長と撮影カメラから見た方位差を評価する。
+       ShadowMapの切替チャタリングを防ぐため、現在灯より18%以上有利な候補だけへ切替える。 */
+    const SHADOW_SWITCH_RATIO=1.18,SHADOW_KEEP_MIN_LUX=1;
+    const SHADOW_LENGTH_MIN=.15,SHADOW_LENGTH_GOOD=.45,SHADOW_LENGTH_MAX_GOOD=2.8,SHADOW_LENGTH_REJECT=4.2;
+    const shadowSelectionState={primaryFixture:null,secondaryFixture:null};
+    const SHADOW_CAMERA_DEFAULT_NEAR=.35,SHADOW_CAMERA_DEFAULT_FAR=20,SHADOW_CAMERA_MAX_FAR=25;
+    const SHADOW_CAMERA_FOCUS_MIN=.28,SHADOW_CAMERA_MARGIN_NEAR=.25,SHADOW_CAMERA_MARGIN_FAR=.50,SHADOW_CAMERA_ANGLE_MARGIN=THREE.MathUtils.degToRad(2.5);
+    function shadowCachedBox(wrapper,key){
+      const box=wrapper?.userData?.[key]?.shadowBox;
+      return box?.isBox3&&!box.isEmpty()?box.clone():null;
+    }
+    function shadowCasterBoxes(){
+      const out=[];
+      if(isExternalSubject()&&model?.userData?.externalSubject){
+        const box=shadowCachedBox(model,'externalSubject');if(box)out.push({box,kind:'main'});
+      }else if(!isExternalSubject()){
+        // 手続き型被写体でも既存の影を壊さないため、人物領域だけを軽量な固定Boundsで扱う。
+        const fy=shadowFloorY(SUBJECT.x,SUBJECT.z);
+        out.push({box:new THREE.Box3(V3(SUBJECT.x-.48,fy,SUBJECT.z-.32),V3(SUBJECT.x+.48,fy+1.72,SUBJECT.z+.32)),kind:'main'});
+      }
+      if(smallModelDisplayed?.userData?.smallModel){
+        const box=shadowCachedBox(smallModelDisplayed,'smallModel');if(box)out.push({box,kind:'small'});
+      }
+      return out;
+    }
+    function shadowBoxIntersectsSpot(box,light){
+      const sphere=box.getBoundingSphere(new THREE.Sphere()),to=sphere.center.clone().sub(light.position),distance=to.length();
+      if(distance<=sphere.radius+.02)return true;
+      const axis=light.target.position.clone().sub(light.position);if(axis.lengthSq()<1e-8)return false;axis.normalize();
+      const angle=Math.acos(THREE.MathUtils.clamp(axis.dot(to.clone().normalize()),-1,1));
+      const radiusAngle=Math.asin(THREE.MathUtils.clamp(sphere.radius/distance,0,1));
+      return angle<=light.angle+radiusAngle+THREE.MathUtils.degToRad(2);
+    }
+    function shadowBoxCorners(box){
+      const pts=[];
+      for(const x of [box.min.x,box.max.x])for(const y of [box.min.y,box.max.y])for(const z of [box.min.z,box.max.z])pts.push(V3(x,y,z));
+      return pts;
+    }
+    function shadowReceiverPoints(box,light){
+      const center=box.getCenter(new THREE.Vector3()),size=box.getSize(new THREE.Vector3()),floorY=shadowFloorY(center.x,center.z);
+      const base=V3(center.x,floorY,center.z),away=V3(center.x-light.position.x,0,center.z-light.position.z),horizontal=away.length();
+      if(horizontal>1e-5)away.normalize();else away.set(0,0,1);
+      const side=V3(-away.z,0,away.x),casterH=Math.max(.05,box.max.y-floorY),lightH=light.position.y-floorY;
+      let projected=0;
+      if(horizontal>1e-5)projected=lightH>casterH+.05?casterH*horizontal/(lightH-casterH):3.5;
+      projected=THREE.MathUtils.clamp(projected,0,3.5);
+      const half=Math.max(.12,.30*Math.hypot(size.x,size.z)),end=base.clone().addScaledVector(away,projected),endHalf=half+projected*.10;
+      return [base.clone().addScaledVector(side,-half),base.clone().addScaledVector(side,half),end.clone().addScaledVector(side,-endHalf),end.clone().addScaledVector(side,endHalf)];
+    }
+    function resetShadowCameraFit(light){
+      if(!light?.shadow)return;
+      const cam=light.shadow.camera;cam.near=SHADOW_CAMERA_DEFAULT_NEAR;cam.far=SHADOW_CAMERA_DEFAULT_FAR;light.shadow.focus=1;cam.updateProjectionMatrix();
+      light.userData.shadowFit={optimized:false,near:cam.near,far:cam.far,focus:1,casterCount:0};
+    }
+    function fitShadowCameraToCasters(light){
+      if(!light?.shadow||!light.castShadow)return false;
+      const boxes=shadowCasterBoxes().filter(v=>shadowBoxIntersectsSpot(v.box,light));
+      if(!boxes.length){resetShadowCameraFit(light);return false}
+      const axis=light.target.position.clone().sub(light.position);if(axis.lengthSq()<1e-8){resetShadowCameraFit(light);return false}axis.normalize();
+      const points=[];for(const entry of boxes){points.push(...shadowBoxCorners(entry.box),...shadowReceiverPoints(entry.box,light))}
+      let minDepth=Infinity,maxDepth=-Infinity,maxAngle=0;
+      for(const point of points){
+        const to=point.clone().sub(light.position),distance=to.length();if(distance<1e-5)continue;
+        const depth=to.dot(axis);if(depth<=.02)continue;
+        minDepth=Math.min(minDepth,depth);maxDepth=Math.max(maxDepth,depth);
+        maxAngle=Math.max(maxAngle,Math.acos(THREE.MathUtils.clamp(depth/distance,-1,1)));
+      }
+      if(!Number.isFinite(minDepth)||!Number.isFinite(maxDepth)){resetShadowCameraFit(light);return false}
+      const cam=light.shadow.camera;
+      cam.near=Math.max(.15,minDepth-SHADOW_CAMERA_MARGIN_NEAR);
+      cam.far=Math.min(SHADOW_CAMERA_MAX_FAR,Math.max(cam.near+.50,maxDepth+SHADOW_CAMERA_MARGIN_FAR));
+      const required=maxAngle+SHADOW_CAMERA_ANGLE_MARGIN;
+      light.shadow.focus=THREE.MathUtils.clamp(required/Math.max(.01,light.angle),SHADOW_CAMERA_FOCUS_MIN,1);
+      cam.updateProjectionMatrix();
+      light.userData.shadowFit={optimized:true,near:cam.near,far:cam.far,focus:light.shadow.focus,casterCount:boxes.length,maxAngle:THREE.MathUtils.radToDeg(maxAngle)};
+      return true;
+    }
+    function shadowShootingCameraPosition(){
+      // 俯瞰中は上空カメラではなく、編集中の実撮影位置を評価に使う。
+      if(cameraMode==='map'&&mapReturnState?.position)return new THREE.Vector3().fromArray(mapReturnState.position);
+      return camera.position.clone();
+    }
+    function shadowSubjectHeight(){
+      const wrapper=isExternalSubject()?currentExternalSubjectTemplate():null;
+      const meta=wrapper?.userData?.externalSubject;
+      return Math.max(.15,Number(meta?.height)||EXTERNAL_SUBJECT_TARGET_HEIGHT||1.60);
+    }
+    function shadowCandidateMetrics(c){
+      if(!c||c.lux<=.01)return {score:-1,qLux:0,qLength:0,qCamera:0,qBackground:0,shadowLength:Infinity};
+      const f=RIG[c.i],floorY=shadowFloorY(SUBJECT.x,SUBJECT.z),subjectH=shadowSubjectHeight();
+      const horizontalDist=Math.hypot(SUBJECT.x-f.pos.x,SUBJECT.z-f.pos.z);
+      const lightHeight=f.pos.y-floorY,denom=lightHeight-subjectH;
+      const shadowLength=denom>.02?subjectH*horizontalDist/denom:Infinity;
+      const lengthRise=Number.isFinite(shadowLength)?THREE.MathUtils.smoothstep(shadowLength,SHADOW_LENGTH_MIN,SHADOW_LENGTH_GOOD):0;
+      const lengthFall=Number.isFinite(shadowLength)?1-THREE.MathUtils.smoothstep(shadowLength,SHADOW_LENGTH_MAX_GOOD,SHADOW_LENGTH_REJECT):0;
+      const qLength=THREE.MathUtils.clamp(lengthRise*lengthFall,0,1);
+
+      const cam=shadowShootingCameraPosition();
+      const lx=f.pos.x-SUBJECT.x,lz=f.pos.z-SUBJECT.z,cx=cam.x-SUBJECT.x,cz=cam.z-SUBJECT.z;
+      const ll=Math.hypot(lx,lz),cl=Math.hypot(cx,cz);
+      let sinTheta=0;
+      if(ll>1e-5&&cl>1e-5){
+        const cosTheta=THREE.MathUtils.clamp((lx*cx+lz*cz)/(ll*cl),-1,1);
+        sinTheta=Math.sqrt(Math.max(0,1-cosTheta*cosTheta));
+      }
+      const qCamera=.65+.35*sinTheta;
+      const qLux=Math.sqrt(THREE.MathUtils.clamp(c.lux/120,0,2));
+      const qBackground=c.background?.45:1;
+      const score=qLux*(.15+.85*qLength)*qCamera*qBackground;
+      return {score,qLux,qLength,qCamera,qBackground,shadowLength,lightHeight,subjectH};
+    }
+    function shadowCandidateScore(c){return shadowCandidateMetrics(c).score}
+    function shadowHorizontalSeparation(a,b){
+      if(!a||!b)return 0;
+      const af=RIG[a.i],bf=RIG[b.i];
+      const ax=af.pos.x-SUBJECT.x,az=af.pos.z-SUBJECT.z,bx=bf.pos.x-SUBJECT.x,bz=bf.pos.z-SUBJECT.z;
+      const al=Math.hypot(ax,az),bl=Math.hypot(bx,bz);if(al<1e-5||bl<1e-5)return 0;
+      const cos=THREE.MathUtils.clamp((ax*bx+az*bz)/(al*bl),-1,1);
+      return THREE.MathUtils.radToDeg(Math.acos(cos));
+    }
+    function shadowSeparationQuality(primary,candidate){
+      const deg=shadowHorizontalSeparation(primary,candidate);
+      return .35+.65*THREE.MathUtils.smoothstep(deg,20,50);
+    }
+    function chooseShadowEntry(ranked,currentFixture,scoreOf=v=>v.score){
+      const challenger=ranked[0]||null;
+      if(!challenger)return null;
+      const current=ranked.find(v=>v.c.i===currentFixture)||null;
+      if(!current||current.c.lux<SHADOW_KEEP_MIN_LUX)return challenger;
+      if(challenger.c.i===current.c.i)return current;
+      return scoreOf(challenger)>scoreOf(current)*SHADOW_SWITCH_RATIO?challenger:current;
     }
     function selectShadowSlots(renderLights){
       const budget=SHADOW_BUDGET[board.shadow.mode]??SHADOW_BUDGET.natural;
-      if(budget<=0||board.blackout)return {slots:new Set(),best:null};
-      const ranked=renderLights.map((c,k)=>({c,k,score:shadowCandidateScore(c)})).filter(v=>v.score>0).sort((a,b)=>b.score-a.score);
-      return {slots:new Set(ranked.slice(0,budget).map(v=>v.k)),best:ranked[0]?.c||null};
+      if(budget<=0||board.blackout){
+        shadowSelectionState.primaryFixture=null;shadowSelectionState.secondaryFixture=null;
+        return {slots:new Set(),best:null,primary:null,selected:[],realShadowLux:0,ranked:[]};
+      }
+      const ranked=renderLights.map((c,k)=>{
+        const metrics=shadowCandidateMetrics(c);return {c,k,score:metrics.score,metrics};
+      }).filter(v=>v.score>0).sort((a,b)=>b.score-a.score);
+      const primary=chooseShadowEntry(ranked,shadowSelectionState.primaryFixture);
+      shadowSelectionState.primaryFixture=primary?.c.i??null;
+
+      const selected=primary?[primary]:[];
+      if(budget>=2&&primary){
+        const secondaryRanked=ranked.filter(v=>v.c.i!==primary.c.i).map(v=>({
+          ...v,separation:shadowHorizontalSeparation(primary.c,v.c),separationQuality:shadowSeparationQuality(primary.c,v.c),secondaryScore:v.score*shadowSeparationQuality(primary.c,v.c)
+        })).sort((a,b)=>b.secondaryScore-a.secondaryScore);
+        const secondary=chooseShadowEntry(secondaryRanked,shadowSelectionState.secondaryFixture,v=>v.secondaryScore);
+        shadowSelectionState.secondaryFixture=secondary?.c.i??null;
+        if(secondary)selected.push(secondary);
+      }else shadowSelectionState.secondaryFixture=null;
+
+      const slots=new Set(selected.map(v=>v.k));
+      const realShadowLux=selected.reduce((sum,v)=>sum+Math.max(0,v.c.lux||0),0);
+      return {slots,best:primary?.c||null,primary:primary?.c||null,selected:selected.map(v=>v.c),realShadowLux,ranked};
     }
 
     function updateScene(t){
@@ -3723,13 +3874,13 @@
         const f=RIG[c.i], d=Math.max(0.5,c.background?c.aim.distanceTo(f.pos):SUBJECT.distanceTo(f.pos));
         l.visible=true; l.position.copy(f.pos); l.target.position.copy(c.aim); l.target.updateMatrixWorld();
         l.color.copy(c.col); l.angle=CONE[f.type]; l.penumbra=pen; l.decay=2; l.distance=0;
+        if(casts)fitShadowCameraToCasters(l);
         l.shadow.bias=isExternalSubject()?-.00035:-.0009;l.shadow.normalBias=isExternalSubject()?.010:.004;l.shadow.radius=board.shadow.mode==='accent'?1.0:1.6;
         // E = I/d²。顔用は被写体点、背景用は灯体の狙い位置で所定照度になる光度[cd]を与える。
         l.intensity=c.renderLux*d*d;
       });
-      const regularShadowLux=shadowSelection.best?.lux||0;
-      const dominantSource=followLux>=regularShadowLux&&followLux>0?currentSubjectSpotSource():(shadowSelection.best?RIG[shadowSelection.best.i].pos:null);
-      updateContactShadows(contrib.reduce((sum,c)=>sum+c.lux,0)+followLux,dominantSource);
+      const realShadowLux=shadowSelection.realShadowLux+(subjectSpotLight.castShadow?followLux:0);
+      updateContactShadows(meter.stage,realShadowLux);
       // 未割当灯は上限付きの環境反射へ回し、無方向光で会場が平坦になるのを防ぐ。
       let rest=0; const restCol=new THREE.Color(0,0,0);
       for(const c of contrib){if(renderSelection.used.has(c.i)||c.lux<=0)continue;rest+=c.lux;restCol.r+=c.col.r*c.lux;restCol.g+=c.col.g*c.lux;restCol.b+=c.col.b*c.lux}
