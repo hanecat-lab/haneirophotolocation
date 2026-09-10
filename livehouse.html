@@ -167,6 +167,16 @@
           <div class="two"><button class="mode" data-beam-style="diffuse">拡散光</button><button class="mode" data-beam-style="rays">光条</button></div>
           <div class="hint" id="beamStyleHint">灯体から広がり、床へ近づくほど薄くなる柔らかい光です。</div>
         </section>
+        <section class="section"><div class="label"><span>レーザーシート</span><small>LASER SHEET</small></div>
+          <button class="mode" id="laserSheetToggle" type="button" style="width:100%">○ レーザーシート</button>
+          <div class="slider" style="margin-top:8px"><div><span>明るさ</span><strong id="v-laserSheetLevel">65%</strong></div><input type="range" id="laserSheetLevel" min="0" max="100" step="1" value="65" /></div>
+          <div class="slider"><div><span>高さ</span><strong id="v-laserSheetHeight">1.35m</strong></div><input type="range" id="laserSheetHeight" min="0.35" max="2.6" step="0.05" value="1.35" /></div>
+          <div class="slider"><div><span>広がり</span><strong id="v-laserSheetSpread">86%</strong></div><input type="range" id="laserSheetSpread" min="30" max="100" step="1" value="86" /></div>
+          <div class="slider"><div><span>チルト</span><strong id="v-laserSheetTilt">0°</strong></div><input type="range" id="laserSheetTilt" min="-25" max="25" step="1" value="0" /></div>
+          <div class="slider"><div><span>スイープ速度</span><strong id="v-laserSheetSpeed">0.0</strong></div><input type="range" id="laserSheetSpeed" min="0" max="2" step="0.1" value="0" /></div>
+          <div class="slider"><div><span>色</span><strong id="v-laserSheetColor">#36ff74</strong></div><input type="color" id="laserSheetColor" value="#36ff74" /></div>
+          <div class="hint">ステージ奥中央から前方へ薄い面状レーザーを展開します。スモークONで散乱が強くなり、ブラックアウトでは必ず消灯します。速度を0より上げると上下へスイープします。</div>
+        </section>
         <section class="section"><div class="label"><span>被写体スポット</span><small>FOLLOW SPOT</small></div>
           <button class="mode" id="subjectSpotToggle" type="button" style="width:100%">● 被写体スポット</button>
           <div class="slider" style="margin-top:8px"><div><span>スポットの明るさ</span><strong id="v-subjectSpotLevel">45%</strong></div><input type="range" id="subjectSpotLevel" min="0" max="100" step="1" value="45" /></div>
@@ -2487,12 +2497,13 @@
 
     /* --- 卓の状態 -------------------------------------------------------- */
     const LIGHTING_FRAME_VERSION=1;
-    const LIGHTING_STATE_VERSION=6;
+    const LIGHTING_STATE_VERSION=7;
     const board={
       sceneId:'band', bright:70, tilt:-25, soft:62, frontFill:58, blackout:false, smoke:false, rainbow:false,beamStyle:'diffuse',
       group:'all', color:'#fff4e0',
       subjectSpot:{on:true,level:45,policy:'follow'},
       faceFill:{on:true,level:32},
+      laserSheet:{on:false,level:65,height:1.35,spread:86,tilt:0,speed:0,color:'#36ff74'},
       show:{mode:'blinder',speed:1,level:80,fade:.55,spread:70,loop:true,keepSpot:true,playing:false},
       overlay:{enabled:false,mode:'fan',speed:1,level:65},
       timeline:{bpm:120,beats:4,loop:true,playing:false,index:0,steps:[]},
@@ -3054,6 +3065,49 @@
     });
 
     /* --- スモーク（漂うパーティクル。静止画でもヘイズとして見える） -------- */
+    /* --- レーザーシート --------------------------------------------------
+       実SpotLightは増やさず、加算合成の薄い面と細い光条を1メッシュで表現する。
+       スモークON時は散乱を強め、モバイルでも負荷を増やしすぎない。 */
+    const laserSheetGeo=new THREE.BufferGeometry();
+    laserSheetGeo.setAttribute('position',new THREE.Float32BufferAttribute([
+      -.02,0,0,.02,0,0,1,0,1,-.02,0,0,1,0,1,-1,0,1
+    ],3));
+    laserSheetGeo.setAttribute('uv',new THREE.Float32BufferAttribute([0,0,1,0,1,1,0,0,1,1,0,1],2));
+    const laserSheetMat=new THREE.ShaderMaterial({
+      transparent:true,depthWrite:false,depthTest:true,side:THREE.DoubleSide,blending:THREE.AdditiveBlending,
+      uniforms:{uColor:{value:new THREE.Color('#36ff74')},uOpacity:{value:0},uTime:{value:0}},
+      vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
+      fragmentShader:`precision mediump float;varying vec2 vUv;uniform vec3 uColor;uniform float uOpacity;uniform float uTime;
+        void main(){
+          float edge=smoothstep(0.0,.08,vUv.y)*(1.0-smoothstep(.84,1.0,vUv.y));
+          float bands=.12+.88*pow(max(0.0,sin((vUv.x*18.0+uTime*.025)*3.14159265)),18.0);
+          float center=.55+.45*(1.0-abs(vUv.x-.5)*2.0);
+          float a=uOpacity*edge*center*(.26+.74*bands);
+          if(a<.002)discard;gl_FragColor=vec4(uColor,a);
+        }`
+    });
+    const laserSheetMesh=new THREE.Mesh(laserSheetGeo,laserSheetMat);
+    laserSheetMesh.frustumCulled=false;laserSheetMesh.renderOrder=6;laserSheetMesh.visible=false;scene.add(laserSheetMesh);
+    const LASER_SHEET_SOURCE_Z=STAGE_Z-STAGE_D/2+.16,LASER_SHEET_LENGTH=6.9;
+    function updateLaserSheet(t,frame=composeLightingFrame(t)){
+      const ls=board.laserSheet;
+      const power=ls.on&&!frame.safety.blackout&&!frame.show.blackoutMask?THREE.MathUtils.clamp(ls.level/100,0,1)*frame.safety.master:0;
+      laserSheetMesh.visible=power>.001;
+      if(!laserSheetMesh.visible)return;
+      const sweep=ls.speed>0?Math.sin(t*Math.PI*2*ls.speed)*12:0;
+      const tilt=(ls.tilt+sweep)*Math.PI/180;
+      const farY=Math.tan(tilt)*LASER_SHEET_LENGTH;
+      const halfW=(STAGE_W*.72)*(ls.spread/100);
+      const pos=laserSheetGeo.attributes.position.array;
+      const verts=[-.025,0,0,.025,0,0,halfW,farY,LASER_SHEET_LENGTH,-.025,0,0,halfW,farY,LASER_SHEET_LENGTH,-halfW,farY,LASER_SHEET_LENGTH];
+      for(let i=0;i<verts.length;i++)pos[i]=verts[i];
+      laserSheetGeo.attributes.position.needsUpdate=true;
+      laserSheetMesh.position.set(0,ls.height,LASER_SHEET_SOURCE_Z);
+      laserSheetMat.uniforms.uColor.value.set(ls.color);
+      laserSheetMat.uniforms.uTime.value=t;
+      laserSheetMat.uniforms.uOpacity.value=power*(board.smoke?.42:.085);
+    }
+
     const SMOKE_N=420;
     const smokePos=new Float32Array(SMOKE_N*3), smokeVel=new Float32Array(SMOKE_N*3);
     for(let i=0;i<SMOKE_N;i++){
@@ -3151,6 +3205,7 @@
     }
     function updateScene(t){
       const frame=composeLightingFrame(t);
+      updateLaserSheet(t,frame);
       // ブラックアウトでは補助環境光も止め、顔や会場だけが残光しないようにする。
       hemi.intensity=frame.safety.blackout?0:.05;
       const contrib=[];
@@ -3481,6 +3536,14 @@
       Object.assign(board.faceFill,src.faceFill||{});
       board.faceFill.on=board.faceFill.on!==false;
       board.faceFill.level=THREE.MathUtils.clamp(Math.round(Number(board.faceFill.level)||32),0,100);
+      Object.assign(board.laserSheet,src.laserSheet||{});
+      board.laserSheet.on=!!board.laserSheet.on;
+      board.laserSheet.level=THREE.MathUtils.clamp(Math.round(Number(board.laserSheet.level)||65),0,100);
+      board.laserSheet.height=THREE.MathUtils.clamp(Number(board.laserSheet.height)||1.35,.35,2.6);
+      board.laserSheet.spread=THREE.MathUtils.clamp(Math.round(Number(board.laserSheet.spread)||86),30,100);
+      board.laserSheet.tilt=THREE.MathUtils.clamp(Number(board.laserSheet.tilt)||0,-25,25);
+      board.laserSheet.speed=THREE.MathUtils.clamp(Number(board.laserSheet.speed)||0,0,2);
+      board.laserSheet.color=/^#[0-9a-f]{6}$/i.test(String(board.laserSheet.color||''))?board.laserSheet.color:'#36ff74';
       if(!['maintain','follow','off'].includes(board.subjectSpot.policy))board.subjectSpot.policy='follow';
       Object.assign(board.show,src.show||{});
       Object.assign(board.overlay,src.overlay||{});
@@ -3614,10 +3677,16 @@
       // v4以前のステップには灯体スナップショットがないため、nullのまま残して現在状態を維持する。
       const fixtures=Array.isArray(source.fixtures)&&source.fixtures.length===N
         ?source.fixtures.map(Boolean):null;
+      const laser=source.laser&&typeof source.laser==='object'?source.laser:null;
       return{
         beats:[1,2,4,8,16].includes(+source.beats)?+source.beats:4,
         keepSpot:source.keepSpot!==false,
         fixtures,
+        laser:laser?{
+          on:!!laser.on,level:clamp(laser.level,0,100,65),height:clamp(laser.height,.35,2.6,1.35),
+          spread:clamp(laser.spread,30,100,86),tilt:clamp(laser.tilt,-25,25,0),speed:clamp(laser.speed,0,2,0),
+          color:/^#[0-9a-f]{6}$/i.test(String(laser.color||''))?laser.color:'#36ff74'
+        }:null,
         a:{
           mode:SHOW_DURATIONS[a.mode]?a.mode:'blinder',
           speed:clamp(a.speed,.2,4,1),level:clamp(a.level,0,100,80),
@@ -3632,6 +3701,7 @@
     function captureTimelineStep(){
       return sanitizeTimelineStep({beats:board.timeline.beats,keepSpot:board.show.keepSpot,
         fixtures:board.fixtures.map(s=>!!s.on),
+        laser:{...board.laserSheet},
         a:{mode:board.show.mode,speed:board.show.speed,level:board.show.level,fade:board.show.fade,spread:board.show.spread},
         b:{enabled:board.overlay.enabled,mode:board.overlay.mode,speed:board.overlay.speed,level:board.overlay.level}});
     }
@@ -3642,6 +3712,7 @@
       if(Array.isArray(step.fixtures)&&step.fixtures.length===N){
         step.fixtures.forEach((on,i)=>{board.fixtures[i].on=!!on});
       }
+      if(step.laser)Object.assign(board.laserSheet,step.laser);
       board.show.keepSpot=step.keepSpot!==undefined?!!step.keepSpot:!combinationUsesDarkMode();
       showStart=startAt;
     }
@@ -3734,6 +3805,12 @@
       q('#frontFillR').value=board.frontFill;q('#v-frontFill').textContent=board.frontFill+'%';
       q('#subjectSpotLevel').value=board.subjectSpot.level;q('#v-subjectSpotLevel').textContent=board.subjectSpot.level+'%';
       q('#faceFillLevel').value=board.faceFill.level;q('#v-faceFillLevel').textContent=board.faceFill.level+'%';
+      q('#laserSheetLevel').value=board.laserSheet.level;q('#v-laserSheetLevel').textContent=board.laserSheet.level+'%';
+      q('#laserSheetHeight').value=board.laserSheet.height;q('#v-laserSheetHeight').textContent=board.laserSheet.height.toFixed(2)+'m';
+      q('#laserSheetSpread').value=board.laserSheet.spread;q('#v-laserSheetSpread').textContent=board.laserSheet.spread+'%';
+      q('#laserSheetTilt').value=board.laserSheet.tilt;q('#v-laserSheetTilt').textContent=board.laserSheet.tilt+'°';
+      q('#laserSheetSpeed').value=board.laserSheet.speed;q('#v-laserSheetSpeed').textContent=board.laserSheet.speed.toFixed(1);
+      q('#laserSheetColor').value=board.laserSheet.color;q('#v-laserSheetColor').textContent=board.laserSheet.color;
       q('#showMode').value=board.show.mode;
       q('#showLevel').value=board.show.level;q('#v-showLevel').textContent=board.show.level+'%';
       q('#showSpeed').value=board.show.speed;q('#v-showSpeed').textContent=board.show.speed.toFixed(1);
@@ -3755,6 +3832,7 @@
       setToggle('blackoutToggle',board.blackout,'ブラックアウト');
       setToggle('subjectSpotToggle',board.subjectSpot.on,'被写体スポット');
       setToggle('faceFillToggle',board.faceFill.on,'フェイスフィル');
+      setToggle('laserSheetToggle',board.laserSheet.on,'レーザーシート');
       setToggle('showKeepSpot',board.show.keepSpot,'被写体スポットを維持');
       setToggle('overlayToggle',board.overlay.enabled,'SLOT Bを重ねる');
       setToggle('rainbowToggle',board.rainbow,'レインボー');
@@ -3797,6 +3875,13 @@
     q('#colorPick').oninput=e=>{board.color=e.target.value;q('#v-color').textContent=board.color;applyColorToSelection()};
     q('#smokeToggle').onclick=()=>{board.smoke=!board.smoke;setToggle('smokeToggle',board.smoke,'スモーク');saveSettings();refresh()};
     q('#blackoutToggle').onclick=()=>{board.blackout=!board.blackout;setToggle('blackoutToggle',board.blackout,'ブラックアウト');saveSettings();refresh()};
+    q('#laserSheetToggle').onclick=()=>{board.laserSheet.on=!board.laserSheet.on;setToggle('laserSheetToggle',board.laserSheet.on,'レーザーシート');saveSettings();refresh()};
+    q('#laserSheetLevel').oninput=e=>{board.laserSheet.level=+e.target.value;q('#v-laserSheetLevel').textContent=board.laserSheet.level+'%';saveSettings();refresh()};
+    q('#laserSheetHeight').oninput=e=>{board.laserSheet.height=+e.target.value;q('#v-laserSheetHeight').textContent=board.laserSheet.height.toFixed(2)+'m';saveSettings();refresh()};
+    q('#laserSheetSpread').oninput=e=>{board.laserSheet.spread=+e.target.value;q('#v-laserSheetSpread').textContent=board.laserSheet.spread+'%';saveSettings();refresh()};
+    q('#laserSheetTilt').oninput=e=>{board.laserSheet.tilt=+e.target.value;q('#v-laserSheetTilt').textContent=board.laserSheet.tilt+'°';saveSettings();refresh()};
+    q('#laserSheetSpeed').oninput=e=>{board.laserSheet.speed=+e.target.value;q('#v-laserSheetSpeed').textContent=board.laserSheet.speed.toFixed(1);saveSettings();refresh()};
+    q('#laserSheetColor').oninput=e=>{board.laserSheet.color=e.target.value;q('#v-laserSheetColor').textContent=board.laserSheet.color;saveSettings();refresh()};
     q('#rainbowToggle').onclick=()=>{board.rainbow=!board.rainbow;setToggle('rainbowToggle',board.rainbow,'レインボー');saveSettings();refresh()};
     document.querySelectorAll('[data-beam-style]').forEach(b=>b.onclick=()=>{
       board.beamStyle=b.dataset.beamStyle;syncBoardUI();saveSettings();refresh();
@@ -4044,7 +4129,7 @@
     function loop(now){
       requestAnimationFrame(loop);
       const dt=Math.min((now-last)/1000,0.05); last=now;
-      const animating=board.chase.playing||board.blink.playing||board.show.playing||board.rainbow;
+      const animating=board.chase.playing||board.blink.playing||board.show.playing||board.rainbow||(board.laserSheet.on&&board.laserSheet.speed>0);
       if(animating){
         clock+=dt;
         advanceTimeline(clock);
@@ -4078,7 +4163,7 @@
     requestAnimationFrame(loop);
 
     // 数値検証用。表示に依存せずチェイス／露出／照度を読み出せる
-    window.__livehouse={RIG,board,composeLightingFrame,activeShowSlots,showRunComplete,levelAt,luxOf,stageLux,subjectSpotLux,faceFillLux,showLevelAt,showAimOf,showBlinderPulse,showWhitePulse,showBlackoutPulse,evCamOf,evSceneOf,getExpo:()=>expo,CHALLENGES,updateScene,
+    window.__livehouse={RIG,board,laserSheet:{mesh:laserSheetMesh,material:laserSheetMat,update:updateLaserSheet},composeLightingFrame,activeShowSlots,showRunComplete,levelAt,luxOf,stageLux,subjectSpotLux,faceFillLux,showLevelAt,showAimOf,showBlinderPulse,showWhitePulse,showBlackoutPulse,evCamOf,evSceneOf,getExpo:()=>expo,CHALLENGES,updateScene,
       setClock(t){clock=t;updateScene(t)},setBody:(id)=>setBody(id),getBodyId:()=>bodyId,BODIES,validateLowPolyModel,camera,CAMERA_PRESETS,
       stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,updateVenueCutaway,faceExposureOf,selectRenderLights,
       timeline:{capture:captureTimelineStep,add:addTimelineStep,start:startTimeline,stop:stopTimeline,advance:advanceTimeline,setBpm:setTimelineBpm,sanitize:sanitizeTimelineStep},
