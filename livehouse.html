@@ -218,6 +218,14 @@
             <div class="hint">追加の実SpotLightは使わず、既存の影なし正面補助光をGLBの顔〜胸上部へ追従させます。暗転・バックシルエット時は自動で消灯します。</div>
           </div>
         </section>
+        <section class="section"><div class="label"><span>影</span><small>GLB SHADOW</small></div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px">
+            <button class="mode" data-shadow-mode="off" type="button">OFF</button>
+            <button class="mode active" data-shadow-mode="natural" type="button">自然</button>
+            <button class="mode" data-shadow-mode="accent" type="button">強調</button>
+          </div>
+          <div class="hint" id="shadowModeHint">GLBへ主光のリアルシャドウと薄い接地影を追加します。フェイスフィルは影を作りません。</div>
+        </section>
         <section class="section"><div class="label"><span>色</span><small>COLOR</small></div>
           <div class="slider"><div><span>選択中の灯体に適用</span><strong id="v-color">#fff4e0</strong></div><input type="color" id="colorPick" value="#fff4e0" /></div>
           <div class="swatches" id="swatches"></div>
@@ -2525,7 +2533,7 @@
       const wrapper=new THREE.Group();wrapper.name='ImportedFixedPoseSubject_'+subjectId;wrapper.add(root);
       const finalBox=new THREE.Box3().setFromObject(wrapper),finalSize=finalBox.getSize(new THREE.Vector3());
       wrapper.userData.externalSubject={
-        source:config.url,modelId:subjectId,label:config.label,rawHeight:rawSize.y,height:finalSize.y,baseHeight:finalSize.y,baseDepth:finalSize.z,
+        source:config.url,modelId:subjectId,label:config.label,rawHeight:rawSize.y,height:finalSize.y,baseHeight:finalSize.y,baseWidth:finalSize.x,baseDepth:finalSize.z,
         scale,baseScale:scale,triangles,fixedPose:true,front:'+Z',groundY:finalBox.min.y
       };
       applyExternalSubjectAdjustment(wrapper);
@@ -2632,7 +2640,7 @@
       });
       const wrapper=new THREE.Group();wrapper.name='SmallModel_'+id;wrapper.add(root);
       const finalBox=new THREE.Box3().setFromObject(wrapper),finalSize=finalBox.getSize(new THREE.Vector3());
-      wrapper.userData.smallModel={source:config.url,modelId:id,label:config.label,rawHeight:rawSize.y,baseHeight:finalSize.y,height:finalSize.y,triangles,groundY:finalBox.min.y};
+      wrapper.userData.smallModel={source:config.url,modelId:id,label:config.label,rawHeight:rawSize.y,baseHeight:finalSize.y,baseWidth:finalSize.x,baseDepth:finalSize.z,height:finalSize.y,triangles,groundY:finalBox.min.y};
       return wrapper;
     }
     function loadSmallModel(id=smallModelState.id){
@@ -2709,6 +2717,59 @@
         refresh();
       }
     }
+    /* --- GLB Shadow System -----------------------------------------------
+       実SpotLightのシャドウはShadow Budgetで最大数を制限し、GLBには薄い
+       接地影を別レイヤーで加える。フェイスフィルは影を生成しない。 */
+    const contactShadowTexture=(()=>{
+      const c=document.createElement('canvas');c.width=c.height=128;
+      const x=c.getContext('2d'),img=x.createImageData(128,128);
+      for(let py=0;py<128;py++)for(let px=0;px<128;px++){
+        const nx=(px-63.5)/57,ny=(py-63.5)/31;
+        const r2=nx*nx+ny*ny,soft=Math.exp(-2.45*r2),edge=THREE.MathUtils.clamp((1.18-r2)/.40,0,1);
+        const irregular=.92+.08*Math.cos(nx*4.7+ny*2.3);
+        const a=Math.round(255*soft*edge*irregular),j=(py*128+px)*4;
+        img.data[j]=img.data[j+1]=img.data[j+2]=a;img.data[j+3]=255;
+      }
+      x.putImageData(img,0,0);const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.NoColorSpace;return t;
+    })();
+    function makeContactShadow(name){
+      const mat=new THREE.MeshBasicMaterial({color:'#000000',alphaMap:contactShadowTexture,transparent:true,opacity:0,depthWrite:false,depthTest:true,toneMapped:false,side:THREE.DoubleSide,polygonOffset:true,polygonOffsetFactor:-1,polygonOffsetUnits:-1});
+      const m=new THREE.Mesh(new THREE.PlaneGeometry(1,1),mat);m.name=name;m.rotation.x=-Math.PI/2;m.visible=false;m.renderOrder=4;scene.add(m);return m;
+    }
+    const mainContactShadow=makeContactShadow('MainGLBContactShadow'),smallContactShadow=makeContactShadow('SmallGLBContactShadow');
+    function shadowFloorY(x,z){
+      const onStage=Math.abs(x)<=STAGE_W/2+.05&&z>=STAGE_Z-STAGE_D/2-.05&&z<=STAGE_FRONT+.05;
+      return onStage?.014:-STAGE_HEIGHT+.014;
+    }
+    function updateOneContactShadow(mesh,wrapper,isSmall,shadowLux,source){
+      if(!wrapper||board.shadow.mode==='off'||board.blackout||cameraMode==='map'){mesh.visible=false;return}
+      const meta=isSmall?wrapper.userData?.smallModel:wrapper.userData?.externalSubject;
+      if(!meta){mesh.visible=false;return}
+      const height=Math.max(.05,Number(meta.height)||Number(meta.baseHeight)||.4),ratio=height/Math.max(.001,Number(meta.baseHeight)||height);
+      const worldWidth=Math.max(.06,(Number(meta.baseWidth)||height*.45)*ratio),worldDepth=Math.max(.05,(Number(meta.baseDepth)||height*.30)*ratio);
+      const floorY=shadowFloorY(wrapper.position.x,wrapper.position.z),groundY=Number.isFinite(meta.groundY)?meta.groundY:floorY;
+      const gap=Math.max(0,groundY-floorY),presence=THREE.MathUtils.clamp(shadowLux/45,0,1);
+      if(presence<=.002){mesh.visible=false;return}
+      const baseOpacity=board.shadow.mode==='accent'?(isSmall?.17:.20):(isSmall?.105:.125);
+      const smokeFade=board.smoke?.72:1,brightFade=1-.23*THREE.MathUtils.clamp((shadowLux-70)/520,0,1),gapFade=Math.exp(-gap*.62);
+      const opacity=baseOpacity*presence*smokeFade*brightFade*gapFade;
+      if(opacity<.003){mesh.visible=false;return}
+      const footprintW=isSmall?Math.min(worldWidth,height*.95):Math.min(worldWidth,height*.42);
+      const footprintD=isSmall?Math.min(worldDepth,height*.90):Math.min(worldDepth,height*.34);
+      const growW=Math.min(1.1,gap*.28),growD=Math.min(1.35,gap*.36);
+      let ox=0,oz=0;
+      if(source){const ax=wrapper.position.x-source.x,az=wrapper.position.z-source.z,len=Math.hypot(ax,az);if(len>1e-4){const push=Math.min(.32,.018*height+gap*.11);ox=ax/len*push;oz=az/len*push}}
+      mesh.position.set(wrapper.position.x+ox,floorY,wrapper.position.z+oz);
+      mesh.rotation.set(-Math.PI/2,0,wrapper.rotation.y||0);
+      mesh.scale.set(Math.max(.13,footprintW+growW),Math.max(.10,footprintD+growD),1);
+      mesh.material.opacity=opacity;mesh.visible=true;
+    }
+    function updateContactShadows(shadowLux,dominantSource){
+      const mainWrapper=isExternalSubject()&&model?.userData?.externalSubject?model:null;
+      updateOneContactShadow(mainContactShadow,mainWrapper,false,shadowLux,dominantSource);
+      updateOneContactShadow(smallContactShadow,smallModelDisplayed,true,shadowLux,dominantSource);
+    }
+
     function syncHeadAccessories(){
       if(isExternalSubject()){
         [glasses,sunglasses,catEars].forEach(g=>{if(g)g.visible=false});
@@ -2749,7 +2810,10 @@
     const REF_DIST=3, FIX_LUX={par:36,moving:70,side:25,uplight:15};
     const CONE={par:0.22,moving:0.13,side:0.26,uplight:0.40};   // ビーム半角[rad]
     const C_INCIDENT=2.5;                                       // 入射光式の定数 E = 2.5 × 2^EV100
-    const REAL_LIGHTS=8, SHADOW_LIGHTS=2;                       // 実光源とシャドウマップの上限（下の説明を参照）
+    const REAL_LIGHTS=8;                                         // 実光源の上限
+    const SHADOW_IS_MOBILE=/iPhone|iPad|iPod|Android|Mobile/i.test(navigator.userAgent||'')||matchMedia('(max-width:720px)').matches;
+    const SHADOW_MAP_SIZE=SHADOW_IS_MOBILE?512:1024;
+    const SHADOW_BUDGET=Object.freeze({off:0,natural:1,accent:SHADOW_IS_MOBILE?1:2});
     const TONE_K=1.2;                                           // 適正露出のとき画面が中庸になるよう決めた係数
 
     const SCENES=[
@@ -2764,12 +2828,13 @@
 
     /* --- 卓の状態 -------------------------------------------------------- */
     const LIGHTING_FRAME_VERSION=1;
-    const LIGHTING_STATE_VERSION=7;
+    const LIGHTING_STATE_VERSION=8;
     const board={
       sceneId:'band', bright:70, tilt:-25, soft:62, frontFill:58, blackout:false, smoke:false, rainbow:false,beamStyle:'diffuse',
       group:'all', color:'#fff4e0',
       subjectSpot:{on:true,level:45,policy:'follow'},
       faceFill:{on:true,level:32},
+      shadow:{mode:'natural'},
       laserSheet:{on:false,level:28,height:1.40,spread:35,tilt:0,mode:'fixed',speed:.6,color:'#36ff74'},
       show:{mode:'blinder',speed:1,level:80,fade:.55,spread:70,loop:true,keepSpot:true,playing:false},
       overlay:{enabled:false,mode:'fan',speed:1,level:65},
@@ -3145,7 +3210,7 @@
 
     /* ======================================================================
        灯体の見た目 — 筐体＋加算ビーム。30灯すべてに出す（負荷が軽い）
-       実光源(SpotLight)は寄与の大きい 8 灯まで、シャドウマップは上位 2 灯まで。
+       実光源(SpotLight)は寄与の大きい8灯まで。シャドウマップはShadow BudgetでPC最大2灯・モバイル最大1灯へ動的制限。
        WebGLのライト数とシャドウマップのコストに対する明示的な上限で、
        残り 22 灯の寄与は AmbientLight に色平均として足し込んで補う。
        ====================================================================== */
@@ -3292,9 +3357,9 @@
       rigGroup.add(g);
       return {body,bodyMat,beam,beamMat,core,coreMat,lens,lensMat,pool,poolMat,beamAxis:new THREE.Vector3(0,-1,0)};
     });
-    const spots=Array.from({length:REAL_LIGHTS},(_,k)=>{
+    const spots=Array.from({length:REAL_LIGHTS},()=>{
       const l=new THREE.SpotLight('#ffffff',0,0,0.3,0.5,2), t=new THREE.Object3D();
-      if(k<SHADOW_LIGHTS){l.castShadow=true;l.shadow.mapSize.set(1024,1024);l.shadow.bias=-0.0012;l.shadow.camera.near=0.5;l.shadow.camera.far=20;}
+      l.castShadow=false;l.shadow.mapSize.set(SHADOW_MAP_SIZE,SHADOW_MAP_SIZE);l.shadow.bias=-.00065;l.shadow.normalBias=.008;l.shadow.radius=1.4;l.shadow.camera.near=.35;l.shadow.camera.far=20;
       l.target=t; scene.add(l,t); return l;
     });
     // 客席側上部から演者へ向ける独立フォロースポット。30灯のチェイス状態とは別系統。
@@ -3302,7 +3367,7 @@
     const subjectSpotTarget=new THREE.Object3D();subjectSpotTarget.position.copy(currentSubjectSpotAim());scene.add(subjectSpotTarget);
     const subjectSpotLight=new THREE.SpotLight(SUBJECT_SPOT_COLOR,0,0,SUBJECT_SPOT_CONE,.68,2);
     subjectSpotLight.position.copy(SUBJECT_SPOT_POS);subjectSpotLight.target=subjectSpotTarget;
-    subjectSpotLight.castShadow=true;subjectSpotLight.shadow.mapSize.set(512,512);subjectSpotLight.shadow.bias=-.0012;
+    subjectSpotLight.castShadow=true;subjectSpotLight.shadow.mapSize.set(SHADOW_MAP_SIZE,SHADOW_MAP_SIZE);subjectSpotLight.shadow.bias=-.0012;
     subjectSpotLight.shadow.normalBias=0;subjectSpotLight.shadow.radius=1;
     scene.add(subjectSpotLight);
     const subjectSpotBeamMat=makeBeamMaterial(.937),subjectSpotBeam=new THREE.Mesh(beamGeo,subjectSpotBeamMat);
@@ -3481,6 +3546,7 @@
         subjectSpotLight.shadow.normalBias=0;
         subjectSpotLight.shadow.radius=1;
       }
+      subjectSpotLight.castShadow=on&&!board.blackout&&board.shadow.mode!=='off';
       subjectSpotLight.visible=on;subjectSpotLight.intensity=on?lux*source.distanceTo(aim)**2:0;
       subjectSpotBeam.visible=on;subjectSpotCore.visible=on;
       if(!on)return;
@@ -3511,6 +3577,19 @@
         faceBeamToCamera(g);
       }
     }
+    function shadowCandidateScore(c){
+      if(!c||c.lux<=.01)return -1;
+      const f=RIG[c.i],dx=SUBJECT.x-f.pos.x,dy=SUBJECT.y-f.pos.y,dz=SUBJECT.z-f.pos.z,d=Math.max(.001,Math.hypot(dx,dy,dz));
+      const horizontal=Math.hypot(dx,dz)/d,angleQuality=.35+.65*horizontal;
+      return c.lux*angleQuality*(c.background?.48:1);
+    }
+    function selectShadowSlots(renderLights){
+      const budget=SHADOW_BUDGET[board.shadow.mode]??SHADOW_BUDGET.natural;
+      if(budget<=0||board.blackout)return {slots:new Set(),best:null};
+      const ranked=renderLights.map((c,k)=>({c,k,score:shadowCandidateScore(c)})).filter(v=>v.score>0).sort((a,b)=>b.score-a.score);
+      return {slots:new Set(ranked.slice(0,budget).map(v=>v.k)),best:ranked[0]?.c||null};
+    }
+
     function updateScene(t){
       const frame=composeLightingFrame(t);
       updateLaserSheet(t,frame);
@@ -3634,18 +3713,23 @@
       faceBounce.intensity=board.blackout?0:meter.bounce;
       faceBounceTarget.updateMatrixWorld();
 
-      const renderSelection=selectRenderLights(contrib);
-      // 顔用6灯＋背景用2灯を、実光源の上限8灯へ割り当てる。
+      const renderSelection=selectRenderLights(contrib),shadowSelection=selectShadowSlots(renderSelection.lights);
+      // 顔用6灯＋背景用2灯を、実光源の上限8灯へ割り当てる。影はShadow Budget内の主光だけに限定する。
       const pen=THREE.MathUtils.lerp(0.15,0.85,board.soft/100);
       spots.forEach((l,k)=>{
-        const c=renderSelection.lights[k];
-        if(!c||c.renderLux<=0.01){l.intensity=0;l.visible=false;return}
+        const c=renderSelection.lights[k],casts=shadowSelection.slots.has(k);
+        l.castShadow=casts;
+        if(!c||c.renderLux<=0.01){l.intensity=0;l.visible=false;l.castShadow=false;return}
         const f=RIG[c.i], d=Math.max(0.5,c.background?c.aim.distanceTo(f.pos):SUBJECT.distanceTo(f.pos));
         l.visible=true; l.position.copy(f.pos); l.target.position.copy(c.aim); l.target.updateMatrixWorld();
         l.color.copy(c.col); l.angle=CONE[f.type]; l.penumbra=pen; l.decay=2; l.distance=0;
+        l.shadow.bias=isExternalSubject()?-.00035:-.0009;l.shadow.normalBias=isExternalSubject()?.010:.004;l.shadow.radius=board.shadow.mode==='accent'?1.0:1.6;
         // E = I/d²。顔用は被写体点、背景用は灯体の狙い位置で所定照度になる光度[cd]を与える。
         l.intensity=c.renderLux*d*d;
       });
+      const regularShadowLux=shadowSelection.best?.lux||0;
+      const dominantSource=followLux>=regularShadowLux&&followLux>0?currentSubjectSpotSource():(shadowSelection.best?RIG[shadowSelection.best.i].pos:null);
+      updateContactShadows(contrib.reduce((sum,c)=>sum+c.lux,0)+followLux,dominantSource);
       // 未割当灯は上限付きの環境反射へ回し、無方向光で会場が平坦になるのを防ぐ。
       let rest=0; const restCol=new THREE.Color(0,0,0);
       for(const c of contrib){if(renderSelection.used.has(c.i)||c.lux<=0)continue;rest+=c.lux;restCol.r+=c.col.r*c.lux;restCol.g+=c.col.g*c.lux;restCol.b+=c.col.b*c.lux}
@@ -3845,6 +3929,8 @@
       Object.assign(board.faceFill,src.faceFill||{});
       board.faceFill.on=board.faceFill.on!==false;
       board.faceFill.level=THREE.MathUtils.clamp(Math.round(Number(board.faceFill.level)||32),0,100);
+      Object.assign(board.shadow,src.shadow||{});
+      board.shadow.mode=['off','natural','accent'].includes(board.shadow.mode)?board.shadow.mode:'natural';
       Object.assign(board.laserSheet,src.laserSheet||{});
       board.laserSheet.on=!!board.laserSheet.on;
       board.laserSheet.level=THREE.MathUtils.clamp(Math.round(Number(board.laserSheet.level)||28),0,100);
@@ -4146,6 +4232,13 @@
       setToggle('blackoutToggle',board.blackout,'ブラックアウト');
       setToggle('subjectSpotToggle',board.subjectSpot.on,'被写体スポット');
       setToggle('faceFillToggle',board.faceFill.on,'フェイスフィル');
+      document.querySelectorAll('[data-shadow-mode]').forEach(b=>b.classList.toggle('active',b.dataset.shadowMode===board.shadow.mode));
+      const shadowHint=q('#shadowModeHint');if(shadowHint){
+        const budget=SHADOW_BUDGET[board.shadow.mode]??1;
+        shadowHint.textContent=board.shadow.mode==='off'?'リアルシャドウと接地影を停止します。':
+          (board.shadow.mode==='accent'?'主光を強調し、接地影を少し濃くします。':'主光の影＋薄い接地影で自然な立体感を作ります。')+
+          ' '+(SHADOW_IS_MOBILE?'モバイルは実照明最大1灯・512px。':'PCは実照明最大'+budget+'灯・1024px。')+' フェイスフィルは影なしです。';
+      }
       setToggle('laserSheetToggle',board.laserSheet.on,'レーザーシート');
       setToggle('showKeepSpot',board.show.keepSpot,'被写体スポットを維持');
       setToggle('overlayToggle',board.overlay.enabled,'SLOT Bを重ねる');
@@ -4186,6 +4279,7 @@
     q('#subjectSpotLevel').oninput=e=>{board.subjectSpot.level=+e.target.value;q('#v-subjectSpotLevel').textContent=board.subjectSpot.level+'%';saveSettings();refresh()};
     q('#faceFillToggle').onclick=()=>{board.faceFill.on=!board.faceFill.on;setToggle('faceFillToggle',board.faceFill.on,'フェイスフィル');saveSettings();refresh()};
     q('#faceFillLevel').oninput=e=>{board.faceFill.level=+e.target.value;q('#v-faceFillLevel').textContent=board.faceFill.level+'%';saveSettings();refresh()};
+    document.querySelectorAll('[data-shadow-mode]').forEach(b=>b.onclick=()=>{board.shadow.mode=b.dataset.shadowMode;syncBoardUI();saveSettings();refresh()});
     q('#colorPick').oninput=e=>{board.color=e.target.value;q('#v-color').textContent=board.color;applyColorToSelection()};
     q('#smokeToggle').onclick=()=>{board.smoke=!board.smoke;setToggle('smokeToggle',board.smoke,'スモーク');saveSettings();refresh()};
     q('#blackoutToggle').onclick=()=>{board.blackout=!board.blackout;setToggle('blackoutToggle',board.blackout,'ブラックアウト');saveSettings();refresh()};
