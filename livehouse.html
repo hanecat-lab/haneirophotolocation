@@ -272,6 +272,11 @@
             <div class="hint" id="beamOrbitHint">ファンの角度を固定します。</div>
           </div>
         </section>
+        <section class="section"><div class="label"><span>逆光</span><small>BACKLIGHT</small></div>
+          <button class="mode" id="backlightToggle" type="button" style="width:100%">○ 逆光</button>
+          <div class="slider" style="margin-top:8px"><div><span>逆光の強さ</span><strong id="v-backlightLevel">70%</strong></div><input type="range" id="backlightLevel" min="0" max="100" step="1" value="70" /></div>
+          <div class="hint" id="backlightHint">最奥トラスの6灯を逆光へ回します。中央2灯が演者の輪郭、外側4灯が客席へ抜けてレンズに入ります。</div>
+        </section>
         <section class="section"><div class="label"><span>レーザーシート</span><small>LASER SHEET</small></div>
           <button class="mode" id="laserSheetToggle" type="button" style="width:100%">○ レーザーシート</button>
           <div class="slider" style="margin-top:8px"><div><span>明るさ</span><strong id="v-laserSheetLevel">28%</strong></div><input type="range" id="laserSheetLevel" min="0" max="100" step="1" value="28" /></div>
@@ -3004,6 +3009,7 @@
       shadow:{mode:'natural'},
       laserSheet:{on:false,level:28,height:1.40,spread:35,tilt:0,mode:'fixed',speed:.6,color:'#36ff74'},
       beamOrbit:{mode:'fixed',width:100},
+      backlight:{on:false,level:70},
       show:{mode:'blinder',speed:1,level:80,fade:.55,spread:70,loop:true,keepSpot:true,playing:false},
       overlay:{enabled:false,mode:'fan',speed:1,level:65},
       timeline:{bpm:120,beats:4,loop:true,playing:false,index:0,steps:[]},
@@ -3030,11 +3036,31 @@
        舞台上PARはチルト角どおりに床を狙い、客席側フロント灯は上半身を狙う。
        ムービングは演者を追い、サイドは腰から上、バック足元は背景幕を舐める。 */
     const D2R_=Math.PI/180;
+    /* --- 逆光 — 最奥トラス row0 の6灯を2役に分ける ------------------------
+       中央2灯（col 2,3）… 演者の肩口を狙い、輪郭を作る（リム）
+       外側4灯（col 0,1,4,5）… 客席の目線へ抜き、レンズへ入れる（フレア）
+       1灯で兼用できない理由：灯体から見た「肩」と「カメラ」の角度差は
+       外側で26.1〜31.3°あり、PARのコーン半角12.6°に両方を収められない。
+       灯体位置は動かさず狙いだけを変える。既定はOFFで従来の床狙いを保つ。 */
+    const BACKLIGHT_ROW=0;                  // 最奥トラス（z=-2.35）
+    const BACKLIGHT_RIM_COLS=[2,3];         // 中央2灯をリムへ
+    const BACKLIGHT_RIM_AIM=V3(0,1.65,0);   // 演者の肩口
+    const BACKLIGHT_FLARE_X=.30;            // 客席へ抜くときの横の収束
+    const BACKLIGHT_FLARE_Y=.95;            // 客席の目線高さ
+    const BACKLIGHT_FLARE_Z=6.4;            // 既定カメラ位置
+    const BACKLIGHT_FLARE_REACH=17;         // 客席床まで届く光柱長[m]
+    function backlightRoleOf(f){
+      if(!board.backlight.on||f.type!=='par'||f.row!==BACKLIGHT_ROW)return null;
+      return BACKLIGHT_RIM_COLS.includes(f.col)?'rim':'flare';
+    }
     function aimOf(f){
       if(f.type==='moving') return SUBJECT.clone();
       if(f.type==='side')   return V3(0,1.5,f.pos.z*0.3);
       if(f.type==='uplight')return V3(f.pos.x*0.6,3,-3.1);
       if(f.role==='foh')    return V3(f.pos.x*.12,1.28,.05);
+      const backRole=backlightRoleOf(f);
+      if(backRole==='rim')  return BACKLIGHT_RIM_AIM.clone();
+      if(backRole==='flare')return V3(f.pos.x*BACKLIGHT_FLARE_X,BACKLIGHT_FLARE_Y,BACKLIGHT_FLARE_Z);
       // チルトは「垂直からステージ中央へ倒す角度」。前トラスは奥へ、後トラスは手前へ振る
       const off=Math.tan(-board.tilt*D2R_)*f.pos.y, sign=f.pos.z>0?-1:1;
       let z=f.pos.z+sign*off;
@@ -3052,8 +3078,12 @@
         return f.pos.clone().addScaledVector(axis,THREE.MathUtils.clamp(t,1,8));
       }
       if(axis.y<-.04){
-        const t=(.025-f.pos.y)/axis.y;
-        return f.pos.clone().addScaledVector(axis,THREE.MathUtils.clamp(t,.6,10));
+        // 客席へ抜くフレア灯だけは、舞台面ではなく客席床（0.75m低い）を床とし、
+        // 上限も客席奥へ届く長さへ広げる。既定の10mでは客席手前の空中で途切れる。
+        const flare=backlightRoleOf(f)==='flare';
+        const floorY=flare?.025-STAGE_HEIGHT:.025;
+        const t=(floorY-f.pos.y)/axis.y;
+        return f.pos.clone().addScaledVector(axis,THREE.MathUtils.clamp(t,.6,flare?BACKLIGHT_FLARE_REACH:10));
       }
       return f.pos.clone().addScaledVector(axis,7);
     }
@@ -3259,8 +3289,10 @@
       const frontScale=f.role==='foh'?board.frontFill/100:1;
       // ステージ中央の逆光ムービング2灯は、他灯より実効出力を10%抑える。
       const centralBackScale=f.type==='moving'&&f.role==='stage'?.9:1;
+      // 逆光へ回した灯体だけ、他灯とは独立した強さで調整する。
+      const backlightScale=backlightRoleOf(f)?THREE.MathUtils.clamp(board.backlight.level/100,0,1):1;
       return{layer:'base',priority:LAYER_PRIORITY.base,startedAt:0,replacesLevel:false,
-        level:frontScale*centralBackScale*(s.level/100),forceOff:false,
+        level:frontScale*centralBackScale*backlightScale*(s.level/100),forceOff:false,
         enabled:!!s.on,color:baseColorAt(i,t),aim:aimOf(f)};
     }
     function movementFixtureRequest(i,t,base){
@@ -4271,7 +4303,10 @@
           // RGBに光量を持たせるため、アルファによる二重減衰は起きない。
           g.beamMat.uniforms.uColor.value.copy(col);
           const typeDensity=f.type==='moving'?1.12:(f.type==='side'?.82:1);
-          const scatterLux=Math.max(aimLux,0);
+          // 煙の中の光柱の濃さは灯体の光度で決まり、どこを狙ったかには依存しない。
+          // 客席へ抜くフレア灯だけは投射が9m超で、狙い先の照度では筋が床狙いの11%まで落ちる。
+          // この4灯に限り基準距離3mで評価する。床のプールと実光源の選抜は aimLux のまま。
+          const scatterLux=backlightRoleOf(f)==='flare'?FIX_LUX[f.type]*lv:Math.max(aimLux,0);
           g.beamMat.uniforms.uStyle.value=diffuseStyle?1:0;
           g.beamMat.uniforms.uScatter.value=(board.smoke
             ?(diffuseStyle?.28:.48)
@@ -4591,6 +4626,9 @@
       board.laserSheet.mode=['fixed','open','close','cross'].includes(board.laserSheet.mode)?board.laserSheet.mode:'fixed';
       board.laserSheet.speed=THREE.MathUtils.clamp(Number.isFinite(+board.laserSheet.speed)?+board.laserSheet.speed:.6,0,2);
       board.laserSheet.color=/^#[0-9a-f]{6}$/i.test(String(board.laserSheet.color||''))?board.laserSheet.color:'#36ff74';
+      Object.assign(board.backlight,src.backlight||{});
+      board.backlight.on=!!board.backlight.on;
+      board.backlight.level=THREE.MathUtils.clamp(Math.round(Number(board.backlight.level)||70),0,100);
       Object.assign(board.beamOrbit,src.beamOrbit||{});
       board.beamOrbit.mode=board.beamOrbit.mode==='circle'?'circle':'fixed';
       board.beamOrbit.width=THREE.MathUtils.clamp(Math.round(Number(board.beamOrbit.width)||100),20,160);
@@ -4895,6 +4933,8 @@
           (board.shadow.mode==='accent'?'実照明の明るさは変えず、リアルシャドウのコントラストを高めます。':'実照明の明るさは変えず、柔らかいリアルシャドウと薄い接地影を表示します。')+
           ' '+(SHADOW_IS_MOBILE?'モバイルは実照明最大1灯・512px。':'PCは実照明最大'+budget+'灯・1024px。')+' フェイスフィルは影なしです。';
       }
+      setToggle('backlightToggle',board.backlight.on,'逆光');
+      q('#backlightLevel').value=board.backlight.level;q('#v-backlightLevel').textContent=board.backlight.level+'%';
       setToggle('laserSheetToggle',board.laserSheet.on,'レーザーシート');
       setToggle('showKeepSpot',board.show.keepSpot,'被写体スポットを維持');
       setToggle('overlayToggle',board.overlay.enabled,'SLOT Bを重ねる');
@@ -4947,6 +4987,8 @@
     q('#colorPick').oninput=e=>{board.color=e.target.value;q('#v-color').textContent=board.color;applyColorToSelection()};
     q('#smokeToggle').onclick=()=>{board.smoke=!board.smoke;setToggle('smokeToggle',board.smoke,'スモーク');saveSettings();refresh()};
     q('#blackoutToggle').onclick=()=>{board.blackout=!board.blackout;setToggle('blackoutToggle',board.blackout,'ブラックアウト');saveSettings();refresh()};
+    q('#backlightToggle').onclick=()=>{board.backlight.on=!board.backlight.on;setToggle('backlightToggle',board.backlight.on,'逆光');saveSettings();refresh()};
+    q('#backlightLevel').oninput=e=>{board.backlight.level=+e.target.value;q('#v-backlightLevel').textContent=board.backlight.level+'%';saveSettings();refresh()};
     q('#laserSheetToggle').onclick=()=>{board.laserSheet.on=!board.laserSheet.on;setToggle('laserSheetToggle',board.laserSheet.on,'レーザーシート');saveSettings();refresh()};
     q('#laserSheetLevel').oninput=e=>{board.laserSheet.level=+e.target.value;q('#v-laserSheetLevel').textContent=board.laserSheet.level+'%';saveSettings();refresh()};
     q('#laserSheetHeight').oninput=e=>{board.laserSheet.height=+e.target.value;q('#v-laserSheetHeight').textContent=board.laserSheet.height.toFixed(2)+'m';saveSettings();refresh()};
@@ -5287,6 +5329,8 @@
       setClock(t){clock=t;updateScene(t)},setBody:(id)=>setBody(id),getBodyId:()=>bodyId,BODIES,validateLowPolyModel,camera,CAMERA_PRESETS,
       stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,moveCameraAroundSubject,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,getSubjectDistance:subjectDistanceMeters,syncMapShootingMarker,moveMapShootingPosition,rotateMapShootingYaw,updateVenueCutaway,faceExposureOf,selectRenderLights,applyExposureCompareTarget,resetExposureCompareBaseline,getExposureCompare:()=>({target:exposureCompareTarget,baseline:exposureCompareBaseline?{...exposureCompareBaseline}:null,expo:{...expo}}),applyToneMapMode,getToneMapMode:()=>toneMapMode,highlightWarning:{sample:()=>sampleSubjectHighlights(performance.now(),true),get:()=>({...highlightReading}),classify:classifyHighlightPixels},
       timeline:{capture:captureTimelineStep,add:addTimelineStep,start:startTimeline,stop:stopTimeline,advance:advanceTimeline,setBpm:setTimelineBpm,sanitize:sanitizeTimelineStep},
+      backlight:{roleOf:backlightRoleOf,aimOf,beamEndOf,
+        scatterOf:i=>gear[i].beamMat.uniforms.uScatter.value,coreOf:i=>gear[i].coreMat.color.clone(),poolOf:i=>gear[i].poolMat.color.clone(),poolVisible:i=>gear[i].pool.visible},
       beamOrbit:{sync:syncBeamOrbitPeriod,targetPeriod:beamOrbitTargetPeriod,phaseAt:beamOrbitPhaseAt,gainAt:beamOrbitGainAt,setTarget:setBeamOrbitTarget,scaleOf:beamOrbitScaleOf},
       setPose:(n)=>document.querySelector('[data-pose="'+n+'"]').click(),render(){renderer.render(scene,camera)},applyBoard,toneExposure(){return renderer.toneMappingExposure},triangles(){return renderer.info.render.triangles},lightStats(){return{spots:spots.filter(l=>l.visible&&l.intensity>0).length,shadows:spots.filter(l=>l.castShadow).length}}};
   </script>
