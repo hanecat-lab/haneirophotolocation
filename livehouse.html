@@ -3374,6 +3374,9 @@
     const highlightDisplayContext=highlightDisplayCanvas.getContext('2d',{willReadFrequently:true});
     const highlightZebraCanvas=document.createElement('canvas');highlightZebraCanvas.className='highlight-zebra-overlay';highlightZebraCanvas.setAttribute('aria-hidden','true');host.append(highlightZebraCanvas);
     const highlightZebraContext=highlightZebraCanvas.getContext('2d');
+    const highlightZebraLayerCanvas=document.createElement('canvas'),highlightZebraLayerContext=highlightZebraLayerCanvas.getContext('2d');
+    const highlightWhiteMaskCanvas=document.createElement('canvas'),highlightWhiteMaskContext=highlightWhiteMaskCanvas.getContext('2d');
+    const highlightColorMaskCanvas=document.createElement('canvas'),highlightColorMaskContext=highlightColorMaskCanvas.getContext('2d');
     const highlightMaskTarget=new THREE.WebGLRenderTarget(1,1,{depthBuffer:true,stencilBuffer:false});
     highlightMaskTarget.texture.colorSpace=THREE.NoColorSpace;
     const highlightMaskMaterial=new THREE.MeshBasicMaterial({color:0xffffff,toneMapped:false,depthTest:true,depthWrite:true});
@@ -3381,7 +3384,8 @@
     let highlightSampleWidth=1,highlightSampleHeight=1;
     let highlightColorPixels=new Uint8ClampedArray(4),highlightMaskPixels=new Uint8Array(4);
     let highlightLastSampleAt=-Infinity,highlightReadbackFailed=false;
-    let highlightZebraEnabled=false,highlightZebraImageData=null,highlightZebraHasFrame=false;
+    let highlightZebraEnabled=false,highlightWhiteMaskImageData=null,highlightColorMaskImageData=null,highlightZebraHasFrame=false;
+    let highlightWhiteZebraPattern=null,highlightColorZebraPattern=null;
     let highlightReading={state:'checking',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,subjectPixels:0};
     let highlightRawReading={...highlightReading},highlightPendingKey='',highlightPendingCount=0,highlightStateChangedAt=-Infinity;
     function clearHighlightZebra(){
@@ -3394,16 +3398,43 @@
       button.classList.toggle('active',highlightZebraEnabled);button.setAttribute('aria-pressed',String(highlightZebraEnabled));
       button.textContent=(highlightZebraEnabled?'● ':'○ ')+'ゼブラ表示';
     }
+    function createHighlightZebraPattern(color,pixelRatio){
+      if(!highlightZebraLayerContext)return null;
+      const size=Math.max(12,Math.round(16*pixelRatio)),colorWidth=Math.max(4,Math.round(6*pixelRatio)),outlineWidth=Math.max(colorWidth+2,Math.round(8*pixelRatio));
+      const tile=document.createElement('canvas');tile.width=tile.height=size;
+      const context=tile.getContext('2d');if(!context)return null;
+      const stroke=(style,width)=>{
+        context.strokeStyle=style;context.lineWidth=width;context.lineCap='butt';context.beginPath();
+        for(let offset=-size;offset<=size;offset+=size){context.moveTo(offset,0);context.lineTo(offset+size,size)}
+        context.stroke();
+      };
+      stroke('rgba(0,0,0,.42)',outlineWidth);stroke(color,colorWidth);
+      return highlightZebraLayerContext.createPattern(tile,'repeat');
+    }
     function resizeHighlightTargets(viewWidth,viewHeight){
       const aspect=THREE.MathUtils.clamp(viewWidth/Math.max(1,viewHeight),.45,2.8);
       const width=Math.max(96,Math.round(aspect>=1?224:224*aspect));
       const height=Math.max(80,Math.round(aspect>=1?224/aspect:224));
-      if(width===highlightSampleWidth&&height===highlightSampleHeight)return;
-      highlightSampleWidth=width;highlightSampleHeight=height;
-      highlightDisplayCanvas.width=width;highlightDisplayCanvas.height=height;highlightMaskTarget.setSize(width,height);
-      highlightZebraCanvas.width=width;highlightZebraCanvas.height=height;
-      highlightZebraImageData=highlightZebraContext?highlightZebraContext.createImageData(width,height):null;highlightZebraHasFrame=false;
-      highlightMaskPixels=new Uint8Array(width*height*4);
+      const pixelRatio=Math.min(Number(globalThis.devicePixelRatio)||1,2);
+      const displayWidth=Math.max(1,Math.round(viewWidth*pixelRatio)),displayHeight=Math.max(1,Math.round(viewHeight*pixelRatio));
+      const sampleChanged=width!==highlightSampleWidth||height!==highlightSampleHeight;
+      const displayChanged=displayWidth!==highlightZebraCanvas.width||displayHeight!==highlightZebraCanvas.height;
+      if(!sampleChanged&&!displayChanged)return;
+      if(sampleChanged){
+        highlightSampleWidth=width;highlightSampleHeight=height;
+        highlightDisplayCanvas.width=width;highlightDisplayCanvas.height=height;highlightMaskTarget.setSize(width,height);
+        highlightWhiteMaskCanvas.width=width;highlightWhiteMaskCanvas.height=height;highlightColorMaskCanvas.width=width;highlightColorMaskCanvas.height=height;
+        highlightWhiteMaskImageData=highlightWhiteMaskContext?highlightWhiteMaskContext.createImageData(width,height):null;
+        highlightColorMaskImageData=highlightColorMaskContext?highlightColorMaskContext.createImageData(width,height):null;
+        highlightMaskPixels=new Uint8Array(width*height*4);
+      }
+      if(displayChanged){
+        highlightZebraCanvas.width=displayWidth;highlightZebraCanvas.height=displayHeight;
+        highlightZebraLayerCanvas.width=displayWidth;highlightZebraLayerCanvas.height=displayHeight;
+        highlightWhiteZebraPattern=createHighlightZebraPattern('rgba(255,54,44,.84)',pixelRatio);
+        highlightColorZebraPattern=createHighlightZebraPattern('rgba(255,196,0,.82)',pixelRatio);
+      }
+      clearHighlightZebra();
     }
     function highlightPercentile(hist,total,q){
       const target=Math.max(1,Math.ceil(total*q));let sum=0;
@@ -3449,13 +3480,15 @@
       resetHighlightTransition(now);return raw;
     }
     function renderHighlightZebra(reading,useCurrentPixels){
-      if(!highlightZebraContext)return;
+      if(!highlightZebraContext||!highlightZebraLayerContext||!highlightWhiteMaskContext||!highlightColorMaskContext)return;
       if(reading.state!=='clip'){clearHighlightZebra();return}
       if(!useCurrentPixels)return;
-      if(!highlightZebraImageData||highlightZebraImageData.width!==highlightSampleWidth||highlightZebraImageData.height!==highlightSampleHeight){
-        highlightZebraImageData=highlightZebraContext.createImageData(highlightSampleWidth,highlightSampleHeight);
+      if(!highlightWhiteMaskImageData||highlightWhiteMaskImageData.width!==highlightSampleWidth||highlightWhiteMaskImageData.height!==highlightSampleHeight){
+        highlightWhiteMaskImageData=highlightWhiteMaskContext.createImageData(highlightSampleWidth,highlightSampleHeight);
+        highlightColorMaskImageData=highlightColorMaskContext.createImageData(highlightSampleWidth,highlightSampleHeight);
       }
-      const pixels=highlightZebraImageData.data,width=highlightSampleWidth,height=highlightSampleHeight;pixels.fill(0);
+      const whitePixels=highlightWhiteMaskImageData.data,colorPixels=highlightColorMaskImageData.data;
+      const width=highlightSampleWidth,height=highlightSampleHeight;whitePixels.fill(0);colorPixels.fill(0);
       for(let y=0;y<height;y++){
         const sourceY=height-1-y;
         for(let x=0;x<width;x++){
@@ -3463,13 +3496,22 @@
           if(highlightMaskPixels[source]<192&&highlightMaskPixels[source+1]<192&&highlightMaskPixels[source+2]<192)continue;
           const r=highlightColorPixels[source],g=highlightColorPixels[source+1],b=highlightColorPixels[source+2];
           const white=Math.min(r,g,b)>=HIGHLIGHT_CLIP,color=!white&&Math.max(r,g,b)>=HIGHLIGHT_CLIP;
-          if((!white&&!color)||((x+y)%8)>=3)continue;
+          if(!white&&!color)continue;
           const target=(y*width+x)*4;
-          if(white){pixels[target]=255;pixels[target+1]=54;pixels[target+2]=44;pixels[target+3]=225}
-          else{pixels[target]=255;pixels[target+1]=196;pixels[target+2]=0;pixels[target+3]=215}
+          const pixels=white?whitePixels:colorPixels;pixels[target]=pixels[target+1]=pixels[target+2]=pixels[target+3]=255;
         }
       }
-      highlightZebraContext.putImageData(highlightZebraImageData,0,0);highlightZebraHasFrame=true;
+      highlightWhiteMaskContext.putImageData(highlightWhiteMaskImageData,0,0);highlightColorMaskContext.putImageData(highlightColorMaskImageData,0,0);
+      highlightZebraContext.clearRect(0,0,highlightZebraCanvas.width,highlightZebraCanvas.height);
+      const drawLayer=(mask,pattern)=>{
+        if(!pattern)return;
+        highlightZebraLayerContext.globalCompositeOperation='source-over';highlightZebraLayerContext.clearRect(0,0,highlightZebraLayerCanvas.width,highlightZebraLayerCanvas.height);
+        highlightZebraLayerContext.fillStyle=pattern;highlightZebraLayerContext.fillRect(0,0,highlightZebraLayerCanvas.width,highlightZebraLayerCanvas.height);
+        highlightZebraLayerContext.globalCompositeOperation='destination-in';highlightZebraLayerContext.imageSmoothingEnabled=true;highlightZebraLayerContext.imageSmoothingQuality='high';
+        highlightZebraLayerContext.drawImage(mask,0,0,highlightZebraLayerCanvas.width,highlightZebraLayerCanvas.height);
+        highlightZebraLayerContext.globalCompositeOperation='source-over';highlightZebraContext.drawImage(highlightZebraLayerCanvas,0,0);
+      };
+      drawLayer(highlightWhiteMaskCanvas,highlightWhiteZebraPattern);drawLayer(highlightColorMaskCanvas,highlightColorZebraPattern);highlightZebraHasFrame=true;
     }
     function updateHighlightWarningUI(next){
       highlightReading={...highlightReading,...next};
