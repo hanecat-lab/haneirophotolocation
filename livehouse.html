@@ -153,7 +153,7 @@
             <div class="highlight-warning-status"><span class="highlight-warning-state" id="highlightWarningState">測定中</span><strong class="highlight-warning-metric" id="highlightWarningMetric">明部 -- / 255</strong></div>
             <div class="highlight-warning-meter" aria-hidden="true"><i id="highlightWarningLevel"></i></div>
             <div class="highlight-warning-message" id="highlightWarningMessage">被写体の明部を確認しています。</div>
-            <div class="highlight-warning-note">Neutral固定。灯体と背景を除き、メイン被写体だけを判定します。245以上は注意、252以上の広がりは白飛び候補です。</div>
+            <div class="highlight-warning-note">Neutral表示の完成画像を測定。灯体と背景を除き、メイン被写体だけを判定し、白飛びと色飽和を分けて表示します。</div>
           </div>
           <div class="hint" id="expoReadout"></div>
           <div class="warn" id="expoWarn"></div>
@@ -3322,24 +3322,24 @@
        平均露出とは別に、最終表示を低解像度で読み取る。専用Layerのマスクを
        併用するため、灯体・背景・床の明るさは判定へ混ぜない。 */
     const HIGHLIGHT_SAMPLE_INTERVAL=320,HIGHLIGHT_NEAR=245,HIGHLIGHT_CLIP=252;
-    const highlightColorTarget=new THREE.WebGLRenderTarget(1,1,{depthBuffer:true,stencilBuffer:false});
+    const highlightDisplayCanvas=document.createElement('canvas');
+    const highlightDisplayContext=highlightDisplayCanvas.getContext('2d',{willReadFrequently:true});
     const highlightMaskTarget=new THREE.WebGLRenderTarget(1,1,{depthBuffer:true,stencilBuffer:false});
-    highlightColorTarget.texture.colorSpace=THREE.SRGBColorSpace;
     highlightMaskTarget.texture.colorSpace=THREE.NoColorSpace;
     const highlightMaskMaterial=new THREE.MeshBasicMaterial({color:0xffffff,toneMapped:false,depthTest:true,depthWrite:true});
     const highlightMaskBackground=new THREE.Color(0x000000);
     let highlightSampleWidth=1,highlightSampleHeight=1;
-    let highlightColorPixels=new Uint8Array(4),highlightMaskPixels=new Uint8Array(4);
+    let highlightColorPixels=new Uint8ClampedArray(4),highlightMaskPixels=new Uint8Array(4);
     let highlightLastSampleAt=-Infinity,highlightReadbackFailed=false;
-    let highlightReading={state:'checking',bright:0,clipPercent:0,subjectPixels:0};
+    let highlightReading={state:'checking',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,subjectPixels:0};
     function resizeHighlightTargets(viewWidth,viewHeight){
       const aspect=THREE.MathUtils.clamp(viewWidth/Math.max(1,viewHeight),.45,2.8);
       const width=Math.max(96,Math.round(aspect>=1?224:224*aspect));
       const height=Math.max(80,Math.round(aspect>=1?224/aspect:224));
       if(width===highlightSampleWidth&&height===highlightSampleHeight)return;
       highlightSampleWidth=width;highlightSampleHeight=height;
-      highlightColorTarget.setSize(width,height);highlightMaskTarget.setSize(width,height);
-      highlightColorPixels=new Uint8Array(width*height*4);highlightMaskPixels=new Uint8Array(width*height*4);
+      highlightDisplayCanvas.width=width;highlightDisplayCanvas.height=height;highlightMaskTarget.setSize(width,height);
+      highlightMaskPixels=new Uint8Array(width*height*4);
     }
     function highlightPercentile(hist,total,q){
       const target=Math.max(1,Math.ceil(total*q));let sum=0;
@@ -3347,59 +3347,71 @@
       return 0;
     }
     function classifyHighlightPixels(colors,masks){
-      const hist=new Uint32Array(256);let subjectPixels=0,nearPixels=0,clipPixels=0;
+      const hist=new Uint32Array(256);let subjectPixels=0,nearPixels=0,whiteClipPixels=0,colorClipPixels=0;
       for(let i=0;i<colors.length;i+=4){
         if(masks[i]<192&&masks[i+1]<192&&masks[i+2]<192)continue;
-        const peak=Math.max(colors[i],colors[i+1],colors[i+2]);
-        subjectPixels++;hist[peak]++;if(peak>=HIGHLIGHT_NEAR)nearPixels++;if(peak>=HIGHLIGHT_CLIP)clipPixels++;
+        const r=colors[i],g=colors[i+1],b=colors[i+2],peak=Math.max(r,g,b),floor=Math.min(r,g,b);
+        subjectPixels++;hist[peak]++;if(peak>=HIGHLIGHT_NEAR)nearPixels++;
+        if(floor>=HIGHLIGHT_CLIP)whiteClipPixels++;else if(peak>=HIGHLIGHT_CLIP)colorClipPixels++;
       }
-      if(subjectPixels<24)return{state:'unavailable',bright:0,clipPercent:0,nearPercent:0,subjectPixels};
+      if(subjectPixels<24)return{state:'unavailable',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,nearPercent:0,subjectPixels};
       const bright=highlightPercentile(hist,subjectPixels,.995),p99=highlightPercentile(hist,subjectPixels,.99);
-      const clipPercent=clipPixels/subjectPixels*100,nearPercent=nearPixels/subjectPixels*100;
-      const clipEnough=clipPixels>=Math.max(3,Math.ceil(subjectPixels*.003));
+      const whitePercent=whiteClipPixels/subjectPixels*100,colorPercent=colorClipPixels/subjectPixels*100;
+      const clipPercent=whitePercent+colorPercent,nearPercent=nearPixels/subjectPixels*100;
+      const clipThreshold=Math.max(3,Math.ceil(subjectPixels*.003));
+      const whiteClipEnough=whiteClipPixels>=clipThreshold,colorClipEnough=colorClipPixels>=clipThreshold;
       const nearEnough=nearPixels>=Math.max(4,Math.ceil(subjectPixels*.01));
-      const state=clipEnough&&bright>=HIGHLIGHT_CLIP?'clip':((nearEnough&&p99>=HIGHLIGHT_NEAR)||bright>=HIGHLIGHT_CLIP?'caution':'safe');
-      return{state,bright,clipPercent,nearPercent,subjectPixels};
+      const state=(whiteClipEnough||colorClipEnough)&&bright>=HIGHLIGHT_CLIP?'clip':((nearEnough&&p99>=HIGHLIGHT_NEAR)||bright>=HIGHLIGHT_CLIP?'caution':'safe');
+      const kind=state==='clip'?(whiteClipEnough?'white':'color'):(state==='caution'?'near':'none');
+      return{state,kind,bright,clipPercent,whitePercent,colorPercent,nearPercent,subjectPixels};
     }
     function updateHighlightWarningUI(next){
       highlightReading={...highlightReading,...next};
       const panel=document.querySelector('#highlightWarning'),badge=document.querySelector('#highlightBadge');
       const stateEl=document.querySelector('#highlightWarningState'),metric=document.querySelector('#highlightWarningMetric');
       const level=document.querySelector('#highlightWarningLevel'),message=document.querySelector('#highlightWarningMessage');
-      const copy={
+      const copy=highlightReading.state==='clip'&&highlightReading.kind==='color'
+        ?['色飽和警告','HL 色飽和','赤・青など一部の色チャンネルが飽和しています。ISOを1/3段下げて再確認してください。']:{
         checking:['測定中','HL 測定中','被写体の明部を確認しています。'],
         safe:['余裕あり','HL 余裕','被写体の明部に階調が残っています。'],
         caution:['注意','HL 注意','限界に近い明部があります。−0.3EV付近で比較してください。'],
-        clip:['白飛び警告','HL 白飛び','被写体内で色チャンネルの飽和を検出。ISOを1/3段下げて再確認してください。'],
+        clip:['白飛び警告','HL 白飛び','被写体の明部で白飛びを検出しました。ISOを1/3段下げて再確認してください。'],
         idle:['判定待機','HL 待機','撮影画面へ戻るとハイライト判定を再開します。'],
         unavailable:['判定できません','HL 判定外','被写体が小さいか画面外です。構図を合わせて再確認してください。']
       }[highlightReading.state]||['測定中','HL 測定中','被写体の明部を確認しています。'];
       if(panel)panel.dataset.state=highlightReading.state;if(badge){badge.dataset.state=highlightReading.state;badge.textContent=copy[1]}
       if(stateEl)stateEl.textContent=copy[0];if(message)message.textContent=copy[2];
       if(metric)metric.textContent=['safe','caution','clip'].includes(highlightReading.state)
-        ?'明部 '+highlightReading.bright+'/255 ・ 飽和候補 '+highlightReading.clipPercent.toFixed(highlightReading.clipPercent<1?1:0)+'%'
+        ?'ピーク '+highlightReading.bright+'/255 ・ 白 '+highlightReading.whitePercent.toFixed(highlightReading.whitePercent<1?1:0)+'% ・ 色 '+highlightReading.colorPercent.toFixed(highlightReading.colorPercent<1?1:0)+'%'
         :'明部 -- / 255';
       if(level)level.style.width=(['safe','caution','clip'].includes(highlightReading.state)?highlightReading.bright/255*100:0).toFixed(1)+'%';
     }
     function sampleSubjectHighlights(now=performance.now(),force=false){
       if(!force&&now-highlightLastSampleAt<HIGHLIGHT_SAMPLE_INTERVAL)return highlightReading;
       highlightLastSampleAt=now;
-      if(cameraMode==='map'){updateHighlightWarningUI({state:'idle',bright:0,clipPercent:0,subjectPixels:0});return highlightReading}
+      if(cameraMode==='map'){updateHighlightWarningUI({state:'idle',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,subjectPixels:0});return highlightReading}
       if(!model||!model.visible||(isExternalSubject()&&!model.userData?.externalSubject)){
-        updateHighlightWarningUI({state:'checking',bright:0,clipPercent:0,subjectPixels:0});return highlightReading;
+        updateHighlightWarningUI({state:'checking',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,subjectPixels:0});return highlightReading;
       }
       tagHighlightSubject(model);model.updateMatrixWorld(true);
       const previousTarget=renderer.getRenderTarget(),previousMask=camera.layers.mask;
       const previousOverride=scene.overrideMaterial,previousBackground=scene.background,previousFog=scene.fog;
       try{
-        renderer.setRenderTarget(highlightColorTarget);renderer.clear();renderer.render(scene,camera);
-        renderer.readRenderTargetPixels(highlightColorTarget,0,0,highlightSampleWidth,highlightSampleHeight,highlightColorPixels);
+        if(!highlightDisplayContext)throw new Error('2D canvas is unavailable');
+        // 画面へ描画済みのNeutral＋露出適用後の色を縮小取得する。
+        // readRenderTargetPixelsの下始まり配列へ合わせるため、上下反転して保持する。
+        highlightDisplayContext.save();
+        highlightDisplayContext.setTransform(1,0,0,1,0,0);highlightDisplayContext.clearRect(0,0,highlightSampleWidth,highlightSampleHeight);
+        highlightDisplayContext.setTransform(1,0,0,-1,0,highlightSampleHeight);
+        highlightDisplayContext.drawImage(renderer.domElement,0,0,highlightSampleWidth,highlightSampleHeight);
+        highlightDisplayContext.restore();
+        highlightColorPixels=highlightDisplayContext.getImageData(0,0,highlightSampleWidth,highlightSampleHeight).data;
         camera.layers.set(HIGHLIGHT_SUBJECT_LAYER);scene.overrideMaterial=highlightMaskMaterial;scene.background=highlightMaskBackground;scene.fog=null;
         renderer.setRenderTarget(highlightMaskTarget);renderer.clear();renderer.render(scene,camera);
         renderer.readRenderTargetPixels(highlightMaskTarget,0,0,highlightSampleWidth,highlightSampleHeight,highlightMaskPixels);
       }catch(error){
         if(!highlightReadbackFailed){console.warn('Highlight warning readback is unavailable.',error);highlightReadbackFailed=true}
-        updateHighlightWarningUI({state:'unavailable',bright:0,clipPercent:0,subjectPixels:0});return highlightReading;
+        updateHighlightWarningUI({state:'unavailable',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,subjectPixels:0});return highlightReading;
       }finally{
         camera.layers.mask=previousMask;scene.overrideMaterial=previousOverride;scene.background=previousBackground;scene.fog=previousFog;
         renderer.setRenderTarget(previousTarget);
