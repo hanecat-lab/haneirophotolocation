@@ -265,6 +265,12 @@
           <div class="label" style="margin-top:14px"><span>光線の質感</span><small>BEAM LOOK</small></div>
           <div class="two"><button class="mode" data-beam-style="diffuse">拡散光</button><button class="mode" data-beam-style="rays">光条</button></div>
           <div class="hint" id="beamStyleHint">灯体から広がり、床へ近づくほど薄くなる柔らかい光です。</div>
+          <div id="beamOrbitRow" class="hidden">
+            <div class="label" style="margin-top:14px"><span>小円ファン</span><small>BEAM ORBIT</small></div>
+            <div class="two"><button class="mode" type="button" data-beam-orbit="fixed">固定</button><button class="mode" type="button" data-beam-orbit="circle">小円旋回</button></div>
+            <div class="slider" style="margin-top:8px"><div><span>旋回幅</span><strong id="v-beamOrbitWidth">100%</strong></div><input type="range" id="beamOrbitWidth" min="20" max="160" step="5" value="100" /></div>
+            <div class="hint" id="beamOrbitHint">ファンの角度を固定します。</div>
+          </div>
         </section>
         <section class="section"><div class="label"><span>レーザーシート</span><small>LASER SHEET</small></div>
           <button class="mode" id="laserSheetToggle" type="button" style="width:100%">○ レーザーシート</button>
@@ -2997,6 +3003,7 @@
       faceFill:{on:true,level:32},
       shadow:{mode:'natural'},
       laserSheet:{on:false,level:28,height:1.40,spread:35,tilt:0,mode:'fixed',speed:.6,color:'#36ff74'},
+      beamOrbit:{mode:'fixed',width:100},
       show:{mode:'blinder',speed:1,level:80,fade:.55,spread:70,loop:true,keepSpot:true,playing:false},
       overlay:{enabled:false,mode:'fan',speed:1,level:65},
       timeline:{bpm:120,beats:4,loop:true,playing:false,index:0,steps:[]},
@@ -3049,6 +3056,73 @@
         return f.pos.clone().addScaledVector(axis,THREE.MathUtils.clamp(t,.6,10));
       }
       return f.pos.clone().addScaledVector(axis,7);
+    }
+
+    /* --- 小円ファン（光条モード専用） ------------------------------------
+       ファンの整った形は崩さず、現在の照射方向を中心に小さな楕円を描かせる。
+       灯体位置は動かさず照射方向だけを回し、回転で光路長が変わらないため
+       逆二乗則による明るさは一切変化しない。aim を一点で書き換えるので
+       SpotLight・光条・中心光・床のプール・影がそのまま同期する。 */
+    const BEAM_ORBIT_YAW_DEG=2.2;        // 外側の灯体の横振り幅（片側）
+    const BEAM_ORBIT_PITCH_DEG=1.3;      // 外側の灯体の縦振り幅（片側）
+    const BEAM_ORBIT_CENTER_SCALE=.4;    // 中央列は外側の約40%
+    const BEAM_ORBIT_FREE_PERIOD=3.2;    // BPM未使用時の1周[秒]
+    const BEAM_ORBIT_BEATS=4;            // BPM使用時は4拍で1周
+    const BEAM_ORBIT_RAMP=.4;            // 開始・停止の移行時間[秒]
+    // 位相は時刻 t の純関数として持つ。アンカーを置き換えるのは周期が変わった瞬間だけなので、
+    // BPMの入切やテンポ変更でも位相が飛ばない。暗転中も clock は進むため復帰時の位置飛びもない。
+    const beamOrbitAnchor={t:0,phase:0,period:BEAM_ORBIT_FREE_PERIOD};
+    const beamOrbitRamp={at:0,from:0,to:0};
+    function beamOrbitUsesBpm(){return !!board.timeline.playing}
+    function beamOrbitTargetPeriod(){
+      return beamOrbitUsesBpm()
+        ?BEAM_ORBIT_BEATS*60/THREE.MathUtils.clamp(board.timeline.bpm||120,60,200)
+        :BEAM_ORBIT_FREE_PERIOD;
+    }
+    function beamOrbitPhaseAt(t){
+      return beamOrbitAnchor.phase+(t-beamOrbitAnchor.t)*Math.PI*2/Math.max(.05,beamOrbitAnchor.period);
+    }
+    function syncBeamOrbitPeriod(t){
+      const period=beamOrbitTargetPeriod();
+      if(Math.abs(period-beamOrbitAnchor.period)<1e-6)return;
+      beamOrbitAnchor.phase=beamOrbitPhaseAt(t);beamOrbitAnchor.t=t;beamOrbitAnchor.period=period;
+    }
+    function beamOrbitEnabled(){return board.beamStyle==='rays'&&board.beamOrbit.mode==='circle'}
+    function beamOrbitGainAt(t){
+      const k=BEAM_ORBIT_RAMP>0?THREE.MathUtils.clamp((t-beamOrbitRamp.at)/BEAM_ORBIT_RAMP,0,1):1;
+      return THREE.MathUtils.lerp(beamOrbitRamp.from,beamOrbitRamp.to,k*k*(3-2*k));
+    }
+    function setBeamOrbitTarget(t){
+      const to=beamOrbitEnabled()?1:0;
+      if(to===beamOrbitRamp.to)return;
+      beamOrbitRamp.from=beamOrbitGainAt(t);beamOrbitRamp.to=to;beamOrbitRamp.at=t;
+    }
+    function beamOrbitActive(t){return beamOrbitEnabled()||beamOrbitGainAt(t)>1e-4}
+    // 列位置で振り幅を決める。中央列(col 2,3)=40%、外側列(col 0,5)=100%。
+    // サイド・バック足元はファンを構成しないため動かさない。
+    function beamOrbitScaleOf(f){
+      if(!Number.isFinite(f.col))return 0;
+      const span=Math.abs(f.col-2.5);
+      return THREE.MathUtils.clamp(BEAM_ORBIT_CENTER_SCALE+(1-BEAM_ORBIT_CENTER_SCALE)*(span-.5)/2,0,1);
+    }
+    const _orbitVec=new THREE.Vector3(),_orbitRight=new THREE.Vector3(),BEAM_ORBIT_UP=new THREE.Vector3(0,1,0);
+    function beamOrbitAim(f,aim,t,gain){
+      if(gain<=1e-4)return aim;
+      const scale=beamOrbitScaleOf(f);if(scale<=0)return aim;
+      const width=THREE.MathUtils.clamp((board.beamOrbit.width||0)/100,0,2)*gain*scale;
+      if(width<=1e-4)return aim;
+      _orbitVec.copy(aim).sub(f.pos);
+      if(_orbitVec.lengthSq()<1e-8)return aim;
+      // 左右の灯体は逆方向へ回す。中央の2列も左右で向きが分かれる。
+      const phase=beamOrbitPhaseAt(t)*(f.pos.x<0?-1:1);
+      const yaw=BEAM_ORBIT_YAW_DEG*D2R_*width*Math.cos(phase);
+      const pitch=BEAM_ORBIT_PITCH_DEG*D2R_*width*Math.sin(phase);
+      // applyAxisAngle は長さを保つ。したがって灯体から狙い点までの距離は不変。
+      _orbitVec.applyAxisAngle(BEAM_ORBIT_UP,yaw);
+      _orbitRight.set(_orbitVec.z,0,-_orbitVec.x);
+      if(_orbitRight.lengthSq()<1e-10)_orbitRight.set(1,0,0);
+      _orbitVec.applyAxisAngle(_orbitRight.normalize(),pitch);
+      return f.pos.clone().add(_orbitVec);
     }
 
     /* --- チェイス／ブリンク（時刻 t の純関数。表示なしで数値検証できる） --- */
@@ -3228,6 +3302,7 @@
     function composeLightingFrame(t){
       const master=THREE.MathUtils.clamp(board.bright/100,0,1),blackout=!!board.blackout;
       const showSlots=activeShowSlots(t);
+      const orbitGain=beamOrbitGainAt(t);
       const fixtures=RIG.map((f,i)=>{
         const base=baseFixtureRequest(i,t),movement=movementFixtureRequest(i,t,base),accents=accentFixtureRequests(i,t,base,showSlots);
         const requests=[base,movement,...accents].filter(Boolean),levelRequests=activeLevelRequests(requests);
@@ -3236,7 +3311,7 @@
         const level=manualOff||blackout?0:THREE.MathUtils.clamp(preMaster*master,0,1);
         const source=levelRequests.reduce((best,r)=>!best||r.level>=best.level?r:best,null);
         return{id:f.id,level,preMaster,color:ltpValue(requests,'color',base.color),
-          aim:ltpValue(requests,'aim',base.aim),forceOff:offMask||manualOff||blackout,
+          aim:beamOrbitAim(f,ltpValue(requests,'aim',base.aim),t,orbitGain),forceOff:offMask||manualOff||blackout,
           sourceLayer:source?.layer||'base',sourceSlot:source?.slot||null};
       });
       const requestedPolicy=['maintain','follow','off'].includes(board.subjectSpot.policy)?board.subjectSpot.policy:'follow';
@@ -4516,6 +4591,9 @@
       board.laserSheet.mode=['fixed','open','close','cross'].includes(board.laserSheet.mode)?board.laserSheet.mode:'fixed';
       board.laserSheet.speed=THREE.MathUtils.clamp(Number.isFinite(+board.laserSheet.speed)?+board.laserSheet.speed:.6,0,2);
       board.laserSheet.color=/^#[0-9a-f]{6}$/i.test(String(board.laserSheet.color||''))?board.laserSheet.color:'#36ff74';
+      Object.assign(board.beamOrbit,src.beamOrbit||{});
+      board.beamOrbit.mode=board.beamOrbit.mode==='circle'?'circle':'fixed';
+      board.beamOrbit.width=THREE.MathUtils.clamp(Math.round(Number(board.beamOrbit.width)||100),20,160);
       if(!['maintain','follow','off'].includes(board.subjectSpot.policy))board.subjectSpot.policy='follow';
       Object.assign(board.show,src.show||{});
       Object.assign(board.overlay,src.overlay||{});
@@ -4535,6 +4613,7 @@
         (board.overlay.enabled&&['silhouette','blackout-hit'].includes(board.overlay.mode));
       if(board.show.playing&&!loadedDarkMode)board.show.keepSpot=true;
       if(Array.isArray(src.fixtures))src.fixtures.forEach((s,i)=>{if(board.fixtures[i])Object.assign(board.fixtures[i],s)});
+      setBeamOrbitTarget(clock);
       rebuildOrder();syncBoardUI();saveSettings();refresh();
     }
     function exportSettingsFile(){
@@ -4824,6 +4903,14 @@
       q('#beamStyleHint').textContent=board.beamStyle==='diffuse'
         ?'灯体から広がり、床へ近づくほど薄くなる柔らかい光です。'
         :'細い光の筋と煙の流れを強調する演出用の光条です。';
+      // 小円ファンは光条モード専用。拡散光では行そのものを隠す。
+      q('#beamOrbitRow').classList.toggle('hidden',board.beamStyle!=='rays');
+      document.querySelectorAll('[data-beam-orbit]').forEach(b=>b.classList.toggle('active',b.dataset.beamOrbit===board.beamOrbit.mode));
+      q('#beamOrbitWidth').value=board.beamOrbit.width;q('#v-beamOrbitWidth').textContent=board.beamOrbit.width+'%';
+      q('#beamOrbitHint').textContent=board.beamOrbit.mode==='circle'
+        ?'灯体位置は固定したまま、現在のファン角度を中心に小さな楕円を描きます。'
+         +(beamOrbitUsesBpm()?'BPM同期で4拍1周。':'約3.2秒で1周。')+'明るさは変わりません。'
+        :'ファンの角度を固定します。';
       q('#chasePlay').textContent=board.chase.playing?'■ 停止':'▶ 再生';
       q('#chasePlay').classList.toggle('active',board.chase.playing);
       q('#chaseLoop').classList.toggle('active',board.chase.loop);
@@ -4870,8 +4957,13 @@
     q('#laserSheetColor').oninput=e=>{board.laserSheet.color=e.target.value;q('#v-laserSheetColor').textContent=board.laserSheet.color;saveSettings();refresh()};
     q('#rainbowToggle').onclick=()=>{board.rainbow=!board.rainbow;setToggle('rainbowToggle',board.rainbow,'レインボー');saveSettings();refresh()};
     document.querySelectorAll('[data-beam-style]').forEach(b=>b.onclick=()=>{
-      board.beamStyle=b.dataset.beamStyle;syncBoardUI();saveSettings();refresh();
+      board.beamStyle=b.dataset.beamStyle;setBeamOrbitTarget(clock);syncBoardUI();saveSettings();refresh();
     });
+    document.querySelectorAll('[data-beam-orbit]').forEach(b=>b.onclick=()=>{
+      board.beamOrbit.mode=b.dataset.beamOrbit==='circle'?'circle':'fixed';
+      setBeamOrbitTarget(clock);syncBoardUI();saveSettings();refresh();
+    });
+    q('#beamOrbitWidth').oninput=e=>{board.beamOrbit.width=+e.target.value;q('#v-beamOrbitWidth').textContent=board.beamOrbit.width+'%';saveSettings();refresh()};
     q('#groupSelect').onchange=e=>{board.group=e.target.value;renderFixtures();saveSettings()};
     q('#groupOn').onclick=()=>{selectedIds().forEach(i=>board.fixtures[i].on=true);renderFixtures();saveSettings();refresh()};
     q('#groupOff').onclick=()=>{selectedIds().forEach(i=>board.fixtures[i].on=false);renderFixtures();saveSettings();refresh()};
@@ -5153,10 +5245,12 @@
     function loop(now){
       requestAnimationFrame(loop);
       const dt=Math.min((now-last)/1000,0.05); last=now;
-      const animating=board.chase.playing||board.blink.playing||board.show.playing||board.rainbow||(board.laserSheet.on&&board.laserSheet.mode!=='fixed'&&board.laserSheet.speed>0);
+      const animating=board.chase.playing||board.blink.playing||board.show.playing||board.rainbow||(board.laserSheet.on&&board.laserSheet.mode!=='fixed'&&board.laserSheet.speed>0)||beamOrbitActive(clock);
       if(animating){
         clock+=dt;
         advanceTimeline(clock);
+        // 暗転中も clock は進むため、小円ファンの位相は途切れない。
+        syncBeamOrbitPeriod(clock);
         // ループOFFのときは1周したら止める
         if(board.chase.playing&&!board.chase.loop&&(clock-chaseStart)*board.chase.speed>N*0.6){
           board.chase.playing=false; syncBoardUI();
@@ -5193,6 +5287,7 @@
       setClock(t){clock=t;updateScene(t)},setBody:(id)=>setBody(id),getBodyId:()=>bodyId,BODIES,validateLowPolyModel,camera,CAMERA_PRESETS,
       stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,moveCameraAroundSubject,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,getSubjectDistance:subjectDistanceMeters,syncMapShootingMarker,moveMapShootingPosition,rotateMapShootingYaw,updateVenueCutaway,faceExposureOf,selectRenderLights,applyExposureCompareTarget,resetExposureCompareBaseline,getExposureCompare:()=>({target:exposureCompareTarget,baseline:exposureCompareBaseline?{...exposureCompareBaseline}:null,expo:{...expo}}),applyToneMapMode,getToneMapMode:()=>toneMapMode,highlightWarning:{sample:()=>sampleSubjectHighlights(performance.now(),true),get:()=>({...highlightReading}),classify:classifyHighlightPixels},
       timeline:{capture:captureTimelineStep,add:addTimelineStep,start:startTimeline,stop:stopTimeline,advance:advanceTimeline,setBpm:setTimelineBpm,sanitize:sanitizeTimelineStep},
+      beamOrbit:{sync:syncBeamOrbitPeriod,targetPeriod:beamOrbitTargetPeriod,phaseAt:beamOrbitPhaseAt,gainAt:beamOrbitGainAt,setTarget:setBeamOrbitTarget,scaleOf:beamOrbitScaleOf},
       setPose:(n)=>document.querySelector('[data-pose="'+n+'"]').click(),render(){renderer.render(scene,camera)},applyBoard,toneExposure(){return renderer.toneMappingExposure},triangles(){return renderer.info.render.triangles},lightStats(){return{spots:spots.filter(l=>l.visible&&l.intensity>0).length,shadows:spots.filter(l=>l.castShadow).length}}};
   </script>
 </body>
