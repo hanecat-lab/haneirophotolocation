@@ -1571,6 +1571,8 @@
       // マネキンのGLBは非同期で届く。届くまでは手続き生成の簡易マネキンを表示し、
       // 読み込めたら登録済みのグループの中身だけを差し替える。失敗時は簡易マネキンが残る。
       let mannequinTemplate = null; const personGroups = [];
+      // 実機でしか起きない読み込み失敗を切り分けるための記録。?diag=1 で画面に出す。
+      const mannequinDiag = { loader: null, url: '', load: 'pending', detail: '', fetch: '未実行' };
       let drag = {
         active: false, lastX: 0, lastY: 0, moved: false, pointers: new Map(), pinchDistance: 0,
         azimuth: .55, elevation: 1.18, radius: 12,
@@ -1937,18 +1939,21 @@
         if (mannequinTemplate) applyMannequinModel(group);
         return group;
       }
+      const MANNEQUIN_URL = 'assets/mannequin-suit.glb';
       function applyMannequinModel(group) {
         while (group.children.length) group.remove(group.children[0]);
         group.add(mannequinTemplate.clone(true));
       }
       function loadMannequin() {
         const THREE = window.THREE;
-        if (!THREE || !THREE.GLTFLoader) return;
-        new THREE.GLTFLoader().load('assets/mannequin-suit.glb', gltf => {
+        mannequinDiag.loader = Boolean(THREE && THREE.GLTFLoader);
+        try { mannequinDiag.url = new URL(MANNEQUIN_URL, location.href).href; } catch (error) { mannequinDiag.url = MANNEQUIN_URL; }
+        if (!mannequinDiag.loader) { mannequinDiag.load = 'skipped'; mannequinDiag.detail = 'THREE.GLTFLoader が未定義'; return; }
+        new THREE.GLTFLoader().load(MANNEQUIN_URL, gltf => {
           const root = gltf.scene;
           const bounds = new THREE.Box3().setFromObject(root);
           const height = bounds.max.y - bounds.min.y;
-          if (!(height > 0)) return;
+          if (!(height > 0)) { mannequinDiag.load = 'error'; mannequinDiag.detail = '高さ0'; return; }
           // 身長1.70m、足元をy=0に揃える。以後のcloneはこの正規化を引き継ぐ。
           root.scale.setScalar(1.70 / height);
           const scaled = new THREE.Box3().setFromObject(root);
@@ -1956,8 +1961,33 @@
           root.traverse(node => { if (node.isMesh) { node.castShadow = true; node.receiveShadow = true; } });
           mannequinTemplate = root;
           personGroups.forEach(applyMannequinModel);
+          mannequinDiag.load = 'ok';
           if (state.sceneReady) updateScene(state.progress);
-        }, undefined, () => {});
+        }, undefined, error => {
+          mannequinDiag.load = 'error';
+          mannequinDiag.detail = String((error && (error.message || error.type)) || error);
+        });
+      }
+      // 端末で状態を読み出すための診断表示。?diag=1 のときだけ出す。
+      function showMannequinDiagnostics() {
+        const panel = document.createElement('div');
+        panel.style.cssText = 'position:fixed;z-index:200;left:8px;right:8px;bottom:8px;max-height:54vh;overflow:auto;padding:12px;border:1px solid rgba(140,210,255,.6);border-radius:12px;background:rgba(4,12,24,.96);color:#dff2ff;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;-webkit-user-select:text;user-select:text;';
+        const lines = () => [
+          'MANNEQUIN DIAG',
+          `THREE          : ${typeof window.THREE}`,
+          `GLTFLoader     : ${typeof (window.THREE && window.THREE.GLTFLoader)}`,
+          `GLB URL        : ${mannequinDiag.url}`,
+          `load           : ${mannequinDiag.load}${mannequinDiag.detail ? ' / ' + mannequinDiag.detail : ''}`,
+          `fetch          : ${mannequinDiag.fetch}`,
+          `表示中のマネキン : ${mannequinTemplate ? 'GLBモデル' : '簡易マネキン'}`
+        ].join('\n');
+        const paint = () => { panel.textContent = lines(); };
+        paint(); document.body.appendChild(panel);
+        fetch(mannequinDiag.url || MANNEQUIN_URL).then(response => response.arrayBuffer().then(buffer => {
+          const head = Array.from(new Uint8Array(buffer.slice(0, 4))).map(v => String.fromCharCode(v)).join('');
+          mannequinDiag.fetch = `${response.status} / ${response.headers.get('content-type') || 'type不明'} / ${buffer.byteLength}B / 先頭=${head}`;
+        })).catch(error => { mannequinDiag.fetch = 'failed: ' + String((error && error.message) || error); }).then(paint);
+        setInterval(paint, 1000);
       }
       function buildPlaceholderPerson(THREE) {
         // 身長1.70m、足は地面に接地。スマートなマネキンの比率で組む。
@@ -2508,6 +2538,7 @@
       }
       function start() {
         state.library=readLibrary(); renderPresets(); renderCameraWorkOptions(); renderTagPicker(); renderLibrary(); syncUI(); bindEvents(); initScene();
+        if (new URLSearchParams(location.search).get('diag') === '1') showMannequinDiagnostics();
       }
       start();
     })();
