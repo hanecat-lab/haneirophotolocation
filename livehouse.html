@@ -258,7 +258,9 @@
         </section>
         <section class="section"><div class="label"><span>全体</span><small>MASTER</small></div>
           <div class="slider"><div><span>明るさ</span><strong id="v-bright">70</strong></div><input type="range" id="brightR" min="0" max="100" step="1" value="70" /></div>
-          <div class="slider"><div><span>チルト</span><strong id="v-tilt">-25°</strong></div><input type="range" id="tiltR" min="-60" max="10" step="1" value="-25" /></div>
+          <div class="slider"><div><span>出力ゲイン</span><strong id="v-outputGain">0.0段</strong></div><input type="range" id="outputGainR" min="0" max="4" step="0.1" value="0" /></div>
+          <div class="hint" id="outputGainHint">灯体そのものの光度を段数で持ち上げます。少数の灯で組むときに使います。</div>
+          <div class="slider" style="margin-top:8px"><div><span>チルト</span><strong id="v-tilt">-25°</strong></div><input type="range" id="tiltR" min="-60" max="10" step="1" value="-25" /></div>
           <div class="slider"><div><span>ビームのやわらかさ</span><strong id="v-soft">62%</strong></div><input type="range" id="softR" min="0" max="100" step="1" value="62" /></div>
           <div class="slider"><div><span>フロント照明</span><strong id="v-frontFill">58%</strong></div><input type="range" id="frontFillR" min="0" max="100" step="1" value="58" /></div>
           <div class="two" style="margin-top:8px"><button class="mode" id="smokeToggle">○ スモーク</button><button class="mode" id="blackoutToggle">○ ブラックアウト</button></div>
@@ -2981,6 +2983,16 @@
 
     // 基準距離3mでの被写体面照度[lx]。小規模ライブハウスのLED灯体を想定した実効値
     const REF_DIST=3, FIX_LUX={par:36,moving:70,side:25,uplight:15};
+    /* 出力ゲイン — 灯体そのものの光度を段数で持ち上げる。
+       実測（ISO3200/F2.8/1/500・明るさ100）での適正までの不足段数は
+       ムービング1灯 4.2段 / ムービング4灯 1.5段 / 全30灯 0.9段 / 全30灯+スポット 0段。
+       必要量が構成で大きく変わるため固定値ではなくスライダーで持つ。既定0段で従来と一致。
+       被写体照度・実光源・床のプールは線形(×G)。ヘイズの濃さだけは加算合成のため
+       線形だと画面が塗り潰されるので平方根(×√G)へ抑える。表示上の意図的な非線形。
+       灯体の発光球は既にクリップ域（PARで色係数1080）なのでゲインを掛けない。 */
+    const OUTPUT_GAIN_MAX=4;
+    const outputGainOf=()=>Math.pow(2,THREE.MathUtils.clamp(board.outputGain||0,0,OUTPUT_GAIN_MAX));
+    const scatterGainOf=()=>Math.sqrt(outputGainOf());
     const CONE={par:0.22,moving:0.13,side:0.26,uplight:0.40};   // ビーム半角[rad]
     const C_INCIDENT=2.5;                                       // 入射光式の定数 E = 2.5 × 2^EV100
     const REAL_LIGHTS=8;                                         // 実光源の上限
@@ -3019,6 +3031,7 @@
       beamOrbit:{mode:'fixed',width:100},
       backlight:{on:false,level:70},
       beamZoom:{mode:'fixed',width:100,depth:60},
+      outputGain:0,
       show:{mode:'blinder',speed:1,level:80,fade:.55,spread:70,loop:true,keepSpot:true,playing:false},
       overlay:{enabled:false,mode:'fan',speed:1,level:65},
       timeline:{bpm:120,beats:4,loop:true,playing:false,index:0,steps:[]},
@@ -3433,7 +3446,7 @@
       const cone=coneOf(f,t), pen=THREE.MathUtils.lerp(0.25,0.9,board.soft/100);
       const beam=1-THREE.MathUtils.smoothstep(ang,cone*(1-pen),cone);
       if(beam<=0) return 0;
-      return FIX_LUX[f.type]*lv*beam*(REF_DIST*REF_DIST)/(d*d);
+      return FIX_LUX[f.type]*outputGainOf()*lv*beam*(REF_DIST*REF_DIST)/(d*d);
     }
     function stageLux(t){const frame=composeLightingFrame(t);let s=frame.subjectSpot.lux+frame.faceFill.lux;for(let i=0;i<N;i++)s+=luxOf(i,t,frame);return s}
 
@@ -4332,7 +4345,9 @@
         const beamEnd=beamEndOf(f,aim), dir=beamEnd.clone().sub(f.pos), len=Math.max(0.4,dir.length());
         const cone=coneOf(f,t), rad=Math.tan(cone)*len;
         const aimDistance=Math.max(.5,aim.distanceTo(f.pos));
-        const aimLux=FIX_LUX[f.type]*lv*(REF_DIST*REF_DIST)/(aimDistance*aimDistance);   // 狙った先の照度[lx]
+        // ゲイン前の照度を残す。ヘイズだけは線形に上げないため。
+        const aimLuxBase=FIX_LUX[f.type]*lv*(REF_DIST*REF_DIST)/(aimDistance*aimDistance);
+        const aimLux=aimLuxBase*outputGainOf();   // 狙った先の照度[lx]
         contrib.push({i,lux,aimLux,lv,col,aim});
         g.lens.visible=lv>0.001;
         if(g.lens.visible) g.lensMat.color.copy(col).multiplyScalar(FIX_LUX[f.type]*lv*30);
@@ -4354,7 +4369,7 @@
           // 煙の中の光柱の濃さは灯体の光度で決まり、どこを狙ったかには依存しない。
           // 客席へ抜くフレア灯だけは投射が9m超で、狙い先の照度では筋が床狙いの11%まで落ちる。
           // この4灯に限り基準距離3mで評価する。床のプールと実光源の選抜は aimLux のまま。
-          const scatterLux=backlightRoleOf(f)==='flare'?FIX_LUX[f.type]*lv:Math.max(aimLux,0);
+          const scatterLux=(backlightRoleOf(f)==='flare'?FIX_LUX[f.type]*lv:Math.max(aimLuxBase,0))*scatterGainOf();
           g.beamMat.uniforms.uStyle.value=diffuseStyle?1:0;
           g.beamMat.uniforms.uScatter.value=(board.smoke
             ?(diffuseStyle?.28:.48)
@@ -4677,6 +4692,8 @@
       Object.assign(board.backlight,src.backlight||{});
       board.backlight.on=!!board.backlight.on;
       board.backlight.level=THREE.MathUtils.clamp(Math.round(Number(board.backlight.level)||70),0,100);
+      const gain=Number(src.outputGain);
+      board.outputGain=THREE.MathUtils.clamp(Number.isFinite(gain)?gain:0,0,OUTPUT_GAIN_MAX);
       Object.assign(board.beamZoom,src.beamZoom||{});
       board.beamZoom.mode=board.beamZoom.mode==='breathe'?'breathe':'fixed';
       board.beamZoom.width=THREE.MathUtils.clamp(Math.round(Number(board.beamZoom.width)||100),40,160);
@@ -4947,6 +4964,11 @@
     }
     function syncBoardUI(){
       q('#brightR').value=board.bright; q('#v-bright').textContent=board.bright;
+      q('#outputGainR').value=board.outputGain;
+      q('#v-outputGain').textContent=board.outputGain.toFixed(1)+'段';
+      q('#outputGainHint').textContent=board.outputGain>0
+        ?'灯体の光度を'+board.outputGain.toFixed(1)+'段（×'+Math.pow(2,board.outputGain).toFixed(1)+'）持ち上げています。光柱の濃さは√倍に抑えています。'
+        :'灯体そのものの光度を段数で持ち上げます。少数の灯で組むときに使います。';
       q('#tiltR').value=board.tilt;     q('#v-tilt').textContent=board.tilt+'°';
       q('#softR').value=board.soft;     q('#v-soft').textContent=board.soft+'%';
       q('#frontFillR').value=board.frontFill;q('#v-frontFill').textContent=board.frontFill+'%';
@@ -5044,6 +5066,7 @@
     q('#faceFillToggle').onclick=()=>{board.faceFill.on=!board.faceFill.on;setToggle('faceFillToggle',board.faceFill.on,'フェイスフィル');saveSettings();refresh()};
     q('#faceFillLevel').oninput=e=>{board.faceFill.level=+e.target.value;q('#v-faceFillLevel').textContent=board.faceFill.level+'%';saveSettings();refresh()};
     document.querySelectorAll('[data-shadow-mode]').forEach(b=>b.onclick=()=>{board.shadow.mode=b.dataset.shadowMode;syncBoardUI();saveSettings();refresh()});
+    q('#outputGainR').oninput=e=>{board.outputGain=+e.target.value;syncBoardUI();saveSettings();refresh()};
     q('#colorPick').oninput=e=>{board.color=e.target.value;q('#v-color').textContent=board.color;applyColorToSelection()};
     q('#smokeToggle').onclick=()=>{board.smoke=!board.smoke;setToggle('smokeToggle',board.smoke,'スモーク');saveSettings();refresh()};
     q('#blackoutToggle').onclick=()=>{board.blackout=!board.blackout;setToggle('blackoutToggle',board.blackout,'ブラックアウト');saveSettings();refresh()};
@@ -5397,6 +5420,7 @@
       timeline:{capture:captureTimelineStep,add:addTimelineStep,start:startTimeline,stop:stopTimeline,advance:advanceTimeline,setBpm:setTimelineBpm,sanitize:sanitizeTimelineStep},
       backlight:{roleOf:backlightRoleOf,aimOf,beamEndOf,
         scatterOf:i=>gear[i].beamMat.uniforms.uScatter.value,coreOf:i=>gear[i].coreMat.color.clone(),poolOf:i=>gear[i].poolMat.color.clone(),poolVisible:i=>gear[i].pool.visible},
+      outputGain:{gainOf:outputGainOf,scatterGainOf,MAX:OUTPUT_GAIN_MAX},
       beamZoom:{coneOf,factor:beamZoomFactor,gainAt:beamZoomGainAt,setTarget:setBeamZoomTarget,CONE},
       beamOrbit:{sync:syncBeamOrbitPeriod,targetPeriod:beamOrbitTargetPeriod,phaseAt:beamOrbitPhaseAt,gainAt:beamOrbitGainAt,setTarget:setBeamOrbitTarget,scaleOf:beamOrbitScaleOf},
       setPose:(n)=>document.querySelector('[data-pose="'+n+'"]').click(),render(){renderer.render(scene,camera)},applyBoard,toneExposure(){return renderer.toneMappingExposure},triangles(){return renderer.info.render.triangles},lightStats(){return{spots:spots.filter(l=>l.visible&&l.intensity>0).length,shadows:spots.filter(l=>l.castShadow).length}},
