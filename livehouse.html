@@ -153,7 +153,7 @@
             <div class="highlight-warning-status"><span class="highlight-warning-state" id="highlightWarningState">測定中</span><strong class="highlight-warning-metric" id="highlightWarningMetric">明部 -- / 255</strong></div>
             <div class="highlight-warning-meter" aria-hidden="true"><i id="highlightWarningLevel"></i></div>
             <div class="highlight-warning-message" id="highlightWarningMessage">被写体の明部を確認しています。</div>
-            <div class="highlight-warning-note">Neutral表示の完成画像を測定。灯体と背景を除き、メイン被写体だけを判定し、白飛びと色飽和を分けて表示します。</div>
+            <div class="highlight-warning-note">Neutral表示の完成画像を測定。灯体と背景を除外し、白飛びと色飽和を分離。警告表示は連続する測定結果で安定化します。</div>
           </div>
           <div class="hint" id="expoReadout"></div>
           <div class="warn" id="expoWarn"></div>
@@ -3322,6 +3322,7 @@
        平均露出とは別に、最終表示を低解像度で読み取る。専用Layerのマスクを
        併用するため、灯体・背景・床の明るさは判定へ混ぜない。 */
     const HIGHLIGHT_SAMPLE_INTERVAL=320,HIGHLIGHT_NEAR=245,HIGHLIGHT_CLIP=252;
+    const HIGHLIGHT_CONFIRM_SAMPLES=2,HIGHLIGHT_CLEAR_SAMPLES=3,HIGHLIGHT_WARNING_HOLD_MS=1000,HIGHLIGHT_STRONG_WHITE_PERCENT=1;
     const highlightDisplayCanvas=document.createElement('canvas');
     const highlightDisplayContext=highlightDisplayCanvas.getContext('2d',{willReadFrequently:true});
     const highlightMaskTarget=new THREE.WebGLRenderTarget(1,1,{depthBuffer:true,stencilBuffer:false});
@@ -3332,6 +3333,7 @@
     let highlightColorPixels=new Uint8ClampedArray(4),highlightMaskPixels=new Uint8Array(4);
     let highlightLastSampleAt=-Infinity,highlightReadbackFailed=false;
     let highlightReading={state:'checking',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,subjectPixels:0};
+    let highlightRawReading={...highlightReading},highlightPendingKey='',highlightPendingCount=0,highlightStateChangedAt=-Infinity;
     function resizeHighlightTargets(viewWidth,viewHeight){
       const aspect=THREE.MathUtils.clamp(viewWidth/Math.max(1,viewHeight),.45,2.8);
       const width=Math.max(96,Math.round(aspect>=1?224:224*aspect));
@@ -3365,6 +3367,25 @@
       const kind=state==='clip'?(whiteClipEnough?'white':'color'):(state==='caution'?'near':'none');
       return{state,kind,bright,clipPercent,whitePercent,colorPercent,nearPercent,subjectPixels};
     }
+    function highlightStateKey(reading){return reading.state==='clip'?reading.state+':'+reading.kind:reading.state}
+    function highlightSeverity(reading){return reading.state==='clip'?(reading.kind==='white'?3:2):(reading.state==='caution'?1:0)}
+    function resetHighlightTransition(now){highlightPendingKey='';highlightPendingCount=0;highlightStateChangedAt=now}
+    function stabilizeHighlightReading(raw,now=performance.now()){
+      const measuredStates=['safe','caution','clip'];
+      const rawMeasured=measuredStates.includes(raw.state),currentMeasured=measuredStates.includes(highlightReading.state);
+      if(!rawMeasured){resetHighlightTransition(now);return raw}
+      const rawKey=highlightStateKey(raw),currentKey=highlightStateKey(highlightReading);
+      if(!currentMeasured&&raw.state==='safe'){resetHighlightTransition(now);return raw}
+      if(rawKey===currentKey){highlightPendingKey='';highlightPendingCount=0;return raw}
+      const rawSeverity=highlightSeverity(raw),currentSeverity=highlightSeverity(highlightReading);
+      const strongWhite=raw.state==='clip'&&raw.kind==='white'&&raw.whitePercent>=HIGHLIGHT_STRONG_WHITE_PERCENT;
+      if(strongWhite&&rawSeverity>currentSeverity){resetHighlightTransition(now);return raw}
+      if(rawKey===highlightPendingKey)highlightPendingCount++;else{highlightPendingKey=rawKey;highlightPendingCount=1}
+      const required=raw.state==='safe'?HIGHLIGHT_CLEAR_SAMPLES:HIGHLIGHT_CONFIRM_SAMPLES;
+      const releaseHeld=currentSeverity>0&&rawSeverity<currentSeverity&&now-highlightStateChangedAt<HIGHLIGHT_WARNING_HOLD_MS;
+      if(highlightPendingCount<required||releaseHeld)return highlightReading;
+      resetHighlightTransition(now);return raw;
+    }
     function updateHighlightWarningUI(next){
       highlightReading={...highlightReading,...next};
       const panel=document.querySelector('#highlightWarning'),badge=document.querySelector('#highlightBadge');
@@ -3386,12 +3407,15 @@
         :'明部 -- / 255';
       if(level)level.style.width=(['safe','caution','clip'].includes(highlightReading.state)?highlightReading.bright/255*100:0).toFixed(1)+'%';
     }
+    function setHighlightReadingImmediate(next,now){
+      highlightRawReading={...highlightRawReading,...next};resetHighlightTransition(now);updateHighlightWarningUI(next);return highlightReading;
+    }
     function sampleSubjectHighlights(now=performance.now(),force=false){
       if(!force&&now-highlightLastSampleAt<HIGHLIGHT_SAMPLE_INTERVAL)return highlightReading;
       highlightLastSampleAt=now;
-      if(cameraMode==='map'){updateHighlightWarningUI({state:'idle',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,subjectPixels:0});return highlightReading}
+      if(cameraMode==='map')return setHighlightReadingImmediate({state:'idle',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,nearPercent:0,subjectPixels:0},now);
       if(!model||!model.visible||(isExternalSubject()&&!model.userData?.externalSubject)){
-        updateHighlightWarningUI({state:'checking',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,subjectPixels:0});return highlightReading;
+        return setHighlightReadingImmediate({state:'checking',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,nearPercent:0,subjectPixels:0},now);
       }
       tagHighlightSubject(model);model.updateMatrixWorld(true);
       const previousTarget=renderer.getRenderTarget(),previousMask=camera.layers.mask;
@@ -3411,12 +3435,13 @@
         renderer.readRenderTargetPixels(highlightMaskTarget,0,0,highlightSampleWidth,highlightSampleHeight,highlightMaskPixels);
       }catch(error){
         if(!highlightReadbackFailed){console.warn('Highlight warning readback is unavailable.',error);highlightReadbackFailed=true}
-        updateHighlightWarningUI({state:'unavailable',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,subjectPixels:0});return highlightReading;
+        return setHighlightReadingImmediate({state:'unavailable',kind:'none',bright:0,clipPercent:0,whitePercent:0,colorPercent:0,nearPercent:0,subjectPixels:0},now);
       }finally{
         camera.layers.mask=previousMask;scene.overrideMaterial=previousOverride;scene.background=previousBackground;scene.fog=previousFog;
         renderer.setRenderTarget(previousTarget);
       }
-      updateHighlightWarningUI(classifyHighlightPixels(highlightColorPixels,highlightMaskPixels));
+      highlightRawReading=classifyHighlightPixels(highlightColorPixels,highlightMaskPixels);
+      updateHighlightWarningUI(stabilizeHighlightReading(highlightRawReading,now));
       return highlightReading;
     }
 
