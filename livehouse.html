@@ -272,6 +272,12 @@
             <div class="hint" id="beamOrbitHint">ファンの角度を固定します。</div>
           </div>
         </section>
+        <section class="section"><div class="label"><span>ビームズーム</span><small>BEAM ZOOM</small></div>
+          <div class="two"><button class="mode" type="button" data-beam-zoom="fixed">固定</button><button class="mode" type="button" data-beam-zoom="breathe">呼吸</button></div>
+          <div class="slider" style="margin-top:8px"><div><span>ビーム幅</span><strong id="v-beamZoomWidth">100%</strong></div><input type="range" id="beamZoomWidth" min="40" max="160" step="5" value="100" /></div>
+          <div class="slider"><div><span>呼吸の深さ</span><strong id="v-beamZoomDepth">60%</strong></div><input type="range" id="beamZoomDepth" min="0" max="100" step="5" value="60" /></div>
+          <div class="hint" id="beamZoomHint">全30灯のビーム幅を変えます。照度・光柱・床の照射・影が同時に追従します。</div>
+        </section>
         <section class="section"><div class="label"><span>逆光</span><small>BACKLIGHT</small></div>
           <button class="mode" id="backlightToggle" type="button" style="width:100%">○ 逆光</button>
           <div class="slider" style="margin-top:8px"><div><span>逆光の強さ</span><strong id="v-backlightLevel">70%</strong></div><input type="range" id="backlightLevel" min="0" max="100" step="1" value="70" /></div>
@@ -3012,6 +3018,7 @@
       laserSheet:{on:false,level:28,height:1.40,spread:35,tilt:0,mode:'fixed',speed:.6,color:'#36ff74'},
       beamOrbit:{mode:'fixed',width:100},
       backlight:{on:false,level:70},
+      beamZoom:{mode:'fixed',width:100,depth:60},
       show:{mode:'blinder',speed:1,level:80,fade:.55,spread:70,loop:true,keepSpot:true,playing:false},
       overlay:{enabled:false,mode:'fan',speed:1,level:65},
       timeline:{bpm:120,beats:4,loop:true,playing:false,index:0,steps:[]},
@@ -3156,6 +3163,37 @@
       _orbitVec.applyAxisAngle(_orbitRight.normalize(),pitch);
       return f.pos.clone().add(_orbitVec);
     }
+
+    /* --- ビームズーム（コーン角の可変化） --------------------------------
+       CONE は灯体種別ごとの定数だったが、実機のムービングは必ずズームを持つ。
+       coneOf() を luxOf・光柱半径・実SpotLightの角度の3か所へ通すだけで、
+       被写体照度・光柱・中心光・床のプール・実光源・影がまとめて追従する。
+       位相は小円ファンと共有し、BPM同期時に両者が拍の上で揃うようにする。
+       倍率の上下限は実測値。0.4〜1.6の範囲では、3.2秒1周の間に実光源8枠の
+       入れ替わりが最大2灯／異なる組合せ2通りに留まり、チラつきにならない。
+       広げるほど被写体に届く灯が増えて明るくなる（実測 x0.4:318.5lx/12灯 →
+       x1.6:424.9lx/14灯）。これはコーンの物理的な帰結なので補正しない。 */
+    const BEAM_ZOOM_MIN=.4,BEAM_ZOOM_MAX=1.6,BEAM_ZOOM_RAMP=.4;
+    const beamZoomRamp={at:0,from:0,to:0};
+    const beamZoomBreathing=()=>board.beamZoom.mode==='breathe';
+    function beamZoomGainAt(t){
+      const k=BEAM_ZOOM_RAMP>0?THREE.MathUtils.clamp((t-beamZoomRamp.at)/BEAM_ZOOM_RAMP,0,1):1;
+      return THREE.MathUtils.lerp(beamZoomRamp.from,beamZoomRamp.to,k*k*(3-2*k));
+    }
+    function setBeamZoomTarget(t){
+      const to=beamZoomBreathing()?1:0;
+      if(to===beamZoomRamp.to)return;
+      beamZoomRamp.from=beamZoomGainAt(t);beamZoomRamp.to=to;beamZoomRamp.at=t;
+    }
+    function beamZoomActive(t){return beamZoomBreathing()||beamZoomGainAt(t)>1e-4}
+    function beamZoomFactor(t){
+      const w=THREE.MathUtils.clamp((board.beamZoom.width||100)/100,BEAM_ZOOM_MIN,BEAM_ZOOM_MAX);
+      const gain=beamZoomGainAt(t);
+      if(gain<=1e-4)return w;            // 固定時は幅のみ。既定(100%)なら倍率はちょうど1.0
+      const depth=THREE.MathUtils.clamp((board.beamZoom.depth||0)/100,0,1)*gain;
+      return THREE.MathUtils.clamp(w*(1+depth*.5*Math.cos(beamOrbitPhaseAt(t))),BEAM_ZOOM_MIN,BEAM_ZOOM_MAX);
+    }
+    function coneOf(f,t){return CONE[f.type]*beamZoomFactor(t)}
 
     /* --- チェイス／ブリンク（時刻 t の純関数。表示なしで数値検証できる） --- */
     let orderIdx=new Array(N).fill(0);
@@ -3388,7 +3426,7 @@
       const toSub=SUBJECT.clone().sub(f.pos), d=Math.max(0.5,toSub.length());
       const axis=state.aim.clone().sub(f.pos).normalize();
       const ang=Math.acos(THREE.MathUtils.clamp(toSub.normalize().dot(axis),-1,1));
-      const cone=CONE[f.type], pen=THREE.MathUtils.lerp(0.25,0.9,board.soft/100);
+      const cone=coneOf(f,t), pen=THREE.MathUtils.lerp(0.25,0.9,board.soft/100);
       const beam=1-THREE.MathUtils.smoothstep(ang,cone*(1-pen),cone);
       if(beam<=0) return 0;
       return FIX_LUX[f.type]*lv*beam*(REF_DIST*REF_DIST)/(d*d);
@@ -4288,7 +4326,7 @@
         // 筐体・レンズ・ビーム・床のプール。照明の狙いと光柱の終点は分離する。
         // 実光源は aim で人物を照らし、可視光柱は beamEnd の床／天井まで通す。
         const beamEnd=beamEndOf(f,aim), dir=beamEnd.clone().sub(f.pos), len=Math.max(0.4,dir.length());
-        const cone=CONE[f.type], rad=Math.tan(cone)*len;
+        const cone=coneOf(f,t), rad=Math.tan(cone)*len;
         const aimDistance=Math.max(.5,aim.distanceTo(f.pos));
         const aimLux=FIX_LUX[f.type]*lv*(REF_DIST*REF_DIST)/(aimDistance*aimDistance);   // 狙った先の照度[lx]
         contrib.push({i,lux,aimLux,lv,col,aim});
@@ -4412,7 +4450,7 @@
         if(!c||c.renderLux<=0.01){l.intensity=0;l.visible=false;l.castShadow=false;l.shadow.intensity=0;return}
         const f=RIG[c.i], d=Math.max(0.5,c.background?c.aim.distanceTo(f.pos):SUBJECT.distanceTo(f.pos));
         l.visible=true; l.position.copy(f.pos); l.target.position.copy(c.aim); l.target.updateMatrixWorld();
-        l.color.copy(c.col); l.angle=CONE[f.type]; l.penumbra=pen; l.decay=2; l.distance=0;
+        l.color.copy(c.col); l.angle=coneOf(f,t); l.penumbra=pen; l.decay=2; l.distance=0;
         if(casts)fitShadowCameraToCasters(l);
         l.shadow.bias=isExternalSubject()?-.00035:-.0009;l.shadow.normalBias=isExternalSubject()?.010:.004;l.shadow.radius=shadowStyle.regularRadius;
         // E = I/d²。顔用は被写体点、背景用は灯体の狙い位置で所定照度になる光度[cd]を与える。
@@ -4635,6 +4673,12 @@
       Object.assign(board.backlight,src.backlight||{});
       board.backlight.on=!!board.backlight.on;
       board.backlight.level=THREE.MathUtils.clamp(Math.round(Number(board.backlight.level)||70),0,100);
+      Object.assign(board.beamZoom,src.beamZoom||{});
+      board.beamZoom.mode=board.beamZoom.mode==='breathe'?'breathe':'fixed';
+      board.beamZoom.width=THREE.MathUtils.clamp(Math.round(Number(board.beamZoom.width)||100),40,160);
+      // depth は 0 が有効値なので || で既定へ倒せない。?? は NaN を拾わないため isFinite で判定する。
+      const zoomDepth=Number(board.beamZoom.depth);
+      board.beamZoom.depth=THREE.MathUtils.clamp(Math.round(Number.isFinite(zoomDepth)?zoomDepth:60),0,100);
       Object.assign(board.beamOrbit,src.beamOrbit||{});
       board.beamOrbit.mode=board.beamOrbit.mode==='circle'?'circle':'fixed';
       board.beamOrbit.width=THREE.MathUtils.clamp(Math.round(Number(board.beamOrbit.width)||100),20,160);
@@ -4657,7 +4701,7 @@
         (board.overlay.enabled&&['silhouette','blackout-hit'].includes(board.overlay.mode));
       if(board.show.playing&&!loadedDarkMode)board.show.keepSpot=true;
       if(Array.isArray(src.fixtures))src.fixtures.forEach((s,i)=>{if(board.fixtures[i])Object.assign(board.fixtures[i],s)});
-      setBeamOrbitTarget(clock);
+      setBeamOrbitTarget(clock);setBeamZoomTarget(clock);
       rebuildOrder();syncBoardUI();saveSettings();refresh();
     }
     function exportSettingsFile(){
@@ -4939,6 +4983,12 @@
           (board.shadow.mode==='accent'?'実照明の明るさは変えず、リアルシャドウのコントラストを高めます。':'実照明の明るさは変えず、柔らかいリアルシャドウと薄い接地影を表示します。')+
           ' '+(SHADOW_IS_MOBILE?'モバイルは実照明最大1灯・512px。':'PCは実照明最大'+budget+'灯・1024px。')+' フェイスフィルは影なしです。';
       }
+      document.querySelectorAll('[data-beam-zoom]').forEach(b=>b.classList.toggle('active',b.dataset.beamZoom===board.beamZoom.mode));
+      q('#beamZoomWidth').value=board.beamZoom.width;q('#v-beamZoomWidth').textContent=board.beamZoom.width+'%';
+      q('#beamZoomDepth').value=board.beamZoom.depth;q('#v-beamZoomDepth').textContent=board.beamZoom.depth+'%';
+      q('#beamZoomHint').textContent=board.beamZoom.mode==='breathe'
+        ?'ビーム幅を中心に'+(beamOrbitUsesBpm()?'BPM同期で4拍1周':'約3.2秒で1周')+'の呼吸をさせます。広げるほど被写体に届く灯が増えて明るくなります。'
+        :'全30灯のビーム幅を変えます。照度・光柱・床の照射・影が同時に追従します。';
       setToggle('backlightToggle',board.backlight.on,'逆光');
       q('#backlightLevel').value=board.backlight.level;q('#v-backlightLevel').textContent=board.backlight.level+'%';
       setToggle('laserSheetToggle',board.laserSheet.on,'レーザーシート');
@@ -4993,6 +5043,12 @@
     q('#colorPick').oninput=e=>{board.color=e.target.value;q('#v-color').textContent=board.color;applyColorToSelection()};
     q('#smokeToggle').onclick=()=>{board.smoke=!board.smoke;setToggle('smokeToggle',board.smoke,'スモーク');saveSettings();refresh()};
     q('#blackoutToggle').onclick=()=>{board.blackout=!board.blackout;setToggle('blackoutToggle',board.blackout,'ブラックアウト');saveSettings();refresh()};
+    document.querySelectorAll('[data-beam-zoom]').forEach(b=>b.onclick=()=>{
+      board.beamZoom.mode=b.dataset.beamZoom==='breathe'?'breathe':'fixed';
+      setBeamZoomTarget(clock);syncBoardUI();saveSettings();refresh();
+    });
+    q('#beamZoomWidth').oninput=e=>{board.beamZoom.width=+e.target.value;q('#v-beamZoomWidth').textContent=board.beamZoom.width+'%';saveSettings();refresh()};
+    q('#beamZoomDepth').oninput=e=>{board.beamZoom.depth=+e.target.value;q('#v-beamZoomDepth').textContent=board.beamZoom.depth+'%';saveSettings();refresh()};
     q('#backlightToggle').onclick=()=>{board.backlight.on=!board.backlight.on;setToggle('backlightToggle',board.backlight.on,'逆光');saveSettings();refresh()};
     q('#backlightLevel').oninput=e=>{board.backlight.level=+e.target.value;q('#v-backlightLevel').textContent=board.backlight.level+'%';saveSettings();refresh()};
     q('#laserSheetToggle').onclick=()=>{board.laserSheet.on=!board.laserSheet.on;setToggle('laserSheetToggle',board.laserSheet.on,'レーザーシート');saveSettings();refresh()};
@@ -5293,7 +5349,7 @@
     function loop(now){
       requestAnimationFrame(loop);
       const dt=Math.min((now-last)/1000,0.05); last=now;
-      const animating=board.chase.playing||board.blink.playing||board.show.playing||board.rainbow||(board.laserSheet.on&&board.laserSheet.mode!=='fixed'&&board.laserSheet.speed>0)||beamOrbitActive(clock);
+      const animating=board.chase.playing||board.blink.playing||board.show.playing||board.rainbow||(board.laserSheet.on&&board.laserSheet.mode!=='fixed'&&board.laserSheet.speed>0)||beamOrbitActive(clock)||beamZoomActive(clock);
       if(animating){
         clock+=dt;
         advanceTimeline(clock);
@@ -5337,6 +5393,7 @@
       timeline:{capture:captureTimelineStep,add:addTimelineStep,start:startTimeline,stop:stopTimeline,advance:advanceTimeline,setBpm:setTimelineBpm,sanitize:sanitizeTimelineStep},
       backlight:{roleOf:backlightRoleOf,aimOf,beamEndOf,
         scatterOf:i=>gear[i].beamMat.uniforms.uScatter.value,coreOf:i=>gear[i].coreMat.color.clone(),poolOf:i=>gear[i].poolMat.color.clone(),poolVisible:i=>gear[i].pool.visible},
+      beamZoom:{coneOf,factor:beamZoomFactor,gainAt:beamZoomGainAt,setTarget:setBeamZoomTarget,CONE},
       beamOrbit:{sync:syncBeamOrbitPeriod,targetPeriod:beamOrbitTargetPeriod,phaseAt:beamOrbitPhaseAt,gainAt:beamOrbitGainAt,setTarget:setBeamOrbitTarget,scaleOf:beamOrbitScaleOf},
       setPose:(n)=>document.querySelector('[data-pose="'+n+'"]').click(),render(){renderer.render(scene,camera)},applyBoard,toneExposure(){return renderer.toneMappingExposure},triangles(){return renderer.info.render.triangles},lightStats(){return{spots:spots.filter(l=>l.visible&&l.intensity>0).length,shadows:spots.filter(l=>l.castShadow).length}},
       renderLights(){return spots.filter(l=>l.visible&&l.intensity>0).map(l=>({pos:l.position.toArray(),intensity:l.intensity,castShadow:l.castShadow}))}};
