@@ -155,6 +155,7 @@
           <div class="slider"><div><span>ISO感度</span><strong id="v-iso">1600</strong></div><input type="range" id="isoR" min="0" max="27" step="1" value="15" /></div>
           <div class="slider"><div><span>絞り</span><strong id="v-fstop">F2.8</strong></div><input type="range" id="fstopR" min="0" max="10" step="1" value="3" /></div>
           <div class="slider"><div><span>シャッター速度</span><strong id="v-shutter">1/250</strong></div><input type="range" id="shutterR" class="sun-range" min="0" max="11" step="1" value="6" /></div>
+          <div class="slider"><div><span>ホワイトバランス</span><strong id="v-wb">5600K デイライト</strong></div><input type="range" id="wbR" min="0" max="8" step="1" value="6" /></div>
           <div class="exposure-compare" id="exposureCompare">
             <div class="exposure-compare-head"><span>頭頂部の露出比較</span><small>MULTI MODEL CHECK</small></div>
             <div class="exposure-compare-grid">
@@ -3630,6 +3631,43 @@
     const FLICKER_LIMIT=1/250;      // これより速いとLEDのPWM調光で色ムラ・横縞が出やすい
     const SAFE_ACTION=1/125;        // 演者の動きを止められる目安
     const NOISE_ISO=6400;
+    /* --- ホワイトバランス — カメラ側の色補正 ------------------------------
+       いまの描画は「デイライトで正しく写る状態」を基準にしている。したがって
+       WB_REFERENCE_K で WB_GAIN は厳密に (1,1,1) となり、既定では見え方が変わらない。
+       ゲインは輝度を保つように正規化するため、露出段数の判定（EV差）は動かさない。
+       変わるのは色だけで、赤や青に偏った舞台で白飛びしている「色」は変化する。 */
+    const WB_STOPS=[2500,2800,3200,3800,4300,5000,5600,6500,7500];
+    const WB_NAMES=['ろうそく','電球','タングステン','ハロゲン','白色蛍光灯','昼白色','デイライト','曇り','日陰'];
+    const WB_REFERENCE_K=5600, WB_DEFAULT_INDEX=6;
+    // 黒体放射の近似（Tanner Helland）。sRGB値を作ってから線形作業色空間へ入れる。
+    function blackbodyColor(kelvin){
+      const t=THREE.MathUtils.clamp(kelvin,1000,40000)/100;
+      let r,g,b;
+      if(t<=66){ r=255; g=99.4708025861*Math.log(t)-161.1195681661; }
+      else { r=329.698727446*Math.pow(t-60,-0.1332047592); g=288.1221695283*Math.pow(t-60,-0.0755148492); }
+      if(t>=66) b=255; else if(t<=19) b=0; else b=138.5177312231*Math.log(t-10)-305.0447927307;
+      const u=v=>THREE.MathUtils.clamp(v,0,255)/255;
+      return new THREE.Color().setRGB(u(r),u(g),u(b),THREE.SRGBColorSpace);
+    }
+    const WB_GAIN=new THREE.Color(1,1,1);
+    function whiteBalanceIndex(){
+      const el=document.querySelector('#wbR');
+      return THREE.MathUtils.clamp(el?+el.value:WB_DEFAULT_INDEX,0,WB_STOPS.length-1);
+    }
+    function whiteBalanceKelvin(){ return WB_STOPS[whiteBalanceIndex()]; }
+    function syncWhiteBalance(){
+      const k=whiteBalanceKelvin();
+      if(k===WB_REFERENCE_K)WB_GAIN.setRGB(1,1,1);
+      else{
+        const ref=blackbodyColor(WB_REFERENCE_K),cur=blackbodyColor(k);
+        const r=ref.r/Math.max(cur.r,1e-4),g=ref.g/Math.max(cur.g,1e-4),b=ref.b/Math.max(cur.b,1e-4);
+        // 輝度を保つ正規化。グレーの明るさが変わらないので露出判定と食い違わない。
+        const lum=Math.max(.2126*r+.7152*g+.0722*b,1e-4);
+        WB_GAIN.setRGB(r/lum,g/lum,b/lum);
+      }
+      const label=document.querySelector('#v-wb');
+      if(label)label.textContent=k+'K '+WB_NAMES[whiteBalanceIndex()];
+    }
     let expo={iso:1600,fstop:2.8,shutter:1/250,evCam:0,evScene:0,stageEV:0,over:0,lux:0,stageLux:0};
     const evCamOf=(iso,f,t)=>Math.log2(f*f/t)-Math.log2(iso/100);
     const evSceneOf=lux=>Math.log2(Math.max(lux,1e-4)/C_INCIDENT);
@@ -4192,7 +4230,7 @@
       item.geo.computeBoundingSphere();
       item.mesh.position.set(sourceX,ls.height,LASER_SHEET_SOURCE_Z);
       item.mesh.rotation.set(0,0,0);
-      item.mat.uniforms.uColor.value.set(ls.color);
+      item.mat.uniforms.uColor.value.set(ls.color).multiply(WB_GAIN);
       item.mat.uniforms.uOpacity.value=power*(board.smoke?.34:.055);
       item.mesh.visible=power>.001;
     }
@@ -4287,11 +4325,12 @@
       subjectSpotBeam.position.copy(source).addScaledVector(dir,.5);
       subjectSpotBeam.scale.set(rad,len,rad);subjectSpotCore.position.copy(subjectSpotBeam.position);
       subjectSpotCore.scale.set(rad*.72,len,rad*.72);subjectSpotGear.beamAxis.copy(dir).normalize();
-      subjectSpotBeamMat.uniforms.uColor.value.copy(SUBJECT_SPOT_COLOR);
+      subjectSpotLight.color.copy(SUBJECT_SPOT_COLOR).multiply(WB_GAIN);
+      subjectSpotBeamMat.uniforms.uColor.value.copy(SUBJECT_SPOT_COLOR).multiply(WB_GAIN);
       subjectSpotBeamMat.uniforms.uStyle.value=1;subjectSpotBeamMat.uniforms.uSoftness.value=board.soft/100;
       subjectSpotBeamMat.uniforms.uScatter.value=(board.smoke?.20:.0012)*lux;
       subjectSpotBeamMat.uniforms.uTime.value=t;
-      subjectSpotCoreMat.color.copy(SUBJECT_SPOT_COLOR).multiplyScalar((board.smoke?.035:.0006)*lux);
+      subjectSpotCoreMat.color.copy(SUBJECT_SPOT_COLOR).multiply(WB_GAIN).multiplyScalar((board.smoke?.035:.0006)*lux);
       faceBeamToCamera(subjectSpotGear);
     }
     function updateBlinders(t,pulse=composeLightingFrame(t).blinder.level){
@@ -4302,10 +4341,11 @@
         const end=g.target.position,dir=end.clone().sub(g.pos),len=dir.length(),rad=Math.tan(.24)*len;
         g.beam.position.copy(g.pos).addScaledVector(dir,.5);g.beam.scale.set(rad,len,rad);
         g.core.position.copy(g.beam.position);g.core.scale.set(rad*.68,len,rad*.68);g.beamAxis.copy(dir).normalize();
-        g.beamMat.uniforms.uColor.value.copy(BLINDER_COLOR);g.beamMat.uniforms.uStyle.value=1;
+        g.light.color.copy(BLINDER_COLOR).multiply(WB_GAIN);
+        g.beamMat.uniforms.uColor.value.copy(BLINDER_COLOR).multiply(WB_GAIN);g.beamMat.uniforms.uStyle.value=1;
         g.beamMat.uniforms.uSoftness.value=board.show.fade;g.beamMat.uniforms.uTime.value=t;
         g.beamMat.uniforms.uScatter.value=(board.smoke?.22:.0014)*95*pulse;
-        g.coreMat.color.copy(BLINDER_COLOR).multiplyScalar((board.smoke?.042:.0008)*95*pulse);
+        g.coreMat.color.copy(BLINDER_COLOR).multiply(WB_GAIN).multiplyScalar((board.smoke?.042:.0008)*95*pulse);
         faceBeamToCamera(g);
       }
     }
@@ -4489,7 +4529,7 @@
         const aimLux=aimLuxBase*outputGainOf();   // 狙った先の照度[lx]
         contrib.push({i,lux,aimLux,lv,col,aim});
         g.lens.visible=lv>0.001;
-        if(g.lens.visible) g.lensMat.color.copy(col).multiplyScalar(FIX_LUX[f.type]*lv*30);
+        if(g.lens.visible) g.lensMat.color.copy(col).multiply(WB_GAIN).multiplyScalar(FIX_LUX[f.type]*lv*30);
         g.beam.visible=lv>0.001;
         g.core.visible=g.beam.visible;
         if(g.beam.visible){
@@ -4503,7 +4543,7 @@
           // 散乱光も被写体への入射光と同じく照度に比例させる。
           // 平方根にすると、カメラを適正露出へ絞った際に光線だけが先に沈むため使わない。
           // RGBに光量を持たせるため、アルファによる二重減衰は起きない。
-          g.beamMat.uniforms.uColor.value.copy(col);
+          g.beamMat.uniforms.uColor.value.copy(col).multiply(WB_GAIN);
           const typeDensity=f.type==='moving'?1.12:(f.type==='side'?.82:1);
           // 煙の中の光柱の濃さは灯体の光度で決まり、どこを狙ったかには依存しない。
           // 客席へ抜くフレア灯だけは投射が9m超で、狙い先の照度では筋が床狙いの11%まで落ちる。
@@ -4519,7 +4559,7 @@
           const coreTex=diffuseStyle?beamDiffuseTex:beamCoreTex;
           if(g.coreMat.alphaMap!==coreTex)g.coreMat.alphaMap=coreTex;
           const coreGain=board.smoke?(diffuseStyle?.055:.11):(diffuseStyle?.0008:.003);
-          g.coreMat.color.copy(col).multiplyScalar(coreGain*scatterLux*typeDensity);
+          g.coreMat.color.copy(col).multiply(WB_GAIN).multiplyScalar(coreGain*scatterLux*typeDensity);
         }
         // 床のプール。人物狙いの灯も、延長した光柱が舞台面に当たれば着地光を出す。
         const onStageFloor=beamEnd.y<.06&&Math.abs(beamEnd.x)<=STAGE_W/2+.2&&
@@ -4529,7 +4569,7 @@
         if(onFloor){
           g.pool.position.set(beamEnd.x,0.02,beamEnd.z);
           g.pool.scale.set(rad,rad,1);
-          g.poolMat.color.copy(col).multiplyScalar(aimLux*0.198);  // 床の拡散反射を10%抑制
+          g.poolMat.color.copy(col).multiply(WB_GAIN).multiplyScalar(aimLux*0.198);  // 床の拡散反射を10%抑制
         }
       }
       const followLux=frame.subjectSpot.lux,faceFillLux=frame.faceFill.lux;
@@ -4586,6 +4626,8 @@
         smoke.material.color.set('#93a2b2');smoke.material.opacity=.032;
         hemi.color.set('#3a4756');hemi.intensity=board.blackout?0:.05;
       }
+      // ヘイズの有無どちらの枝を通っても、最後に一度だけWBを掛ける。
+      hemi.color.multiply(WB_GAIN);smoke.material.color.multiply(WB_GAIN);
       // 暗転系がどちらの演出スロットにあっても、固定の環境光を同じタイミングまで落とす。
       hemi.intensity*=frame.show.environmentGain;
 
@@ -4595,6 +4637,7 @@
       faceBounceTarget.position.copy(faceFillLux>0?currentSubjectSpotAim():SUBJECT);
       faceBounce.color.copy(_atmosphereColor).lerp(HAZE_WHITE,.62);
       if(faceFillLux>0)faceBounce.color.lerp(FACE_FILL_COLOR,.62);
+      faceBounce.color.multiply(WB_GAIN);
       faceBounce.intensity=board.blackout?0:meter.bounce;
       faceBounceTarget.updateMatrixWorld();
 
@@ -4608,7 +4651,7 @@
         if(!c||c.renderLux<=0.01){l.intensity=0;l.visible=false;l.castShadow=false;l.shadow.intensity=0;return}
         const f=RIG[c.i], d=Math.max(0.5,c.background?c.aim.distanceTo(f.pos):SUBJECT.distanceTo(f.pos));
         l.visible=true; l.position.copy(f.pos); l.target.position.copy(c.aim); l.target.updateMatrixWorld();
-        l.color.copy(c.col); l.angle=coneOf(f,t); l.penumbra=pen; l.decay=2; l.distance=0;
+        l.color.copy(c.col).multiply(WB_GAIN); l.angle=coneOf(f,t); l.penumbra=pen; l.decay=2; l.distance=0;
         if(casts)fitShadowCameraToCasters(l);
         l.shadow.bias=isExternalSubject()?-.00035:-.0009;l.shadow.normalBias=isExternalSubject()?.010:.004;l.shadow.radius=shadowStyle.regularRadius;
         // E = I/d²。顔用は被写体点、背景用は灯体の狙い位置で所定照度になる光度[cd]を与える。
@@ -4620,7 +4663,7 @@
       // 未割当灯は上限付きの環境反射へ回し、無方向光で会場が平坦になるのを防ぐ。
       let rest=0; const restCol=new THREE.Color(0,0,0);
       for(const c of contrib){if(renderSelection.used.has(c.i)||c.lux<=0)continue;rest+=c.lux;restCol.r+=c.col.r*c.lux;restCol.g+=c.col.g*c.lux;restCol.b+=c.col.b*c.lux}
-      if(rest>0){restCol.multiplyScalar(1/rest);ambient.color.copy(restCol);ambient.intensity=Math.min(rest*.28,14)}else{ambient.intensity=0}
+      if(rest>0){restCol.multiplyScalar(1/rest);ambient.color.copy(restCol).multiply(WB_GAIN);ambient.intensity=Math.min(rest*.28,14)}else{ambient.intensity=0}
       smoke.visible=board.smoke&&!board.blackout;
       // 露出。シーン照度は上と同じ luxOf の合計を使う
       calcExposure(t,meter.lux,meter.stage,meter);
@@ -4628,8 +4671,8 @@
       // 大気の色はシェーダのトーンマップを通らないので、ここで露出ぶんを掛ける。
       // 上のヘイズ処理が毎フレーム色を作り直すため、その場で掛けてよい。
       const atmoGain=atmosphereExposureGain();
-      scene.background.multiplyScalar(atmoGain);
-      scene.fog.color.multiplyScalar(atmoGain);
+      scene.background.multiplyScalar(atmoGain).multiply(WB_GAIN);
+      scene.fog.color.multiplyScalar(atmoGain).multiply(WB_GAIN);
       renderChallengeStatus();
     }
 
@@ -4769,6 +4812,7 @@
         smallModel:{version:2,activeSlot:activeSmallModelSlot,slots:{a:{...smallModelSlots.a},b:{...smallModelSlots.b}}},
         mannequinColor:document.querySelector('#mannequinColor').value,
         costumeColor:document.querySelector('#costumeColor').value,
+        wbR:whiteBalanceIndex(),
         isoR:+document.querySelector('#isoR').value,
         isoValue:ISO_STOPS[+document.querySelector('#isoR').value],
         fstopR:+document.querySelector('#fstopR').value,
@@ -4903,6 +4947,8 @@
       highlightZebraEnabled=!!s.highlightZebraEnabled;syncHighlightZebraUI();
       if(s.costumeColor){document.querySelector('#costumeColor').value=s.costumeColor;costumeMaterial.color.set(s.costumeColor);lowPolyCostumeMaterial.color.set(s.costumeColor);}
       ['fstopR','shutterR'].forEach(id=>{if(s[id]!==undefined)document.querySelector('#'+id).value=s[id]});
+      if(s.wbR!==undefined)document.querySelector('#wbR').value=THREE.MathUtils.clamp(+s.wbR,0,WB_STOPS.length-1);
+      syncWhiteBalance();
       if(Number.isFinite(s.isoValue))document.querySelector('#isoR').value=nearestIsoIndex(s.isoValue);
       else if(s.isoR!==undefined){
         const legacyValue=LEGACY_ISO_STOPS[Math.max(0,Math.min(LEGACY_ISO_STOPS.length-1,+s.isoR))];
@@ -5326,6 +5372,7 @@
 
     // カメラ側
     document.querySelectorAll('#isoR,#fstopR,#shutterR').forEach(e=>e.oninput=()=>{resetExposureCompareBaseline();saveSettings();refresh()});
+    q('#wbR').oninput=()=>{syncWhiteBalance();saveSettings();refresh()};
     document.querySelectorAll('[data-exposure-compare]').forEach(b=>b.onclick=()=>applyExposureCompareTarget(b.dataset.exposureCompare));
     q('#highlightZebraToggle').onclick=()=>{highlightZebraEnabled=!highlightZebraEnabled;syncHighlightZebraUI();saveSettings()};
     document.querySelectorAll('[data-camera]').forEach(b=>b.onclick=()=>{applyCameraPreset(b.dataset.camera);saveSettings()});
@@ -5505,6 +5552,7 @@
        初期化とループ
        ====================================================================== */
     syncHighlightZebraUI();
+    syncWhiteBalance();
     if(!restoreSettings())applyScene(board.sceneId);
     applyPoseProps();
     document.querySelectorAll('#poses button').forEach(v=>v.classList.toggle('active',v.dataset.pose===pose));
@@ -5671,6 +5719,8 @@
       backlight:{roleOf:backlightRoleOf,aimOf,beamEndOf,
         scatterOf:i=>gear[i].beamMat.uniforms.uScatter.value,coreOf:i=>gear[i].coreMat.color.clone(),poolOf:i=>gear[i].poolMat.color.clone(),poolVisible:i=>gear[i].pool.visible},
       outputGain:{gainOf:outputGainOf,scatterGainOf,MAX:OUTPUT_GAIN_MAX},
+      whiteBalance:{STOPS:WB_STOPS,kelvin:whiteBalanceKelvin,gain:()=>WB_GAIN.clone(),
+        setIndex(i){document.querySelector('#wbR').value=THREE.MathUtils.clamp(i,0,WB_STOPS.length-1);syncWhiteBalance();refresh()}},
       beamZoom:{coneOf,factor:beamZoomFactor,gainAt:beamZoomGainAt,setTarget:setBeamZoomTarget,CONE},
       beamOrbit:{sync:syncBeamOrbitPeriod,targetPeriod:beamOrbitTargetPeriod,phaseAt:beamOrbitPhaseAt,gainAt:beamOrbitGainAt,setTarget:setBeamOrbitTarget,scaleOf:beamOrbitScaleOf},
       setPose:(n)=>document.querySelector('[data-pose="'+n+'"]').click(),scene,render(){renderer.render(scene,camera)},applyBoard,toneExposure(){return renderer.toneMappingExposure},triangles(){return renderer.info.render.triangles},lightStats(){return{spots:spots.filter(l=>l.visible&&l.intensity>0).length,shadows:spots.filter(l=>l.castShadow).length}},
