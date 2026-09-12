@@ -2640,25 +2640,58 @@
        mip=off は「ミップ無効」と「異方性1」を同時に変えてしまい、実機の比較で
        どちらが効いたか分離できなかった。間に「ミップ有・異方性1」を挟んで、
        カメラを動かさずに順に切り替えられるようにする。既定(0)の描画は変えない。 */
-    const DIAG_TEX_MODES=Object.freeze(['既定 ミップ有/異方性最大','ミップ有/異方性1','ミップ無/異方性1']);
+       モード1の「事前縮小」は、GPUのミップ生成で明線を取りこぼしているのか、
+       テクスチャ内容そのものなのかを分けるためのもの。0との差はcolor mapの
+       解像度だけになるよう、フィルタ条件は0と揃えて隣に置く。 */
+    const DIAG_SHRINK_SIZE=512;
+    const DIAG_TEX_MODES=Object.freeze([
+      '既定 2048/ミップ有/異方性最大','事前縮小'+DIAG_SHRINK_SIZE+'/ミップ有/異方性最大',
+      '2048/ミップ有/異方性1','2048/ミップ無/異方性1']);
     let DIAG_TEX_MODE=(()=>{
       try{
         const q=new URLSearchParams(location.search);
         if(q.get('diag')!=='speckle')return 0;
-        if(q.get('mip')==='off')return 2;
-        return q.get('aniso')==='1'?1:0;
+        if(q.get('mip')==='off')return 3;
+        if(q.get('aniso')==='1')return 2;
+        return q.get('tex')===String(DIAG_SHRINK_SIZE)?1:0;
       }catch(e){return 0}
     })();
+    // color map をブラウザ側で高品質縮小した版。元のテクスチャは破棄せず持ち続ける
+    const diagShrunkTextures=new WeakMap();
+    function diagShrunkTexture(tex){
+      if(diagShrunkTextures.has(tex))return diagShrunkTextures.get(tex);
+      const img=tex.image;
+      if(!img||!img.width||!img.height)return null;
+      const c=document.createElement('canvas');
+      c.width=Math.max(1,Math.min(DIAG_SHRINK_SIZE,img.width));
+      c.height=Math.max(1,Math.round(c.width*img.height/img.width));
+      const ctx=c.getContext('2d');
+      ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
+      ctx.drawImage(img,0,0,c.width,c.height);
+      const next=new THREE.CanvasTexture(c);
+      next.colorSpace=tex.colorSpace;next.wrapS=tex.wrapS;next.wrapT=tex.wrapT;
+      next.flipY=tex.flipY;next.channel=tex.channel;
+      next.offset.copy(tex.offset);next.repeat.copy(tex.repeat);next.center.copy(tex.center);
+      next.rotation=tex.rotation;next.needsUpdate=true;
+      diagShrunkTextures.set(tex,next);
+      return next;
+    }
     function applyGlbTextureFilter(mat){
       if(!mat)return;
+      if(mat.map){
+        if(!mat.userData.diagOriginalMap)mat.userData.diagOriginalMap=mat.map;
+        const base=mat.userData.diagOriginalMap;
+        const want=DIAG_TEX_MODE===1?(diagShrunkTexture(base)||base):base;
+        if(mat.map!==want){mat.map=want;mat.needsUpdate=true}
+      }
       GLB_TEXTURE_SLOTS.forEach(slot=>{
         const tex=mat[slot];if(!tex)return;
         // モードを往復させても元へ戻せるよう、GLB本来の値を一度だけ控える
         if(!tex.userData.diagOriginalFilter)tex.userData.diagOriginalFilter={min:tex.minFilter,gen:tex.generateMipmaps};
         const orig=tex.userData.diagOriginalFilter;
-        const min=DIAG_TEX_MODE===2?THREE.LinearFilter:orig.min,
-              gen=DIAG_TEX_MODE===2?false:orig.gen,
-              aniso=DIAG_TEX_MODE===0?(MAX_ANISOTROPY>1?MAX_ANISOTROPY:tex.anisotropy):1;
+        const min=DIAG_TEX_MODE===3?THREE.LinearFilter:orig.min,
+              gen=DIAG_TEX_MODE===3?false:orig.gen,
+              aniso=DIAG_TEX_MODE<=1?(MAX_ANISOTROPY>1?MAX_ANISOTROPY:tex.anisotropy):1;
         if(tex.minFilter!==min||tex.generateMipmaps!==gen||tex.anisotropy!==aniso){
           tex.minFilter=min;tex.generateMipmaps=gen;tex.anisotropy=aniso;tex.needsUpdate=true;
         }
