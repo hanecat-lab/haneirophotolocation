@@ -28,6 +28,7 @@
     .highlight-warning-meter i{display:block;width:0;height:100%;background:rgba(255,255,255,.82);mix-blend-mode:screen;transition:width .18s ease}
     .highlight-warning-message{margin-top:7px;color:#c6cfcc;font-size:9px;line-height:1.45}
     .highlight-warning-note{margin-top:6px;color:#87918e;font-size:9px;line-height:1.45}
+    .wb-auto-toggle{width:100%;margin-top:6px}
     .highlight-zebra-tools{display:grid;grid-template-columns:1fr auto;align-items:center;gap:8px;margin-top:7px}
     .highlight-zebra-toggle{min-height:30px}
     .highlight-zebra-legend{display:flex;flex-direction:column;gap:2px;color:#aeb7b3;font:600 8px ui-monospace,SFMono-Regular,monospace;white-space:nowrap}
@@ -155,7 +156,7 @@
           <div class="slider"><div><span>ISO感度</span><strong id="v-iso">1600</strong></div><input type="range" id="isoR" min="0" max="27" step="1" value="15" /></div>
           <div class="slider"><div><span>絞り</span><strong id="v-fstop">F2.8</strong></div><input type="range" id="fstopR" min="0" max="10" step="1" value="3" /></div>
           <div class="slider"><div><span>シャッター速度</span><strong id="v-shutter">1/250</strong></div><input type="range" id="shutterR" class="sun-range" min="0" max="11" step="1" value="6" /></div>
-          <div class="slider"><div><span>ホワイトバランス</span><strong id="v-wb">5600K デイライト</strong></div><input type="range" id="wbR" min="0" max="8" step="1" value="6" /></div>
+          <div class="slider"><div><span>ホワイトバランス</span><strong id="v-wb">5600K デイライト</strong></div><input type="range" id="wbR" min="0" max="8" step="1" value="6" /><button class="mode wb-auto-toggle" id="wbAutoToggle" type="button" aria-pressed="false">○ AW（オート）</button></div>
           <div class="exposure-compare" id="exposureCompare">
             <div class="exposure-compare-head"><span>頭頂部の露出比較</span><small>MULTI MODEL CHECK</small></div>
             <div class="exposure-compare-grid">
@@ -3650,23 +3651,79 @@
       return new THREE.Color().setRGB(u(r),u(g),u(b),THREE.SRGBColorSpace);
     }
     const WB_GAIN=new THREE.Color(1,1,1);
+    // ケルビンごとのゲイン。段は固定なので一度だけ作る。
+    function whiteBalanceGainFor(k){
+      if(k===WB_REFERENCE_K)return new THREE.Color(1,1,1);
+      const ref=blackbodyColor(WB_REFERENCE_K),cur=blackbodyColor(k);
+      const r=ref.r/Math.max(cur.r,1e-4),g=ref.g/Math.max(cur.g,1e-4),b=ref.b/Math.max(cur.b,1e-4);
+      // 輝度を保つ正規化。グレーの明るさが変わらないので露出判定と食い違わない。
+      const lum=Math.max(.2126*r+.7152*g+.0722*b,1e-4);
+      return new THREE.Color(r/lum,g/lum,b/lum);
+    }
+    const WB_GAIN_TABLE=WB_STOPS.map(whiteBalanceGainFor);
     function whiteBalanceIndex(){
       const el=document.querySelector('#wbR');
       return THREE.MathUtils.clamp(el?+el.value:WB_DEFAULT_INDEX,0,WB_STOPS.length-1);
     }
     function whiteBalanceKelvin(){ return WB_STOPS[whiteBalanceIndex()]; }
     function syncWhiteBalance(){
-      const k=whiteBalanceKelvin();
-      if(k===WB_REFERENCE_K)WB_GAIN.setRGB(1,1,1);
-      else{
-        const ref=blackbodyColor(WB_REFERENCE_K),cur=blackbodyColor(k);
-        const r=ref.r/Math.max(cur.r,1e-4),g=ref.g/Math.max(cur.g,1e-4),b=ref.b/Math.max(cur.b,1e-4);
-        // 輝度を保つ正規化。グレーの明るさが変わらないので露出判定と食い違わない。
-        const lum=Math.max(.2126*r+.7152*g+.0722*b,1e-4);
-        WB_GAIN.setRGB(r/lum,g/lum,b/lum);
-      }
+      const i=whiteBalanceIndex();
+      WB_GAIN.copy(WB_GAIN_TABLE[i]);
       const label=document.querySelector('#v-wb');
-      if(label)label.textContent=k+'K '+WB_NAMES[whiteBalanceIndex()];
+      if(label)label.textContent=(whiteBalanceAutoOn?'AW ':'')+WB_STOPS[i]+'K '+WB_NAMES[i];
+    }
+
+    /* --- AW（オートホワイトバランス）--------------------------------------
+       舞台の灯体を照度で重み付けした平均の光色を求め、9段のケルビンのうち
+       いちばん無彩色へ寄せられる1つを選ぶ。実機のカメラと同じく 2500〜7500K の
+       外へは出ないので、単色に近い舞台では補正しきれず色かぶりが残る。
+       光色は灯体データから直接求めるため updateScene の処理順に依存しない。
+       被写体スポットとフェイスフィルはカメラ側の補助光なので含めない。 */
+    let whiteBalanceAutoOn=false, whiteBalanceAutoIndex=-1;
+    const _awColor=new THREE.Color();
+    function sceneIlluminant(t,frame){
+      _awColor.setRGB(0,0,0);
+      let sum=0;
+      for(let i=0;i<N;i++){
+        const lux=luxOf(i,t,frame);
+        if(!(lux>0))continue;
+        const col=frame.fixtures[i].color;
+        _awColor.r+=col.r*lux;_awColor.g+=col.g*lux;_awColor.b+=col.b*lux;sum+=lux;
+      }
+      return sum>0?_awColor.multiplyScalar(1/sum):null;
+    }
+    // 補正後の色がどれだけ無彩色から離れているか。0 が完全な無彩色。
+    function whiteBalanceResidual(col,gain){
+      const r=col.r*gain.r,g=col.g*gain.g,b=col.b*gain.b;
+      const mx=Math.max(r,g,b),mn=Math.min(r,g,b);
+      return mx>1e-6?(mx-mn)/mx:0;
+    }
+    function autoWhiteBalanceIndex(t,frame=composeLightingFrame(t)){
+      const lit=sceneIlluminant(t,frame);
+      if(!lit)return WB_DEFAULT_INDEX;
+      let best=WB_DEFAULT_INDEX,bestScore=Infinity;
+      for(let i=0;i<WB_STOPS.length;i++){
+        const s=whiteBalanceResidual(lit,WB_GAIN_TABLE[i]);
+        if(s<bestScore){bestScore=s;best=i}
+      }
+      return best;
+    }
+    function applyAutoWhiteBalance(t,frame){
+      const i=autoWhiteBalanceIndex(t,frame);
+      if(i===whiteBalanceAutoIndex)return;          // 同じ段なら DOM も触らない
+      whiteBalanceAutoIndex=i;
+      const el=document.querySelector('#wbR');
+      if(el)el.value=String(i);
+      syncWhiteBalance();
+    }
+    function setWhiteBalanceAuto(on){
+      whiteBalanceAutoOn=!!on;
+      whiteBalanceAutoIndex=-1;                      // 入れ直したら選び直す
+      const btn=document.querySelector('#wbAutoToggle');
+      if(btn){btn.classList.toggle('active',whiteBalanceAutoOn);
+        btn.setAttribute('aria-pressed',String(whiteBalanceAutoOn));
+        btn.textContent=(whiteBalanceAutoOn?'● ':'○ ')+'AW（オート）';}
+      syncWhiteBalance();
     }
     let expo={iso:1600,fstop:2.8,shutter:1/250,evCam:0,evScene:0,stageEV:0,over:0,lux:0,stageLux:0};
     const evCamOf=(iso,f,t)=>Math.log2(f*f/t)-Math.log2(iso/100);
@@ -3923,7 +3980,7 @@
       const stateEl=document.querySelector('#highlightWarningState'),metric=document.querySelector('#highlightWarningMetric');
       const level=document.querySelector('#highlightWarningLevel'),message=document.querySelector('#highlightWarningMessage');
       const copy=highlightReading.state==='clip'&&highlightReading.kind==='color'
-        ?['色飽和警告','HL 色飽和','赤・青など一部の色チャンネルが飽和しています。ISOを1/3段下げて再確認してください。']:{
+        ?['色飽和警告','HL 色飽和','赤・青など一部の色チャンネルが飽和しています。舞台の色と反対側へホワイトバランスを振ると、露出を変えずに減らせます（赤い舞台なら冷たい側へ）。足りなければISOを1/3段下げてください。']:{
         checking:['測定中','HL 測定中','被写体の明部を確認しています。'],
         safe:['余裕あり','HL 余裕','被写体の明部に階調が残っています。'],
         caution:['注意','HL 注意','限界に近い明部があります。−0.3EV付近で比較してください。'],
@@ -4514,6 +4571,8 @@
 
     function updateScene(t){
       const frame=composeLightingFrame(t);
+      // WB_GAIN を使う処理より前に、この瞬間の光色から段を選び直す。
+      if(whiteBalanceAutoOn)applyAutoWhiteBalance(t,frame);
       updateLaserSheet(t,frame);
       // ブラックアウトでは補助環境光も止め、顔や会場だけが残光しないようにする。
       hemi.intensity=frame.safety.blackout?0:.05;
@@ -4820,6 +4879,7 @@
         fstopR:+document.querySelector('#fstopR').value,
         shutterR:+document.querySelector('#shutterR').value,
         highlightZebraEnabled,
+        wbAuto:whiteBalanceAutoOn,
         camera:{preset:cameraState.preset,focalLength,focalStopsVersion:1,position:cameraState.position,target:cameraState.target},
         board:JSON.parse(JSON.stringify(board))
       };
@@ -4950,6 +5010,7 @@
       if(s.costumeColor){document.querySelector('#costumeColor').value=s.costumeColor;costumeMaterial.color.set(s.costumeColor);lowPolyCostumeMaterial.color.set(s.costumeColor);}
       ['fstopR','shutterR'].forEach(id=>{if(s[id]!==undefined)document.querySelector('#'+id).value=s[id]});
       if(s.wbR!==undefined)document.querySelector('#wbR').value=THREE.MathUtils.clamp(+s.wbR,0,WB_STOPS.length-1);
+      setWhiteBalanceAuto(!!s.wbAuto);
       syncWhiteBalance();
       if(Number.isFinite(s.isoValue))document.querySelector('#isoR').value=nearestIsoIndex(s.isoValue);
       else if(s.isoR!==undefined){
@@ -5374,7 +5435,9 @@
 
     // カメラ側
     document.querySelectorAll('#isoR,#fstopR,#shutterR').forEach(e=>e.oninput=()=>{resetExposureCompareBaseline();saveSettings();refresh()});
-    q('#wbR').oninput=()=>{syncWhiteBalance();saveSettings();refresh()};
+    // スライダーを動かしたら AW を降りる。実機のカメラと同じ振る舞い。
+    q('#wbR').oninput=()=>{if(whiteBalanceAutoOn)setWhiteBalanceAuto(false);syncWhiteBalance();saveSettings();refresh()};
+    q('#wbAutoToggle').onclick=()=>{setWhiteBalanceAuto(!whiteBalanceAutoOn);saveSettings();refresh()};
     document.querySelectorAll('[data-exposure-compare]').forEach(b=>b.onclick=()=>applyExposureCompareTarget(b.dataset.exposureCompare));
     q('#highlightZebraToggle').onclick=()=>{highlightZebraEnabled=!highlightZebraEnabled;syncHighlightZebraUI();saveSettings()};
     document.querySelectorAll('[data-camera]').forEach(b=>b.onclick=()=>{applyCameraPreset(b.dataset.camera);saveSettings()});
@@ -5722,6 +5785,8 @@
         scatterOf:i=>gear[i].beamMat.uniforms.uScatter.value,coreOf:i=>gear[i].coreMat.color.clone(),poolOf:i=>gear[i].poolMat.color.clone(),poolVisible:i=>gear[i].pool.visible},
       outputGain:{gainOf:outputGainOf,scatterGainOf,MAX:OUTPUT_GAIN_MAX},
       whiteBalance:{STOPS:WB_STOPS,kelvin:whiteBalanceKelvin,gain:()=>WB_GAIN.clone(),
+        auto:{get on(){return whiteBalanceAutoOn},set:setWhiteBalanceAuto,index:autoWhiteBalanceIndex,
+              illuminant:(t)=>{const c=sceneIlluminant(t,composeLightingFrame(t));return c?c.clone():null}},
         setIndex(i){document.querySelector('#wbR').value=THREE.MathUtils.clamp(i,0,WB_STOPS.length-1);syncWhiteBalance();refresh()}},
       beamZoom:{coneOf,factor:beamZoomFactor,gainAt:beamZoomGainAt,setTarget:setBeamZoomTarget,CONE},
       beamOrbit:{sync:syncBeamOrbitPeriod,targetPeriod:beamOrbitTargetPeriod,phaseAt:beamOrbitPhaseAt,gainAt:beamOrbitGainAt,setTarget:setBeamOrbitTarget,scaleOf:beamOrbitScaleOf},
