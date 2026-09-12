@@ -5394,6 +5394,72 @@
     addEventListener('resize',()=>{scheduleChromeVisualViewportSync();resize()}); resize();
     scheduleChromeVisualViewportSync();
 
+    /* --- 白い斑点の実機観測用オーバーレイ（?diag=speckle のときだけ有効）-----
+       画面上の描画画素数・ピクセル比・実フレームレートは端末側でしか読めない入力で、
+       コードを読んでも分からない。実機で数値として読み出すための表示専用の仕組みで、
+       描画結果や状態には一切触れない。 */
+    const diagSpeckle=(()=>{
+      let mode='';try{mode=new URLSearchParams(location.search).get('diag')||''}catch(e){mode=''}
+      if(mode!=='speckle')return null;
+      const el=document.createElement('div');el.id='diagSpeckle';
+      el.style.cssText='position:fixed;left:8px;top:8px;z-index:9999;max-width:94vw;padding:8px 10px;'
+        +'background:rgba(0,0,0,.82);color:#8fe9d8;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;'
+        +'white-space:pre;border:1px solid rgba(140,233,216,.4);border-radius:6px;pointer-events:none';
+      document.body.append(el);
+      const diagBox=new THREE.Box3(),diagVec=new THREE.Vector3();
+      let frames=0,fpsAt=0,fps=0,lastDraw=0;
+      // ワールドbboxを画面へ投影し、そのモデルが占める矩形の画素サイズを返す
+      function screenBox(obj){
+        if(!obj)return null;
+        diagBox.setFromObject(obj);if(diagBox.isEmpty())return null;
+        const vw=host.clientWidth,vh=host.clientHeight;
+        let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+        for(let i=0;i<8;i++){
+          diagVec.set(i&1?diagBox.max.x:diagBox.min.x,i&2?diagBox.max.y:diagBox.min.y,i&4?diagBox.max.z:diagBox.min.z).project(camera);
+          const px=(diagVec.x*.5+.5)*vw,py=(-diagVec.y*.5+.5)*vh;
+          x0=Math.min(x0,px);x1=Math.max(x1,px);y0=Math.min(y0,py);y1=Math.max(y1,py);
+        }
+        const worldH=diagBox.max.y-diagBox.min.y;diagBox.getCenter(diagVec);
+        return {w:Math.round(x1-x0),h:Math.round(y1-y0),worldH,dist:camera.position.distanceTo(diagVec)};
+      }
+      function textureWidth(obj){
+        let size=0;
+        if(obj)obj.traverse(o=>{
+          if(size||!o.isMesh)return;
+          const mats=Array.isArray(o.material)?o.material:[o.material];
+          mats.forEach(m=>{const img=m&&m.map&&m.map.image;if(!size&&img&&img.width)size=img.width});
+        });
+        return size;
+      }
+      function line(label,obj,name){
+        const s=screenBox(obj);if(!s)return label+' —';
+        const tex=textureWidth(obj),pr=renderer.getPixelRatio();
+        const drawH=Math.round(s.h*pr);
+        return label+' '+name+' 実寸'+s.worldH.toFixed(2)+'m 画面'+s.w+'x'+s.h+'px(実描画高'+drawH+'px)'
+          +' 距離'+s.dist.toFixed(1)+'m tex'+(tex||'—')+' 縮小'+(tex&&drawH>0?(tex/drawH).toFixed(1)+'倍':'—');
+      }
+      return {el,tick(now){
+        if(!fpsAt)fpsAt=now;
+        frames++;
+        if(now-fpsAt>=1000){fps=Math.round(frames*1000/(now-fpsAt));frames=0;fpsAt=now}
+        if(lastDraw&&now-lastDraw<500)return;
+        lastDraw=now;
+        const cv=renderer.domElement,hl=highlightReading;
+        el.textContent=[
+          'DPR '+(Number(devicePixelRatio)||1).toFixed(2)+' → 適用 '+renderer.getPixelRatio().toFixed(2)
+            +' / canvas '+cv.width+'x'+cv.height+'px (CSS '+host.clientWidth+'x'+host.clientHeight+') / '+fps+'fps',
+          '露出 '+(expo&&Number.isFinite(expo.over)?(expo.over>=0?'+':'')+expo.over.toFixed(1)+'段':'—')
+            +' / HL '+hl.state+'・'+hl.kind+' clip'+hl.clipPercent.toFixed(1)+'% white'+hl.whitePercent.toFixed(1)+'% color'+hl.colorPercent.toFixed(1)+'%',
+          '出力ゲイン '+board.outputGain.toFixed(1)+'段 / bright '+board.bright+' / spot '+board.subjectSpot.level+' / frontFill '+board.frontFill,
+          // GLB読込中は bodyId だけ先に変わり model は前の被写体のままなので、それを明示する
+          line('主',model,(isExternalSubject()?(currentExternalSubjectConfig()?.label||bodyId):bodyId)
+            +(isExternalSubject()&&!model?.userData?.externalSubject?'(読込中)':'')),
+          line('小A',smallModelDisplayed.a,SMALL_MODELS[smallModelSlots.a.id]?.label||'off'),
+          line('小B',smallModelDisplayed.b,SMALL_MODELS[smallModelSlots.b.id]?.label||'off')
+        ].join('\n');
+      }};
+    })();
+
     let last=performance.now();
     function loop(now){
       requestAnimationFrame(loop);
@@ -5432,6 +5498,7 @@
       updateVenueCutaway();
       renderer.render(scene,camera);
       sampleSubjectHighlights(now);
+      if(diagSpeckle)diagSpeckle.tick(now);
     }
     requestAnimationFrame(loop);
 
@@ -5440,7 +5507,7 @@
       setClock(t){clock=t;updateScene(t)},setBody:(id)=>setBody(id),getBodyId:()=>bodyId,BODIES,validateLowPolyModel,camera,CAMERA_PRESETS,
       stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,moveCameraAroundSubject,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,getSubjectDistance:subjectDistanceMeters,syncMapShootingMarker,moveMapShootingPosition,rotateMapShootingYaw,updateVenueCutaway,faceExposureOf,selectRenderLights,applyExposureCompareTarget,resetExposureCompareBaseline,getExposureCompare:()=>({target:exposureCompareTarget,baseline:exposureCompareBaseline?{...exposureCompareBaseline}:null,expo:{...expo}}),applyToneMapMode,getToneMapMode:()=>toneMapMode,highlightWarning:{sample:()=>sampleSubjectHighlights(performance.now(),true),get:()=>({...highlightReading}),classify:classifyHighlightPixels},
       timeline:{capture:captureTimelineStep,add:addTimelineStep,start:startTimeline,stop:stopTimeline,advance:advanceTimeline,setBpm:setTimelineBpm,sanitize:sanitizeTimelineStep},
-      maxAnisotropy:()=>MAX_ANISOTROPY,
+      maxAnisotropy:()=>MAX_ANISOTROPY,diagSpeckle,
       backlight:{roleOf:backlightRoleOf,aimOf,beamEndOf,
         scatterOf:i=>gear[i].beamMat.uniforms.uScatter.value,coreOf:i=>gear[i].coreMat.color.clone(),poolOf:i=>gear[i].poolMat.color.clone(),poolVisible:i=>gear[i].pool.visible},
       outputGain:{gainOf:outputGainOf,scatterGainOf,MAX:OUTPUT_GAIN_MAX},
