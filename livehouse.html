@@ -2636,23 +2636,41 @@
        テクスチャに焼き込まれた細い線が縮小時にちらつく。GPUの上限まで引き上げる。 */
     const MAX_ANISOTROPY=(()=>{try{return renderer.capabilities.getMaxAnisotropy()||1}catch(e){return 1}})();
     const GLB_TEXTURE_SLOTS=['map','normalMap','roughnessMap','metalnessMap','emissiveMap','aoMap'];
-    /* ?diag=speckle&mip=off のときだけミップマップを無効にする観測用トグル。
-       白い斑点が「ミップが効いていて取りこぼしている」のか「そもそもミップが
-       使われていない」のかを実機で分けるためのもので、既定の描画は変えない。 */
-    const DIAG_MIP_OFF=(()=>{
-      try{const q=new URLSearchParams(location.search);return q.get('diag')==='speckle'&&q.get('mip')==='off'}catch(e){return false}
+    /* ?diag=speckle のときだけ使えるテクスチャフィルタの観測用モード。
+       mip=off は「ミップ無効」と「異方性1」を同時に変えてしまい、実機の比較で
+       どちらが効いたか分離できなかった。間に「ミップ有・異方性1」を挟んで、
+       カメラを動かさずに順に切り替えられるようにする。既定(0)の描画は変えない。 */
+    const DIAG_TEX_MODES=Object.freeze(['既定 ミップ有/異方性最大','ミップ有/異方性1','ミップ無/異方性1']);
+    let DIAG_TEX_MODE=(()=>{
+      try{
+        const q=new URLSearchParams(location.search);
+        if(q.get('diag')!=='speckle')return 0;
+        if(q.get('mip')==='off')return 2;
+        return q.get('aniso')==='1'?1:0;
+      }catch(e){return 0}
     })();
     function applyGlbTextureFilter(mat){
       if(!mat)return;
       GLB_TEXTURE_SLOTS.forEach(slot=>{
         const tex=mat[slot];if(!tex)return;
-        if(DIAG_MIP_OFF){
-          if(tex.minFilter!==THREE.LinearFilter||tex.generateMipmaps){
-            tex.minFilter=THREE.LinearFilter;tex.generateMipmaps=false;tex.needsUpdate=true;
-          }
-          return;
+        // モードを往復させても元へ戻せるよう、GLB本来の値を一度だけ控える
+        if(!tex.userData.diagOriginalFilter)tex.userData.diagOriginalFilter={min:tex.minFilter,gen:tex.generateMipmaps};
+        const orig=tex.userData.diagOriginalFilter;
+        const min=DIAG_TEX_MODE===2?THREE.LinearFilter:orig.min,
+              gen=DIAG_TEX_MODE===2?false:orig.gen,
+              aniso=DIAG_TEX_MODE===0?(MAX_ANISOTROPY>1?MAX_ANISOTROPY:tex.anisotropy):1;
+        if(tex.minFilter!==min||tex.generateMipmaps!==gen||tex.anisotropy!==aniso){
+          tex.minFilter=min;tex.generateMipmaps=gen;tex.anisotropy=aniso;tex.needsUpdate=true;
         }
-        if(MAX_ANISOTROPY>1&&tex.anisotropy!==MAX_ANISOTROPY){tex.anisotropy=MAX_ANISOTROPY;tex.needsUpdate=true}
+      });
+    }
+    // モード切替時に、表示中の全モデルのテクスチャへ適用し直す
+    function reapplyGlbTextureFilter(){
+      const seen=new Set();
+      scene.traverse(o=>{
+        if(!o.isMesh)return;
+        const mats=Array.isArray(o.material)?o.material:[o.material];
+        mats.forEach(m=>{if(m&&!seen.has(m)){seen.add(m);applyGlbTextureFilter(m);m.needsUpdate=true}});
       });
     }
     function prepareExternalSubject(root,subjectId,config){
@@ -5417,8 +5435,15 @@
       el.style.cssText='position:fixed;left:8px;top:8px;z-index:9999;max-width:94vw;padding:8px 10px;'
         +'background:rgba(0,0,0,.82);color:#8fe9d8;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;'
         // 実機(CSS幅390px)では1行が画面外へ出て読めなかったので、折り返す
-        +'white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid rgba(140,233,216,.4);border-radius:6px;pointer-events:none';
+        // カメラを動かさずにテクスチャフィルタを切り替えたいので、ここだけ触れるようにする
+        +'white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid rgba(140,233,216,.4);border-radius:6px;'
+        +'pointer-events:auto;cursor:pointer;-webkit-user-select:none;user-select:none;touch-action:manipulation';
       document.body.append(el);
+      // 一度ミップを捨てると同じセッションでは元の絵に戻らないので、巡回させず一方向にする
+      el.addEventListener('click',()=>{
+        if(DIAG_TEX_MODE>=DIAG_TEX_MODES.length-1)return;
+        DIAG_TEX_MODE++;reapplyGlbTextureFilter();lastDraw=0;
+      });
       const diagBox=new THREE.Box3(),diagVec=new THREE.Vector3();
       let frames=0,fpsAt=0,fps=0,lastDraw=0;
       // ワールドbboxを画面へ投影し、そのモデルが占める矩形の画素サイズを返す
@@ -5466,7 +5491,8 @@
         el.textContent=[
           fps+'fps DPR'+(Number(devicePixelRatio)||1).toFixed(2)+'→'+renderer.getPixelRatio().toFixed(2)
             +' canvas'+cv.width+'x'+cv.height+' CSS'+host.clientWidth+'x'+host.clientHeight
-            +(DIAG_MIP_OFF?'  ★mip=off':'  mip=既定'),
+            +'\n'+(DIAG_TEX_MODE<DIAG_TEX_MODES.length-1?'▼ここをタップで次へ':'●最後（戻すにはリロード）')
+            +' ['+(DIAG_TEX_MODE+1)+'/'+DIAG_TEX_MODES.length+'] '+DIAG_TEX_MODES[DIAG_TEX_MODE],
           '露出'+(expo&&Number.isFinite(expo.over)?(expo.over>=0?'+':'')+expo.over.toFixed(1)+'段':'—')
             +' HL '+hl.state+'・'+hl.kind+' clip'+hl.clipPercent.toFixed(1)+'/白'+hl.whitePercent.toFixed(1)+'/色'+hl.colorPercent.toFixed(1)+'%',
           'gain'+board.outputGain.toFixed(1)+'段 bright'+board.bright+' spot'+board.subjectSpot.level+' fill'+board.frontFill,
