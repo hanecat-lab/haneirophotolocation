@@ -47,6 +47,13 @@
     /* --- livehouse 固有 ------------------------------------------------- */
     #bodies{grid-template-columns:repeat(5,1fr)}
     #smallModels{grid-template-columns:repeat(3,1fr)}
+    #frameModes{grid-template-columns:repeat(3,1fr)}
+    .shot-frame{position:absolute;z-index:2;pointer-events:none;opacity:0;
+      border:1px solid rgba(255,214,92,.8);box-shadow:0 0 0 9999px rgba(0,0,0,.72);
+      transition:opacity .15s linear}
+    .shot-frame.enabled{opacity:1}
+    .shot-frame b{position:absolute;left:7px;bottom:6px;color:#ffd784;
+      font:400 9px var(--lcd);letter-spacing:.05em;text-shadow:0 1px 2px rgba(0,0,0,.95)}
     .small-model-launcher{margin-top:12px;padding:10px;border:1px solid rgba(224,168,58,.38);background:rgba(224,168,58,.055);border-radius:8px}
     .small-model-launcher .label{margin-bottom:8px}.small-model-launcher .mode{min-height:42px}
     .small-model-launcher .mode.active{border-color:rgba(224,168,58,.9);background:rgba(224,168,58,.16);color:#ffe3a8}
@@ -263,6 +270,9 @@
           <div class="slider"><div><span>絞り</span><strong id="v-fstop">F2.8</strong></div><input type="range" id="fstopR" min="0" max="17" step="1" value="4" /></div>
           <div class="slider"><div><span>シャッター速度</span><strong id="v-shutter">1/250</strong></div><input type="range" id="shutterR" class="sun-range" min="0" max="33" step="1" value="18" /></div>
           <div class="slider"><div><span>焦点距離</span><strong id="v-focal">50mm</strong></div><input type="range" id="focalR" min="0" max="8" step="1" value="3" /></div>
+          <div class="label" style="margin-top:10px"><span>画角の枠</span><small>FRAME</small></div>
+          <div class="two" id="frameModes" role="group" aria-label="画角の枠"><button class="mode active" type="button" data-frame="off" aria-pressed="true">枠なし</button><button class="mode" type="button" data-frame="land43" aria-pressed="false">横 4:3</button><button class="mode" type="button" data-frame="port34" aria-pressed="false">縦 3:4</button></div>
+          <div class="hint">実機と同じ範囲だけを見ます。枠の外は写らないので、白飛び・色飽和の判定とゼブラも枠の中だけを見ます。縦位置はカメラを倒すのと同じで、長辺が縦に来るぶん垂直の画角が広がります。</div>
           <div class="slider"><div><span>ホワイトバランス</span><strong id="v-wb">5600K デイライト</strong></div><input type="range" id="wbR" min="0" max="8" step="1" value="6" /><button class="mode wb-auto-toggle" id="wbAutoToggle" type="button" aria-pressed="false">○ AW（オート）</button></div>
           <div class="exposure-compare" id="exposureCompare">
             <div class="exposure-compare-head"><span>頭頂部の露出比較</span><small>MULTI MODEL CHECK</small></div>
@@ -567,9 +577,35 @@
     };
     const FOCAL_LENGTHS=[24,28,35,50,70,85,105,135,200];
     const SENSOR_HEIGHT_MM=24; // 35mmフルサイズの縦寸法。焦点距離→垂直FOV換算を固定する。
-    const focalToVerticalFov=mm=>THREE.MathUtils.radToDeg(2*Math.atan(SENSOR_HEIGHT_MM/(2*Math.max(.001,Number(mm)||50))));
-    function applyPhysicalLens(mm,targetCamera=camera){
-      targetCamera.fov=focalToVerticalFov(mm);
+    const focalToFov=(mm,sensorMM)=>THREE.MathUtils.radToDeg(2*Math.atan(sensorMM/(2*Math.max(.001,Number(mm)||50))));
+    const focalToVerticalFov=mm=>focalToFov(mm,SENSOR_HEIGHT_MM);
+    /* --- 画角の枠 --------------------------------------------------------
+       枠なしのときは縦だけが実寸で、横は窓の形なりに広がる。実機と同じ範囲を
+       見るために、フルサイズ36×24mmからの切り出しとして枠を定義する。
+       縦位置はカメラを90°倒すことなので長辺が縦に来て、垂直画角は広くなる。
+       キャンバスとレンダラーのサイズは変えない（診断表示・ゼブラ・検証がそのまま生きる）。 */
+    const FRAME_MODES={
+      land43:{label:'4:3 横',w:32,h:24},
+      port34:{label:'3:4 縦',w:24,h:32}
+    };
+    let frameMode='off';
+    const frameSensorHeight=()=>FRAME_MODES[frameMode]?FRAME_MODES[frameMode].h:SENSOR_HEIGHT_MM;
+    const frameAspect=()=>FRAME_MODES[frameMode]?FRAME_MODES[frameMode].w/FRAME_MODES[frameMode].h:0;
+    // 撮影画面の垂直画角。俯瞰カメラ自体はここを通さず固定画角のまま。
+    const frameVerticalFov=mm=>focalToFov(mm,frameSensorHeight());
+    // キャンバスへ内接させた枠の矩形（CSSピクセル）
+    function frameRect(){
+      const hostW=host.clientWidth,hostH=host.clientHeight,a=frameAspect();
+      if(!a||hostW<=0||hostH<=0)return null;
+      const w=a<=hostW/hostH?hostH*a:hostW, h=a<=hostW/hostH?hostH:hostW/a;
+      return {x:(hostW-w)/2,y:(hostH-h)/2,w,h,hostW,hostH};
+    }
+    function applyPhysicalLens(mm,targetCamera=camera,useFrame=true){
+      let fov=useFrame?frameVerticalFov(mm):focalToVerticalFov(mm);
+      const r=useFrame?frameRect():null;
+      // 枠がキャンバスより低いぶん、キャンバス全体の画角は広げる。枠の中が実寸になる。
+      if(r&&r.h>0)fov=THREE.MathUtils.radToDeg(2*Math.atan(Math.tan(THREE.MathUtils.degToRad(fov)/2)*(r.hostH/r.h)));
+      targetCamera.fov=fov;
       targetCamera.zoom=1;
       targetCamera.updateProjectionMatrix();
     }
@@ -588,6 +624,7 @@
       focalLength=FOCAL_LENGTHS.reduce((best,v)=>Math.abs(v-requested)<Math.abs(best-requested)?v:best,FOCAL_LENGTHS[0]);
       // 撮影画面は常にフルサイズ縦24mm基準でFOVを算出。俯瞰カメラ自体は固定画角のままにする。
       if(cameraMode!=='map')applyPhysicalLens(focalLength);
+      updateFrameOverlay();
       updateShootingFrustum();
       updateSubjectDistanceReadout();
       const out=document.querySelector('#v-focal');if(out)out.textContent=Math.round(focalLength)+'mm';
@@ -830,6 +867,34 @@
       const d=subjectDistanceMeters();
       out.textContent=Number.isFinite(d)?(d<10?d.toFixed(2):d.toFixed(1))+' m':'-- m';
     }
+    /* 枠の表示。div 1枚の外側影でキャンバスの外周をまとめて落とす。 */
+    const frameOverlay=document.createElement('div');
+    frameOverlay.className='shot-frame';frameOverlay.setAttribute('aria-hidden','true');
+    const frameOverlayLabel=document.createElement('b');frameOverlay.append(frameOverlayLabel);host.append(frameOverlay);
+    function syncShootingAspect(){
+      if(cameraMode==='map')return;
+      shootingAspect=frameAspect()||camera.aspect;
+    }
+    function updateFrameOverlay(){
+      const r=cameraMode==='map'?null:frameRect();
+      frameOverlay.classList.toggle('enabled',!!r);
+      if(!r)return;
+      frameOverlay.style.left=r.x+'px';frameOverlay.style.top=r.y+'px';
+      frameOverlay.style.width=r.w+'px';frameOverlay.style.height=r.h+'px';
+      const m=FRAME_MODES[frameMode];
+      const v=frameVerticalFov(focalLength),hRad=2*Math.atan(Math.tan(THREE.MathUtils.degToRad(v)/2)*(m.w/m.h));
+      frameOverlayLabel.textContent=m.label+' · '+m.w+'×'+m.h+'mm · 水平'+Math.round(THREE.MathUtils.radToDeg(hRad))+'° / 垂直'+Math.round(v)+'°';
+    }
+    // 判定に使う縮小画像（下始まり）の中で、枠に入る画素の範囲
+    function frameSampleRect(){
+      const r=cameraMode==='map'?null:frameRect();
+      if(!r)return null;
+      const W=highlightSampleWidth,H=highlightSampleHeight;
+      return {
+        x0:Math.floor(r.x/r.hostW*W), x1:Math.ceil((r.x+r.w)/r.hostW*W),
+        y0:Math.floor((1-(r.y+r.h)/r.hostH)*H), y1:Math.ceil((1-r.y/r.hostH)*H)
+      };
+    }
     function updateShootingFrustum(){
       if(!shootingFrustum)return;
       if(cameraMode!=='map'||!mapReturnState){shootingFrustum.visible=false;return}
@@ -838,7 +903,7 @@
       const forward=state.target.clone().sub(state.position);forward.y=0;
       if(forward.lengthSq()<1e-8)forward.set(0,0,-1);else forward.normalize();
       const right=new THREE.Vector3(-forward.z,0,forward.x).normalize();
-      const vFov=THREE.MathUtils.degToRad(focalToVerticalFov(focalLength));
+      const vFov=THREE.MathUtils.degToRad(frameVerticalFov(focalLength));
       const hFov=2*Math.atan(Math.tan(vFov/2)*Math.max(.2,shootingAspect));
       const length=5.2,halfWidth=Math.min(12,length*Math.tan(hFov/2));
       const farCenter=origin.clone().addScaledVector(forward,length);
@@ -4179,9 +4244,13 @@
       for(let i=0;i<256;i++){sum+=hist[i];if(sum>=target)return i}
       return 0;
     }
-    function classifyHighlightPixels(colors,masks){
+    function classifyHighlightPixels(colors,masks,rect){
       const hist=new Uint32Array(256);let subjectPixels=0,nearPixels=0,whiteClipPixels=0,colorClipPixels=0;
+      const W=highlightSampleWidth;
       for(let i=0;i<colors.length;i+=4){
+        // 枠の外に出た被写体は写らないので数えない
+        if(rect){const idx=i>>2,px=idx%W,py=(idx/W)|0;
+          if(px<rect.x0||px>=rect.x1||py<rect.y0||py>=rect.y1)continue}
         if(masks[i]<192&&masks[i+1]<192&&masks[i+2]<192)continue;
         const r=colors[i],g=colors[i+1],b=colors[i+2],peak=Math.max(r,g,b),floor=Math.min(r,g,b);
         subjectPixels++;hist[peak]++;if(peak>=HIGHLIGHT_NEAR)nearPixels++;
@@ -4227,9 +4296,12 @@
       }
       const whitePixels=highlightWhiteMaskImageData.data,colorPixels=highlightColorMaskImageData.data;
       const width=highlightSampleWidth,height=highlightSampleHeight;whitePixels.fill(0);colorPixels.fill(0);
+      const rect=frameSampleRect();
       for(let y=0;y<height;y++){
         const sourceY=height-1-y;
+        if(rect&&(sourceY<rect.y0||sourceY>=rect.y1))continue;
         for(let x=0;x<width;x++){
+          if(rect&&(x<rect.x0||x>=rect.x1))continue;
           const source=(sourceY*width+x)*4;
           if(highlightMaskPixels[source]<192&&highlightMaskPixels[source+1]<192&&highlightMaskPixels[source+2]<192)continue;
           const r=highlightColorPixels[source],g=highlightColorPixels[source+1],b=highlightColorPixels[source+2];
@@ -4305,7 +4377,7 @@
         camera.layers.mask=previousMask;scene.overrideMaterial=previousOverride;scene.background=previousBackground;scene.fog=previousFog;
         renderer.setRenderTarget(previousTarget);
       }
-      highlightRawReading=classifyHighlightPixels(highlightColorPixels,highlightMaskPixels);
+      highlightRawReading=classifyHighlightPixels(highlightColorPixels,highlightMaskPixels,frameSampleRect());
       const displayedReading=stabilizeHighlightReading(highlightRawReading,now);
       updateHighlightWarningUI(displayedReading);renderHighlightZebra(displayedReading,displayedReading===highlightRawReading);
       return highlightReading;
@@ -5096,7 +5168,7 @@
         shutterValue:SHUTTER_STOPS[+document.querySelector('#shutterR').value],
         highlightZebraEnabled,
         wbAuto:whiteBalanceAutoOn,
-        camera:{preset:cameraState.preset,focalLength,focalStopsVersion:1,position:cameraState.position,target:cameraState.target},
+        camera:{preset:cameraState.preset,focalLength,focalStopsVersion:1,frame:frameMode,position:cameraState.position,target:cameraState.target},
         board:JSON.parse(JSON.stringify(board))
       };
     }
@@ -5244,6 +5316,7 @@
         document.querySelector('#isoR').value=nearestIsoIndex(legacyValue);
       }
       if(s.camera){
+        setFrameMode(s.camera.frame);
         applyFocalLength(s.camera.focalStopsVersion===1?s.camera.focalLength:50);
         if(CAMERA_PRESETS[s.camera.preset])applyCameraPreset(s.camera.preset);
         else if(Array.isArray(s.camera.position)&&Array.isArray(s.camera.target)){
@@ -5759,6 +5832,22 @@
     document.querySelectorAll('[data-camera]').forEach(b=>b.onclick=()=>{applyCameraPreset(b.dataset.camera);saveSettings()});
     document.querySelectorAll('[data-subject-view]').forEach(b=>b.onclick=()=>{moveCameraAroundSubject(b.dataset.subjectView);saveSettings()});
     q('#focalR').oninput=e=>{applyFocalLength(FOCAL_LENGTHS[+e.target.value]);saveSettings()};
+    function syncFrameModeUI(){
+      document.querySelectorAll('[data-frame]').forEach(b=>{
+        const on=b.dataset.frame===frameMode;
+        b.classList.toggle('active',on);b.setAttribute('aria-pressed',String(on));
+      });
+    }
+    function setFrameMode(mode){
+      frameMode=FRAME_MODES[mode]?mode:'off';
+      syncFrameModeUI();syncShootingAspect();
+      if(cameraMode!=='map')applyPhysicalLens(focalLength);
+      updateFrameOverlay();updateShootingFrustum();refresh();
+    }
+    document.querySelectorAll('[data-frame]').forEach(b=>b.onclick=()=>{
+      if(b.dataset.frame===frameMode)return;
+      setFrameMode(b.dataset.frame);saveSettings();
+    });
     q('#positionMapToggle').onclick=()=>cameraMode==='map'?exitPositionMap(true):enterPositionMap();
     controls.addEventListener('start',markCameraCustom);
     controls.addEventListener('end',saveSettings);
@@ -5956,7 +6045,8 @@
     function resize(){
       const w=host.clientWidth,h=host.clientHeight;
       camera.aspect=w/h;
-      if(cameraMode==='map')applyPhysicalLens(35);else{shootingAspect=camera.aspect;applyPhysicalLens(focalLength)}
+      if(cameraMode==='map')applyPhysicalLens(35,camera,false);else{syncShootingAspect();applyPhysicalLens(focalLength)}
+      updateFrameOverlay();
       updateShootingFrustum();
       renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.setSize(w,h);resizeHighlightTargets(w,h);
     }
