@@ -267,6 +267,8 @@
           <div class="hint" id="outputGainHint">灯体そのものの光度を段数で持ち上げます。少数の灯で組むときに使います。</div>
           <div class="slider" style="margin-top:8px"><div><span>チルト</span><strong id="v-tilt">-25°</strong></div><input type="range" id="tiltR" min="-60" max="10" step="1" value="-25" /></div>
           <div class="slider"><div><span>ビームのやわらかさ</span><strong id="v-soft">62%</strong></div><input type="range" id="softR" min="0" max="100" step="1" value="62" /></div>
+          <div class="slider" style="margin-top:8px"><div><span>ムービングの設置角</span><strong id="v-movingRig">既定</strong></div><input type="range" id="movingRigR" min="20" max="70" step="1" value="40" /><button class="mode wb-auto-toggle" id="movingRigToggle" type="button" aria-pressed="false">○ 設置角を調整</button></div>
+          <div class="hint" id="movingRigNote">ムービング4灯を元の天井位置に置いています。</div>
           <div class="slider"><div><span>フロント照明</span><strong id="v-frontFill">58%</strong></div><input type="range" id="frontFillR" min="0" max="100" step="1" value="58" /></div>
           <div class="two" style="margin-top:8px"><button class="mode" id="smokeToggle">○ スモーク</button><button class="mode" id="blackoutToggle">○ ブラックアウト</button></div>
           <div class="label" style="margin-top:14px"><span>光線の質感</span><small>BEAM LOOK</small></div>
@@ -3073,11 +3075,59 @@
       a.push({id:id++,type:'side',pos:V3(-3.15,2.15,-1.15)},{id:id++,type:'side',pos:V3(-3.15,2.15,.55)},
              {id:id++,type:'side',pos:V3( 3.15,2.15,-1.15)},{id:id++,type:'side',pos:V3( 3.15,2.15,.55)});
       a.push({id:id++,type:'uplight',pos:V3(-1.8,.12,-2.75)},{id:id++,type:'uplight',pos:V3(1.8,.12,-2.75)});
+      // 元の格子位置。灯体を動かしても、グループ分け・チェイスの並び順・旋回の
+      // 左右符号といった「配置の意味」はこちらを見続ける。
+      a.forEach(f=>{f.homePos=f.pos.clone()});
       return a;
     })();
     const N=RIG.length;
 
     // 基準距離3mでの被写体面照度[lx]。小規模ライブハウスのLED灯体を想定した実効値
+    /* --- ムービングの設置角 ------------------------------------------------
+       天井高はそのままに、被写体から見た水平距離だけを俯角から逆算して灯体を
+       動かす。方位（どちらの向きから当てるか）は元の配置のまま保つ。
+       入のあいだは狙点を被写体に固定するので、動かした分がそのまま入射角になる。
+       切れば従来どおり。 */
+    const MOVING_RIG_MIN=20, MOVING_RIG_MAX=70, MOVING_RIG_MAX_REACH=4.0;
+    function movingRigElevation(){
+      return THREE.MathUtils.clamp(Number(board.movingRig?.elevation)||40,MOVING_RIG_MIN,MOVING_RIG_MAX);
+    }
+    // 実際に置ける位置と、そこから決まる本当の俯角を返す（壁の外へは出さない）
+    function movingRigPlacement(f){
+      const home=f.homePos, drop=home.y-SUBJECT.y;
+      const wantReach=drop/Math.tan(movingRigElevation()*Math.PI/180);
+      const reach=Math.min(wantReach,MOVING_RIG_MAX_REACH);
+      const hx=home.x-SUBJECT.x, hz=home.z-SUBJECT.z, hl=Math.hypot(hx,hz)||1;
+      return {pos:V3(SUBJECT.x+hx/hl*reach,home.y,SUBJECT.z+hz/hl*reach),
+              reach, elevation:Math.atan2(drop,reach)*180/Math.PI};
+    }
+    function syncMovingRig(){
+      const on=!!board.movingRig?.on;
+      RIG.forEach((f,i)=>{
+        if(f.type!=='moving')return;
+        f.pos.copy(on?movingRigPlacement(f).pos:f.homePos);
+        const g=gear[i];                      // 筐体とレンズは生成時に一度置くだけなので追従させる
+        if(g){if(g.body)g.body.position.copy(f.pos);if(g.lens)g.lens.position.copy(f.pos);}
+      });
+      const label=document.querySelector('#v-movingRig');
+      if(label)label.textContent=on?movingRigElevation()+'°':'既定';
+      const note=document.querySelector('#movingRigNote');
+      if(note){
+        if(!on)note.textContent='ムービング4灯を元の天井位置に置いています。';
+        else{
+          const rows=RIG.filter(f=>f.type==='moving').map(movingRigPlacement);
+          const lo=Math.min(...rows.map(r=>r.elevation)),hi=Math.max(...rows.map(r=>r.elevation));
+          const reach=Math.max(...rows.map(r=>r.reach));
+          note.textContent='ムービングは常に被写体を狙うので、実効の俯角は'
+            +(Math.abs(hi-lo)<0.5?lo.toFixed(0)+'°':lo.toFixed(0)+'〜'+hi.toFixed(0)+'°')
+            +'、水平距離は最大'+reach.toFixed(2)+'mです。'
+            +(reach>=MOVING_RIG_MAX_REACH-1e-6?'（会場の外へ出ないよう距離を'+MOVING_RIG_MAX_REACH+'mで止めています）':'');
+        }
+      }
+      const btn=document.querySelector('#movingRigToggle');
+      if(btn){btn.classList.toggle('active',on);btn.setAttribute('aria-pressed',String(on));
+        btn.textContent=(on?'● ':'○ ')+'設置角を調整';}
+    }
     const REF_DIST=3, FIX_LUX={par:36,moving:70,side:25,uplight:15};
     /* 出力ゲイン — 灯体そのものの光度を段数で持ち上げる。
        実測（ISO3200/F2.8/1/500・明るさ100）での適正までの不足段数は
@@ -3157,6 +3207,7 @@
       show:{mode:'blinder',speed:1,level:80,fade:.55,spread:70,loop:true,keepSpot:true,playing:false},
       overlay:{enabled:false,mode:'fan',speed:1,level:65},
       timeline:{bpm:120,beats:4,loop:true,playing:false,index:0,steps:[]},
+      movingRig:{on:false,elevation:40},
       chase:{mode:'front-back',speed:1.2,fade:0.6,loop:true,playing:false},
       blink:{mode:'all',speed:1.8,playing:false},
       fixtures:RIG.map(()=>({on:true,color:'#fff4e0',level:100}))
@@ -3168,7 +3219,7 @@
     const GROUPS={
       all:      ()=>RIG.map(f=>f.id),
       front:    ()=>RIG.filter(f=>f.role==='foh').map(f=>f.id),
-      back:     ()=>RIG.filter(f=>f.pos.z<=0).map(f=>f.id),
+      back:     ()=>RIG.filter(f=>f.homePos.z<=0).map(f=>f.id),
       par:      ()=>RIG.filter(f=>f.type==='par').map(f=>f.id),
       moving:   ()=>RIG.filter(f=>f.type==='moving').map(f=>f.id),
       side:     ()=>RIG.filter(f=>f.type==='side').map(f=>f.id),
@@ -3288,7 +3339,7 @@
       _orbitVec.copy(aim).sub(f.pos);
       if(_orbitVec.lengthSq()<1e-8)return aim;
       // 左右の灯体は逆方向へ回す。中央の2列も左右で向きが分かれる。
-      const phase=beamOrbitPhaseAt(t)*(f.pos.x<0?-1:1);
+      const phase=beamOrbitPhaseAt(t)*(f.homePos.x<0?-1:1);
       const yaw=BEAM_ORBIT_YAW_DEG*D2R_*width*Math.cos(phase);
       const pitch=BEAM_ORBIT_PITCH_DEG*D2R_*width*Math.sin(phase);
       // applyAxisAngle は長さを保つ。したがって灯体から狙い点までの距離は不変。
@@ -3338,9 +3389,9 @@
     let orderIdx=new Array(N).fill(0);
     function rebuildOrder(){
       const m=board.chase.mode;
-      const key = m==='front-back' ? (f=>f.pos.z)
-                : m==='left-right' ? (f=>f.pos.x)
-                : m==='center-out' ? (f=>Math.hypot(f.pos.x,f.pos.z))
+      const key = m==='front-back' ? (f=>f.homePos.z)
+                : m==='left-right' ? (f=>f.homePos.x)
+                : m==='center-out' ? (f=>Math.hypot(f.homePos.x,f.homePos.z))
                 : (f=>f.id);
       const sorted=[...RIG].sort((a,b)=>key(a)-key(b));
       sorted.forEach((f,k)=>{orderIdx[f.id]=k});
@@ -3403,7 +3454,7 @@
       const f=RIG[i],amount=effect.level/100,mode=effect.mode;
       if(mode==='blinder')return 1-amount*.48;
       if(mode==='silhouette'){
-        const back=f.type==='uplight'||(f.role==='stage'&&f.pos.z<=-.15);
+        const back=f.type==='uplight'||(f.role==='stage'&&f.homePos.z<=-.15);
         const breathe=.86+.14*Math.sin(effectElapsed(effect,t,startTime)*1.15+f.id*.19);
         return back?amount*breathe:0;
       }
@@ -3458,7 +3509,7 @@
         return V3((f.col-2.5)*4.2*spread*open,.16,-.72+(f.row===3?.18:0));
       }
       if(effect.mode==='cross'){
-        const opposite=f.pos.x<0?1:-1,sweep=Math.sin(e*1.15+f.row*.8)*.38*spread;
+        const opposite=f.homePos.x<0?1:-1,sweep=Math.sin(e*1.15+f.row*.8)*.38*spread;
         return V3(opposite*(1.05+1.05*spread)+sweep,.42,-.58);
       }
       return null;
@@ -4984,6 +5035,9 @@
       if(!SHOW_DURATIONS[board.overlay.mode])board.overlay.mode='fan';
       board.overlay.enabled=!!board.overlay.enabled;
       const restoredTimelineWasPlaying=!!src.timeline?.playing;
+      Object.assign(board.movingRig,src.movingRig||{});
+      board.movingRig.on=!!board.movingRig.on;
+      board.movingRig.elevation=THREE.MathUtils.clamp(Number(board.movingRig.elevation)||40,MOVING_RIG_MIN,MOVING_RIG_MAX);
       Object.assign(board.timeline,src.timeline||{});
       board.timeline.bpm=THREE.MathUtils.clamp(Math.round(Number(board.timeline.bpm)||120),60,200);
       board.timeline.beats=[1,2,4,8,16].includes(+board.timeline.beats)?+board.timeline.beats:4;
@@ -5245,6 +5299,7 @@
         const active=b.dataset.glbTexture===board.glbTexture;
         b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active));
       });
+      q('#movingRigR').value=board.movingRig.elevation; syncMovingRig();
       q('#brightR').value=board.bright; q('#v-bright').textContent=board.bright;
       q('#outputGainR').value=board.outputGain;
       q('#v-outputGain').textContent=board.outputGain.toFixed(1)+'段';
@@ -5342,6 +5397,8 @@
     q('#brightR').oninput=e=>{board.bright=+e.target.value;q('#v-bright').textContent=board.bright;saveSettings();refresh()};
     q('#tiltR').oninput=e=>{board.tilt=+e.target.value;q('#v-tilt').textContent=board.tilt+'°';saveSettings();refresh()};
     q('#softR').oninput=e=>{board.soft=+e.target.value;q('#v-soft').textContent=board.soft+'%';saveSettings();refresh()};
+    q('#movingRigR').oninput=e=>{board.movingRig.elevation=+e.target.value;syncMovingRig();saveSettings();refresh()};
+    q('#movingRigToggle').onclick=()=>{board.movingRig.on=!board.movingRig.on;syncMovingRig();saveSettings();refresh()};
     q('#frontFillR').oninput=e=>{board.frontFill=+e.target.value;q('#v-frontFill').textContent=board.frontFill+'%';saveSettings();refresh()};
     q('#subjectSpotToggle').onclick=()=>{board.subjectSpot.on=!board.subjectSpot.on;setToggle('subjectSpotToggle',board.subjectSpot.on,'被写体スポット');saveSettings();refresh()};
     q('#subjectSpotLevel').oninput=e=>{board.subjectSpot.level=+e.target.value;q('#v-subjectSpotLevel').textContent=board.subjectSpot.level+'%';saveSettings();refresh()};
@@ -5806,6 +5863,8 @@
       backlight:{roleOf:backlightRoleOf,aimOf,beamEndOf,
         scatterOf:i=>gear[i].beamMat.uniforms.uScatter.value,coreOf:i=>gear[i].coreMat.color.clone(),poolOf:i=>gear[i].poolMat.color.clone(),poolVisible:i=>gear[i].pool.visible},
       outputGain:{gainOf:outputGainOf,scatterGainOf,MAX:OUTPUT_GAIN_MAX},
+      movingRig:{sync:syncMovingRig,placementOf:movingRigPlacement,elevation:movingRigElevation,
+        posOf:i=>RIG[i].pos.clone(),homeOf:i=>RIG[i].homePos.clone()},
       whiteBalance:{STOPS:WB_STOPS,kelvin:whiteBalanceKelvin,gain:()=>WB_GAIN.clone(),
         auto:{get on(){return whiteBalanceAutoOn},set:setWhiteBalanceAuto,index:autoWhiteBalanceIndex,
               illuminant:(t)=>{const c=sceneIlluminant(t,composeLightingFrame(t));return c?c.clone():null}},
