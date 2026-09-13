@@ -3698,18 +3698,39 @@
       const mx=Math.max(r,g,b),mn=Math.min(r,g,b);
       return mx>1e-6?(mx-mn)/mx:0;
     }
-    function autoWhiteBalanceIndex(t,frame=composeLightingFrame(t)){
+    /* チェイスの一瞬の色に飛びつかないよう、ステージ時計で光色を平滑してから選ぶ。
+       実機のAWBが0.5〜2秒かけて寄っていくのと同じ狙い。時間が進んでいないとき
+       （停止中・ヘッドレスで同じtを繰り返すとき）や大きく飛んだときは平滑せず
+       その場の色をそのまま使うので、決定性は保たれる。 */
+    const AW_TIME_CONSTANT=0.8, AW_RESET_GAP=2.0;
+    const _awSmoothed=new THREE.Color(); let _awHasSmoothed=false,_awLastT=null;
+    function smoothedIlluminant(t,frame){
       const lit=sceneIlluminant(t,frame);
+      if(!lit){_awHasSmoothed=false;_awLastT=t;return null}
+      const dt=(_awLastT===null)?Infinity:t-_awLastT;
+      _awLastT=t;
+      if(!_awHasSmoothed||!(dt>0)||dt>AW_RESET_GAP){_awSmoothed.copy(lit);_awHasSmoothed=true;return _awSmoothed}
+      _awSmoothed.lerp(lit,1-Math.exp(-dt/AW_TIME_CONSTANT));
+      return _awSmoothed;
+    }
+    /* 9段の境界で1段ぶん行き来しないよう、今の段より明確に良いときだけ乗り換える。
+       0.01 まで緩めるとランダムポップで15回/10秒のチャタリングが戻り、0.02 で 0 になる。
+       代わりに最適な段の1つ手前で止まることがあるが、安定を優先する。 */
+    const AW_SWITCH_MARGIN=0.02;
+    function autoWhiteBalanceIndex(t,frame=composeLightingFrame(t),current=-1){
+      const lit=smoothedIlluminant(t,frame);
       if(!lit)return WB_DEFAULT_INDEX;
       let best=WB_DEFAULT_INDEX,bestScore=Infinity;
       for(let i=0;i<WB_STOPS.length;i++){
         const s=whiteBalanceResidual(lit,WB_GAIN_TABLE[i]);
         if(s<bestScore){bestScore=s;best=i}
       }
-      return best;
+      if(current<0||current===best)return best;
+      const cur=whiteBalanceResidual(lit,WB_GAIN_TABLE[current]);
+      return (cur-bestScore>AW_SWITCH_MARGIN)?best:current;
     }
     function applyAutoWhiteBalance(t,frame){
-      const i=autoWhiteBalanceIndex(t,frame);
+      const i=autoWhiteBalanceIndex(t,frame,whiteBalanceAutoIndex);
       if(i===whiteBalanceAutoIndex)return;          // 同じ段なら DOM も触らない
       whiteBalanceAutoIndex=i;
       const el=document.querySelector('#wbR');
@@ -3719,6 +3740,7 @@
     function setWhiteBalanceAuto(on){
       whiteBalanceAutoOn=!!on;
       whiteBalanceAutoIndex=-1;                      // 入れ直したら選び直す
+      _awHasSmoothed=false;_awLastT=null;            // 平滑も持ち越さない
       const btn=document.querySelector('#wbAutoToggle');
       if(btn){btn.classList.toggle('active',whiteBalanceAutoOn);
         btn.setAttribute('aria-pressed',String(whiteBalanceAutoOn));
