@@ -96,10 +96,10 @@
     .timeline-list{display:flex;flex-direction:column;gap:4px;margin:8px 0}
     .timeline-empty{padding:9px;border:1px dashed rgba(255,255,255,.14);color:#87918e;font-size:9px;line-height:1.45}
     .timeline-step{display:grid;grid-template-columns:28px 1fr auto auto;align-items:center;gap:6px;min-height:38px;padding:5px 6px;background:rgba(0,0,0,.16);border:1px solid var(--line)}
-    .timeline-step-drag{width:24px;height:25px;padding:0;background:transparent;border:1px solid rgba(255,255,255,.12);
-      color:#9ba2a1;font-size:12px;line-height:1;cursor:grab;touch-action:none}
-    .timeline-step.dragging{opacity:.72;border-color:rgba(224,168,58,.72);box-shadow:0 2px 8px rgba(0,0,0,.5)}
-    .timeline-step.dragging .timeline-step-drag{cursor:grabbing}
+    .timeline-step-pick{width:44px;height:25px;padding:0;background:transparent;border:1px solid rgba(255,255,255,.12);
+      color:#9ba2a1;font-size:9px;line-height:1}
+    .timeline-step-pick.picked{border-color:rgba(224,168,58,.72);color:#ffe3a8}
+    .timeline-step.moving{border-color:rgba(224,168,58,.72);background:rgba(224,168,58,.09)}
     .timeline-step.active{border-color:rgba(224,168,58,.72);background:rgba(224,168,58,.09)}
     .timeline-step-index{display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:#252c2c;color:#ffe3a8;font:700 9px ui-monospace,SFMono-Regular,monospace}
     .timeline-step-main{min-width:0;background:none;color:#e5e9e5;text-align:left;padding:0;font-size:9px;line-height:1.35}
@@ -130,7 +130,7 @@
     }
     @media(max-width:720px){
       .shell :is(button,.bar,.readout,.drawer,.drawer *,label,span,strong,small,p,h1,h2,summary){touch-action:manipulation}
-      .camera-nudge button,.timeline-step-drag{touch-action:none}
+      .camera-nudge button{touch-action:none}
     }
     .camera-nudge [data-pan="up"]{grid-column:2;grid-row:1}.camera-nudge [data-pan="left"]{grid-column:1;grid-row:2}.camera-nudge .nudge-home{grid-column:2;grid-row:2;font-size:12px}.camera-nudge [data-pan="right"]{grid-column:3;grid-row:2}.camera-nudge [data-pan="down"]{grid-column:2;grid-row:3}
     .position-map-legend{display:none;position:absolute;z-index:2;left:50%;top:16px;transform:translateX(-50%);padding:8px 12px;border:1px solid rgba(255,214,92,.65);border-radius:999px;background:rgba(17,22,22,.86);color:#ffdc79;font:700 11px ui-monospace,SFMono-Regular,monospace;pointer-events:none}
@@ -5497,6 +5497,7 @@
       const beat=Math.min(beats,Math.floor(Math.max(0,t-timelineStepStart)*board.timeline.bpm/60)+1);
       el.textContent='STEP '+(board.timeline.index+1)+' / '+board.timeline.steps.length+' · BEAT '+beat+' / '+beats+' · '+board.timeline.bpm+' BPM';
     }
+    let timelineMoveFrom=null;   // 2タップ並べ替えの移動元。保存しない
     function renderTimeline(){
       const el=q('#timelineList');if(!el)return;
       if(!board.timeline.steps.length)el.innerHTML='<div class="timeline-empty">現在のSLOT A/B・灯体・レーザー状態を追加すると、ここへ再生順に並びます。</div>';
@@ -5505,10 +5506,13 @@
         const fixtureCount=Array.isArray(step.fixtures)?step.fixtures.filter(Boolean).length:null;
         const fixtureLabel=fixtureCount===null?'・灯体は現在状態':'・'+fixtureCount+'/'+N+'灯ON';
         const laserLabel=step.laser?.on?'・LASER '+(LASER_MODE_LABEL[step.laser.mode]||'固定')+' '+Math.round(step.laser.level||0)+'%':'・LASER OFF';
-        return '<div class="timeline-step'+(board.timeline.playing&&board.timeline.index===i?' active':'')+'" data-timeline-row="'+i+'">'+
+        return '<div class="timeline-step'+(board.timeline.playing&&board.timeline.index===i?' active':'')+
+          (timelineMoveFrom===i?' moving':'')+'" data-timeline-row="'+i+'">'+
           '<span class="timeline-step-index">'+(i+1)+'</span><button class="timeline-step-main" type="button" data-timeline-load="'+i+'">'+
           showName(step.a?.mode)+'<small>'+Math.max(1,step.beats||4)+'拍'+fixtureLabel+laserLabel+b+'</small></button>'+
-          '<button class="timeline-step-drag" type="button" data-timeline-drag="'+i+'" aria-label="ドラッグして並べ替え">≡</button>'+
+          '<button class="timeline-step-pick'+(timelineMoveFrom===i?' picked':'')+'" type="button" data-timeline-pick="'+i+'" aria-label="'+
+            (timelineMoveFrom===null?'この行を動かす':timelineMoveFrom===i?'移動をやめる':'ここへ移動')+'">'+
+            (timelineMoveFrom===null?'≡':timelineMoveFrom===i?'✕':'ここへ')+'</button>'+
           '<button class="timeline-step-delete" type="button" data-timeline-delete="'+i+'" aria-label="このステップを削除">×</button></div>';
       }).join('');
       el.querySelectorAll('[data-timeline-load]').forEach(button=>button.onclick=()=>{
@@ -5516,51 +5520,22 @@
         applyTimelineStep(board.timeline.steps[+button.dataset.timelineLoad]);board.show.playing=false;
         syncBoardUI();saveSettings();refresh();
       });
-      /* つまみを掴んで並べ替える。HTML5のdraggableはタッチで動かないのでポインタ
-         イベントで組む。ドラッグ中はDOMを動かすので、その見た目がそのまま結果になる。
-         確定は pointerup。board.timeline.steps はそれまで触らないので、
-         pointercancel は再描画するだけで元へ戻る。 */
-      el.querySelectorAll('[data-timeline-drag]').forEach(handle=>{
-        handle.addEventListener('pointerdown',e=>{
-          const row=handle.closest('.timeline-step');if(!row)return;
-          e.preventDefault();
-          /* insertBefore で行を動かすとポインタキャプチャが外れ、以降の move と up が
-             つまみへ届かなくなる。キャプチャは使わず window で受ける。 */
-          const order=[...el.querySelectorAll('.timeline-step')].map(r=>+r.dataset.timelineRow);
-          row.classList.add('dragging');
-          const move=ev=>{
-            const rows=[...el.querySelectorAll('.timeline-step')];
-            const at=rows.indexOf(row);if(at<0)return;
-            let to=at;
-            for(let i=0;i<rows.length;i++){
-              const r=rows[i].getBoundingClientRect();
-              if(ev.clientY<r.top+r.height/2){to=i;break}
-              to=i;
-            }
-            if(to===at)return;
-            el.insertBefore(row,to>at?rows[to].nextSibling:rows[to]);
-            order.splice(to,0,order.splice(at,1)[0]);
-          };
-          const finish=commit=>{
-            window.removeEventListener('pointermove',move);
-            window.removeEventListener('pointerup',up);
-            window.removeEventListener('pointercancel',cancel);
-            row.classList.remove('dragging');
-            if(!commit){renderTimeline();return}
-            const steps=board.timeline.steps;
-            const next=order.map(i=>steps[i]);
-            if(next.every((s,i)=>s===steps[i])){renderTimeline();return}
-            if(board.timeline.playing)stopTimeline(true);
-            board.timeline.steps=next;board.timeline.index=0;
-            renderTimeline();renderTimelineStatus();saveSettings();
-          };
-          const up=()=>finish(true),cancel=()=>finish(false);
-          window.addEventListener('pointermove',move);
-          window.addEventListener('pointerup',up);
-          window.addEventListener('pointercancel',cancel);
-        });
+      /* 並べ替えは2タップ。掴んだ行を、タップした行の位置へ入れる（入れ替えではない）。
+         全部タップなのでドロワーのスクロールと競合しない。スクロールしながら遠くへも運べる。 */
+      el.querySelectorAll('[data-timeline-pick]').forEach(button=>button.onclick=()=>{
+        const i=+button.dataset.timelinePick;
+        if(timelineMoveFrom===null){timelineMoveFrom=i;renderTimeline();return}
+        if(timelineMoveFrom===i){timelineMoveFrom=null;renderTimeline();return}
+        const steps=board.timeline.steps,from=timelineMoveFrom;
+        timelineMoveFrom=null;
+        if(from<0||from>=steps.length||i<0||i>=steps.length){renderTimeline();return}
+        if(board.timeline.playing)stopTimeline(true);
+        steps.splice(i,0,steps.splice(from,1)[0]);
+        board.timeline.index=0;
+        renderTimeline();renderTimelineStatus();saveSettings();
       });
       el.querySelectorAll('[data-timeline-delete]').forEach(button=>button.onclick=()=>{
+        timelineMoveFrom=null;
         if(board.timeline.playing)stopTimeline(true);
         board.timeline.steps.splice(+button.dataset.timelineDelete,1);board.timeline.index=0;
         renderTimeline();renderTimelineStatus();saveSettings();
@@ -5890,6 +5865,7 @@
     q('#timelineClear').onclick=()=>{
       if(!board.timeline.steps.length)return;
       if(!confirm('タイムラインの全ステップを消去しますか？'))return;
+      timelineMoveFrom=null;
       if(board.timeline.playing)stopTimeline(true);
       board.timeline.steps=[];board.timeline.index=0;
       renderTimeline();saveSettings();refresh();
