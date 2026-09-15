@@ -4722,7 +4722,7 @@
        1ドローコールで出す。実SpotLightは増やさない。
        既存のレーザーシート・スモーク・被写体スポットには書き込まない。 */
     // 発光点12基の合計本数（12+6+8+4）。バッファはこの本数ぶんだけ確保する。
-    const RED_MESH_MAX=30, RED_MESH_CLEAR_R=.9;
+    const RED_MESH_MAX=30, RED_MESH_CLEAR_R=.9, RED_MESH_HEAD_Y=2.2;
     // 線の太さ: ワールド幅 5cm を基準に、画面上で最低 3.6px を割らないようにする。
     const RED_MESH_W=.05, RED_MESH_PX_FLOOR=3.6, RED_MESH_HALF_MAX=.18, RED_MESH_TAU=Math.PI*2;
     // 発光点は固定配列。乱数で作らないので毎回同じ骨格になる。
@@ -4762,10 +4762,13 @@
           // 基準の照射角。発光点は動かさず、この角度だけを毎フレーム振る。
           th0:Math.atan2(dx,dz),
           el0:THREE.MathUtils.clamp(Math.asin(THREE.MathUtils.clamp(dy/len,-1,1)),-.95,.95),
-          // 本ごとに振り幅・速さ・位相を変える。全体を同じに回さない。
-          ay:.13+.28*redMeshSeed(k,5),
-          ap:.08+.17*redMeshSeed(k,6),
-          speed:.09+.21*redMeshSeed(k,7),
+          /* 本ごとに振り幅・速さ・位相を変える。全体を同じに回さない。
+             振り幅は「小刻みな揺れ」ではなく空間を舐める大きさ（左右 52〜115度）。
+             そのぶん速さは落として、大きな動きがせわしなくならないようにする。 */
+          ay:.45+.55*redMeshSeed(k,5),
+          ap:Math.min(.22+.38*redMeshSeed(k,6),
+                      Math.max(.06,(1.40-Math.abs(THREE.MathUtils.clamp(Math.asin(THREE.MathUtils.clamp(dy/len,-1,1)),-.95,.95)))/1.45)),
+          speed:.05+.11*redMeshSeed(k,7),
           phase:redMeshSeed(k,8)*RED_MESH_TAU,
           mode:k%4, aud, layer
         });
@@ -4815,22 +4818,35 @@
       out.normalize();
       return dist;
     }
-    /* 被写体（半径 RED_MESH_CLEAR_R の円筒）は、長さを変えずに方位角で避ける。
-       終点を押し出す方式は、長い線だと押し出し量が発散して向きが壊れるため使わない。
-       被写体の距離に届かない線だけは曲げない。 */
-    function redMeshClearAzimuth(r,th,el){
+    /* 被写体（半径 RED_MESH_CLEAR_R の円筒）の避け方。
+       方位角を押し戻す方式は、大きく振ったとき被写体の手前で角度が張り付いて
+       「舐める動き」が止まってしまうので使わない。方位はそのまま通し、
+       被写体の方位に入っている間だけ仰角を連続的に持ち上げて頭上を通す。 */
+    function redMeshLiftOverSubject(r,th,el){
       const dx=SUBJECT.x-r.src[0], dz=SUBJECT.z-r.src[2];
       const dSub=Math.hypot(dx,dz);
-      if(dSub<=RED_MESH_CLEAR_R*1.15)return th;
-      const ce=Math.cos(el);
-      if(r.len*ce<dSub-RED_MESH_CLEAR_R)return th;      // そこまで届かない
-      const need=Math.asin(THREE.MathUtils.clamp(RED_MESH_CLEAR_R*1.15/dSub,-1,1));
-      const thSub=Math.atan2(dx,dz);
-      let diff=th-thSub;
+      if(dSub<=RED_MESH_CLEAR_R*1.15)return el;
+      if(r.len*Math.cos(el)<dSub-RED_MESH_CLEAR_R)return el;   // そこまで届かない
+      const soft=Math.asin(THREE.MathUtils.clamp(RED_MESH_CLEAR_R*1.15/dSub,-1,1));
+      let diff=th-Math.atan2(dx,dz);
       while(diff>Math.PI)diff-=RED_MESH_TAU;
       while(diff<-Math.PI)diff+=RED_MESH_TAU;
-      if(Math.abs(diff)>=need)return th;
-      return thSub+need*(diff<0?-1:1);
+      const ad=Math.abs(diff);
+      if(ad>=soft)return el;
+      // soft の縁で0、円筒に触れる角度で1。持ち上げ量が段差にならないよう滑らかに。
+      const hard=Math.asin(THREE.MathUtils.clamp(RED_MESH_CLEAR_R/dSub,-1,1));
+      const w=THREE.MathUtils.clamp((soft-ad)/Math.max(1e-4,soft-hard),0,1);
+      const smooth=w*w*(3-2*w);
+      const dClose=Math.max(.5,dSub*Math.cos(diff));
+      let out=el;
+      for(let n=0;n<2;n++){
+        // 円筒を横切る間ずっと頭上に居られるだけの高さ（傾きのぶん余裕を足す）
+        const yNeed=RED_MESH_HEAD_Y+.12+Math.abs(Math.tan(out))*RED_MESH_CLEAR_R*1.15;
+        const elNeed=Math.atan2(yNeed-r.src[1],dClose);
+        if(out>=elNeed)break;
+        out=THREE.MathUtils.lerp(el,elNeed,smooth);
+      }
+      return out;
     }
     function updateRedMesh(t,frame=composeLightingFrame(t)){
       const rm=board.redMesh;
@@ -4865,8 +4881,8 @@
           case 2: yaw=r.ay*Math.sin(ph);        pitch=r.ap*Math.sin(ph+.4);              break;  // 斜め
           default:yaw=r.ay*Math.sin(ph);        pitch=r.ap*Math.cos(ph);                 break;  // 楕円
         }
-        const el=THREE.MathUtils.clamp(r.el0+pitch*amp,-1.3,1.3);
-        const th=redMeshClearAzimuth(r,r.th0+yaw*amp,el);
+        const th=r.th0+yaw*amp;
+        const el=redMeshLiftOverSubject(r,th,THREE.MathUtils.clamp(r.el0+pitch*amp,-1.45,1.45));
         const ce=Math.cos(el);
         _rmA.set(r.src[0],r.src[1],r.src[2]);
         _rmDir.set(ce*Math.sin(th),Math.sin(el),ce*Math.cos(th));
@@ -4897,7 +4913,7 @@
         const w=[0,0, 1,0, 1,1, 0,0, 1,1, 0,1];
         for(let n=0;n<12;n++)uv[ou+n]=w[n];
         // 近い線ほど明るい。遠い線にも下限を置いて線として消えないようにする。
-        let b=THREE.MathUtils.clamp(4.2/Math.max(.6,dcam),.55,1.6)*(r.layer===0?.74:r.layer===1?.86:1);
+        let b=THREE.MathUtils.clamp(4.2/Math.max(.6,dcam),.72,1.6)*(r.layer===0?.80:r.layer===1?.90:1);
         // レンズを貫く線だけ落とす。かすめる線は明るいまま。
         if(dcam<.35)b*=THREE.MathUtils.lerp(.30,1,dcam/.35);
         for(let n=0;n<6;n++)br[ob+n]=b;
