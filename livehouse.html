@@ -4725,6 +4725,8 @@
     const RED_MESH_MAX=30, RED_MESH_CLEAR_R=.9, RED_MESH_HEAD_Y=2.2;
     // 線の太さ: ワールド幅 5cm を基準に、画面上で最低 3.6px を割らないようにする。
     const RED_MESH_W=.05, RED_MESH_PX_FLOOR=3.6, RED_MESH_HALF_MAX=.18, RED_MESH_TAU=Math.PI*2;
+    // 拍で掃引が前へ加速する量。1未満なので角速度は常に正＝逆走（震え）にならない。
+    const RED_MESH_SURGE=.6;
     // 発光点は固定配列。乱数で作らないので毎回同じ骨格になる。
     // [x,y,z, 本数] — BACK 4基 / SIDE 2基 / FRONT-TOP 4基 / LOW 2基 = 32本
     const RED_MESH_EMITTERS=Object.freeze([
@@ -4765,8 +4767,8 @@
           /* 本ごとに振り幅・速さ・位相を変える。全体を同じに回さない。
              振り幅は「小刻みな揺れ」ではなく空間を舐める大きさ（左右 52〜115度）。
              そのぶん速さは落として、大きな動きがせわしなくならないようにする。 */
-          ay:.45+.55*redMeshSeed(k,5),
-          ap:Math.min(.22+.38*redMeshSeed(k,6),
+          ay:.51+.63*redMeshSeed(k,5),
+          ap:Math.min(.25+.43*redMeshSeed(k,6),
                       Math.max(.06,(1.40-Math.abs(THREE.MathUtils.clamp(Math.asin(THREE.MathUtils.clamp(dy/len,-1,1)),-.95,.95)))/1.45)),
           speed:.05+.11*redMeshSeed(k,7),
           phase:redMeshSeed(k,8)*RED_MESH_TAU,
@@ -4826,25 +4828,28 @@
       const dx=SUBJECT.x-r.src[0], dz=SUBJECT.z-r.src[2];
       const dSub=Math.hypot(dx,dz);
       if(dSub<=RED_MESH_CLEAR_R*1.15)return el;
-      if(r.len*Math.cos(el)<dSub-RED_MESH_CLEAR_R)return el;   // そこまで届かない
-      const soft=Math.asin(THREE.MathUtils.clamp(RED_MESH_CLEAR_R*1.15/dSub,-1,1));
+      const hard=Math.asin(THREE.MathUtils.clamp(RED_MESH_CLEAR_R/dSub,-1,1));
+      /* 持ち上げ始める角度は、円筒の見かけの半径よりずっと手前に取る。
+         円筒の縁だけで持ち上げると、掃引が速いとき数フレームで持ち上がって
+         一瞬跳ねて見えるため。広く取れば被写体の上をゆっくり越えていく。 */
+      const wide=Math.min(1.45,hard*3.5+.25);
       let diff=th-Math.atan2(dx,dz);
       while(diff>Math.PI)diff-=RED_MESH_TAU;
       while(diff<-Math.PI)diff+=RED_MESH_TAU;
       const ad=Math.abs(diff);
-      if(ad>=soft)return el;
-      // soft の縁で0、円筒に触れる角度で1。持ち上げ量が段差にならないよう滑らかに。
-      const hard=Math.asin(THREE.MathUtils.clamp(RED_MESH_CLEAR_R/dSub,-1,1));
-      const w=THREE.MathUtils.clamp((soft-ad)/Math.max(1e-4,soft-hard),0,1);
+      if(ad>=wide)return el;
+      const w=THREE.MathUtils.clamp((wide-ad)/Math.max(1e-4,wide-hard),0,1);
       const smooth=w*w*(3-2*w);
       const dClose=Math.max(.5,dSub*Math.cos(diff));
       let out=el;
       for(let n=0;n<2;n++){
-        // 円筒を横切る間ずっと頭上に居られるだけの高さ（傾きのぶん余裕を足す）
-        const yNeed=RED_MESH_HEAD_Y+.12+Math.abs(Math.tan(out))*RED_MESH_CLEAR_R*1.15;
+        /* 円筒を横切る間ずっと頭上に居られるだけの高さ。傾きが急なほど余裕が要るので、
+           持ち上げ前と後の急なほうの傾きで見積もる。max で受けるため単調に増え、
+           持ち上げ不要になる境目でも段差が出ない。 */
+        const slope=Math.max(Math.abs(Math.tan(el)),Math.abs(Math.tan(out)));
+        const yNeed=RED_MESH_HEAD_Y+.12+slope*RED_MESH_CLEAR_R*1.15;
         const elNeed=Math.atan2(yNeed-r.src[1],dClose);
-        if(out>=elNeed)break;
-        out=THREE.MathUtils.lerp(el,elNeed,smooth);
+        out=Math.max(out,THREE.MathUtils.lerp(el,elNeed,smooth));
       }
       return out;
     }
@@ -4858,9 +4863,13 @@
       const pulse=THREE.MathUtils.clamp(rm.pulse/100,0,1);
       const beatWave=.5+.5*Math.cos(beat*Math.PI*2);   // 拍の頭が山
       const pulseGain=1-pulse*.55+pulse*.55*beatWave;
-      /* ビートは発光強度と移動幅を一時的に強めるだけ。位相 ph は t に比例して
-         進み続けるので、BPM同期でも移動は止まらない。 */
-      const amp=1+pulse*.45*beatWave;
+      /* 拍は「掃引の進む速さ」に効かせる。振れ幅に掛けると拍の速さ（BPM120で2Hz）で
+         角度が往復してしまい、大きな動きの上に小刻みな震えが乗るため。
+         角速度 speed*TAU*(1+surge*cos(拍)) を解析的に積分した時刻 phT を使うので、
+         拍の境目でも角度が飛ばない。surge<1 なので常に前進する。 */
+      const fBeat=Math.max(30,board.timeline.bpm)/60;
+      const surge=pulse*RED_MESH_SURGE;
+      const phT=t+surge*Math.sin(beat*RED_MESH_TAU)/(RED_MESH_TAU*fBeat);
       const bulge=1+pulse*.30*beatWave;
       const pos=redMeshGeo.attributes.position.array,uv=redMeshGeo.attributes.uv.array,br=redMeshGeo.attributes.aBright.array;
       const camPos=camera.position;
@@ -4873,7 +4882,7 @@
       for(let i=0;i<RED_MESH_RAYS.length&&q<want;i++){
         const r=RED_MESH_RAYS[i];
         if(r.len<.2)continue;
-        const ph=r.phase+t*r.speed*RED_MESH_TAU;
+        const ph=r.phase+phT*r.speed*RED_MESH_TAU;
         let yaw,pitch;
         switch(r.mode){
           case 0: yaw=r.ay*Math.sin(ph);        pitch=r.ap*.30*Math.sin(ph*.53+r.phase); break;  // 横振り
@@ -4881,8 +4890,8 @@
           case 2: yaw=r.ay*Math.sin(ph);        pitch=r.ap*Math.sin(ph+.4);              break;  // 斜め
           default:yaw=r.ay*Math.sin(ph);        pitch=r.ap*Math.cos(ph);                 break;  // 楕円
         }
-        const th=r.th0+yaw*amp;
-        const el=redMeshLiftOverSubject(r,th,THREE.MathUtils.clamp(r.el0+pitch*amp,-1.45,1.45));
+        const th=r.th0+yaw;
+        const el=redMeshLiftOverSubject(r,th,THREE.MathUtils.clamp(r.el0+pitch,-1.45,1.45));
         const ce=Math.cos(el);
         _rmA.set(r.src[0],r.src[1],r.src[2]);
         _rmDir.set(ce*Math.sin(th),Math.sin(el),ce*Math.cos(th));
