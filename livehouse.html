@@ -432,7 +432,8 @@
           <div class="slider" style="margin-top:8px"><div><span>ビーム密度</span><strong id="v-redMeshDensity">55%</strong></div><input type="range" id="redMeshDensity" min="0" max="100" step="1" value="55" /></div>
           <div class="slider"><div><span>パルス強度</span><strong id="v-redMeshPulse">60%</strong></div><input type="range" id="redMeshPulse" min="0" max="100" step="1" value="60" /></div>
           <div class="slider"><div><span>光条視認性</span><strong id="v-redMeshGlow">70%</strong></div><input type="range" id="redMeshGlow" min="0" max="100" step="1" value="70" /></div>
-          <div class="hint">ステージの奥・左右・上部・手前の12基から、細い赤い線を違う角度と奥行きで飛ばします。格子ではなく、空間で不規則に交差する立体的な檻です。演者の周囲は空けてあるのでシルエットが埋もれません。脈動はBPMタイムラインのテンポに同期します。光条視認性はスモークの状態に連動し、スモークOFFでは薄くなります。</div>
+          <div class="slider"><div><span>ブランキング</span><strong id="v-redMeshBlanking">50%</strong></div><input type="range" id="redMeshBlanking" min="0" max="100" step="1" value="50" /></div>
+          <div class="hint">ステージの奥・左右・上部・手前の12基から、細い赤い線を違う角度と奥行きで飛ばします。格子ではなく、空間で不規則に交差する立体的な檻です。演者の周囲は空けてあるのでシルエットが埋もれません。脈動はBPMタイムラインのテンポに同期します。光条視認性はスモークの状態に連動し、スモークOFFでは薄くなります。ブランキングは実機のレーザーと同じく、消灯している間だけ照射角を切り替える仕組みです。半数の線は消灯中に別の角度へ飛び（スナップ）、残り半数は掃引したまま一瞬だけ切れます。0%で消灯なしの連続掃引に戻ります。</div>
         </details></section>
         <section class="section"><details class="sec" data-sec="sec13"><summary class="label"><span>被写体スポット</span><small>FOLLOW SPOT</small></summary>
           <button class="mode" id="subjectSpotToggle" type="button" style="width:100%">● 被写体スポット</button>
@@ -3477,7 +3478,7 @@
       faceFill:{on:true,level:32},
       shadow:{mode:'natural'},
       laserSheet:{on:false,level:28,height:1.40,spread:35,tilt:0,mode:'fixed',speed:.6,color:'#36ff74'},
-      redMesh:{on:false,density:55,pulse:60,glow:70},
+      redMesh:{on:false,density:55,pulse:60,glow:70,blanking:50},
       beamOrbit:{mode:'fixed',width:100},
       backlight:{on:false,level:70},
       beamZoom:{mode:'fixed',width:100,depth:60},
@@ -4772,6 +4773,10 @@
                       Math.max(.06,(1.40-Math.abs(THREE.MathUtils.clamp(Math.asin(THREE.MathUtils.clamp(dy/len,-1,1)),-.95,.95)))/1.45)),
           speed:.05+.11*redMeshSeed(k,7),
           phase:redMeshSeed(k,8)*RED_MESH_TAU,
+          /* ブランキング用。消灯する周期と、消灯中に角度を飛ばすか（スナップ）を
+             本ごとに決める。乱数状態は持たず固定シードなので再現性は保たれる。 */
+          idx:k, cue:1.6+2.8*redMeshSeed(k,10), snap:redMeshSeed(k,11)<.5,
+          cueOff:redMeshSeed(k,12)*4.4,
           mode:k%4, aud, layer
         });
       }
@@ -4878,6 +4883,13 @@
          近い端は遠近法でそのまま太く、遠い端は最低幅を割らない。 */
       const viewH=Math.max(240,renderer.domElement.clientHeight||renderer.domElement.height||700);
       const pxK=2*Math.tan(camera.fov*Math.PI/360)/viewH*(RED_MESH_PX_FLOOR*.5);
+      /* ブランキング。実機のレーザーと同じく、消灯している間だけ照射角を切り替える。
+         消灯窓は各本の周期の末尾に置き、角度の切り替えは周期の変わり目に起こるので、
+         移動の瞬間は必ず暗い。0% なら消灯なしの連続掃引（従来どおり）。 */
+      const bl=THREE.MathUtils.clamp(rm.blanking/100,0,1);
+      const blankFrac=bl>0?.04+.14*bl:0;
+      const blankRamp=blankFrac*.22;
+      const snapYaw=.35+.85*bl, snapPitch=(.35+.85*bl)*.4;
       let q=0;
       for(let i=0;i<RED_MESH_RAYS.length&&q<want;i++){
         const r=RED_MESH_RAYS[i];
@@ -4890,8 +4902,26 @@
           case 2: yaw=r.ay*Math.sin(ph);        pitch=r.ap*Math.sin(ph+.4);              break;  // 斜め
           default:yaw=r.ay*Math.sin(ph);        pitch=r.ap*Math.cos(ph);                 break;  // 楕円
         }
-        const th=r.th0+yaw;
-        const el=redMeshLiftOverSubject(r,th,THREE.MathUtils.clamp(r.el0+pitch,-1.45,1.45));
+        let gate=1,snapY=0,snapP=0;
+        if(blankFrac>0){
+          const c=(t+r.cueOff)/r.cue;
+          const u=c-Math.floor(c);
+          if(u>1-blankFrac){
+            const e=(u-(1-blankFrac))/blankRamp;          // 消灯へ落ちる
+            gate=e>=1?0:1-e*e*(3-2*e);
+          }else if(u<blankRamp){
+            const e=u/blankRamp;                           // 点灯へ戻る
+            gate=e*e*(3-2*e);
+          }
+          if(r.snap){
+            // 周期ごとに別の角度へ飛ぶ。切り替わるのは消灯が明けた瞬間。
+            const n=Math.floor(c)&63;
+            snapY=(redMeshSeed(r.idx,40+n)*2-1)*snapYaw;
+            snapP=(redMeshSeed(r.idx,104+n)*2-1)*snapPitch;
+          }
+        }
+        const th=r.th0+yaw+snapY;
+        const el=redMeshLiftOverSubject(r,th,THREE.MathUtils.clamp(r.el0+pitch+snapP,-1.45,1.45));
         const ce=Math.cos(el);
         _rmA.set(r.src[0],r.src[1],r.src[2]);
         _rmDir.set(ce*Math.sin(th),Math.sin(el),ce*Math.cos(th));
@@ -4925,6 +4955,7 @@
         let b=THREE.MathUtils.clamp(4.2/Math.max(.6,dcam),.72,1.6)*(r.layer===0?.80:r.layer===1?.90:1);
         // レンズを貫く線だけ落とす。かすめる線は明るいまま。
         if(dcam<.35)b*=THREE.MathUtils.lerp(.30,1,dcam/.35);
+        b*=gate;   // 消灯中は芯もにじみも一緒に消える（シェーダ側で discard される）
         for(let n=0;n<6;n++)br[ob+n]=b;
         q++;
       }
@@ -5520,9 +5551,11 @@
       board.laserSheet.color=/^#[0-9a-f]{6}$/i.test(String(board.laserSheet.color||''))?board.laserSheet.color:'#36ff74';
       Object.assign(board.redMesh,src.redMesh||{});
       board.redMesh.on=!!board.redMesh.on;
-      ['density','pulse','glow'].forEach(k=>{
-        board.redMesh[k]=THREE.MathUtils.clamp(Math.round(Number(board.redMesh[k])),0,100);
-        if(!Number.isFinite(board.redMesh[k]))board.redMesh[k]={density:55,pulse:60,glow:70}[k];
+      ['density','pulse','glow','blanking'].forEach(k=>{
+        const v=Math.round(Number(board.redMesh[k]));
+        // 旧い保存データには blanking が無いので、既定値へ落とす
+        board.redMesh[k]=Number.isFinite(v)?THREE.MathUtils.clamp(v,0,100)
+                                           :{density:55,pulse:60,glow:70,blanking:50}[k];
       });
       Object.assign(board.backlight,src.backlight||{});
       board.backlight.on=!!board.backlight.on;
@@ -5968,6 +6001,7 @@
       q('#redMeshDensity').value=board.redMesh.density;q('#v-redMeshDensity').textContent=board.redMesh.density+'%';
       q('#redMeshPulse').value=board.redMesh.pulse;q('#v-redMeshPulse').textContent=board.redMesh.pulse+'%';
       q('#redMeshGlow').value=board.redMesh.glow;q('#v-redMeshGlow').textContent=board.redMesh.glow+'%';
+      q('#redMeshBlanking').value=board.redMesh.blanking;q('#v-redMeshBlanking').textContent=board.redMesh.blanking+'%';
       q('#laserSheetMode').value=board.laserSheet.mode;q('#v-laserSheetMode').textContent=LASER_MODE_LABEL[board.laserSheet.mode]||'固定';
       q('#laserSheetSpeed').value=board.laserSheet.speed;q('#v-laserSheetSpeed').textContent=board.laserSheet.speed.toFixed(1);
       q('#laserSheetColor').value=board.laserSheet.color;q('#v-laserSheetColor').textContent=board.laserSheet.color;
@@ -6083,6 +6117,7 @@
       board.redMesh[key]=THREE.MathUtils.clamp(Math.round(+e.target.value)||0,0,100);
       q('#v-'+id).textContent=board.redMesh[key]+suffix;saveSettings();refresh()}};
     bindRedMesh('redMeshDensity','density');bindRedMesh('redMeshPulse','pulse');bindRedMesh('redMeshGlow','glow');
+    bindRedMesh('redMeshBlanking','blanking');
     q('#laserSheetMode').onchange=e=>{board.laserSheet.mode=e.target.value;q('#v-laserSheetMode').textContent=LASER_MODE_LABEL[board.laserSheet.mode]||'固定';saveSettings();refresh()};
     q('#laserSheetSpeed').oninput=e=>{board.laserSheet.speed=+e.target.value;q('#v-laserSheetSpeed').textContent=board.laserSheet.speed.toFixed(1);saveSettings();refresh()};
     q('#laserSheetColor').oninput=e=>{board.laserSheet.color=e.target.value;q('#v-laserSheetColor').textContent=board.laserSheet.color;saveSettings();refresh()};
