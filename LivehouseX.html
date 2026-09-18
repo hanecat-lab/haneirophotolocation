@@ -247,7 +247,11 @@
     .sun-range::-webkit-slider-thumb{background:repeating-linear-gradient(180deg,rgba(0,0,0,.18) 0 1px,transparent 1px 3px),linear-gradient(#ffd894,#e0a83a 46%,#a8761f)}
     .sun-range::-moz-range-thumb{background:repeating-linear-gradient(180deg,rgba(0,0,0,.18) 0 1px,transparent 1px 3px),linear-gradient(#ffd894,#e0a83a 46%,#a8761f)}
     @media(prefers-reduced-motion:reduce){.sec>summary span{transition:none}}
-  </style>
+  
+    body.expo-locked #scene{box-shadow:inset 0 0 0 2px rgba(224,168,58,.8), inset 0 0 30px rgba(224,168,58,.15);}
+    body.expo-locked #expoBadge{outline:1.5px solid #e0a83a;}
+    #expoLockToggle.locked{background:#e0a83a !important;color:#000 !important;border-color:#e0a83a !important;}
+    </style>
   <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 </head>
 <body>
@@ -281,6 +285,25 @@
           <div class="hint">実機と同じ範囲だけを見ます。枠の外は写らないので、白飛び・色飽和の判定とゼブラも枠の中だけを見ます。縦位置はカメラを倒すのと同じで、長辺が縦に来るぶん垂直の画角が広がります。</div>
           <div class="slider"><div><span>ホワイトバランス</span><strong id="v-wb">5600K デイライト</strong></div><input type="range" id="wbR" min="0" max="8" step="1" value="6" /><button class="mode wb-auto-toggle" id="wbAutoToggle" type="button" aria-pressed="false">○ AW（オート）</button></div>
         </details></section>
+        <section class="section" id="expoLockSectionAlways">
+          <div id="expoLockPanel" style="margin-top:4px;padding:10px;border:1px solid rgba(224,168,58,.25);border-radius:8px;background:rgba(10,8,6,.6)">
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+              <button id="expoLockToggle" type="button" class="mode" style="flex:0 0 auto;padding:6px 14px;font-weight:700">🔓 露出ロック</button>
+              <span id="expoLockStatus" style="font-size:12px;color:#87918e">未ロック - 被写体スポットの影響を除外済み</span>
+            </div>
+            <div id="expoLockBars" style="display:none">
+              <div style="margin:4px 0"><span style="font-size:11px;color:#e0a83a">LOCKED</span> <span id="expoLockEv" style="font-size:12px">—</span>
+                <div style="height:8px;background:#222;border-radius:4px;overflow:hidden;margin-top:2px"><div id="expoLockBar" style="height:100%;width:50%;background:#e0a83a;transition:width .2s"></div></div>
+              </div>
+              <div style="margin:6px 0"><span style="font-size:11px;color:#88aaff">CURRENT</span> <span id="expoCurrentEv" style="font-size:12px">—</span> <span id="expoDelta" style="font-size:12px;margin-left:8px"></span>
+                <div style="height:8px;background:#222;border-radius:4px;overflow:hidden;margin-top:2px"><div id="expoCurrentBar" style="height:100%;width:50%;background:#88aaff;transition:width .2s"></div></div>
+              </div>
+            </div>
+            <canvas id="expoEvGraph" width="300" height="60" style="width:100%;height:60px;background:#0a0a0a;border-radius:4px;margin-top:8px;display:none"></canvas>
+            <div style="font-size:10px;color:#666;margin-top:4px">黄色点線=ロック基準 / 青線=現在のEV推移 / Space長押しでTEMPロック</div>
+          </div>
+        </section>
+
         <section class="section"><details class="sec" data-sec="sec24"><summary class="label"><span>露出の詳細</span><small>METER / HIGHLIGHT</small></summary>
           <div class="exposure-compare" id="exposureCompare">
             <div class="exposure-compare-head"><span>頭頂部の露出比較</span><small>MULTI MODEL CHECK</small></div>
@@ -4876,7 +4899,9 @@
        すべての描画・測光は、この関数が返す同一フレームを参照する。
        明るさは同じ優先層内でHTP、色と照準は優先度＋開始時刻によるLTP。
        消灯マスク、ブラックアウト、マスターは最後に適用する。 */
-    const SUBJECT_SPOT_LUX=110,FACE_FILL_LUX=80,FACE_FILL_COLOR=new THREE.Color('#fff4e8');
+    const SUBJECT_SPOT_LUX=110,FACE_FILL_LUX=80,FACE_FILL_COLOR=new THREE.Color('#ffe8c8');
+    window.lockedExpo=null;
+    window.evHistory=[];
     const LAYER_PRIORITY=Object.freeze({base:10,movement:20,accent:30,subjectSpot:40,safety:100});
     const _c=new THREE.Color();
     function baseColorAt(i,t){
@@ -5020,6 +5045,7 @@
       return FIX_LUX[f.type]*movingRigOutputGain(f)*outputGainOf()*lv*beam*(REF_DIST*REF_DIST)/(d*d);
     }
     function stageLux(t){const frame=composeLightingFrame(t);let s=frame.subjectSpot.lux+frame.faceFill.lux;for(let i=0;i<N;i++)s+=luxOf(i,t,frame);return s}
+    function stageLuxNoSubject(t){const frame=composeLightingFrame(t);let s=0;for(let i=0;i<N;i++)s+=luxOf(i,t,frame);return s}
 
     // 写真の見た目に合わせた顔面スポット測光。
     // 舞台総照度だけでは、強いバックライトで顔が暗いのに「オーバー」と判定されるため、
@@ -5310,6 +5336,73 @@
       if(shutter<FLICKER_LIMIT) w.push('⚠ 1/'+den+' は 1/250 より速く、LED灯体のフリッカーで色ムラや横縞が出ることがあります。');
       if(iso>=NOISE_ISO) w.push('⚠ ISO'+iso+' は暗部にノイズが乗ります。');
       document.querySelector('#expoWarn').innerHTML=w.join('<br>');
+      // P1: 露出ロック視覚化 - EVグラフ
+      try{
+        const evGraph=document.getElementById('expoEvGraph');
+        const lockBar=document.getElementById('expoLockBar');
+        const curBar=document.getElementById('expoCurrentBar');
+        const lockEvEl=document.getElementById('expoLockEv');
+        const curEvEl=document.getElementById('expoCurrentEv');
+        const deltaEl=document.getElementById('expoDelta');
+        window.evHistory.push({t:Date.now(), ev:expo.evScene});
+        if(window.evHistory.length>120) window.evHistory.shift();
+        if(evGraph){
+          const ctx=evGraph.getContext('2d');
+          if(ctx){
+            const W=evGraph.width, H=evGraph.height;
+            ctx.clearRect(0,0,W,H);
+            ctx.fillStyle='#0f0f0f'; ctx.fillRect(0,0,W,H);
+            ctx.strokeStyle='rgba(255,255,255,.06)'; ctx.lineWidth=0.5;
+            for(let y=0;y<=H;y+=15){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+            if(window.lockedExpo){
+              const lockY = H - ((window.lockedExpo.evScene+4)/12*H);
+              ctx.strokeStyle='rgba(224,168,58,.9)'; ctx.setLineDash([6,4]); ctx.lineWidth=1.2; ctx.beginPath(); ctx.moveTo(0,lockY); ctx.lineTo(W,lockY); ctx.stroke(); ctx.setLineDash([]);
+              ctx.fillStyle='#e0a83a'; ctx.font='10px monospace'; ctx.fillText('LOCK '+window.lockedExpo.evScene.toFixed(1)+' EV', 4, Math.max(10, lockY-4));
+            }
+            if(window.evHistory.length>1){
+              ctx.strokeStyle='#88aaff'; ctx.lineWidth=1.8; ctx.beginPath();
+              window.evHistory.forEach((p,i)=>{
+                const x=i/119*W;
+                const y=Math.max(2, Math.min(H-2, H - ((p.ev+4)/12*H)));
+                if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+              });
+              ctx.stroke();
+            }
+            ctx.fillStyle='rgba(255,255,255,.35)'; ctx.font='9px monospace';
+            ctx.fillText('EV+8', 2, 10); ctx.fillText('EV0', 2, H/2+3); ctx.fillText('EV-4', 2, H-2);
+          }
+        }
+                // P2-A: 表示削減 - ロック時のみ詳細表示
+        const barsEl=document.getElementById('expoLockBars');
+        const graphEl=document.getElementById('expoEvGraph');
+        if(window.lockedExpo){
+          if(barsEl) barsEl.style.display='block';
+          if(graphEl) graphEl.style.display='block';
+          const delta = expo.evScene - window.lockedExpo.evScene;
+          const absDelta=Math.abs(delta);
+          let col = absDelta<0.3?'#8f8':'#e0a83a';
+          if(absDelta>=0.8) col='#ff4444';
+          if(deltaEl){
+            if(absDelta<0.3) deltaEl.textContent='✓ 安定';
+            else if(absDelta<0.8) deltaEl.textContent='Δ'+delta.toFixed(1)+' ⚠';
+            else deltaEl.textContent='Δ'+delta.toFixed(1)+' ✕';
+            deltaEl.style.color=col;
+          }
+          if(lockEvEl) lockEvEl.textContent='EV '+window.lockedExpo.evScene.toFixed(1)+' LOCKED';
+          if(curEvEl) curEvEl.textContent='EV '+expo.evScene.toFixed(1)+' CURRENT';
+          const toPct=(ev)=> Math.max(5, Math.min(95, (ev+4)/12*100));
+          if(lockBar) lockBar.style.width=toPct(window.lockedExpo.evScene)+'%';
+          if(curBar){ curBar.style.width=toPct(expo.evScene)+'%'; curBar.style.background=col; }
+          document.body.classList.add('expo-locked');
+        } else {
+          if(barsEl) barsEl.style.display='none';
+          if(graphEl) graphEl.style.display='none';
+          document.body.classList.remove('expo-locked');
+          if(deltaEl) deltaEl.textContent='';
+          if(lockEvEl) lockEvEl.textContent='—';
+          if(curEvEl) curEvEl.textContent='EV '+expo.evScene.toFixed(1);
+        }
+              }catch(e){ console.error('expo lock viz', e); }
       syncExposureCompareUI();
     }
 
@@ -6804,6 +6897,8 @@ q++;
       const followLux=frame.subjectSpot.lux,faceFillLux=frame.faceFill.lux;
       updateSubjectSpot(t,followLux);updateBlinders(t,frame.blinder.level);
       const meter=faceExposureOf(contrib),hazeOn=board.smoke&&!board.blackout;
+      // P0: 露出用メーターは被写体スポット・フェイスフィルを含めない
+      const meterForExposure={direct:meter.direct, bounce:meter.bounce, lux:meter.lux, stage:meter.stage};
       if(followLux>0||faceFillLux>0){
         _meterNormal.copy(camera.position).sub(SUBJECT);if(_meterNormal.lengthSq()<1e-6)_meterNormal.set(0,.15,1);
         _meterNormal.normalize();_meterNormal.y+=.16;_meterNormal.normalize();
@@ -6865,7 +6960,10 @@ q++;
       faceBounce.position.copy(camera.position);
       faceBounceTarget.position.copy(faceFillLux>0?currentSubjectSpotAim():SUBJECT);
       faceBounce.color.copy(_atmosphereColor).lerp(HAZE_WHITE,.62);
-      if(faceFillLux>0)faceBounce.color.lerp(FACE_FILL_COLOR,.62);
+      if(faceFillLux>0){
+        // P0: フェイスフィルは固定5200K、AWBから除外
+        faceBounce.color.lerp(new THREE.Color('#ffe8c8'),.62);
+      }
       faceBounce.color.multiply(WB_GAIN);
       faceBounce.intensity=board.blackout?0:meter.bounce;
       faceBounceTarget.updateMatrixWorld();
@@ -6905,8 +7003,8 @@ q++;
         smoke.material.opacity=0.012+0.025*smokeDensityNorm;
       }
       smoke.visible=board.smoke&&!board.blackout;
-      // 露出。シーン照度は上と同じ luxOf の合計を使う
-      calcExposure(t,meter.lux,meter.stage,meter);
+      // 露出。P0: 被写体スポット・フェイスフィルを含めない照度で計測（演出に影響しない）
+      calcExposure(t,meterForExposure.lux,meterForExposure.stage,meterForExposure);
       renderer.toneMappingExposure=THREE.MathUtils.clamp(TONE_K*Math.pow(2,-expo.evCam),TONE_EXPOSURE_MIN,TONE_EXPOSURE_MAX);
       // 大気の色はシェーダのトーンマップを通らないので、ここで露出ぶんを掛ける。
       // 上のヘイズ処理が毎フレーム色を作り直すため、その場で掛けてよい。
@@ -7607,6 +7705,57 @@ q++;
     q('#subjectSpotLevel').oninput=e=>{board.subjectSpot.level=+e.target.value;q('#v-subjectSpotLevel').textContent=board.subjectSpot.level+'%';saveSettings();refresh()};
     q('#faceFillToggle').onclick=()=>{board.faceFill.on=!board.faceFill.on;setToggle('faceFillToggle',board.faceFill.on,'フェイスフィル');saveSettings();refresh()};
     q('#faceFillLevel').oninput=e=>{board.faceFill.level=+e.target.value;q('#v-faceFillLevel').textContent=board.faceFill.level+'%';saveSettings();refresh()};
+    // P1: 露出ロックトグル - 折りたたみ外
+    (function(){
+      const btn=document.getElementById('expoLockToggle');
+      const status=document.getElementById('expoLockStatus');
+      const bars=document.getElementById('expoLockBars');
+      const graph=document.getElementById('expoEvGraph');
+      if(!btn) return;
+      btn.onclick=()=>{
+        if(window.lockedExpo){
+          window.lockedExpo=null;
+          btn.textContent='🔓 露出ロック';
+          btn.classList.remove('locked');
+          if(status) status.textContent='未ロック - 被写体スポットの影響を除外済み';
+          document.body.classList.remove('expo-locked');
+        } else {
+          if(expo){
+            window.lockedExpo={evScene:expo.evScene, lux:expo.lux, stageEV:expo.stageEV, iso:expo.iso, fstop:expo.fstop, shutter:expo.shutter, time:Date.now()};
+            btn.textContent='🔒 ロック中';
+            btn.classList.add('locked');
+            if(status) status.textContent='ロック中 🔒 演出が変わっても露出基準は固定';
+            window.evHistory=[];
+          }
+        }
+      };
+      let tempLocked=false, tempPrev=null;
+      window.addEventListener('keydown', (e)=>{
+        if(e.code==='Space' && !tempLocked && !e.repeat){
+          e.preventDefault();
+          if(!window.lockedExpo && typeof expo!=='undefined'){
+            tempPrev=window.lockedExpo;
+            window.lockedExpo={evScene:expo.evScene, lux:expo.lux, stageEV:expo.stageEV, iso:expo.iso, fstop:expo.fstop, shutter:expo.shutter, time:Date.now(), temp:true};
+            tempLocked=true;
+            document.body.classList.add('expo-locked');
+            if(btn){ btn.textContent='🔒 TEMPロック中 (Space)'; btn.classList.add('locked'); }
+          }
+        }
+      });
+      window.addEventListener('keyup', (e)=>{
+        if(e.code==='Space' && tempLocked){
+          e.preventDefault();
+          window.lockedExpo=tempPrev;
+          tempLocked=false;
+          tempPrev=null;
+          if(!window.lockedExpo){
+            document.body.classList.remove('expo-locked');
+            if(btn){ btn.textContent='🔓 露出ロック'; btn.classList.remove('locked'); }
+          }
+        }
+      });
+    })();
+
     document.querySelectorAll('[data-shadow-mode]').forEach(b=>b.onclick=()=>{board.shadow.mode=b.dataset.shadowMode;syncBoardUI();saveSettings();refresh()});
     q('#outputGainR').oninput=e=>{board.outputGain=+e.target.value;syncBoardUI();saveSettings();refresh()};
     q('#colorPick').oninput=e=>{board.color=e.target.value;q('#v-color').textContent=board.color;applyColorToSelection()};
