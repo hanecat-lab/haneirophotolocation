@@ -6212,13 +6212,24 @@
        PHOTON RAIN — 落ちる光の粒
        位置は頂点シェーダで seed と時刻から求めるので、CPUは毎フレーム触らない。
 
-       上限は実機の自動A/B（?diag=perf,ab）で決めた。iPhone・780x896・DPR2.00 で
-       600粒・筋500cm（塗り面積の最悪ケース）が +1.8ms。20組の中央値を2回取って
-       +1.88 / +1.78ms で一致した。較正点の赤レーザー132本が +6.0ms なので、
-       同じ 6ms を上限の目安として 600 → 2000 へ引き上げる（線形外挿で約6.0ms）。
-       塗り面積の予算式は入れない。この規模では律速していないため。
+       上限と予算は実機の自動A/B（?diag=perf,ab）で決めた。
+       iPhone・780x896・DPR2.00、2000粒での20組中央値:
+
+         筋500cm +2.70ms / 筋8.0cm +0.26ms / 筋1.3cm +0.05ms / 筋0.4cm +0.05ms
+
+       粒数ではなく塗り面積で決まる。塗り面積 = 粒数 × min(筋の長さ, 100cm)。
+       100cm で頭打ちにするのは、それ以上の筋は降る高さ5mと画面からはみ出して
+       見える部分が増えないため。この式は上の4点を説明できる
+       （8.0cm→0.22ms / 1.3cm→0.035ms / 0.4cm→0.011ms の予測）。
+
+       したがって上限は1つの定数では決まらない。筋が短いときは粒を増やしても
+       ほぼ無料で、実際 1/8000 では 2000粒でもまばらに見える。
+       予算 200,000粒·cm（= 実測の最悪ケース +2.70ms そのもの）で毎フレーム絞る。
+       最悪ケースは今の実測値から増えず、速いシャッター側だけ粒が4〜10倍になる。
        ====================================================================== */
-    const PHOTON_RAIN_MAX=SHADOW_IS_MOBILE?2000:8000;
+    const PHOTON_RAIN_MAX=SHADOW_IS_MOBILE?8000:20000;
+    const PHOTON_RAIN_BUDGET=200000;       // 塗り面積の予算[粒·cm]
+    const PHOTON_RAIN_LEN_CAP=100;         // 筋の長さはここで頭打ち[cm]
     const PHOTON_RAIN_AREA_X=4.2, PHOTON_RAIN_Z0=-1.0, PHOTON_RAIN_Z1=12.0, PHOTON_RAIN_H=5.0;
     const PHOTON_RAIN_WIDTH=.010;          // 筋の幅[m]
     const photonRainGeo=(()=>{
@@ -6279,7 +6290,7 @@
     });
     const photonRain=new THREE.Mesh(photonRainGeo,photonRainMat);
     photonRain.frustumCulled=false;photonRain.renderOrder=8;photonRain.visible=false;scene.add(photonRain);
-    let photonRainCount=0;
+    let photonRainCount=0,photonRainClamped=false;
     const _rainSubject=new THREE.Vector4();
     // 等高線と同じく、シャッターを動かした結果を数字で見せる。
     // 毎フレーム呼ばれるので、文字列が変わったときだけDOMへ書く。
@@ -6290,7 +6301,9 @@
       if(on){
         const cm=photonRainMat.uniforms.uStreak.value*100,den=Math.round(1/Math.max(expo.shutter,1e-9));
         text='1/'+den+' で筋 '+(cm<1?cm.toFixed(1):cm.toFixed(0))+'cm'
-          +(cm<0.5?'（点に凍る）':cm<5?'（短い光跡）':'（長く流れる）');
+          +(cm<0.5?'（点に凍る）':cm<5?'（短い光跡）':'（長く流れる）')
+          // 粒数が勝手に変わる仕組みなので、絞っているときは理由を出す
+          +(photonRainClamped?'  筋が長いので '+photonRainCount+'粒へ自動で削減':'');
       }
       if(text!==_rainReadout){_rainReadout=text;el.textContent=text}
     }
@@ -6298,15 +6311,20 @@
       const pr=board.photonRain;
       const power=pr.on&&!frame.safety.blackout&&!frame.show.blackoutMask
         ?THREE.MathUtils.clamp(pr.level/100,0,1)*frame.safety.master:0;
-      if(power<=.001){photonRain.visible=false;photonRainGeo.setDrawRange(0,0);photonRainCount=0;syncPhotonRainReadout(false);return}
-      const count=Math.max(1,Math.round(PHOTON_RAIN_MAX*THREE.MathUtils.clamp(pr.density/100,0,1)));
-      photonRainCount=count;
+      if(power<=.001){photonRain.visible=false;photonRainGeo.setDrawRange(0,0);photonRainCount=0;photonRainClamped=false;syncPhotonRainReadout(false);return}
       const u=photonRainMat.uniforms;
       const fall=THREE.MathUtils.clamp(Number(pr.speed)||8,1,20);
       // 露光している間に粒が落ちた距離が、そのまま筋の長さになる。
       // 等高線の帯と同じ理屈で、ぼかしではなく形として作る。
       u.uStreak.value=Math.max(.004,fall*Math.max(0,Number(expo.shutter)||0));
       u.uSpeed.value=fall;u.uTime.value=t;
+      /* 塗り面積で絞る。粒数を先に決めてしまうと、筋が伸びたときに
+         面積が青天井になる。筋を決めてから粒数を出す順序が要る。 */
+      const streakCm=Math.max(u.uStreak.value*100,.1);
+      const budgetLimit=Math.floor(PHOTON_RAIN_BUDGET/Math.min(streakCm,PHOTON_RAIN_LEN_CAP));
+      const want=Math.round(PHOTON_RAIN_MAX*THREE.MathUtils.clamp(pr.density/100,0,1));
+      const count=Math.max(1,Math.min(want,budgetLimit));
+      photonRainCount=count;photonRainClamped=count<want;
       const spread=THREE.MathUtils.clamp(pr.spread/100,.1,1);
       u.uAreaX.value=PHOTON_RAIN_AREA_X*spread;
       u.uZ0.value=PHOTON_RAIN_Z0;u.uZ1.value=PHOTON_RAIN_Z0+(PHOTON_RAIN_Z1-PHOTON_RAIN_Z0)*spread;
@@ -8760,7 +8778,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
             '赤レーザー  '+(board.redMesh.on?'ON  '+redDrawn+'/'+RED_MESH_MAX+'本':'OFF'),
             'レーザー面  '+(board.laserSheet.on?'ON':'OFF'),
             '等高線      '+(board.humanContour.on?'ON  '+board.humanContour.level+'%':'OFF'),
-            '光の雨      '+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm':'OFF'),
+            '光の雨      '+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒'+(photonRainClamped?'(面積で制限)':'')+'  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm':'OFF'),
             '実光源 '+realLights+'灯 / 影 '+shadowLights+'灯 ('+board.shadow.mode+')',
             '出力ゲイン '+board.outputGain.toFixed(1)+'段   被写体 '+bodyId
           ].join('\n');
