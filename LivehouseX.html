@@ -8635,7 +8635,18 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
        320msごとにマスクパスを1回描く。素直に loop の末尾で読むとマスクパスの
        数字を本描画の数字として出してしまうので、本描画の直後に capture() で捕まえる。 */
     const diagPerf=(()=>{
-      if(!diagHas('perf'))return null;
+      /* A/B モード。?diag=perf,ab（既定=光の雨）／ab=rain／ab=contour。
+         順番に撮る比較は、熱ドリフトと窓の遅れが差と同じ大きさで乗るため成立しない。
+         30フレームごとに対象を ON/OFF へ自動で振り、各フェーズの平均の差を取る。
+         隣り合うフェーズは1秒しか離れていないので、ドリフトは差から消える。 */
+      const AB=(()=>{
+        for(const m of DIAG_MODES){
+          if(m==='ab'||m==='ab=rain')return{key:'photonRain',label:'光の雨'};
+          if(m==='ab=contour')return{key:'humanContour',label:'等高線'};
+        }
+        return null;
+      })();
+      if(!diagHas('perf')&&!AB)return null;
       // 実測で決めた目標。スマホの全部ONが 25fps/40.0ms なので、そこを底とする。
       const PERF_TARGET_FPS=25;
       const el=document.createElement('div');el.id='diagPerf';
@@ -8653,9 +8664,27 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       const DT_WINDOW=120;
       const dtBuf=new Float32Array(DT_WINDOW);let dtN=0,dtAt=0;
       const dtSorted=new Float32Array(DT_WINDOW);
+      const AB_PHASE=30;            // 1フェーズのフレーム数
+      const AB_SKIP=2;              // 切り替え直後は捨てる（パイプラインの立ち上がり）
+      const AB_PAIRS=20;            // 差を貯める組数
+      let abFrame=0,abSum=0,abN=0;
+      const abMean=[NaN,NaN];       // [OFFの平均, ONの平均]（表示用の最新値）
+      /* 差は中心差分で取る。OFF→ON の順に引くと、片方向のドリフトが
+         そのまま差へ乗る（node で 5.00ms の真値が 6.62ms と出た）。
+         ON の前後の OFF の平均を基準にすると、一次のドリフトはちょうど消える。 */
+      let abPrevOff=NaN,abPendOn=NaN;
+      const abD=new Float32Array(AB_PAIRS);let abDn=0,abDat=0;
       const shot={calls:0,triangles:0,points:0,lines:0};
       const acc={calls:0,triangles:0,points:0,lines:0};
       return {el,
+        /* loop の先頭で呼ぶ。A/B 中は対象の ON/OFF をこちらが握る。
+           戻り値を animating へ OR しないと、OFF フェーズで時間が止まる。 */
+        step(){
+          if(!AB)return false;
+          abFrame++;
+          board[AB.key].on=(Math.floor(abFrame/AB_PHASE)%2)===1;
+          return true;
+        },
         /* 描画パスごとに直後に呼ぶ。renderer.info は render() の頭でリセット
            されるので、1フレームに複数パスあるときは呼ぶたびに足していく。
            tick() が1フレームに1回、確定させて0へ戻す。 */
@@ -8664,7 +8693,24 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
           shot.calls=acc.calls;shot.triangles=acc.triangles;shot.points=acc.points;shot.lines=acc.lines;
           acc.calls=acc.triangles=acc.points=acc.lines=0;
           if(prev){const dt=now-prev;if(dt>worst)worst=dt;
-            dtBuf[dtAt]=dt;dtAt=(dtAt+1)%DT_WINDOW;if(dtN<DT_WINDOW)dtN++}
+            dtBuf[dtAt]=dt;dtAt=(dtAt+1)%DT_WINDOW;if(dtN<DT_WINDOW)dtN++;
+            if(AB){
+              const pos=abFrame%AB_PHASE,phase=(Math.floor(abFrame/AB_PHASE)%2);
+              if(pos>=AB_SKIP){abSum+=dt;abN++}
+              if(pos===AB_PHASE-1&&abN){
+                const m=abSum/abN;abSum=0;abN=0;abMean[phase]=m;
+                if(phase===1)abPendOn=m;
+                else{
+                  // OFF が閉じた時点で、その前後のOFFに挟まれたONを1組ぶん確定させる
+                  if(Number.isFinite(abPendOn)&&Number.isFinite(abPrevOff)){
+                    abD[abDat]=abPendOn-(abPrevOff+m)*.5;abDat=(abDat+1)%AB_PAIRS;
+                    if(abDn<AB_PAIRS)abDn++;
+                  }
+                  abPendOn=NaN;abPrevOff=m;
+                }
+              }
+            }
+          }
           prev=now;
           if(!fpsAt)fpsAt=now;
           frames++;
@@ -8689,9 +8735,19 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
           const budget=1000/PERF_TARGET_FPS;
           const verdict=avg<=budget?'OK 余裕 '+(budget-avg).toFixed(1)+'ms'
                                    :'超過 '+(avg-budget).toFixed(1)+'ms';
+          let abLine=null;
+          if(AB){
+            if(abDn){
+              const w2=new Float32Array(abDn);for(let i=0;i<abDn;i++)w2[i]=abD[i];w2.sort();
+              const dmid=abDn&1?w2[abDn>>1]:(w2[abDn/2-1]+w2[abDn/2])/2;
+              abLine='A/B '+AB.label+'  OFF '+abMean[0].toFixed(2)+'ms / ON '+abMean[1].toFixed(2)+'ms'
+                +'  → 差 '+(dmid>=0?'+':'')+dmid.toFixed(2)+'ms ('+abDn+'組の中央値)';
+            }else abLine='A/B '+AB.label+'  測定中… 卓の'+AB.label+'スイッチはA/Bが握っています';
+          }
           el.textContent=[
             fps+' fps   最悪 '+worstShown.toFixed(1)+'ms   平均 '+avg.toFixed(2)+'ms   中央 '+mid.toFixed(2)+'ms ('+dtN+'枚)',
             '目標 '+PERF_TARGET_FPS+'fps ('+budget.toFixed(1)+'ms) → '+verdict,
+            ...(abLine?[abLine]:[]),
             '本描画 '+shot.calls+' calls  三角形 '+shot.triangles.toLocaleString()+'  点 '+shot.points+'  線 '+shot.lines,
             'GPU常駐 geo '+m.geometries+' / tex '+m.textures+' / program '+(renderer.info.programs?renderer.info.programs.length:'-'),
             '画素 '+w+'x'+h+' (DPR '+dpr.toFixed(2)+') = '+(w*h/1e6).toFixed(2)+'M',
@@ -8900,7 +8956,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     function loop(now){
       requestAnimationFrame(loop);
       const dt=Math.min((now-last)/1000,0.05); last=now;
-      const animating=board.chase.playing||board.blink.playing||board.show.playing||board.rainbow||board.smoke||(board.humanContour.on&&board.humanContour.speed>0)||board.photonRain.on||(board.laserSheet.on&&board.laserSheet.mode!=='fixed'&&board.laserSheet.speed>0)||beamOrbitActive(clock)||beamZoomActive(clock)||(board.redMesh.on&&(board.redMesh.moveSpeed>0||!board.redMesh.independent));
+      const abActive=diagPerf?diagPerf.step():false;
+      const animating=abActive||board.chase.playing||board.blink.playing||board.show.playing||board.rainbow||board.smoke||(board.humanContour.on&&board.humanContour.speed>0)||board.photonRain.on||(board.laserSheet.on&&board.laserSheet.mode!=='fixed'&&board.laserSheet.speed>0)||beamOrbitActive(clock)||beamZoomActive(clock)||(board.redMesh.on&&(board.redMesh.moveSpeed>0||!board.redMesh.independent));
       if(animating){
         clock+=dt;
         advanceTimeline(clock);
