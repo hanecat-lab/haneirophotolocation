@@ -8387,6 +8387,30 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         }};
     })();
 
+    /* ?diag=contour — 等高線の虫食いの原因を実機で切り分ける。
+       タップするたびにモードが進む。どれで虫食いが消えるかで原因が確定する。 */
+    const diagContour=(()=>{
+      let mode='';try{mode=new URLSearchParams(location.search).get('diag')||''}catch(e){mode=''}
+      if(mode!=='contour')return null;
+      const el=document.createElement('div');el.id='diagContour';
+      el.style.cssText='position:fixed;left:8px;top:8px;z-index:9999;max-width:94vw;padding:10px 12px;'
+        +'background:rgba(0,0,0,.85);color:#9ff0c4;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;'
+        +'white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid rgba(159,240,196,.5);border-radius:6px;'
+        +'pointer-events:auto;cursor:pointer;-webkit-user-select:none;user-select:none;touch-action:manipulation';
+      document.body.append(el);
+      el.addEventListener('click',()=>{
+        CONTOUR_DIAG_MODE=(CONTOUR_DIAG_MODE+1)%CONTOUR_DIAG_MODES.length;
+        applyContourDiagMode();draw();refresh();
+      });
+      function draw(){
+        el.textContent='等高線の切り分け（タップで次へ）\n▶ '+CONTOUR_DIAG_MODES[CONTOUR_DIAG_MODE]
+          +'\n\n'+CONTOUR_DIAG_MODES.filter((_,i)=>i!==CONTOUR_DIAG_MODE).join('\n')
+          +'\n\n等高線をONにしてから、虫食いが消えるモードを探してください。';
+      }
+      draw();
+      return {el,draw};
+    })();
+
     const diagSpeckle=(()=>{
       let mode='';try{mode=new URLSearchParams(location.search).get('diag')||''}catch(e){mode=''}
       if(mode!=='speckle')return null;
@@ -8481,22 +8505,22 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
        sampleSubjectHighlights(5645付近)と同じ「被写体だけを描く追加パス」を
        使うので、GLBのマテリアルには一切触らない。
        ====================================================================== */
-    const contourMat=new THREE.ShaderMaterial({
-      transparent:true,depthWrite:false,depthTest:true,blending:THREE.AdditiveBlending,
-      uniforms:{uColor:{value:new THREE.Color('#9ff0c4')},uScanY:{value:0},
-        uGap:{value:.05},uSpan:{value:.5},uThick:{value:.012},uLevel:{value:0}},
-      /* gl_Position は three.js の標準シェーダと完全に同じ式で出す。
-         projectionMatrix*viewMatrix*modelMatrix と書くと掛ける順序が変わり、
-         浮動小数の丸めの違いで本描画と深度値がわずかにズレる。同じ面を
-         描いているのに深度テストへ落ちるフラグメントが出て、帯が虫食いになる。
-         ワールドYは深度と無関係なので、こちらだけ modelMatrix から別に取る。 */
-      vertexShader:`varying float vWorldY;
-        void main(){vWorldY=(modelMatrix*vec4(position,1.0)).y;
-          gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
-      /* mod で等間隔の帯を無限に作り、uSpan の窓で10本ぶんだけ切り出す。
-         面が傾いているほど同じ帯幅が画面上では細く見えるので、
-         鼻筋や鎖骨では線が締まり、平らな面では広がる。 */
-      fragmentShader:`precision mediump float;varying float vWorldY;
+    /* 帯が虫食いになる件の観測用。原因の候補が2つあり、どちらも実機でしか
+       確かめられないので、順に切り替えられるようにしておく。
+       1) 深度テスト — 本描画と同じ面を2回描くので、深度値が一致しないと落ちる
+       2) フラグメントの精度 — iOSのmediumpは真の16bit半精度。ワールドY(約1.5)の
+          1目盛りが約0.001mで、帯の厚み0.012mを12段階しか表せない。
+          そこへ mod(y,0.05) の引き算が入ると精度がさらに落ちる。
+          PCではmediumpがhighpへ昇格されることが多く、スマホだけで出る説明もつく
+       ?diag=contour のときだけ表示が出て、タップで巡回する。既定(0)は現状のまま。 */
+    const CONTOUR_DIAG_MODES=Object.freeze([
+      '0: 既定 mediump + 深度テスト有効',
+      '1: highp + 深度テスト有効',
+      '2: mediump + 深度テスト無効',
+      '3: highp + 深度テスト無効'
+    ]);
+    let CONTOUR_DIAG_MODE=0;
+    const contourFragment=precision=>`precision ${precision} float;varying float vWorldY;
         uniform vec3 uColor;uniform float uScanY,uGap,uSpan,uThick,uLevel;
         void main(){
           float d=abs(mod(vWorldY-uScanY,uGap)-uGap*.5);
@@ -8505,8 +8529,29 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
           float a=uLevel*band*win;
           if(a<.002)discard;
           gl_FragColor=vec4(uColor,a);
-        }`
+        }`;
+    const contourMat=new THREE.ShaderMaterial({
+      transparent:true,depthWrite:false,depthTest:true,blending:THREE.AdditiveBlending,
+      uniforms:{uColor:{value:new THREE.Color('#9ff0c4')},uScanY:{value:0},
+        uGap:{value:.05},uSpan:{value:.5},uThick:{value:.012},uLevel:{value:0}},
+      /* gl_Position は three.js の標準シェーダと完全に同じ式で出す。
+         projectionMatrix*viewMatrix*modelMatrix と書くと掛ける順序が変わり、
+         浮動小数の丸めの違いで本描画と深度値がわずかにズレうる。
+         ワールドYは深度と無関係なので、こちらだけ modelMatrix から別に取る。 */
+      vertexShader:`varying float vWorldY;
+        void main(){vWorldY=(modelMatrix*vec4(position,1.0)).y;
+          gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
+      /* mod で等間隔の帯を無限に作り、uSpan の窓で10本ぶんだけ切り出す。
+         面が傾いているほど同じ帯幅が画面上では細く見えるので、
+         鼻筋や鎖骨では線が締まり、平らな面では広がる。 */
+      fragmentShader:contourFragment('mediump')
     });
+    function applyContourDiagMode(){
+      const highp=CONTOUR_DIAG_MODE===1||CONTOUR_DIAG_MODE===3;
+      contourMat.fragmentShader=contourFragment(highp?'highp':'mediump');
+      contourMat.depthTest=CONTOUR_DIAG_MODE<2;
+      contourMat.needsUpdate=true;
+    }
     // 走査の上下端。被写体の占有体積は shadowCasterBoxes が既に持っている
     // （手続き型マネキンの固定Boundsもここが面倒を見ている）。
     const _contourBox=new THREE.Box3();
@@ -8616,7 +8661,10 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       setClock(t){clock=t;updateScene(t)},setBody:(id)=>setBody(id),getBodyId:()=>bodyId,BODIES,validateLowPolyModel,camera,CAMERA_PRESETS,
       stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,moveCameraAroundSubject,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,getSubjectDistance:subjectDistanceMeters,syncMapShootingMarker,moveMapShootingPosition,rotateMapShootingYaw,updateVenueCutaway,faceExposureOf,selectRenderLights,applyExposureCompareTarget,resetExposureCompareBaseline,getExposureCompare:()=>({target:exposureCompareTarget,baseline:exposureCompareBaseline?{...exposureCompareBaseline}:null,expo:{...expo}}),applyToneMapMode,getToneMapMode:()=>toneMapMode,highlightWarning:{sample:()=>sampleSubjectHighlights(performance.now(),true),get:()=>({...highlightReading}),classify:classifyHighlightPixels},
       timeline:{capture:captureTimelineStep,add:addTimelineStep,start:startTimeline,stop:stopTimeline,advance:advanceTimeline,setBpm:setTimelineBpm,sanitize:sanitizeTimelineStep},
-      maxAnisotropy:()=>MAX_ANISOTROPY,diagSpeckle,diagMic,diagPerf,
+      maxAnisotropy:()=>MAX_ANISOTROPY,diagSpeckle,diagMic,diagPerf,diagContour,
+      contourDiag:{get mode(){return CONTOUR_DIAG_MODE},MODES:CONTOUR_DIAG_MODES,
+        set(i){CONTOUR_DIAG_MODE=((i|0)%CONTOUR_DIAG_MODES.length+CONTOUR_DIAG_MODES.length)%CONTOUR_DIAG_MODES.length;
+          applyContourDiagMode();if(diagContour)diagContour.draw();refresh();return CONTOUR_DIAG_MODE}},
       backlight:{roleOf:backlightRoleOf,aimOf,beamEndOf,
         scatterOf:i=>gear[i].beamMat.uniforms.uScatter.value,coreOf:i=>gear[i].coreMat.color.clone(),poolOf:i=>gear[i].poolMat.color.clone(),poolVisible:i=>gear[i].pool.visible},
       outputGain:{gainOf:outputGainOf,scatterGainOf,MAX:OUTPUT_GAIN_MAX},
