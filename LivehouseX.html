@@ -477,7 +477,8 @@
           <div class="slider"><div><span>走査速度</span><strong id="v-humanContourSpeed">1.0 往復/秒</strong></div><input type="range" id="humanContourSpeed" min="0" max="4" step="0.1" value="1.0" /></div>
           <div class="slider"><div><span>線の間隔</span><strong id="v-humanContourGap">5cm</strong></div><input type="range" id="humanContourGap" min="0.02" max="0.20" step="0.005" value="0.05" /></div>
           <div class="slider"><div><span>色</span><strong id="v-humanContourColor">#9ff0c4</strong></div><input type="color" id="humanContourColor" value="#9ff0c4" /></div>
-          <div class="hint">被写体の表面だけに、床と水平な等高線を出して上下に走査します。空中には線を出さず、体の凹凸にだけ乗るのでCTスキャンのように見えます。鼻筋や鎖骨のような傾いた面では線が細く濃く、平らな面では広く薄く出ます。<br>※この段階では等高線のみ。空中の薄板とシャッター速度への連動は未実装です。</div>
+          <div class="label" style="margin-top:8px"><span>シャッターとの関係</span><small id="v-humanContourShutter">—</small></div>
+          <div class="hint">被写体の表面だけに、床と水平な等高線を出して上下に走査します。空中には線を出さず、体の凹凸にだけ乗るのでCTスキャンのように見えます。鼻筋や鎖骨のような傾いた面では線が細く濃く、平らな面では広く薄く出ます。<br><strong>シャッター速度で太さが変わります。</strong>露光している間も走査は進むので、遅いシャッターほど帯はその距離ぶん太ります。1往復/秒なら 1/125 あたりで線が分かれ、1/60 より遅いと全部つながって1枚の面になります。「0.1秒なぞる光」を線として捉えるには速いシャッターが要る、ということです。</div>
         </details></section>
         <section class="section"><details class="sec" data-sec="sec13"><summary class="label"><span>被写体スポット</span><small>FOLLOW SPOT</small></summary>
           <button class="mode" id="subjectSpotToggle" type="button" style="width:100%">● 被写体スポット</button>
@@ -7750,6 +7751,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       q('#humanContourSpeed').value=board.humanContour.speed;q('#v-humanContourSpeed').textContent=board.humanContour.speed.toFixed(1)+' 往復/秒';
       q('#humanContourGap').value=board.humanContour.gap;q('#v-humanContourGap').textContent=Math.round(board.humanContour.gap*100)+'cm';
       q('#humanContourColor').value=board.humanContour.color;q('#v-humanContourColor').textContent=board.humanContour.color;
+      if(!board.humanContour.on)syncContourShutterReadout(null);
       q('#laserSheetMode').value=board.laserSheet.mode;q('#v-laserSheetMode').textContent=LASER_MODE_LABEL[board.laserSheet.mode]||'固定';
       q('#laserSheetSpeed').value=board.laserSheet.speed;q('#v-laserSheetSpeed').textContent=board.laserSheet.speed.toFixed(1);
       q('#laserSheetColor').value=board.laserSheet.color;q('#v-laserSheetColor').textContent=board.laserSheet.color;
@@ -7932,7 +7934,10 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     q('#laserSheetColor').oninput=e=>{board.laserSheet.color=e.target.value;q('#v-laserSheetColor').textContent=board.laserSheet.color;saveSettings();refresh()};
     q('#redMeshColor').oninput=e=>{board.redMesh.color=e.target.value;q('#v-redMeshColor').textContent=board.redMesh.color;saveSettings();refresh()};
     q('#humanContourToggle').onclick=()=>{board.humanContour.on=!board.humanContour.on;
-      setToggle('humanContourToggle',board.humanContour.on,'人体等高線スキャン');saveSettings();refresh()};
+      setToggle('humanContourToggle',board.humanContour.on,'人体等高線スキャン');
+      // OFFにすると renderSubjectContour が走らないので、ここで戻す
+      if(!board.humanContour.on)syncContourShutterReadout(null);
+      saveSettings();refresh()};
     q('#humanContourLevel').oninput=e=>{board.humanContour.level=Math.round(+e.target.value);q('#v-humanContourLevel').textContent=board.humanContour.level+'%';saveSettings();refresh()};
     q('#humanContourSpeed').oninput=e=>{board.humanContour.speed=+e.target.value;q('#v-humanContourSpeed').textContent=board.humanContour.speed.toFixed(1)+' 往復/秒';saveSettings();refresh()};
     q('#humanContourGap').oninput=e=>{board.humanContour.gap=+e.target.value;q('#v-humanContourGap').textContent=Math.round(board.humanContour.gap*100)+'cm';saveSettings();refresh()};
@@ -8590,6 +8595,36 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       const tri=ph<.5?ph*2:2-ph*2;          // 三角波。往復の折り返しで止まらない
       return range.min+(range.max-range.min)*tri;
     }
+    /* 走査が1秒間に進む距離[m/s]。三角波なので1往復で高さの2倍を走る。 */
+    function contourTravelSpeed(range){
+      return (range.max-range.min)*2*Math.max(0,Number(board.humanContour.speed)||0);
+    }
+    /* 露光している間も走査は進むので、1枚の写真の中で帯はその距離ぶん太る。
+       これが実機のカメラで「遅いシャッターだと光跡が伸びる」ことの正体で、
+       このアプリにはポストプロセスが無いぶん、ぼかしではなく帯の幅として作る。
+       帯幅が線の間隔を超えると全部つながって1枚の面になる。そこから先は
+       何も変わらないので間隔で頭打ちにする。 */
+    function contourBandThickness(range){
+      const hc=board.humanContour;
+      const base=Math.max(.002,Number(hc.thickness)||.012);
+      const gap=Math.max(.01,Number(hc.gap)||.05);
+      const smear=contourTravelSpeed(range)*Math.max(0,Number(expo.shutter)||0);
+      return {thickness:Math.min(base+smear,gap),smear,gap,merged:base+smear>=gap};
+    }
+    // シャッターを動かした結果が数字で見えるようにする。毎フレーム呼ばれるので、
+    // 文字列が変わったときだけDOMへ書く。
+    let _contourReadout='';
+    function syncContourShutterReadout(range){
+      const el=document.querySelector('#v-humanContourShutter');if(!el)return;
+      let text;
+      if(!board.humanContour.on||!range)text='—';
+      else{
+        const b=contourBandThickness(range),den=Math.round(1/Math.max(expo.shutter,1e-9));
+        text='1/'+den+' で帯 '+(b.thickness*100).toFixed(1)+'cm'
+          +(b.merged?'（間隔を超えて1枚の面）':'（線が分かれる）');
+      }
+      if(text!==_contourReadout){_contourReadout=text;el.textContent=text}
+    }
     // 通常描画のあとに加算で重ねる。autoClear を切らないと本描画を消してしまう。
     function renderSubjectContour(t){
       const hc=board.humanContour;
@@ -8604,8 +8639,9 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       u.uScanY.value=contourScanY(t,range);
       u.uGap.value=Math.max(.01,Number(hc.gap)||.05);
       u.uSpan.value=Math.max(u.uGap.value*2,Number(hc.span)||.5);
-      u.uThick.value=Math.max(.002,Number(hc.thickness)||.012);
+      u.uThick.value=contourBandThickness(range).thickness;
       u.uLevel.value=level;
+      syncContourShutterReadout(range);
       u.uColor.value.set(/^#[0-9a-f]{6}$/i.test(String(hc.color||''))?hc.color:'#9ff0c4').multiply(WB_GAIN);
       const prevMask=camera.layers.mask,prevOverride=scene.overrideMaterial,
             prevBg=scene.background,prevFog=scene.fog,prevAutoClear=renderer.autoClear;
