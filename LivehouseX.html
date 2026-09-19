@@ -4653,6 +4653,17 @@
         btn.textContent=(on?'● ':'○ ')+'設置角を調整';}
     }
     const REF_DIST=3, FIX_LUX={par:36,moving:70,side:25,uplight:15};
+    /* 等高線が顔を覆い尽くしたときの照度[lx]。PAR灯1台を基準距離から当てたぶんを錨にする。
+       measure は contourFaceLux()。const なので、refresh() → updateScene → contourFaceLux の
+       経路より前に初期化されている必要があり、錨である FIX_LUX の隣に置く。 */
+    const CONTOUR_FACE_LUX=FIX_LUX.par;
+    /* 走査の上下端の作業用。被写体の占有体積は shadowCasterBoxes が既に持っている
+       （手続き型マネキンの固定Boundsもここが面倒を見ている）。
+       subjectScanRange() は以前 renderSubjectContour（loop から）だけが呼んでいたが、
+       測光からも呼ぶようになったので module 評価中に触られる。宣言が後ろにあると
+       refresh() → updateScene → contourFaceLux → subjectScanRange で TDZ になり、
+       起動時に画面が真っ黒になる（8ff457f と同じ型）。ここへ上げておく。 */
+    const _contourBox=new THREE.Box3();
     /* 出力ゲイン — 灯体そのものの光度を段数で持ち上げる。
        実測（ISO3200/F2.8/1/500・明るさ100）での適正までの不足段数は
        ムービング1灯 4.2段 / ムービング4灯 1.5段 / 全30灯 0.9段 / 全30灯+スポット 0段。
@@ -5473,6 +5484,8 @@
       const lines=[];
       if(meter&&Number.isFinite(meter.direct)&&Number.isFinite(meter.bounce))
         lines.push('直接光 '+Math.round(meter.direct)+' lx ／ 回り込み '+Math.round(meter.bounce)+' lx');
+      // 演出ぶんは黙って数字を動かさない。寄与しているときだけ内訳へ出す。
+      if(meter&&meter.contour>0)lines.push('うち等高線 '+Math.round(meter.contour)+' lx');
       const fl=GROUPS.front().reduce((s,i)=>s+luxOf(i,t),0),
             bl=GROUPS.back().reduce((s,i)=>s+luxOf(i,t),0);
       lines.push('フロント:バック = '+(
@@ -7471,8 +7484,19 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       const followLux=frame.subjectSpot.lux,faceFillLux=frame.faceFill.lux;
       updateSubjectSpot(t,followLux);updateBlinders(t,frame.blinder.level);
       const meter=faceExposureOf(contrib),hazeOn=board.smoke&&!board.blackout;
+      /* 演出のうち被写体に当たるのは等高線だけ（赤レーザーは redMeshLiftOverSubject、
+         光の雨は円筒で、どちらもコードが被写体を避けている）。contrib へ擬似灯体を
+         push すると RIG[c.i] を引く4箇所が壊れるので、被写体スポットやフェイスフィルと
+         同じく meter へあとから足す。
+         被写体スポット／フェイスフィルは P0 で露出から外してあるが、等高線は撮影者が
+         選ぶ演出なので、ここ（meterForExposure のスナップショットより前）で足して
+         露出計にも入れる。これが無いと、顔が光っているのに「アンダー」のままになる。
+         stage（舞台総照度）へは足さない ― 会場ではなく被写体の上だけを光らせるので、
+         足すと接地影や大気の色まで動いて嘘をつく。 */
+      meter.contour=contourFaceLux(t);
+      if(meter.contour>0){meter.direct+=meter.contour;meter.lux=meter.direct+meter.bounce}
       // P0: 露出用メーターは被写体スポット・フェイスフィルを含めない
-      const meterForExposure={direct:meter.direct, bounce:meter.bounce, lux:meter.lux, stage:meter.stage};
+      const meterForExposure={direct:meter.direct, bounce:meter.bounce, lux:meter.lux, stage:meter.stage, contour:meter.contour};
       if(followLux>0||faceFillLux>0){
         _meterNormal.copy(camera.position).sub(SUBJECT);if(_meterNormal.lengthSq()<1e-6)_meterNormal.set(0,.15,1);
         _meterNormal.normalize();_meterNormal.y+=.16;_meterNormal.normalize();
@@ -9252,9 +9276,6 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
        sampleSubjectHighlights(5645付近)と同じ「被写体だけを描く追加パス」を
        使うので、GLBのマテリアルには一切触らない。
        ====================================================================== */
-    // 走査の上下端。被写体の占有体積は shadowCasterBoxes が既に持っている
-    // （手続き型マネキンの固定Boundsもここが面倒を見ている）。
-    const _contourBox=new THREE.Box3();
     function subjectScanRange(){
       const main=shadowCasterBoxes().find(e=>e.kind==='main');
       if(!main)return null;
@@ -9292,13 +9313,47 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       return {thickness:Math.min(base+smear,gap),smear,gap,ratio,merged:base+smear>=gap};
     }
     // 通常描画のあとに加算で重ねる。autoClear を切らないと本描画を消してしまう。
+    /* 描いているかどうかの判定は、描画と測光で必ず同じものを使う。
+       ずれると「光っていないのに露出計が反応する」ことになる。0 なら描かない。 */
+    function contourDrawLevel(){
+      const hc=board.humanContour;
+      if(!hc.on||board.blackout||cameraMode==='map')return 0;
+      if(!model||!model.visible)return 0;
+      if(isExternalSubject()&&!model.userData?.externalSubject)return 0;
+      const level=THREE.MathUtils.clamp((Number(hc.level)||0)/100,0,1);
+      return level<=.002?0:level;
+    }
+    /* 等高線が顔へ与える照度[lx]。被写体の表面に直接描くので、外から当たる光の
+       ような入射角は無く、そのまま direct へ足す。
+       断片シェーダは a = uLevel*band*win。顔は高さ方向に何本も帯をまたぐので、
+       band は1周期の平均を使う。win だけは顔の高さでそのまま評価する。 */
+    /* band=1-smoothstep(thick*.5,thick,d) の1周期平均。d は 0〜gap/2 に一様。
+       smoothstep の区間 [thick/2, thick] がその範囲に収まるときは
+       .75*thick/(gap/2) = 1.5*thick/gap になるが、シャッターが遅いと thick は
+       gap まで伸びて区間が範囲からはみ出す（数値積分と1.9%ずれた）。
+       ∫(1-smoothstep) を t-t³+t⁴/2 で閉じた形にして、切れる分も入れて厳密に出す。 */
+    function contourDuty(thick,gap){
+      const h=gap*.5,a=thick*.5,w=thick-a;
+      if(a>=h)return 1;
+      const t=w>1e-9?THREE.MathUtils.clamp((Math.min(thick,h)-a)/w,0,1):0;
+      return Math.min((a+w*(t-t*t*t+t*t*t*t*.5))/h,1);
+    }
+    function contourFaceLux(t){
+      const level=contourDrawLevel();
+      if(!level)return 0;
+      const range=subjectScanRange();
+      if(!range||!(range.max>range.min))return 0;
+      const hc=board.humanContour;
+      const gap=Math.max(.01,Number(hc.gap)||.05);
+      const span=Math.max(gap*2,Number(hc.span)||.5);
+      const duty=contourDuty(contourBandThickness(range).thickness,gap);
+      const win=1-THREE.MathUtils.smoothstep(Math.abs(SUBJECT.y-contourScanY(t,range)),span*.5,span*.6);
+      return CONTOUR_FACE_LUX*level*duty*win;
+    }
     function renderSubjectContour(t){
       const hc=board.humanContour;
-      if(!hc.on||board.blackout||cameraMode==='map')return false;
-      if(!model||!model.visible)return false;
-      if(isExternalSubject()&&!model.userData?.externalSubject)return false;
-      const level=THREE.MathUtils.clamp((Number(hc.level)||0)/100,0,1);
-      if(level<=.002)return false;
+      const level=contourDrawLevel();
+      if(!level)return false;
       const range=subjectScanRange();
       if(!range||!(range.max>range.min))return false;
       const u=contourMat.uniforms;
