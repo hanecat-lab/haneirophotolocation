@@ -8912,7 +8912,12 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         +'white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid rgba(159,240,196,.45);border-radius:6px;'
         +'pointer-events:none';
       document.body.append(el);
-      let frames=0,fpsAt=0,fps=0,lastDraw=0,prev=0,worst=0,worstShown=0;
+      let frames=0,fpsAt=0,fps=0,lastDraw=0,prev=0,stalls=0,stallMs=0;
+      /* バックグラウンド・スリープ・スクリーンショットによる中断は描画負荷ではない。
+         混ぜると平均が壊れる。実機で 120枚の平均が 397.88ms（中央は 40.00ms）と出たが、
+         合計から逆算すると1枚だけ40.8秒以上のフレームが入っていた計算になる。
+         24fps でも1枚 41ms なので、1秒は 24倍の余裕がある。 */
+      const DT_STALL=1000;
       /* fps の逆数を「平均」と呼んでいたが、fps は整数へ丸めた値なので
          22fps 付近では1目盛り 1.98ms あり、それ未満の差は原理的に見えなかった。
          直近フレームの実測 dt を貯めて、平均と中央値をそのまま出す。
@@ -8949,7 +8954,9 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         tick(now){
           shot.calls=acc.calls;shot.triangles=acc.triangles;shot.points=acc.points;shot.lines=acc.lines;
           acc.calls=acc.triangles=acc.points=acc.lines=0;
-          if(prev){const dt=now-prev;if(dt>worst)worst=dt;
+          if(prev){const dt=now-prev;
+            if(dt>DT_STALL){stalls++;stallMs+=dt}
+            else{
             dtBuf[dtAt]=dt;dtAt=(dtAt+1)%DT_WINDOW;if(dtN<DT_WINDOW)dtN++;
             if(AB){
               const pos=abFrame%AB_PHASE,phase=(Math.floor(abFrame/AB_PHASE)%2);
@@ -8967,12 +8974,12 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
                 }
               }
             }
+            }
           }
           prev=now;
           if(!fpsAt)fpsAt=now;
           frames++;
-          // 平均fpsだけでは間欠的な引っかかりが見えないので、1秒ごとの最悪フレームも出す
-          if(now-fpsAt>=1000){fps=Math.round(frames*1000/(now-fpsAt));frames=0;fpsAt=now;worstShown=worst;worst=0}
+          if(now-fpsAt>=1000){fps=Math.round(frames*1000/(now-fpsAt));frames=0;fpsAt=now}
           if(lastDraw&&now-lastDraw<500)return;
           lastDraw=now;
           const m=renderer.info.memory,dpr=renderer.getPixelRatio();
@@ -8982,16 +8989,23 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
           const shadowLights=spots.filter(l=>l.castShadow).length;
           /* 目標は 25fps = 40.0ms。スマホは全OFFで既に32.3ms使っており
              余裕がほとんど無いので、超過を一目で分かるようにする。 */
-          let avg=1000/Math.max(fps,1),mid=avg;
+          /* 最悪も平均・中央と同じ 120枚窓の最大にする。以前は1秒ごとにリセット
+             していたので窓が違い、「最悪58.0ms なのに平均397.88ms」という
+             並べても比較できない表示になっていた。ソート済み配列の末尾で足りる。 */
+          let avg=1000/Math.max(fps,1),mid=avg,worstShown=avg;
           if(dtN){
             let sum=0;for(let i=0;i<dtN;i++){sum+=dtBuf[i];dtSorted[i]=dtBuf[i]}
             avg=sum/dtN;
             const v=dtSorted.subarray(0,dtN);v.sort();
             mid=dtN&1?v[dtN>>1]:(v[dtN/2-1]+v[dtN/2])/2;
+            worstShown=v[dtN-1];
           }
           const budget=1000/PERF_TARGET_FPS;
-          const verdict=avg<=budget?'OK 余裕 '+(budget-avg).toFixed(1)+'ms'
-                                   :'超過 '+(avg-budget).toFixed(1)+'ms';
+          /* 判定は中央値から出す。平均だと 60ms級の単発や端末側の中断1枚で
+             ひっくり返る。中央値を足したのはそのためだったのに、判定のほうを
+             切り替えていなかった（実機で「超過 357.9ms」と出た）。 */
+          const verdict=mid<=budget?'OK 余裕 '+(budget-mid).toFixed(1)+'ms'
+                                   :'超過 '+(mid-budget).toFixed(1)+'ms';
           let abLine=null;
           if(AB){
             if(abDn){
@@ -9002,7 +9016,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
             }else abLine='A/B '+AB.label+'  測定中… 卓の'+AB.label+'スイッチはA/Bが握っています';
           }
           el.textContent=[
-            fps+' fps   最悪 '+worstShown.toFixed(1)+'ms   平均 '+avg.toFixed(2)+'ms   中央 '+mid.toFixed(2)+'ms ('+dtN+'枚)',
+            fps+' fps   最悪 '+worstShown.toFixed(1)+'ms   平均 '+avg.toFixed(2)+'ms   中央 '+mid.toFixed(2)+'ms ('+dtN+'枚)'
+              +(stalls?'   停止 '+stalls+'回 '+(stallMs/1000).toFixed(1)+'秒（集計から除外）':''),
             '目標 '+PERF_TARGET_FPS+'fps ('+budget.toFixed(1)+'ms) → '+verdict,
             ...(abLine?[abLine]:[]),
             '本描画 '+shot.calls+' calls  三角形 '+shot.triangles.toLocaleString()+'  点 '+shot.points+'  線 '+shot.lines,
@@ -9012,8 +9027,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
             'スモーク    '+(board.smoke?'ON  '+SMOKE_N+'粒':'OFF'),
             '赤レーザー  '+(board.redMesh.on?'ON  '+redDrawn+'/'+RED_MESH_MAX+'本':'OFF'),
             'レーザー面  '+(board.laserSheet.on?'ON':'OFF'),
-            '等高線      '+(board.humanContour.on?'ON  '+board.humanContour.level+'%':'OFF'),
-            '光の雨      '+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒'+(photonRainClamped?'(面積で制限)':'')+'  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm  前後'+board.photonRain.tilt+'°  左右'+board.photonRain.tiltX+'°  風'+board.photonRain.wind+'%  突風'+board.photonRain.gust+'%':'OFF'),
+            '等高線      '+(AB&&AB.key==='humanContour'?'(A/B中) ':'')+(board.humanContour.on?'ON  '+board.humanContour.level+'%':'OFF'),
+            '光の雨      '+(AB&&AB.key==='photonRain'?'(A/B中) ':'')+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒'+(photonRainClamped?'(面積で制限)':'')+'  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm  前後'+board.photonRain.tilt+'°  左右'+board.photonRain.tiltX+'°  風'+board.photonRain.wind+'%  突風'+board.photonRain.gust+'%':'OFF'),
             '実光源 '+realLights+'灯 / 影 '+shadowLights+'灯 ('+board.shadow.mode+')',
             '出力ゲイン '+board.outputGain.toFixed(1)+'段   被写体 '+bodyId
           ].join('\n');
