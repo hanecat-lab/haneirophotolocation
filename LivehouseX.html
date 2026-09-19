@@ -6263,23 +6263,49 @@
         uniform vec4 uSubject;
         uniform float uTilt;        // 進行方向。0=真下、正=客席(+Z)、負=奥(-Z)[rad]
         uniform float uWind;        // 風 0..1
+        const float TURB_AMP=.25;   // 乱流の強さ（風の強さに対する割合）
+        const float TURB_FLOOR=.15; // 傾き0°でも風が少しは効くようにする下駄
+        const float TURB_K=.25;     // 渦のスケール。0.25≒周期4m
         varying vec2 vC;
         float h(float n){return fract(sin(n*12.9898)*43758.5453);}
+        /* 2Dバリューノイズ。乱流は空間的に相関している（隣り合う空気は一緒に動く）。
+           粒ごとに独立な乱数は相関長ゼロの白色雑音で、自然界には存在しない。
+           それが「乱数を並べた」感の正体だった。 */
+        float vnoise(vec2 p){
+          vec2 i=floor(p), f=fract(p);
+          f=f*f*(3.-2.*f);
+          float a=h(i.x+i.y*57.),b=h(i.x+1.+i.y*57.),c=h(i.x+(i.y+1.)*57.),d=h(i.x+1.+(i.y+1.)*57.);
+          return mix(mix(a,b,f.x),mix(c,d,f.x),f.y)*2.-1.;
+        }
         void main(){
           vC=position.xy;
           float x=mix(-uAreaX,uAreaX,h(aSeed));
           float z0=mix(uZ0,uZ1,h(aSeed+7.1));
           // x は下で風のぶん巻き戻すので再代入する
           float y0=h(aSeed+13.7)*uHeight;
-          // 粒ごとに速さを散らす。同じ高さに揃って落ちると簾に見える
-          float sp=uSpeed*(.7+.6*h(aSeed+19.3));
-          /* 風その1 — 粒ごとの向きのばらつき。時間で変えないのが要点。
-             位置は uTime*sp*dir という「ずっと同じ向きで来た」式で出しているので、
-             向きを時間変化させると過去の軌跡ごと毎フレーム書き換わり、粒が飛ぶ。
-             ばらつきは粒ごとに固定し、時間変化は下の突風（位置の揺れ）が受け持つ。 */
-          float th=clamp(uTilt+uWind*.35*(h(aSeed+41.7)*2.-1.),-1.5359,1.5359);  // ±88°
-          float az=uWind*.9*(h(aSeed+53.1)*2.-1.);
-          vec3 dirP=vec3(sin(th)*sin(az),-cos(th),sin(th)*cos(az));
+          /* 向きは極座標ではなく「風ベクトル」で組む。
+             旧版は鉛直からの角度 th と方位 az で作っていたが、th の符号が反転すると
+             sin(th) も反転して水平成分が180°ひっくり返る。th は uTilt を中心に
+             対称なので、傾き0°では粒がきれいに半々へ割れ、交差した格子になっていた
+             （4000粒で水平360°、傾きを付けても103°の扇）。あれは雨ではなく噴霧。
+
+             水平成分を「全粒共通の W」＋「小さな乱流」にすると、W の符号が共通なので
+             構造的に交差しない。おまけに物理が正しくなる: 実際の雨滴は粒径で終端速度が
+             変わり、tan(傾き)=風速/落下速度 なので、軽い粒ほど大きく流される。
+             ただし全部が同じ側へ傾く。 */
+          float kf=.7+.6*h(aSeed+19.3);      // 粒ごとの落下速度（粒径の違い）
+          float W=tan(uTilt);                 // 水平/垂直の比。全粒に共通
+          /* 粒径による傾きの違いは風の量で効かせる。風0%では kfDir=1 に揃うので
+             向きが進行方向と厳密に一致する（「風0%＝全部そろう」を守る）。 */
+          float kfDir=mix(1.,kf,uWind);
+          /* 乱流の強さは風の強さに比例させる。風向きの無いところに乱流は無い。
+             絶対値で乗せると、傾き0°のときに左右へ割れて交差の原因になる。
+             TURB_FLOOR は傾き0°でも風スライダーが少しは効くようにする下駄。 */
+          vec2 nq=vec2(x,z0)*TURB_K;
+          float ts=uWind*TURB_AMP*(TURB_FLOOR+abs(W));
+          vec2 turb=ts*vec2(vnoise(nq),vnoise(nq+31.7));
+          vec3 dirP=normalize(vec3(turb.x,-kfDir,W+turb.y));
+          float sp=uSpeed*kf;                 // 速さは落下速度スライダー×粒径
           /* 再利用は箱の各軸で別々に巻き戻す。傾けるとZにも、風で散ればXにも
              進み続けるので、Yだけを mod していた旧版では粒が飛び去って戻らない。
              速度は dirP*sp で一定なので、粒の軌跡は箱の中では常に直線になる。
@@ -6309,7 +6335,8 @@
           float sl=length(side);
           side=sl>1e-3?side/sl:camRight;
           // 尾は進行方向の逆へ伸ばす。真下のときは旧版と同じく鉛直上向きになる
-          vec3 w=p+side*(position.x*uWidth)-dirS*(position.y*uStreak);
+          // 筋はその粒の速度×露光時間。kf の平均は1なので塗り面積の予算は変わらない
+          vec3 w=p+side*(position.x*uWidth)-dirS*(position.y*uStreak*kf);
           gl_Position=projectionMatrix*viewMatrix*vec4(w,1.0);
         }`,
       fragmentShader:`precision mediump float;
