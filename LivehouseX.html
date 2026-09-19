@@ -489,6 +489,7 @@
           <div class="slider"><div><span>前後の傾き</span><strong id="v-photonRainTilt">0° 真下</strong></div><input type="range" id="photonRainTilt" min="-75" max="75" step="1" value="0" /></div>
           <div class="slider"><div><span>左右の傾き</span><strong id="v-photonRainTiltX">0° 真下</strong></div><input type="range" id="photonRainTiltX" min="-75" max="75" step="1" value="0" /></div>
           <div class="slider"><div><span>風</span><strong id="v-photonRainWind">35% ばらつく</strong></div><input type="range" id="photonRainWind" min="0" max="100" step="1" value="35" /></div>
+          <div class="slider"><div><span>突風</span><strong id="v-photonRainGust">50% 20秒に1回・はっきり</strong></div><input type="range" id="photonRainGust" min="0" max="100" step="1" value="50" /></div>
           <div class="slider"><div><span>降る範囲</span><strong id="v-photonRainSpread">60%</strong></div><input type="range" id="photonRainSpread" min="10" max="100" step="1" value="60" /></div>
           <div class="slider"><div><span>色</span><strong id="v-photonRainColor">#bfe1ff</strong></div><input type="color" id="photonRainColor" value="#bfe1ff" /></div>
           <div class="label" style="margin-top:8px"><span>シャッターとの関係</span><small id="v-photonRainShutter">—</small></div>
@@ -4724,7 +4725,7 @@
       humanContour:{on:false,level:60,gap:.05,span:.50,speed:1.0,thickness:.25,color:'#9ff0c4'},
       // PHOTON RAIN — 落ちる光の粒。筋の長さはシャッター速度で決まる。
       // 粒数は実測で決めるので、まずは少数から。
-      photonRain:{on:false,level:55,density:33,speed:8,tilt:0,tiltX:0,wind:35,spread:60,color:'#bfe1ff'},
+      photonRain:{on:false,level:55,density:33,speed:8,tilt:0,tiltX:0,wind:35,gust:50,spread:60,color:'#bfe1ff'},
       beamOrbit:{mode:'fixed',width:100},
       backlight:{on:false,level:70},
       beamZoom:{mode:'fixed',width:100,depth:60},
@@ -6257,13 +6258,14 @@
         uSpeed:{value:8},uHeight:{value:PHOTON_RAIN_H},uAreaX:{value:PHOTON_RAIN_AREA_X},
         uZ0:{value:PHOTON_RAIN_Z0},uZ1:{value:PHOTON_RAIN_Z1},
         uStreak:{value:.02},uWidth:{value:PHOTON_RAIN_WIDTH},uSubject:{value:new THREE.Vector4(0,0,0,.5)},
-        uWind2:{value:new THREE.Vector2(0,0)},uWind:{value:.35}},
+        uWind2:{value:new THREE.Vector2(0,0)},uWind:{value:.35},uGust:{value:.40}},
       vertexShader:`precision highp float;
         attribute float aSeed;
         uniform float uTime,uSpeed,uHeight,uAreaX,uZ0,uZ1,uStreak,uWidth;
         uniform vec4 uSubject;
         uniform vec2 uWind2;        // 傾きの水平成分[水平/垂直の比]。x=左右、y=前後
         uniform float uWind;        // 風 0..1
+        uniform float uGust;        // 突風イベントのピーク時の傾き[水平/垂直の比]
         /* 定数は node で掃引して決めた。
            乱流は粒ごとに静的なので格子化のリスクがあり、円錐角を4.0°に抑えて
            空間相関を上げた（0.5m以内 0.28° に対し 6m超 4.07°＝14.6倍）。
@@ -6278,13 +6280,21 @@
         const float GUST_WS=.35;    // うねりの時間項[rad/s]
         const float GUST_AMP_S=.062;// うねりの振幅[m]
         const float GUST_Q=.73;     // 2軸目の時間項の比。1に近いほど往復へ戻る
-        /* 空間の固定点で見ると、正弦の和は純音の和でしかない。画面のどの場所も
-           5.71 / 7.82 / 17.95 / 24.59秒の4本だけで動いていて、それが「同じ周期で
-           うねる」の正体だった。位相を値ノイズで変調して固定周期を壊す。
-           うねり側は半分にする（変調が位相速度に足す最大量 PM_AMP*PM_W*2.87=0.517
-           が うねりの ω=0.350 を超えると波が逆走するため）。 */
-        const float PM_W=.06;       // 位相の乱れの時間スケール。1ノード≒16.7秒
-        const float PM_AMP=3.0;     // 位相の乱れの振幅[rad]。周波数が±47%揺れる
+        /* 突風イベント。連続なノイズをいくら足しても「ある一定のリズム」からは
+           抜けられない（位相変調を入れたが、10秒窓の自己相関は 0.298→0.341 と
+           むしろ悪化した。位相変調した正弦は局所的には依然として正弦で、
+           1ノード16.7秒では10秒の間に周波数がほとんど変わらない）。
+           断続性（intermittency）へ切り替える。|ノイズ| が閾値を超えたときだけ
+           吹き、符号で順・逆が決まる。掃引で 周期20.1秒 / 1回2.9秒 / 15% に合わせた。 */
+        const float EV_W=.22;       // イベントノイズの時間スケール
+        const float EV_TH=.72;      // 閾値。高いほど稀で短い
+        const float EV_TURB=.8;     // イベント中の乱流の増し分（最大1.8倍）
+        /* ピーク速度比がちょうど uGust になるよう正規化する。
+           解析的な上限 1.5*2.87*EV_W/(1-EV_TH)=3.38 は到達しない ―
+           6u(1-u) の最大は u=0.5 で、そこは |e.x| が閾値と1の中間。一方
+           |e.y| が最大になるのはノードの中点で、そこは e.x が中点値。両立しない。
+           4000秒ぶんの総当たりで測った実測の最大 1.8984 の逆数を使う。 */
+        const float EV_NORM=.5268;
         /* 風向きのゆらぎ。遅く・全体で揃っていて・非周期。変位≒速度÷周波数なので
            30秒周期の横流れは位置が十数m動くが、mod の内側に入れれば巻き戻しが
            吸収して箱から出ない。一様乱数場の平行移動は見えないので、見えるのは
@@ -6357,10 +6367,22 @@
           vec2 dn1=n1(td), dn2=n1(td+37.4);
           vec2 driftPos=uWind*uSpeed*(DR_TAN/DR_W)*vec2(dn1.x,dn2.x);
           vec2 driftVel=uWind*uSpeed* DR_TAN      *vec2(dn1.y,dn2.y);
+          /* 突風イベント。6u(1-u) は u=0 と u=1 でちょうど0になるので、
+             クランプの外で分岐する必要がない。|e.x| の微分で sign が二重に
+             掛かって消えるため、denv に sign は現れない。 */
+          vec2 e=n1(uTime*EV_W);
+          float u=clamp((abs(e.x)-EV_TH)/(1.-EV_TH),0.,1.);
+          float env =sign(e.x)*u*u*(3.-2.*u);
+          float denv=6.*u*(1.-u)/(1.-EV_TH)*e.y*EV_W;
+          float bA=uWind*uGust*uSpeed*EV_NORM;
+          vec2 burstPos=bA*env *wpar;   // 傾きの向きに沿って順・逆が交互に来る
+          vec2 burstVel=bA*denv*wpar;
+          float boost =1.+EV_TURB*abs(env);          // イベント中は乱流も強まる＝「乱れる」
+          float dboost=EV_TURB*sign(env)*denv;
           float depth=uZ1-uZ0, spanX=2.*uAreaX;
           float y=mod(y0+uTime*sp*dirP.y,uHeight);
-          float z=uZ0+mod(z0-uZ0+uTime*sp*dirP.z+driftPos.y,depth);
-          x=-uAreaX+mod(x+uAreaX+uTime*sp*dirP.x+driftPos.x,spanX);
+          float z=uZ0+mod(z0-uZ0+uTime*sp*dirP.z+driftPos.y+burstPos.y,depth);
+          x=-uAreaX+mod(x+uAreaX+uTime*sp*dirP.x+driftPos.x+burstPos.x,spanX);
           /* 風その2 — 突風。位相に「粒の高さ y」を入れるのが肝。
              前版は粒ごとのランダム位相＋周期11.4秒だったが、落下20m/s では粒が
              箱を抜けるのに0.25秒しかかからず、一生の間に位相が2.2%しか進まない。
@@ -6375,24 +6397,25 @@
              速度は「振幅×波数×落下速度」なので、波数を上げて振幅を下げれば
              予算も筋の傾く量も変えずに空間変化だけ増やせる。λ20m→5m にして
              箱を約2波が横切るようにした。 */
-          vec2 pm0=n1(uTime*PM_W),      pm1=n1(uTime*PM_W+11.3);
-          vec2 pm2=n1(uTime*PM_W+23.7), pm3=n1(uTime*PM_W+31.1);
-          float ph  =GUST_K *y+GUST_W        *uTime+PM_AMP   *pm0.x+(x+z0)*.21;
-          float phB =GUST_K *y+GUST_W *GUST_Q*uTime+PM_AMP   *pm1.x+(z0-x)*.27+2.4;
-          float phS =GUST_KS*y+GUST_WS       *uTime+PM_AMP*.5*pm2.x+z0*.35+x*.20;
-          float phSB=GUST_KS*y+GUST_WS*GUST_Q*uTime+PM_AMP*.5*pm3.x+z0*.20-x*.35+1.3;
-          float ga=uWind*GUST_AMP, gaS=uWind*GUST_AMP_S;
+          float ph  =GUST_K *y+GUST_W        *uTime+(x+z0)*.21;
+          float phB =GUST_K *y+GUST_W *GUST_Q*uTime+(z0-x)*.27+2.4;
+          float phS =GUST_KS*y+GUST_WS       *uTime+z0*.35+x*.20;
+          float phSB=GUST_KS*y+GUST_WS*GUST_Q*uTime+z0*.20-x*.35+1.3;
+          float ga =uWind*GUST_AMP  *boost, dga =uWind*GUST_AMP  *dboost;
+          float gaS=uWind*GUST_AMP_S*boost, dgaS=uWind*GUST_AMP_S*dboost;
           vec2 gxz=wperp*(ga*sin(ph )+gaS*sin(phS ))
                   +wpar *(ga*sin(phB)+gaS*sin(phSB));
           /* 位相の進む速さ。位相は y と x の両方に依存するので、両方の項が要る。
              dx の項を落とすと、傾き75°（dx≈19m/s）で筋の向きが0.18ほどずれる。
              dx の係数の符号は位相の係数と必ず一致させること。z0 は粒ごとに
              定数なので項は要らない。x はドリフトのぶんも動くので dx に足す。
-             位相変調の項 PM_AMP*PM_W*pm.y も忘れずに足す。 */
-          float dy=sp*dirP.y, dx=sp*dirP.x+driftVel.x, pmv=PM_AMP*PM_W;
-          vec2 gvel=wperp*(ga*cos(ph )*(GUST_K*dy+GUST_W        +pmv   *pm0.y+.21*dx)+gaS*cos(phS )*(GUST_KS*dy+GUST_WS        +pmv*.5*pm2.y+.20*dx))
-                   +wpar *(ga*cos(phB)*(GUST_K*dy+GUST_W *GUST_Q+pmv   *pm1.y-.27*dx)+gaS*cos(phSB)*(GUST_KS*dy+GUST_WS*GUST_Q+pmv*.5*pm3.y-.35*dx));
-          gvel+=driftVel;   // 筋の向きへ反映される（dirS はここから作られる）
+             イベント中は振幅も時間変化するので、積の微分 dga*sin+ga*cos*dph になる。 */
+          float dy=sp*dirP.y, dx=sp*dirP.x+driftVel.x+burstVel.x;
+          vec2 gvel=wperp*(dga*sin(ph )+ga *cos(ph )*(GUST_K*dy+GUST_W        +.21*dx)
+                          +dgaS*sin(phS )+gaS*cos(phS )*(GUST_KS*dy+GUST_WS        +.20*dx))
+                   +wpar *(dga*sin(phB)+ga *cos(phB)*(GUST_K*dy+GUST_W *GUST_Q-.27*dx)
+                          +dgaS*sin(phSB)+gaS*cos(phSB)*(GUST_KS*dy+GUST_WS*GUST_Q-.35*dx));
+          gvel+=driftVel+burstVel;   // 筋の向きへ反映される（dirS はここから作られる）
           vec3 p=vec3(x+gxz.x,y,z+gxz.y);
           vec3 dirS=normalize(dirP*sp+vec3(gvel.x,0.,gvel.y));   // 筋は実際の速度の向きへ
           // 演者の周りは空ける。被写体は縦に立っているので、傾けても円筒のままでよい
@@ -6427,6 +6450,10 @@
     let photonRainCount=0,photonRainClamped=false;
     // 風は「揃っている⇔乱れている」が伝わればよい。角度の数字は出さない
     const photonRainWindLabel=v=>v+'% '+(v===0?'全部そろう':v<25?'わずかに乱れる':v<60?'ばらつく':v<85?'荒れる':'吹き荒れる');
+    /* 突風は「風」と違って連続ではなくイベント。頻度は一定（約20秒に1回）で、
+       スライダーは1回の強さだけを決める。頻度も書かないと風と区別できない。 */
+    const photonRainGustLabel=v=>v===0?'0% なし':v+'% 20秒に1回・'
+      +(v<25?'かすか':v<55?'はっきり':v<85?'強い':'叩きつける');
     /* 傾きは軸ごとに「どちらへ」を出す。1本のレバーで左右と前後を兼ねると
        「+121° 右おくへ」のような読み替えが要って操作しづらかったので分けた。 */
     const photonRainTiltLabel=(deg,pos,neg)=>deg===0?'0° 真下'
@@ -6467,6 +6494,9 @@
          振幅が uWind*uSwing だったため風0%で完全に死んでいたので、廃止して
          ここへ統合した。 */
       u.uWind.value=THREE.MathUtils.clamp((Number.isFinite(+pr.wind)?+pr.wind:35)/100,0,1);
+      /* 突風イベントのピーク時の傾き[水平/垂直の比]。スライダー100%で0.80。
+         定数を推測して往復するのをやめるため、実機で振れるようにしてある。 */
+      u.uGust.value=THREE.MathUtils.clamp((Number.isFinite(+pr.gust)?+pr.gust:50)/100,0,1)*.80;
       // 露光している間に粒が落ちた距離が、そのまま筋の長さになる。
       // 等高線の帯と同じ理屈で、ぼかしではなく形として作る。
       u.uStreak.value=Math.max(.004,fall*Math.max(0,Number(expo.shutter)||0));
@@ -7701,6 +7731,9 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       // 既定が 35 なので || は使えない。保存した 0 が 35 へ戻ってしまう
       const rainWind=Number(board.photonRain.wind);
       board.photonRain.wind=THREE.MathUtils.clamp(Number.isFinite(rainWind)?Math.round(rainWind):35,0,100);
+      // 既定が 50 なので || は使えない（保存した 0 が 50 へ戻る既知のバグ）
+      const rainGust=Number(board.photonRain.gust);
+      board.photonRain.gust=THREE.MathUtils.clamp(Number.isFinite(rainGust)?Math.round(rainGust):50,0,100);
       const rainTiltX=Number(board.photonRain.tiltX);
       board.photonRain.tiltX=THREE.MathUtils.clamp(Number.isFinite(rainTiltX)?Math.round(rainTiltX):0,-75,75);
       /* 旧データの移行。以前は傾き1つ＋風向き1つで、水平成分を W*(sin,cos) と
@@ -8167,6 +8200,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       q('#photonRainTilt').value=board.photonRain.tilt;q('#v-photonRainTilt').textContent=photonRainTiltZLabel(board.photonRain.tilt);
       q('#photonRainTiltX').value=board.photonRain.tiltX;q('#v-photonRainTiltX').textContent=photonRainTiltXLabel(board.photonRain.tiltX);
       q('#photonRainWind').value=board.photonRain.wind;q('#v-photonRainWind').textContent=photonRainWindLabel(board.photonRain.wind);
+      q('#photonRainGust').value=board.photonRain.gust;q('#v-photonRainGust').textContent=photonRainGustLabel(board.photonRain.gust);
       q('#photonRainSpread').value=board.photonRain.spread;q('#v-photonRainSpread').textContent=board.photonRain.spread+'%';
       q('#photonRainColor').value=board.photonRain.color;q('#v-photonRainColor').textContent=board.photonRain.color;
       if(!board.photonRain.on)syncPhotonRainReadout(false);
@@ -8369,6 +8403,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     q('#photonRainTilt').oninput=e=>{board.photonRain.tilt=Math.round(+e.target.value);q('#v-photonRainTilt').textContent=photonRainTiltZLabel(board.photonRain.tilt);saveSettings();refresh()};
     q('#photonRainTiltX').oninput=e=>{board.photonRain.tiltX=Math.round(+e.target.value);q('#v-photonRainTiltX').textContent=photonRainTiltXLabel(board.photonRain.tiltX);saveSettings();refresh()};
     q('#photonRainWind').oninput=e=>{board.photonRain.wind=Math.round(+e.target.value);q('#v-photonRainWind').textContent=photonRainWindLabel(board.photonRain.wind);saveSettings();refresh()};
+    q('#photonRainGust').oninput=e=>{board.photonRain.gust=Math.round(+e.target.value);q('#v-photonRainGust').textContent=photonRainGustLabel(board.photonRain.gust);saveSettings();refresh()};
     q('#photonRainSpread').oninput=e=>{board.photonRain.spread=Math.round(+e.target.value);q('#v-photonRainSpread').textContent=board.photonRain.spread+'%';saveSettings();refresh()};
     q('#photonRainColor').oninput=e=>{board.photonRain.color=e.target.value;q('#v-photonRainColor').textContent=board.photonRain.color;saveSettings();refresh()};
     q('#humanContourThickness').oninput=e=>{board.humanContour.thickness=+e.target.value;q('#v-humanContourThickness').textContent=Math.round(board.humanContour.thickness*100)+'%';saveSettings();refresh()};
@@ -8955,7 +8990,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
             '赤レーザー  '+(board.redMesh.on?'ON  '+redDrawn+'/'+RED_MESH_MAX+'本':'OFF'),
             'レーザー面  '+(board.laserSheet.on?'ON':'OFF'),
             '等高線      '+(board.humanContour.on?'ON  '+board.humanContour.level+'%':'OFF'),
-            '光の雨      '+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒'+(photonRainClamped?'(面積で制限)':'')+'  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm  前後'+board.photonRain.tilt+'°  左右'+board.photonRain.tiltX+'°  風'+board.photonRain.wind+'%':'OFF'),
+            '光の雨      '+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒'+(photonRainClamped?'(面積で制限)':'')+'  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm  前後'+board.photonRain.tilt+'°  左右'+board.photonRain.tiltX+'°  風'+board.photonRain.wind+'%  突風'+board.photonRain.gust+'%':'OFF'),
             '実光源 '+realLights+'灯 / 影 '+shadowLights+'灯 ('+board.shadow.mode+')',
             '出力ゲイン '+board.outputGain.toFixed(1)+'段   被写体 '+bodyId
           ].join('\n');
@@ -8984,6 +9019,56 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       }
       draw();
       return {el,draw};
+    })();
+
+    /* ?diag=rain — 光の雨の時間変化を実機で読み出す。
+       同じ症状（周期的に見える）の報告が3回続いたので、推測で定数を変えるのを
+       やめて観測へ切り替えるための表示。突風とドリフトは uTime の関数なので
+       シェーダと同じ式を CPU 側で評価できる（空間項の z0 はシーン中央で代表）。
+       画面が繰り返して見えた瞬間に、モデルの数字が何をしていたかを突き合わせる。 */
+    const diagRain=(()=>{
+      if(!diagHas('rain'))return null;
+      const el=document.createElement('div');el.id='diagRain';
+      el.style.cssText='position:fixed;left:8px;'+(diagHas('perf')?'bottom:8px':'top:8px')+';z-index:10000;max-width:94vw;'
+        +'padding:8px 10px;background:rgba(0,0,0,.85);color:#ffd79a;'
+        +'font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;'
+        +'overflow-wrap:anywhere;border:1px solid rgba(255,215,154,.45);border-radius:6px;pointer-events:none';
+      document.body.append(el);
+      // シェーダの h() / n1() と同じもの。値がずれたら意味がないので式を写す
+      const fr=x=>x-Math.floor(x), hh=n=>fr(Math.sin(n*12.9898)*43758.5453);
+      const n1=t=>{const i=Math.floor(t),f=t-i,a=hh(i)*2-1,b=hh(i+1)*2-1;
+        return[a+(b-a)*f*f*(3-2*f),(b-a)*6*f*(1-f)]};
+      const EV_W=.22,EV_TH=.72,EV_TURB=.8,EV_NORM=.5268,DR_W=.045,DR_TAN=.052,DR_KZ=.028;
+      const Z_MID=(PHOTON_RAIN_Z0+PHOTON_RAIN_Z1)*.5;
+      let lastEnd=NaN,wasOn=false,sinceTxt='—',shown='';
+      return {tick(t){
+        const pr=board.photonRain;
+        const wind=THREE.MathUtils.clamp((Number.isFinite(+pr.wind)?+pr.wind:35)/100,0,1);
+        const gust=THREE.MathUtils.clamp((Number.isFinite(+pr.gust)?+pr.gust:50)/100,0,1)*.80;
+        const e=n1(t*EV_W);
+        const u=THREE.MathUtils.clamp((Math.abs(e[0])-EV_TH)/(1-EV_TH),0,1);
+        const env=Math.sign(e[0])*u*u*(3-2*u);
+        const denv=6*u*(1-u)/(1-EV_TH)*e[1]*EV_W;
+        const on=Math.abs(env)>.02;
+        if(!on&&wasOn)lastEnd=t;
+        if(on&&!wasOn)sinceTxt=Number.isFinite(lastEnd)?(t-lastEnd).toFixed(1)+'秒ぶり':'—';
+        wasOn=on;
+        // ピーク時の傾き[度]。速度比は uGust そのものになるよう正規化してある
+        const evDeg=Math.atan(wind*gust*Math.abs(denv)*EV_NORM)*180/Math.PI;
+        const phase=!on?'静穏':(denv*Math.sign(env)>0?'立ち上がり':'減衰');
+        const td=t*DR_W+Z_MID*DR_KZ;
+        const dx=wind*DR_TAN*n1(td)[1], dz=wind*DR_TAN*n1(td+37.4)[1];
+        const txt=[
+          '光の雨の時間変化   風'+Math.round(wind*100)+'%  突風'+pr.gust+'%',
+          '突風イベント  '+phase+(on?'  向き '+(env>0?'順':'逆')+'  傾き '+evDeg.toFixed(1)+'°':'')
+            +'   env '+env.toFixed(3),
+          '  直近の発生  '+(on?sinceTxt:(Number.isFinite(lastEnd)?(t-lastEnd).toFixed(1)+'秒前に終了':'まだ')),
+          '乱流の倍率    '+(1+EV_TURB*Math.abs(env)).toFixed(2)+' 倍（最大1.80）',
+          '風向きドリフト '+(Math.atan(Math.hypot(dx,dz))*180/Math.PI).toFixed(1)+'°  '
+            +(dx>0?'右':'左')+'／'+(dz>0?'客席':'奥')+'  成分 '+dx.toFixed(3)+','+dz.toFixed(3)
+        ].join('\n');
+        if(txt!==shown){shown=txt;el.textContent=txt}
+      }};
     })();
 
     const diagSpeckle=(()=>{
@@ -9202,6 +9287,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       if(diagSpeckle)diagSpeckle.tick(now);
       if(diagMic)diagMic.tick(now);
       if(diagPerf)diagPerf.tick(now);
+      if(diagRain)diagRain.tick(clock);
     }
     requestAnimationFrame(loop);
 
@@ -9210,7 +9296,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       setClock(t){clock=t;updateScene(t)},setBody:(id)=>setBody(id),getBodyId:()=>bodyId,BODIES,validateLowPolyModel,camera,CAMERA_PRESETS,
       stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,moveCameraAroundSubject,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,getSubjectDistance:subjectDistanceMeters,syncMapShootingMarker,moveMapShootingPosition,rotateMapShootingYaw,updateVenueCutaway,faceExposureOf,selectRenderLights,applyExposureCompareTarget,resetExposureCompareBaseline,getExposureCompare:()=>({target:exposureCompareTarget,baseline:exposureCompareBaseline?{...exposureCompareBaseline}:null,expo:{...expo}}),applyToneMapMode,getToneMapMode:()=>toneMapMode,highlightWarning:{sample:()=>sampleSubjectHighlights(performance.now(),true),get:()=>({...highlightReading}),classify:classifyHighlightPixels},
       timeline:{capture:captureTimelineStep,add:addTimelineStep,start:startTimeline,stop:stopTimeline,advance:advanceTimeline,setBpm:setTimelineBpm,sanitize:sanitizeTimelineStep},
-      maxAnisotropy:()=>MAX_ANISOTROPY,diagSpeckle,diagMic,diagPerf,diagContour,
+      maxAnisotropy:()=>MAX_ANISOTROPY,diagSpeckle,diagMic,diagPerf,diagContour,diagRain,
       contourDiag:{get mode(){return CONTOUR_DIAG_MODE},MODES:CONTOUR_DIAG_MODES,
         set(i){CONTOUR_DIAG_MODE=((i|0)%CONTOUR_DIAG_MODES.length+CONTOUR_DIAG_MODES.length)%CONTOUR_DIAG_MODES.length;
           applyContourDiagMode();if(diagContour)diagContour.draw();refresh();return CONTOUR_DIAG_MODE}},
