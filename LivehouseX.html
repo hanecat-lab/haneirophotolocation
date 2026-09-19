@@ -488,6 +488,12 @@
           <div class="slider"><div><span>落下速度</span><strong id="v-photonRainSpeed">8.0 m/s</strong></div><input type="range" id="photonRainSpeed" min="1" max="20" step="0.5" value="8" /></div>
           <div class="slider"><div><span>進行方向</span><strong id="v-photonRainTilt">0° 真下</strong></div><input type="range" id="photonRainTilt" min="-75" max="75" step="1" value="0" /></div>
           <div class="slider"><div><span>風</span><strong id="v-photonRainWind">35% ばらつく</strong></div><input type="range" id="photonRainWind" min="0" max="100" step="1" value="35" /></div>
+          <div class="slider"><div><span>風向き</span><strong id="v-photonRainWindDir">0° 客席へ</strong></div><input type="range" id="photonRainWindDir" min="-180" max="180" step="1" value="0" /></div>
+          <div class="slider"><div><span>風の動き</span><strong id="v-photonRainWindMode">固定</strong></div>
+            <select id="photonRainWindMode" style="width:100%;min-height:34px;background:#111616;border:1px solid var(--line);color:#dce3df;padding:0 8px;font-size:11px">
+              <option value="fixed">固定</option><option value="swing">ゆらぐ</option>
+            </select>
+          </div>
           <div class="slider"><div><span>降る範囲</span><strong id="v-photonRainSpread">60%</strong></div><input type="range" id="photonRainSpread" min="10" max="100" step="1" value="60" /></div>
           <div class="slider"><div><span>色</span><strong id="v-photonRainColor">#bfe1ff</strong></div><input type="color" id="photonRainColor" value="#bfe1ff" /></div>
           <div class="label" style="margin-top:8px"><span>シャッターとの関係</span><small id="v-photonRainShutter">—</small></div>
@@ -4723,7 +4729,7 @@
       humanContour:{on:false,level:60,gap:.05,span:.50,speed:1.0,thickness:.25,color:'#9ff0c4'},
       // PHOTON RAIN — 落ちる光の粒。筋の長さはシャッター速度で決まる。
       // 粒数は実測で決めるので、まずは少数から。
-      photonRain:{on:false,level:55,density:33,speed:8,tilt:0,wind:35,spread:60,color:'#bfe1ff'},
+      photonRain:{on:false,level:55,density:33,speed:8,tilt:0,wind:35,windDir:0,windMode:'fixed',spread:60,color:'#bfe1ff'},
       beamOrbit:{mode:'fixed',width:100},
       backlight:{on:false,level:70},
       beamZoom:{mode:'fixed',width:100,depth:60},
@@ -6232,6 +6238,7 @@
     const PHOTON_RAIN_MAX=SHADOW_IS_MOBILE?8000:20000;
     const PHOTON_RAIN_BUDGET=200000;       // 塗り面積の予算[粒·cm]
     const PHOTON_RAIN_LEN_CAP=100;         // 筋の長さはここで頭打ち[cm]
+    const PHOTON_RAIN_SWING=.35;           // 「ゆらぐ」のうねりの振幅[m]。速度比 0.12
     const PHOTON_RAIN_AREA_X=4.2, PHOTON_RAIN_Z0=-1.0, PHOTON_RAIN_Z1=12.0, PHOTON_RAIN_H=5.0;
     const PHOTON_RAIN_WIDTH=.010;          // 筋の幅[m]
     const photonRainGeo=(()=>{
@@ -6256,16 +6263,27 @@
         uSpeed:{value:8},uHeight:{value:PHOTON_RAIN_H},uAreaX:{value:PHOTON_RAIN_AREA_X},
         uZ0:{value:PHOTON_RAIN_Z0},uZ1:{value:PHOTON_RAIN_Z1},
         uStreak:{value:.02},uWidth:{value:PHOTON_RAIN_WIDTH},uSubject:{value:new THREE.Vector4(0,0,0,.5)},
-        uTilt:{value:0},uWind:{value:.35}},
+        uTilt:{value:0},uWind:{value:.35},uWindDir:{value:0},uSwing:{value:0}},
       vertexShader:`precision highp float;
         attribute float aSeed;
         uniform float uTime,uSpeed,uHeight,uAreaX,uZ0,uZ1,uStreak,uWidth;
         uniform vec4 uSubject;
         uniform float uTilt;        // 進行方向。0=真下、正=客席(+Z)、負=奥(-Z)[rad]
         uniform float uWind;        // 風 0..1
-        const float TURB_AMP=.25;   // 乱流の強さ（風の強さに対する割合）
-        const float TURB_FLOOR=.15; // 傾き0°でも風が少しは効くようにする下駄
-        const float TURB_K=.25;     // 渦のスケール。0.25≒周期4m
+        uniform float uWindDir;     // 風の水平方向[rad]。0=客席(+Z)、+90°=右(+X)
+        uniform float uSwing;       // ゆらぐモードのうねりの振幅[m]。固定なら0
+        /* 定数は node で掃引して決めた。
+           乱流は粒ごとに静的なので格子化のリスクがあり、円錐角を4.0°に抑えて
+           空間相関を上げた（0.5m以内 0.28° に対し 6m超 4.07°＝14.6倍）。
+           突風は「振幅×波数×速さ / 落下速度」を 0.3 以下に保つ。
+           超えると突風が落下を支配して雨に見えなくなる。 */
+        const float TURB_AMP=.13;   // 乱流の強さ[水平/垂直の比]
+        const float TURB_K=.15;     // 渦のスケール。0.15≒周期7m
+        const float GUST_K=3.1416;  // 突風の波数。2π/2m＝波長2m
+        const float GUST_W=1.1;     // 突風の時間項[rad/s]
+        const float GUST_AMP=.055;  // 突風の振幅[m]。速度比 0.18
+        const float GUST_KS=.314;   // ゆらぎの波数。2π/20m＝波長20m
+        const float GUST_WS=.35;    // ゆらぎの時間項[rad/s]
         varying vec2 vC;
         float h(float n){return fract(sin(n*12.9898)*43758.5453);}
         /* 2Dバリューノイズ。乱流は空間的に相関している（隣り合う空気は一緒に動く）。
@@ -6298,13 +6316,18 @@
           /* 粒径による傾きの違いは風の量で効かせる。風0%では kfDir=1 に揃うので
              向きが進行方向と厳密に一致する（「風0%＝全部そろう」を守る）。 */
           float kfDir=mix(1.,kf,uWind);
-          /* 乱流の強さは風の強さに比例させる。風向きの無いところに乱流は無い。
-             絶対値で乗せると、傾き0°のときに左右へ割れて交差の原因になる。
-             TURB_FLOOR は傾き0°でも風スライダーが少しは効くようにする下駄。 */
+          /* 風の水平方向。0=客席(+Z)、+90°=右(+X)。進行方向は「どれだけ傾くか」、
+             こちらは「どちらへ傾くか」。Z軸にしか傾けなかったのを回せるようにした。 */
+          vec2 wdir=vec2(sin(uWindDir),cos(uWindDir));
+          vec2 wperp=vec2(wdir.y,-wdir.x);    // 突風はこの向きへ振る
+          /* 乱流は絶対値の振幅。前版は風の強さ |W| に比例させたので、傾き0°では
+             ほぼゼロになり「風100%でも揺らがない」状態だった。格子にならない
+             根拠は「対称でないこと」ではなく「空間的に相関していること」なので、
+             対称なままで問題ない。 */
           vec2 nq=vec2(x,z0)*TURB_K;
-          float ts=uWind*TURB_AMP*(TURB_FLOOR+abs(W));
-          vec2 turb=ts*vec2(vnoise(nq),vnoise(nq+31.7));
-          vec3 dirP=normalize(vec3(turb.x,-kfDir,W+turb.y));
+          vec2 turb=uWind*TURB_AMP*vec2(vnoise(nq),vnoise(nq+31.7));
+          vec2 hor=W*wdir+turb;
+          vec3 dirP=normalize(vec3(hor.x,-kfDir,hor.y));
           float sp=uSpeed*kf;                 // 速さは落下速度スライダー×粒径
           /* 再利用は箱の各軸で別々に巻き戻す。傾けるとZにも、風で散ればXにも
              進み続けるので、Yだけを mod していた旧版では粒が飛び去って戻らない。
@@ -6314,14 +6337,25 @@
           float y=mod(y0+uTime*sp*dirP.y,uHeight);
           float z=uZ0+mod(z0-uZ0+uTime*sp*dirP.z,depth);
           x=-uAreaX+mod(x+uAreaX+uTime*sp*dirP.x,spanX);
-          /* 風その2 — 突風。向きではなく位置を揺らす。正弦なので微分が閉じた形で
-             書け、筋の向きに正しく足せる。g1は粒ごとの位相で場をざわつかせ、
-             g2は奥行きを位相に使って、うねりが手前へ抜けていくようにする。 */
-          float ph1=h(aSeed+61.3)*6.2832, ph2=uTime*.23+z0*.35, amp=uWind*.8;
-          vec3 gOff=vec3(.4*sin(ph2),0.,sin(uTime*.55+ph1))*amp;
-          vec3 gVel=vec3(.4*.23*cos(ph2),0.,.55*cos(uTime*.55+ph1))*amp;
-          vec3 p=vec3(x,y,z)+gOff;
-          vec3 dirS=normalize(dirP*sp+gVel);   // 筋は「実際の速度」の向きへ伸ばす
+          /* 風その2 — 突風。位相に「粒の高さ y」を入れるのが肝。
+             前版は粒ごとのランダム位相＋周期11.4秒だったが、落下20m/s では粒が
+             箱を抜けるのに0.25秒しかかからず、一生の間に位相が2.2%しか進まない。
+             つまり粒ごとの固定オフセット＝静的なばらつきで、動きに見えなかった。
+             y を位相に入れると、粒は落ちる間に必ず波をまたぐので蛇行して見える。
+             正弦なので微分が閉じた形で書け、筋の向きへ正しく足せる。 */
+          float ph=GUST_K*y+GUST_W*uTime+(x+z0)*.21;
+          float ga=uWind*GUST_AMP;
+          // uSwing は「ゆらぐ」モードの長波長・低速のうねり。見かけの風向きが振れる
+          float phS=GUST_KS*y+GUST_WS*uTime+z0*.11;
+          float gaS=uWind*uSwing;
+          vec2 gxz=wperp*(ga*sin(ph)+gaS*sin(phS));
+          /* 位相の進む速さ。ph は y と x の両方に依存するので、両方の項が要る。
+             dx の項を落とすと、風向き90°・傾き75°（dx≈19m/s）で筋の向きが
+             0.18ほどずれる。phS の位相は z0（粒ごとに定数）なので x の項は無い。 */
+          float dy=sp*dirP.y, dx=sp*dirP.x;
+          vec2 gvel=wperp*(ga*cos(ph)*(GUST_K*dy+GUST_W+.21*dx)+gaS*cos(phS)*(GUST_KS*dy+GUST_WS));
+          vec3 p=vec3(x+gxz.x,y,z+gxz.y);
+          vec3 dirS=normalize(dirP*sp+vec3(gvel.x,0.,gvel.y));   // 筋は実際の速度の向きへ
           // 演者の周りは空ける。被写体は縦に立っているので、傾けても円筒のままでよい
           vec2 d=p.xz-uSubject.xz;
           float dist=length(d);
@@ -6353,6 +6387,14 @@
     photonRain.frustumCulled=false;photonRain.renderOrder=8;photonRain.visible=false;scene.add(photonRain);
     let photonRainCount=0,photonRainClamped=false;
     // 角度そのものより「どちらへ流れるか」が卓では要る
+    /* 方位は数字より「どちらへ」が要る。+Z が客席、+X が右。
+       ±22°までは客席、±158°より外は奥、68〜112°は真横、その間は斜め。 */
+    const photonRainDirLabel=d=>{
+      const a=Math.abs(d), lr=d>0?'右':'左';
+      const side=a<=22?'客席へ':a>=158?'奥へ'
+        :a<68?lr+'まえへ':a<=112?lr+'へ':lr+'おくへ';
+      return (d>0?'+':'')+d+'° '+side;
+    };
     // 風は「揃っている⇔乱れている」が伝わればよい。角度の数字は出さない
     const photonRainWindLabel=v=>v+'% '+(v===0?'全部そろう':v<25?'わずかに乱れる':v<60?'ばらつく':v<85?'荒れる':'吹き荒れる');
     const photonRainTiltLabel=deg=>deg===0?'0° 真下'
@@ -6385,6 +6427,11 @@
       u.uTilt.value=THREE.MathUtils.degToRad(THREE.MathUtils.clamp(Number(pr.tilt)||0,-75,75));
       // 風は進行方向では出せないものだけを担当する。向きのばらつきと突風
       u.uWind.value=THREE.MathUtils.clamp((Number.isFinite(+pr.wind)?+pr.wind:35)/100,0,1);
+      u.uWindDir.value=THREE.MathUtils.degToRad(THREE.MathUtils.clamp(Number(pr.windDir)||0,-180,180));
+      /* 「ゆらぐ」は平均の風向きを回すのではなく、直交方向の長波長のうねりで
+         見かけの向きを振る。平均を時間で回すと位置 uTime*sp*dirP の過去の軌跡ごと
+         書き換わり、300秒後には 0.001rad の変化でも粒が6m飛ぶ。 */
+      u.uSwing.value=pr.windMode==='swing'?PHOTON_RAIN_SWING:0;
       // 露光している間に粒が落ちた距離が、そのまま筋の長さになる。
       // 等高線の帯と同じ理屈で、ぼかしではなく形として作る。
       u.uStreak.value=Math.max(.004,fall*Math.max(0,Number(expo.shutter)||0));
@@ -7619,6 +7666,9 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       // 既定が 35 なので || は使えない。保存した 0 が 35 へ戻ってしまう
       const rainWind=Number(board.photonRain.wind);
       board.photonRain.wind=THREE.MathUtils.clamp(Number.isFinite(rainWind)?Math.round(rainWind):35,0,100);
+      const rainDir=Number(board.photonRain.windDir);
+      board.photonRain.windDir=THREE.MathUtils.clamp(Number.isFinite(rainDir)?Math.round(rainDir):0,-180,180);
+      board.photonRain.windMode=board.photonRain.windMode==='swing'?'swing':'fixed';
       board.photonRain.spread=THREE.MathUtils.clamp(Math.round(Number(board.photonRain.spread)||60),10,100);
       board.photonRain.color=/^#[0-9a-f]{6}$/i.test(String(board.photonRain.color||''))?board.photonRain.color:'#bfe1ff';
       Object.assign(board.beamOrbit,src.beamOrbit||{});
@@ -8071,6 +8121,9 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       q('#photonRainSpeed').value=board.photonRain.speed;q('#v-photonRainSpeed').textContent=board.photonRain.speed.toFixed(1)+' m/s';
       q('#photonRainTilt').value=board.photonRain.tilt;q('#v-photonRainTilt').textContent=photonRainTiltLabel(board.photonRain.tilt);
       q('#photonRainWind').value=board.photonRain.wind;q('#v-photonRainWind').textContent=photonRainWindLabel(board.photonRain.wind);
+      q('#photonRainWindDir').value=board.photonRain.windDir;q('#v-photonRainWindDir').textContent=photonRainDirLabel(board.photonRain.windDir);
+      q('#photonRainWindMode').value=board.photonRain.windMode;
+      q('#v-photonRainWindMode').textContent=board.photonRain.windMode==='swing'?'ゆらぐ':'固定';
       q('#photonRainSpread').value=board.photonRain.spread;q('#v-photonRainSpread').textContent=board.photonRain.spread+'%';
       q('#photonRainColor').value=board.photonRain.color;q('#v-photonRainColor').textContent=board.photonRain.color;
       if(!board.photonRain.on)syncPhotonRainReadout(false);
@@ -8272,6 +8325,9 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     q('#photonRainSpeed').oninput=e=>{board.photonRain.speed=+e.target.value;q('#v-photonRainSpeed').textContent=board.photonRain.speed.toFixed(1)+' m/s';saveSettings();refresh()};
     q('#photonRainTilt').oninput=e=>{board.photonRain.tilt=Math.round(+e.target.value);q('#v-photonRainTilt').textContent=photonRainTiltLabel(board.photonRain.tilt);saveSettings();refresh()};
     q('#photonRainWind').oninput=e=>{board.photonRain.wind=Math.round(+e.target.value);q('#v-photonRainWind').textContent=photonRainWindLabel(board.photonRain.wind);saveSettings();refresh()};
+    q('#photonRainWindDir').oninput=e=>{board.photonRain.windDir=Math.round(+e.target.value);q('#v-photonRainWindDir').textContent=photonRainDirLabel(board.photonRain.windDir);saveSettings();refresh()};
+    q('#photonRainWindMode').onchange=e=>{board.photonRain.windMode=e.target.value==='swing'?'swing':'fixed';
+      q('#v-photonRainWindMode').textContent=board.photonRain.windMode==='swing'?'ゆらぐ':'固定';saveSettings();refresh()};
     q('#photonRainSpread').oninput=e=>{board.photonRain.spread=Math.round(+e.target.value);q('#v-photonRainSpread').textContent=board.photonRain.spread+'%';saveSettings();refresh()};
     q('#photonRainColor').oninput=e=>{board.photonRain.color=e.target.value;q('#v-photonRainColor').textContent=board.photonRain.color;saveSettings();refresh()};
     q('#humanContourThickness').oninput=e=>{board.humanContour.thickness=+e.target.value;q('#v-humanContourThickness').textContent=Math.round(board.humanContour.thickness*100)+'%';saveSettings();refresh()};
@@ -8858,7 +8914,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
             '赤レーザー  '+(board.redMesh.on?'ON  '+redDrawn+'/'+RED_MESH_MAX+'本':'OFF'),
             'レーザー面  '+(board.laserSheet.on?'ON':'OFF'),
             '等高線      '+(board.humanContour.on?'ON  '+board.humanContour.level+'%':'OFF'),
-            '光の雨      '+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒'+(photonRainClamped?'(面積で制限)':'')+'  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm  向き'+board.photonRain.tilt+'°  風'+board.photonRain.wind+'%':'OFF'),
+            '光の雨      '+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒'+(photonRainClamped?'(面積で制限)':'')+'  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm  向き'+board.photonRain.tilt+'°  風'+board.photonRain.wind+'%'+(board.photonRain.windDir?'→'+board.photonRain.windDir+'°':'')+(board.photonRain.windMode==='swing'?'(ゆらぐ)':''):'OFF'),
             '実光源 '+realLights+'灯 / 影 '+shadowLights+'灯 ('+board.shadow.mode+')',
             '出力ゲイン '+board.outputGain.toFixed(1)+'段   被写体 '+bodyId
           ].join('\n');
