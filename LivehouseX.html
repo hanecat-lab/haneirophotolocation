@@ -2007,11 +2007,17 @@
     const GLOW_POSES={
       penlight_swing_down:{
         label:'ペンライト振り下ろし',
+        kind:'swing', sticks:1,     // 右手に1本。左腕は下げたまま
         abduction:15*Math.PI/180,   // 肩の外転。体から横へ開く角
         shoulderFwd:0,              // 肩の前方挙上。0＝下げたまま（relaxed lowered）
         elbowUp:45*Math.PI/180,     // 上げきった位置の肘の内角（前腕の仰角 43.1°）
         elbowDown:90*Math.PI/180,   // 振り下ろした位置＝前腕が水平前方
         w:4.65,                     // 角速度[rad/s]。周期 1.35秒
+      },
+      romance_cycle:{
+        label:'ロマンス周期 右→左→小刻み→左→小刻み',
+        kind:'romance', sticks:2,   // 両手に持つ
+        period:3.6,                 // 1周期の秒数。130BPM なら 3.69 が8拍
       },
     };
     const GLOW_POSE_KEYS=Object.keys(GLOW_POSES);
@@ -2038,16 +2044,18 @@
         const sh=new THREE.Mesh(new THREE.SphereGeometry(.036,8,6), glowFanMat);
         sh.position.set(sx*.10,1.36,0); g.add(sh);
       });
-      /* 左腕。子を −Y へ伸ばすので上端は局所 y=0 ＝ 肩そのもの。
-         rotation.z は −x 側で外へ開く向き（+ にすると体の内側へ入る）。 */
-      const armL=new THREE.Group(); armL.position.set(-.10,1.36,0); armL.rotation.z=-.30;
-      const upperL=new THREE.Mesh(new THREE.CylinderGeometry(.027,.023,.56,6), glowFanMat);
-      upperL.position.y=-.28; armL.add(upperL);
-      const handL=new THREE.Mesh(new THREE.SphereGeometry(.032,8,6), glowFanMat);
-      handL.position.y=-.57; armL.add(handL);
-      g.add(armL);
-      /* 右腕。肩・肘の入れ子ピボットをやめ、4つのメッシュを figure group の直下に
-         置いて毎フレーム IK の結果で position / quaternion を入れる。理由は2つ。
+      /* 左腕。右腕と同じ構成（名前付き3メッシュ）。以前は前腕の無い1本棒の
+         入れ子 Group だったので、振り付け側から一切動かせなかった。 */
+      const upperL=new THREE.Mesh(new THREE.CylinderGeometry(.027,.024,GLOW_L1,6), glowFanMat);
+      upperL.name='glowUpperL'; g.add(upperL);
+      const foreL=new THREE.Mesh(new THREE.CylinderGeometry(.024,.021,GLOW_L2,6), glowFanMat);
+      foreL.name='glowForeL'; g.add(foreL);
+      const handL=new THREE.Mesh(new THREE.SphereGeometry(.035,8,6), glowFanMat);
+      handL.name='glowHandL'; g.add(handL);
+      const stickL=new THREE.Mesh(new THREE.CylinderGeometry(.011,.011,GLOW_STICK,8), glowStickMat);
+      stickL.name='glowStickL'; stickL.visible=false; g.add(stickL);
+      /* 右腕。肩・肘の入れ子ピボットをやめ、メッシュを figure group の直下に
+         置いて毎フレーム姿勢の結果で position / quaternion を入れる。理由は2つ。
          - サイリウムを常に鉛直に保つ必要がある。figure group は Y 回転だけなので、
            その直下なら回転を触らないだけで局所 +Y ＝ ワールド上になる
          - 肘の角度が毎フレーム変わるので、入れ子だと角度の逆算が要る */
@@ -2057,8 +2065,8 @@
       foreR.name='glowForeR'; g.add(foreR);
       const handR=new THREE.Mesh(new THREE.SphereGeometry(.035,8,6), glowFanMat);
       handR.name='glowHandR'; g.add(handR);
-      const stick=new THREE.Mesh(new THREE.CylinderGeometry(.011,.011,GLOW_STICK,8), glowStickMat);
-      stick.name='glowStick'; g.add(stick);
+      const stickR=new THREE.Mesh(new THREE.CylinderGeometry(.011,.011,GLOW_STICK,8), glowStickMat);
+      stickR.name='glowStickR'; g.add(stickR);
       g.visible=false;
       glowFanMeshes[i]=g; venue.add(g);
     }
@@ -2068,49 +2076,121 @@
       g.rotation.y=Math.PI+THREE.MathUtils.degToRad(Number(d.rot)||0);
       g.visible=!!d.on;
       // 位置だけ変えて腕を置き直さないと、ビルド時の原点のまま1フレーム出る
-      const P=glowPoseOf(d);
-      solveGlowArm(g,P,glowElbowAngle(P,0,i));
+      poseGlowFan(g,glowPoseOf(d),0,i);
     }
     /* 円柱（+Y方向・長さ |b-a|）を a→b に架ける。リンク長は固定なので
        ジオメトリは作り直さない。位置と向きだけでよい。 */
     const GLOW_LIMB_UP=new THREE.Vector3(0,1,0);
-    const _gA=new THREE.Vector3(),_gB=new THREE.Vector3(),_gC=new THREE.Vector3(),_gD=new THREE.Vector3();
+    const _gD=new THREE.Vector3();   // placeGlowLimb の向き計算用
     function placeGlowLimb(mesh,a,b){
       mesh.position.copy(a).add(b).multiplyScalar(.5);
       mesh.quaternion.setFromUnitVectors(GLOW_LIMB_UP,_gD.copy(b).sub(a).normalize());
     }
-    /* 2リンクIK。肩 S は固定、手先の目標は中立位置から前後に s[m] だけずらす。
-       x と y は動かさないので、左右にも上下にも振れない（仕様の NG）。
-       肘の位置は S→H 軸上を a 進み、極ベクトル方向へ h 離れた点。極ベクトルは
-       中立の上腕方向から作るので、毎フレーム同じ側に張り出して裏返らない。 */
-    // s は肘の内角[rad]。90°＝前腕が水平前方、45°＝上げきった位置
-    function solveGlowArm(g,P,s){
-      const up=g.getObjectByName('glowUpperR'); if(!up)return;
-      const fo=g.getObjectByName('glowForeR'), ha=g.getObjectByName('glowHandR'), st=g.getObjectByName('glowStick');
-      // 中立姿勢。上腕は下げたまま、外転 abduction、前方挙上 shoulderFwd
-      const ca=Math.cos(P.abduction), sa=Math.sin(P.abduction);
-      const cf=Math.cos(P.shoulderFwd), sf=Math.sin(P.shoulderFwd);
-      const dir=_gA.set(sa*cf,-ca*cf,sf);                 // 肩→肘の単位ベクトル
-      const S=_gB.set(GLOW_SHOULDER_X,GLOW_SHOULDER_Y,0);
-      const E0=_gC.copy(S).addScaledVector(dir,GLOW_L1);  // 中立の肘
-      /* 前腕は肘を中心に回るだけ（順運動学）。肩と上腕が固定なら肘も動かないので、
-         四肢の長さも肘の位置も構造的に保たれる。
-         u = 肘→肩、w = u に直交する前方成分。前腕 f(θ)=cos(θ)u+sin(θ)w とすると
-         θ が肘の内角そのものになる。θ=90° で前腕は u と直交＝水平前方。 */
-      const E=E0.clone();
+    // 肩の位置。side は 'R' / 'L'。左右の鏡像は sx で作る
+    function glowShoulder(side){
+      return new THREE.Vector3((side==='L'?-1:1)*GLOW_SHOULDER_X,GLOW_SHOULDER_Y,0);
+    }
+    /* 上腕の向き。外転 abd は体から横へ開く角、fwd は前方挙上。
+       **sx は肩だけでなく x 成分にも掛ける。**掛け忘れると左腕の外転が
+       右向きになり、体を横切る。 */
+    function glowUpperDir(side,abd,fwd){
+      const sx=side==='L'?-1:1;
+      const ca=Math.cos(abd),sa=Math.sin(abd),cf=Math.cos(fwd),sf=Math.sin(fwd);
+      return new THREE.Vector3(sx*sa*cf,-ca*cf,sf);
+    }
+    // 腕の4メッシュを置く。サイリウムは鉛直固定（figure group は Y 回転だけ）
+    function placeGlowArm(g,side,S,E,H){
+      const up=g.getObjectByName('glowUpper'+side); if(!up)return;
+      placeGlowLimb(up,S,E);
+      placeGlowLimb(g.getObjectByName('glowFore'+side),E,H);
+      g.getObjectByName('glowHand'+side).position.copy(H);
+      const st=g.getObjectByName('glowStick'+side);
+      if(st){st.position.set(H.x,H.y+.035+GLOW_STICK*.5,H.z);st.quaternion.identity()}
+    }
+    /* 順運動学。theta は肘の内角[rad]。90°＝前腕が水平前方、45°＝上げきった位置。
+       前腕は肘を中心に回るだけなので、四肢の長さも肘の位置も構造的に保たれる。
+       u = 肘→肩、w = u に直交する前方成分。f(θ)=cos(θ)u+sin(θ)w とすると
+       θ がそのまま肘の内角になる。 */
+    function solveGlowArm(g,P,theta,side){
+      const S=glowShoulder(side);
+      const dir=glowUpperDir(side,P.abduction,P.shoulderFwd);
+      const E=S.clone().addScaledVector(dir,GLOW_L1);
       const u=dir.clone().multiplyScalar(-1);
       const w=new THREE.Vector3(0,0,1).addScaledVector(u,-u.z);
       // shoulderFwd が ±90° に近いと u が ẑ と平行になり w が決まらない
       if(w.lengthSq()<1e-8)w.set(0,1,0).addScaledVector(u,-u.y);
       w.normalize();
-      const f=u.clone().multiplyScalar(Math.cos(s)).addScaledVector(w,Math.sin(s));
-      const H=E.clone().addScaledVector(f,GLOW_L2);
-      placeGlowLimb(up,S,E);
-      placeGlowLimb(fo,E,H);
-      ha.position.copy(H);
-      // サイリウムは鉛直固定。quaternion は単位のまま（figure group は Y 回転だけ）
-      st.position.set(H.x,H.y+.035+GLOW_STICK*.5,H.z);
-      st.quaternion.identity();
+      const f=u.clone().multiplyScalar(Math.cos(theta)).addScaledVector(w,Math.sin(theta));
+      placeGlowArm(g,side,S,E,E.clone().addScaledVector(f,GLOW_L2));
+    }
+    /* 2リンクIK。手先の目標 H から肩・肘・手を決める。
+       極ベクトルは真下を S→H 軸に直交化したもので固定＝肘は常に下へ張り出す。 */
+    function solveGlowArmIK(g,H,side){
+      const S=glowShoulder(side);
+      const v=H.clone().sub(S);
+      const D=Math.max(v.length(),1e-5);
+      const axis=v.clone().multiplyScalar(1/D);
+      const aLen=(GLOW_L1*GLOW_L1-GLOW_L2*GLOW_L2+D*D)/(2*D);
+      const h=Math.sqrt(Math.max(GLOW_L1*GLOW_L1-aLen*aLen,0));
+      const pole=new THREE.Vector3(0,-1,0).addScaledVector(axis,axis.y);
+      // 腕が真下を向くと極が決まらない。そのときだけ前方から作り直す
+      if(pole.lengthSq()<1e-8)pole.set(0,0,1).addScaledVector(axis,-axis.z);
+      pole.normalize();
+      placeGlowArm(g,side,S,S.clone().addScaledVector(axis,aLen).addScaledVector(pole,h),H);
+    }
+    /* ロマンス周期の振り付け。1行 = [区間の終わり秒, 外転°, 前方挙上°, reach, lift]
+       0.00-0.45 右斜め上指し → 0.45-0.75 胸元へ引く
+       0.75-1.20 左斜め上指し → 1.20-1.50 左胸へ引く
+       1.50-2.30 小刻み（右上→左上→右上→左上）
+       2.30-2.75 左斜め上指し → 2.75-3.05 胸元へ下げて
+       3.05-3.60 小刻み（左→右→左）でループ */
+    const ROMANCE_KEYS={
+      R:[[0.45,38,25,.32,.18],[0.75,15,5,.08,-.05],[1.50,15,0,.10,0],
+         [1.70,20,10,.18,.08],[1.90,15,0,.12,.02],[2.10,20,10,.18,.08],
+         [2.30,15,0,.12,.02],[3.05,15,0,.10,0],[3.25,15,0,.12,.02],
+         [3.45,20,10,.18,.08],[3.60,15,0,.12,.02]],
+      L:[[0.75,15,0,.10,0],[1.20,38,25,.32,.18],[1.50,15,5,.08,-.05],
+         [1.70,15,0,.12,.02],[1.90,20,10,.18,.08],[2.10,15,0,.12,.02],
+         [2.30,20,10,.18,.08],[2.75,38,25,.32,.18],[3.05,15,5,.08,-.10],
+         [3.25,20,10,.18,.08],[3.45,15,0,.12,.02],[3.60,20,10,.18,.08]],
+    };
+    const ROMANCE_RAMP=.12;   // 立ち上がりの秒数。残りはその位置で止める＝ポーズが決まる
+    // キー1行から手先の目標を作る。cm 指定ではなく角度から組む原則は保つ
+    function romanceKeyPos(side,k){
+      const S=glowShoulder(side);
+      const dir=glowUpperDir(side,k[1]*Math.PI/180,k[2]*Math.PI/180);
+      return S.addScaledVector(dir,GLOW_L1).add(new THREE.Vector3(0,k[4],k[3]));
+    }
+    /* 周期内の時刻 t から手先の目標を返す。区間の頭 ROMANCE_RAMP 秒で
+       前の区間の位置から smoothstep し、残りは静止する。
+       最初の区間の「前」は最後の区間なので、添字は剰余で回す。 */
+    function romanceTarget(P,side,t){
+      const K=ROMANCE_KEYS[side], n=K.length;
+      const period=P.period||K[n-1][0];
+      const p=((t%period)+period)%period;
+      let idx=K.findIndex(k=>p<k[0]); if(idx<0)idx=n-1;
+      const start=idx===0?0:K[idx-1][0];
+      const to=romanceKeyPos(side,K[idx]);
+      if(p-start>=ROMANCE_RAMP)return to;
+      const from=romanceKeyPos(side,K[(idx+n-1)%n]);
+      const u=Math.max((p-start)/ROMANCE_RAMP,0);
+      const e=u*u*(3-2*u);
+      return from.multiplyScalar(1-e).addScaledVector(to,e);
+    }
+    /* 静止配置（updateGlowFan）と動作（updateGlowFans）の両方がこれを呼ぶ。
+       分岐を2箇所に書くと、ON にした瞬間の姿勢と動作中の姿勢が食い違う。 */
+    const GLOW_REST_ELBOW=168*Math.PI/180;   // 下げたままの腕。伸ばし切らない
+    function poseGlowFan(g,P,t,i){
+      const stL=g.getObjectByName('glowStickL');
+      if(stL)stL.visible=(P.sticks||1)>=2;
+      if(P.kind==='romance'){
+        const tt=t*(1+i*.03)+i*.4;   // 人ごとに速さと位相をずらす。揃うと機械的に見える
+        solveGlowArmIK(g,romanceTarget(P,'R',tt),'R');
+        solveGlowArmIK(g,romanceTarget(P,'L',tt),'L');
+      }else{
+        solveGlowArm(g,P,glowElbowAngle(P,t,i),'R');
+        solveGlowArm(g,P,GLOW_REST_ELBOW,'L');
+      }
     }
     /* 肘の内角。時刻の純関数なので、他の演出が止まっていても再開時に飛ばない。
        人ごとに位相と速さをずらす。揃うと機械的に見える。
@@ -2128,8 +2208,7 @@
       glowFansData.forEach((d,i)=>{
         if(!d.on)return;
         const g=glowFanMeshes[i]; if(!g)return;
-        const P=glowPoseOf(d);
-        solveGlowArm(g,P,glowElbowAngle(P,t,i));
+        poseGlowFan(g,glowPoseOf(d),t,i);
       });
     }
     // UI生成。renderMicStandUI（1793付近）と同じ作り
