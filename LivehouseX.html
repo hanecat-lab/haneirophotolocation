@@ -489,6 +489,7 @@
           <div class="slider"><div><span>進行方向</span><strong id="v-photonRainTilt">0° 真下</strong></div><input type="range" id="photonRainTilt" min="-75" max="75" step="1" value="0" /></div>
           <div class="slider"><div><span>風</span><strong id="v-photonRainWind">35% ばらつく</strong></div><input type="range" id="photonRainWind" min="0" max="100" step="1" value="35" /></div>
           <div class="slider"><div><span>降る範囲</span><strong id="v-photonRainSpread">60%</strong></div><input type="range" id="photonRainSpread" min="10" max="100" step="1" value="60" /></div>
+          <div class="slider"><div><span>遠くの粒</span><strong id="v-photonRainPxFloor">切</strong></div><input type="range" id="photonRainPxFloor" min="0" max="3" step="0.1" value="0" /></div>
           <div class="slider"><div><span>色</span><strong id="v-photonRainColor">#bfe1ff</strong></div><input type="color" id="photonRainColor" value="#bfe1ff" /></div>
           <div class="label" style="margin-top:8px"><span>シャッターとの関係</span><small id="v-photonRainShutter">—</small></div>
           <div class="hint">点のレーザーが雨として落ちます。<strong>筋の長さはシャッター速度で決まります。</strong>露光している間に粒が落ちた距離がそのまま筋になるので、落下8m/sなら 1/30 で27cmの光跡、1/1000 で8mm、1/8000 では1mmの点に凍ります。<br>※粒数の上限は実機の実測で決めます。いまは少数から始めています（この端末の上限はスライダー100%で決まります）。演者の周囲は空けてあります。</div>
@@ -4723,7 +4724,7 @@
       humanContour:{on:false,level:60,gap:.05,span:.50,speed:1.0,thickness:.25,color:'#9ff0c4'},
       // PHOTON RAIN — 落ちる光の粒。筋の長さはシャッター速度で決まる。
       // 粒数は実測で決めるので、まずは少数から。
-      photonRain:{on:false,level:55,density:33,speed:8,tilt:0,wind:35,spread:60,color:'#bfe1ff'},
+      photonRain:{on:false,level:55,density:33,speed:8,tilt:0,wind:35,spread:60,pxFloor:0,color:'#bfe1ff'},
       beamOrbit:{mode:'fixed',width:100},
       backlight:{on:false,level:70},
       beamZoom:{mode:'fixed',width:100,depth:60},
@@ -6231,6 +6232,12 @@
        ====================================================================== */
     const PHOTON_RAIN_MAX=SHADOW_IS_MOBILE?8000:20000;
     const PHOTON_RAIN_BUDGET=200000;       // 塗り面積の予算[粒·cm]
+    /* 遠くの粒。筋の幅 10mm は 10m 先で画面上 0.5画素ほどになり、拾われるかどうかが
+       粒ごとにばらつく。遠景が虫食いになって奥行きの手がかりが消えるので、
+       画面上の幅に下限を置く。赤レーザーの pxK（6525付近）と同じ式だが、
+       あちらは明度を補正しないので遠いほど総光量が増える。雨は撮影の絵なので
+       太らせた倍率だけ明度を下げ、総光量を保存する。 */
+    const PHOTON_RAIN_PX_MAX=3.0;          // 太らせる倍率の上限。青天井にしない
     const PHOTON_RAIN_LEN_CAP=100;         // 筋の長さはここで頭打ち[cm]
     const PHOTON_RAIN_AREA_X=4.2, PHOTON_RAIN_Z0=-1.0, PHOTON_RAIN_Z1=12.0, PHOTON_RAIN_H=5.0;
     const PHOTON_RAIN_WIDTH=.010;          // 筋の幅[m]
@@ -6256,14 +6263,17 @@
         uSpeed:{value:8},uHeight:{value:PHOTON_RAIN_H},uAreaX:{value:PHOTON_RAIN_AREA_X},
         uZ0:{value:PHOTON_RAIN_Z0},uZ1:{value:PHOTON_RAIN_Z1},
         uStreak:{value:.02},uWidth:{value:PHOTON_RAIN_WIDTH},uSubject:{value:new THREE.Vector4(0,0,0,.5)},
-        uTilt:{value:0},uWind:{value:.35}},
+        uTilt:{value:0},uWind:{value:.35},uPxFloor:{value:0},uPxMax:{value:PHOTON_RAIN_PX_MAX}},
       vertexShader:`precision highp float;
         attribute float aSeed;
         uniform float uTime,uSpeed,uHeight,uAreaX,uZ0,uZ1,uStreak,uWidth;
         uniform vec4 uSubject;
         uniform float uTilt;        // 進行方向。0=真下、正=客席(+Z)、負=奥(-Z)[rad]
         uniform float uWind;        // 風 0..1
+        uniform float uPxFloor;     // 距離1あたりの幅の下限[世界単位]。OFFなら0
+        uniform float uPxMax;       // 太らせる倍率の上限
         varying vec2 vC;
+        varying float vFade;        // 太らせた倍率の逆数。明度へ掛けて総光量を保つ
         float h(float n){return fract(sin(n*12.9898)*43758.5453);}
         void main(){
           vC=position.xy;
@@ -6304,29 +6314,40 @@
              長さを鉛直に固定していたので、傾けると筋が進行方向からずれた。
              進行方向が視線と平行に近いと外積が潰れるので、そのときだけ
              camRight へ逃がす。客席から見て正面に向かってくる構図がここに当たる。 */
+          vec3 toCam=p-cameraPosition;
+          float dist=length(toCam);
           vec3 camRight=vec3(viewMatrix[0][0],viewMatrix[1][0],viewMatrix[2][0]);
-          vec3 side=cross(dirS,normalize(p-cameraPosition));
+          vec3 side=cross(dirS,toCam/max(dist,1e-6));
           float sl=length(side);
           side=sl>1e-3?side/sl:camRight;
+          /* 画面上の幅が1画素を切ると粒ごとに拾われたり消えたりする。
+             下限まで太らせ、太らせた倍率だけ明度を下げる。
+             塗り幅×明度 = uWidth で一定なので、総光量は距離によらない。
+             筋の長さには下限を入れない。長さはシャッターから来る物理量で、
+             床を入れると露出について嘘をつくことになる。 */
+          float wUse=clamp(uPxFloor*dist,uWidth,uWidth*uPxMax);
+          vFade=uWidth/wUse;
           // 尾は進行方向の逆へ伸ばす。真下のときは旧版と同じく鉛直上向きになる
-          vec3 w=p+side*(position.x*uWidth)-dirS*(position.y*uStreak);
+          vec3 w=p+side*(position.x*wUse)-dirS*(position.y*uStreak);
           gl_Position=projectionMatrix*viewMatrix*vec4(w,1.0);
         }`,
       fragmentShader:`precision mediump float;
-        varying vec2 vC;uniform vec3 uColor;uniform float uOpacity;
+        varying vec2 vC;varying float vFade;uniform vec3 uColor;uniform float uOpacity;
         void main(){
           float across=1.0-abs(vC.x);           // 幅方向は中心が濃い
           float along=1.0-vC.y*.65;             // 筋は先頭が濃く尾が薄い
-          float a=uOpacity*across*across*along;
+          float a=uOpacity*across*across*along*vFade;
           if(a<.003)discard;
           gl_FragColor=vec4(uColor,a);
         }`
     });
     const photonRain=new THREE.Mesh(photonRainGeo,photonRainMat);
     photonRain.frustumCulled=false;photonRain.renderOrder=8;photonRain.visible=false;scene.add(photonRain);
-    let photonRainCount=0,photonRainClamped=false;
+    let photonRainCount=0,photonRainClamped=false,photonRainWiden=false;
     // 角度そのものより「どちらへ流れるか」が卓では要る
     // 風は「揃っている⇔乱れている」が伝わればよい。角度の数字は出さない
+    // 総光量は保存されるので「明るくする」ではなく「消えなくする」と伝える
+    const photonRainPxLabel=v=>v<=0?'切':v.toFixed(1)+'画素まで太らせる';
     const photonRainWindLabel=v=>v+'% '+(v===0?'全部そろう':v<25?'わずかに乱れる':v<60?'ばらつく':v<85?'荒れる':'吹き荒れる');
     const photonRainTiltLabel=deg=>deg===0?'0° 真下'
       :(deg>0?'+'+deg+'° 客席へ':deg+'° 奥へ')+(Math.abs(deg)>=60?'（ほぼ真横）':'');
@@ -6358,6 +6379,13 @@
       u.uTilt.value=THREE.MathUtils.degToRad(THREE.MathUtils.clamp(Number(pr.tilt)||0,-75,75));
       // 風は進行方向では出せないものだけを担当する。向きのばらつきと突風
       u.uWind.value=THREE.MathUtils.clamp((Number.isFinite(+pr.wind)?+pr.wind:35)/100,0,1);
+      /* 遠くの粒。距離1mあたり何メートルが1デバイス画素にあたるかを出して渡す。
+         赤レーザーの pxK（6525付近）と同じ式。あちらは CSS画素の clientHeight を
+         使っているが、ラスタライズの単位はデバイス画素なので描画バッファの高さを取る。 */
+      const pxFloor=THREE.MathUtils.clamp(Number(pr.pxFloor)||0,0,3);
+      const bufH=Math.max(240,renderer.domElement.height||700);
+      u.uPxFloor.value=pxFloor>0?2*Math.tan(camera.fov*Math.PI/360)/bufH*pxFloor:0;
+      photonRainWiden=pxFloor>0;
       // 露光している間に粒が落ちた距離が、そのまま筋の長さになる。
       // 等高線の帯と同じ理屈で、ぼかしではなく形として作る。
       u.uStreak.value=Math.max(.004,fall*Math.max(0,Number(expo.shutter)||0));
@@ -7592,6 +7620,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       // 既定が 35 なので || は使えない。保存した 0 が 35 へ戻ってしまう
       const rainWind=Number(board.photonRain.wind);
       board.photonRain.wind=THREE.MathUtils.clamp(Number.isFinite(rainWind)?Math.round(rainWind):35,0,100);
+      const rainPx=Number(board.photonRain.pxFloor);
+      board.photonRain.pxFloor=THREE.MathUtils.clamp(Number.isFinite(rainPx)?rainPx:0,0,3);
       board.photonRain.spread=THREE.MathUtils.clamp(Math.round(Number(board.photonRain.spread)||60),10,100);
       board.photonRain.color=/^#[0-9a-f]{6}$/i.test(String(board.photonRain.color||''))?board.photonRain.color:'#bfe1ff';
       Object.assign(board.beamOrbit,src.beamOrbit||{});
@@ -8044,6 +8074,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       q('#photonRainSpeed').value=board.photonRain.speed;q('#v-photonRainSpeed').textContent=board.photonRain.speed.toFixed(1)+' m/s';
       q('#photonRainTilt').value=board.photonRain.tilt;q('#v-photonRainTilt').textContent=photonRainTiltLabel(board.photonRain.tilt);
       q('#photonRainWind').value=board.photonRain.wind;q('#v-photonRainWind').textContent=photonRainWindLabel(board.photonRain.wind);
+      q('#photonRainPxFloor').value=board.photonRain.pxFloor;q('#v-photonRainPxFloor').textContent=photonRainPxLabel(board.photonRain.pxFloor);
       q('#photonRainSpread').value=board.photonRain.spread;q('#v-photonRainSpread').textContent=board.photonRain.spread+'%';
       q('#photonRainColor').value=board.photonRain.color;q('#v-photonRainColor').textContent=board.photonRain.color;
       if(!board.photonRain.on)syncPhotonRainReadout(false);
@@ -8245,6 +8276,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     q('#photonRainSpeed').oninput=e=>{board.photonRain.speed=+e.target.value;q('#v-photonRainSpeed').textContent=board.photonRain.speed.toFixed(1)+' m/s';saveSettings();refresh()};
     q('#photonRainTilt').oninput=e=>{board.photonRain.tilt=Math.round(+e.target.value);q('#v-photonRainTilt').textContent=photonRainTiltLabel(board.photonRain.tilt);saveSettings();refresh()};
     q('#photonRainWind').oninput=e=>{board.photonRain.wind=Math.round(+e.target.value);q('#v-photonRainWind').textContent=photonRainWindLabel(board.photonRain.wind);saveSettings();refresh()};
+    q('#photonRainPxFloor').oninput=e=>{board.photonRain.pxFloor=+e.target.value;q('#v-photonRainPxFloor').textContent=photonRainPxLabel(board.photonRain.pxFloor);saveSettings();refresh()};
     q('#photonRainSpread').oninput=e=>{board.photonRain.spread=Math.round(+e.target.value);q('#v-photonRainSpread').textContent=board.photonRain.spread+'%';saveSettings();refresh()};
     q('#photonRainColor').oninput=e=>{board.photonRain.color=e.target.value;q('#v-photonRainColor').textContent=board.photonRain.color;saveSettings();refresh()};
     q('#humanContourThickness').oninput=e=>{board.humanContour.thickness=+e.target.value;q('#v-humanContourThickness').textContent=Math.round(board.humanContour.thickness*100)+'%';saveSettings();refresh()};
@@ -8831,7 +8863,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
             '赤レーザー  '+(board.redMesh.on?'ON  '+redDrawn+'/'+RED_MESH_MAX+'本':'OFF'),
             'レーザー面  '+(board.laserSheet.on?'ON':'OFF'),
             '等高線      '+(board.humanContour.on?'ON  '+board.humanContour.level+'%':'OFF'),
-            '光の雨      '+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒'+(photonRainClamped?'(面積で制限)':'')+'  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm  向き'+board.photonRain.tilt+'°  風'+board.photonRain.wind+'%':'OFF'),
+            '光の雨      '+(board.photonRain.on?'ON  '+photonRainCount+'/'+PHOTON_RAIN_MAX+'粒'+(photonRainClamped?'(面積で制限)':'')+'  筋'+(photonRainMat.uniforms.uStreak.value*100).toFixed(1)+'cm  向き'+board.photonRain.tilt+'°  風'+board.photonRain.wind+'%'+(photonRainWiden?'  遠'+board.photonRain.pxFloor.toFixed(1)+'px':''):'OFF'),
             '実光源 '+realLights+'灯 / 影 '+shadowLights+'灯 ('+board.shadow.mode+')',
             '出力ゲイン '+board.outputGain.toFixed(1)+'段   被写体 '+bodyId
           ].join('\n');
