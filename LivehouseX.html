@@ -6284,17 +6284,25 @@
            抜けられない（位相変調を入れたが、10秒窓の自己相関は 0.298→0.341 と
            むしろ悪化した。位相変調した正弦は局所的には依然として正弦で、
            1ノード16.7秒では10秒の間に周波数がほとんど変わらない）。
-           断続性（intermittency）へ切り替える。|ノイズ| が閾値を超えたときだけ
-           吹き、符号で順・逆が決まる。掃引で 周期20.1秒 / 1回2.9秒 / 15% に合わせた。 */
-        const float EV_W=.22;       // イベントノイズの時間スケール
-        const float EV_TH=.72;      // 閾値。高いほど稀で短い
+           断続性（intermittency）へ切り替える。
+
+           最初はノイズの閾値超えで作ったが、実機で2つ外れた。
+           (a) 間隔が 2.6〜93.7秒 とばらつき、20秒超が33%・30秒超が20%あった。
+               平均20.1秒は平均でしかなく、裾が長い。
+           (b) 速度は包絡の「微分」なので、包絡が一定のところでちょうど0になる。
+               しかも閾値0.72〜1.0 の帯をノイズが通り抜けるだけでプラトーはほぼ
+               存在せず（0.47%）、立ち上がりと減衰の細い山だけが残って、
+               傾きの蹴りが平均0.42秒の一瞬にしかならなかった。
+
+           枠（ジッタ付き）＋1回ぶんの正弦1周期へ作り替える。速度が sin そのもの
+           なので持続し、位置 (dur/2π)(1-cos) はイベントの両端でちょうど0へ戻る。
+           累積も不連続もなく、ピークが厳密に1なので正規化の実測定数も要らない。
+           実測: 発生周期 16.4〜27.8秒、傾きが50%以上続く時間 1.54秒。 */
+        const float EV_T=22.0;      // イベントの枠[秒]
+        const float EV_JIT=3.0;     // 枠の中での前後のゆらぎ[秒]
+        const float EV_DMIN=4.0;    // 1回の長さ[秒]
+        const float EV_DMAX=7.0;
         const float EV_TURB=.8;     // イベント中の乱流の増し分（最大1.8倍）
-        /* ピーク速度比がちょうど uGust になるよう正規化する。
-           解析的な上限 1.5*2.87*EV_W/(1-EV_TH)=3.38 は到達しない ―
-           6u(1-u) の最大は u=0.5 で、そこは |e.x| が閾値と1の中間。一方
-           |e.y| が最大になるのはノードの中点で、そこは e.x が中点値。両立しない。
-           4000秒ぶんの総当たりで測った実測の最大 1.8984 の逆数を使う。 */
-        const float EV_NORM=.5268;
         /* 風向きのゆらぎ。遅く・全体で揃っていて・非周期。変位≒速度÷周波数なので
            30秒周期の横流れは位置が十数m動くが、mod の内側に入れれば巻き戻しが
            吸収して箱から出ない。一様乱数場の平行移動は見えないので、見えるのは
@@ -6367,18 +6375,22 @@
           vec2 dn1=n1(td), dn2=n1(td+37.4);
           vec2 driftPos=uWind*uSpeed*(DR_TAN/DR_W)*vec2(dn1.x,dn2.x);
           vec2 driftVel=uWind*uSpeed* DR_TAN      *vec2(dn1.y,dn2.y);
-          /* 突風イベント。6u(1-u) は u=0 と u=1 でちょうど0になるので、
-             クランプの外で分岐する必要がない。|e.x| の微分で sign が二重に
-             掛かって消えるため、denv に sign は現れない。 */
-          vec2 e=n1(uTime*EV_W);
-          float u=clamp((abs(e.x)-EV_TH)/(1.-EV_TH),0.,1.);
-          float env =sign(e.x)*u*u*(3.-2.*u);
-          float denv=6.*u*(1.-u)/(1.-EV_TH)*e.y*EV_W;
-          float bA=uWind*uGust*uSpeed*EV_NORM;
-          vec2 burstPos=bA*env *wpar;   // 傾きの向きに沿って順・逆が交互に来る
-          vec2 burstVel=bA*denv*wpar;
-          float boost =1.+EV_TURB*abs(env);          // イベント中は乱流も強まる＝「乱れる」
-          float dboost=EV_TURB*sign(env)*denv;
+          /* 突風イベント。枠ごとにジッタ・長さ・向き・強さを引く。
+             ek は枠の中では定数なので、時間微分は es の分だけになる。 */
+          float ek=floor(uTime/EV_T);
+          float ejit=h(ek*7.31)*2.*EV_JIT;
+          float edur=mix(EV_DMIN,EV_DMAX,h(ek*5.3));
+          float esg=h(ek*3.7)<.5?-1.:1.;
+          float estr=mix(.6,1.,h(ek*11.9));
+          float es=uTime-ek*EV_T-ejit;
+          float eon=(es>0.&&es<edur)?1.:0.;
+          float ea=6.28319*es/edur;
+          float bA=uWind*uGust*uSpeed*eon*esg*estr;
+          vec2 burstPos=bA*(edur/6.28319)*(1.-cos(ea))*wpar;  // 両端で厳密に0へ戻る
+          vec2 burstVel=bA*sin(ea)*wpar;                      // 順に押して、逆へ押し返す
+          float sb=sin(3.14159*es/edur);
+          float boost =1.+EV_TURB*eon*estr*sb*sb;    // イベント中は乱流も強まる＝「乱れる」
+          float dboost=EV_TURB*eon*estr*(3.14159/edur)*sin(ea);
           float depth=uZ1-uZ0, spanX=2.*uAreaX;
           float y=mod(y0+uTime*sp*dirP.y,uHeight);
           float z=uZ0+mod(z0-uZ0+uTime*sp*dirP.z+driftPos.y+burstPos.y,depth);
@@ -9038,32 +9050,37 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       const fr=x=>x-Math.floor(x), hh=n=>fr(Math.sin(n*12.9898)*43758.5453);
       const n1=t=>{const i=Math.floor(t),f=t-i,a=hh(i)*2-1,b=hh(i+1)*2-1;
         return[a+(b-a)*f*f*(3-2*f),(b-a)*6*f*(1-f)]};
-      const EV_W=.22,EV_TH=.72,EV_TURB=.8,EV_NORM=.5268,DR_W=.045,DR_TAN=.052,DR_KZ=.028;
+      const EV_T=22,EV_JIT=3,EV_DMIN=4,EV_DMAX=7,EV_TURB=.8,DR_W=.045,DR_TAN=.052,DR_KZ=.028;
+      const mixf=(a,b,x)=>a+(b-a)*x;
       const Z_MID=(PHOTON_RAIN_Z0+PHOTON_RAIN_Z1)*.5;
       let lastEnd=NaN,wasOn=false,sinceTxt='—',shown='';
       return {tick(t){
         const pr=board.photonRain;
         const wind=THREE.MathUtils.clamp((Number.isFinite(+pr.wind)?+pr.wind:35)/100,0,1);
         const gust=THREE.MathUtils.clamp((Number.isFinite(+pr.gust)?+pr.gust:50)/100,0,1)*.80;
-        const e=n1(t*EV_W);
-        const u=THREE.MathUtils.clamp((Math.abs(e[0])-EV_TH)/(1-EV_TH),0,1);
-        const env=Math.sign(e[0])*u*u*(3-2*u);
-        const denv=6*u*(1-u)/(1-EV_TH)*e[1]*EV_W;
-        const on=Math.abs(env)>.02;
+        // シェーダと同じ枠・ジッタ・長さ・向き・強さ
+        const ek=Math.floor(t/EV_T);
+        const ejit=hh(ek*7.31)*2*EV_JIT, edur=mixf(EV_DMIN,EV_DMAX,hh(ek*5.3));
+        const esg=hh(ek*3.7)<.5?-1:1, estr=mixf(.6,1,hh(ek*11.9));
+        const es=t-ek*EV_T-ejit, on=es>0&&es<edur;
+        const ea=6.28319*es/edur;
+        const evel=on?esg*estr*Math.sin(ea):0;
+        const sb=Math.sin(3.14159*es/edur), ebump=on?estr*sb*sb:0;
         if(!on&&wasOn)lastEnd=t;
         if(on&&!wasOn)sinceTxt=Number.isFinite(lastEnd)?(t-lastEnd).toFixed(1)+'秒ぶり':'—';
         wasOn=on;
-        // ピーク時の傾き[度]。速度比は uGust そのものになるよう正規化してある
-        const evDeg=Math.atan(wind*gust*Math.abs(denv)*EV_NORM)*180/Math.PI;
-        const phase=!on?'静穏':(denv*Math.sign(env)>0?'立ち上がり':'減衰');
+        // 速度比はそのまま uGust 倍なので、傾きは atan で出せる（正規化の定数は不要）
+        const evDeg=Math.atan(wind*gust*Math.abs(evel))*180/Math.PI;
+        const phase=!on?'静穏':(es<edur*.5?'押し':'押し返し');
         const td=t*DR_W+Z_MID*DR_KZ;
         const dx=wind*DR_TAN*n1(td)[1], dz=wind*DR_TAN*n1(td+37.4)[1];
         const txt=[
           '光の雨の時間変化   風'+Math.round(wind*100)+'%  突風'+pr.gust+'%',
-          '突風イベント  '+phase+(on?'  向き '+(env>0?'順':'逆')+'  傾き '+evDeg.toFixed(1)+'°':'')
-            +'   env '+env.toFixed(3),
+          '突風イベント  '+phase
+            +(on?'  向き '+(evel>0?'順':'逆')+'  傾き '+evDeg.toFixed(1)+'°'
+                +'  経過 '+es.toFixed(1)+'/'+edur.toFixed(1)+'秒':''),
           '  直近の発生  '+(on?sinceTxt:(Number.isFinite(lastEnd)?(t-lastEnd).toFixed(1)+'秒前に終了':'まだ')),
-          '乱流の倍率    '+(1+EV_TURB*Math.abs(env)).toFixed(2)+' 倍（最大1.80）',
+          '乱流の倍率    '+(1+EV_TURB*ebump).toFixed(2)+' 倍（最大1.80）',
           '風向きドリフト '+(Math.atan(Math.hypot(dx,dz))*180/Math.PI).toFixed(1)+'°  '
             +(dx>0?'右':'左')+'／'+(dz>0?'客席':'奥')+'  成分 '+dx.toFixed(3)+','+dz.toFixed(3)
         ].join('\n');
