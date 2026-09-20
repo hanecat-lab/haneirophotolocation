@@ -2030,7 +2030,9 @@
        burst- は左から、burst+ は右から振り始める。 */
     const ROMANCE_ORDER=['L','L','R','R','burst-','R','R','L','L','burst+'];
     function buildRomanceKeys(){
-      const K={R:[],L:[]}, bursts=[];
+      /* plan は区間の時間割。?diag=fan がこれを読む。診断側で時間割を組み直すと
+         二重管理になるので、組み立てているここで一緒に出す。 */
+      const K={R:[],L:[]}, bursts=[], plan=[];
       let t=0;
       const push=(time,r,l)=>{K.R.push([time,...r]);K.L.push([time,...l])};
       for(const step of ROMANCE_ORDER){
@@ -2038,12 +2040,16 @@
           /* 小刻みは手先の目標では表せない（肘の角度が保証できない）ので、
              キーは中立1点だけ置いて窓と向きを記録し、描画側で振り子へ渡す。
              符号 +1 は右から、−1 は左から振り始める。 */
-          bursts.push([t,t+ROMANCE_BURST,step.endsWith('-')?-1:1]);
+          const sign=step.endsWith('-')?-1:1;
+          bursts.push([t,t+ROMANCE_BURST,sign]);
+          plan.push({start:t,end:t+ROMANCE_BURST,kind:'burst',sign});
           t+=ROMANCE_BURST;
           push(t,ROMANCE_POSE.wipe,ROMANCE_POSE.wipe);
         }else{
           const lead=GLOW_MESH[step];          // 本人の左右 → メッシュ名
           const pick=(m,a,b)=>m===lead?a:b;
+          plan.push({start:t,end:t+ROMANCE_GESTURE+ROMANCE_PULL,kind:'gesture',
+                     side:step,mesh:lead,pointEnd:t+ROMANCE_GESTURE});
           // 突き上げの間は反対の手を上げている側の肩へ寄せる
           t+=ROMANCE_GESTURE;
           push(t, pick('R',ROMANCE_POSE.point,ROMANCE_POSE.tuck),
@@ -2054,7 +2060,7 @@
                   pick('L',ROMANCE_POSE.pull,ROMANCE_POSE.rest));
         }
       }
-      return {keys:K,period:t,bursts};
+      return {keys:K,period:t,bursts,plan};
     }
     const ROMANCE=buildRomanceKeys();
     const ROMANCE_KEYS=ROMANCE.keys, ROMANCE_BURSTS=ROMANCE.bursts;
@@ -2278,7 +2284,9 @@
          終点そのものなので、そちらの境目も飛ばない。 */
       add(1.0, ['spinIn',[10,-78,GLOW_REACH_MAX]],
                ['arc',[-4,-72,...THUNDER_HOLD,GLOW_REACH_MAX]]);
-      add(3.0, ['orbit',[...THUNDER_ORBIT,0,3]], ['thrust',THUNDER_HOLD]);
+      /* 回転数が負＝外回し（前方 → 自分の右 → 下 → 上）。orbit の位相が増える向きは
+         ローカル +x ＝本人の左なので、外回しは負の向きになる。 */
+      add(3.0, ['orbit',[...THUNDER_ORBIT,0,-3]], ['thrust',THUNDER_HOLD]);
       return {segments:seg,period:seg.reduce((a,x)=>a+x.dur,0)};   // 20拍
     }
     const THUNDER=buildThunderSegments();
@@ -2325,6 +2333,9 @@
     const GLOW_POSE_KEYS=Object.keys(GLOW_POSES);
     const GLOW_POSE_DEFAULT='penlight_swing_down';
     const glowPoseOf=d=>GLOW_POSES[d&&d.pose]||GLOW_POSES[GLOW_POSE_DEFAULT];
+    /* 人ごとに速さと位相をずらす。揃うと機械的に見える。
+       ?diag=fan が同じ時刻を再現できるよう、名前のある関数にしておく。 */
+    const glowFanTime=(t,i)=>t*(1+i*.03)+i*.4;
     /* 棒人間を1体組む。全高 1.660m、脚は全高の 48%。
        両腕とも肩にピボット Group を置く。子を肩から伸ばすので、腕の端が
        肩に一致することが構造的に保証される。片方だけ中心座標を手計算した
@@ -2475,7 +2486,7 @@
       const stL=g.getObjectByName('glowStickL');
       if(stL)stL.visible=(P.sticks||1)>=2;
       if(P.kind==='romance'){
-        const tt=t*(1+i*.03)+i*.4;   // 人ごとに速さと位相をずらす。揃うと機械的に見える
+        const tt=glowFanTime(t,i);
         const p=((tt%P.period)+P.period)%P.period, win=romanceBurstWindow(p);
         /* 小刻みは順運動学の振り子。立ち上がりの 0.12秒だけは既存のキーフレーム経路で
            中立（ROMANCE_POSE.wipe）へ寄せ、そこから振り始める。中立は振り子の θ=0 と
@@ -2485,8 +2496,11 @@
           /* 振り子の時計は立ち上がりの終わりから始める。窓の頭から数えると
              受け渡しの時点で位相が 0 でなく、手先が 7.5cm 飛ぶ。 */
           const u=(p-win[0]-ROMANCE_RAMP)/(win[1]-win[0]-ROMANCE_RAMP);
-          // win[2] が +1 なら右から、−1 なら左から振り始める
-          const th=win[2]*ROMANCE_WIPER_AMP*Math.sin(Math.PI*ROMANCE_BURST_STEPS*u);
+          /* win[2] は本人のどちら側から振り始めるか（+1 = 本人の右）。
+             glowElbow90 の θ>0 は図形ローカルの +x へ前腕を振るが、棒人間は
+             rotation.y=π で立つのでローカル +x は本人の左。ここで符号を反転して
+             本人の左右へ揃える（GLOW_MESH が名前について言っているのと同じ話）。 */
+          const th=-win[2]*ROMANCE_WIPER_AMP*Math.sin(Math.PI*ROMANCE_BURST_STEPS*u);
           ['R','L'].forEach(side=>{
             const r=glowWiperArm(side,th);
             placeGlowArm(g,side,glowShoulder(side),r.E,r.H);
@@ -2508,7 +2522,7 @@
           });
         }
       }else if(P.kind==='segments'){
-        const tt=t*(1+i*.03)+i*.4;
+        const tt=glowFanTime(t,i);
         ['R','L'].forEach(side=>{
           const r=segmentArm(P,side,tt);
           // E を返す動き（肘固定）は FK でそのまま置く。無ければ IK が肘を出す
@@ -9577,6 +9591,92 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       }};
     })();
 
+    /* ?diag=fan — ロマンスの左右を実機から読み出す。
+       これまで左右を3度取り違えたのは、すべて「図形ローカルの x」を
+       「画面の左右」と読んだため。ここでは推論を一切挟まず、
+       ワールド座標をカメラへ投影した NDC x で測る（NDC x>0 が画面の右）。
+       本人の右が画面のどちら側かも、図形の右方向ベクトルを投影して測る。
+       表示をタップするとログの更新が止まる（スマホで読むため）。 */
+    const diagFan=(()=>{
+      if(!diagHas('fan'))return null;
+      const el=document.createElement('div');el.id='diagFan';
+      el.style.cssText='position:fixed;left:8px;top:8px;z-index:9999;max-width:94vw;padding:8px 10px;'
+        +'background:rgba(0,0,0,.85);color:#9ff0c4;font:10px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;'
+        +'white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid rgba(159,240,196,.45);border-radius:6px;'
+        +'-webkit-user-select:text;user-select:text';
+      document.body.append(el);
+      let frozen=false;
+      el.addEventListener('click',()=>{frozen=!frozen});
+      const wp=new THREE.Vector3(), wq=new THREE.Quaternion(), wv=new THREE.Vector3();
+      const f2=v=>(v>=0?'+':'')+v.toFixed(2);
+      const sideOf=x=>x>0?'右':'左';
+      const log=[]; let lastKey='';
+      /* 位置をカメラへ投影して NDC x を返す。画面外や俯瞰では null。 */
+      function ndcX(v){
+        const p=wv.copy(v).project(camera);
+        return (Math.abs(p.x)>1.4||Math.abs(p.y)>1.4)?null:p.x;
+      }
+      function fmt(x){return x===null?'画角外':f2(x)}
+      return {tick(t){
+        if(frozen)return;
+        const i=glowFansData.findIndex(d=>d.on&&glowPoseOf(d).kind==='romance');
+        if(i<0){el.textContent='ロマンス診断: ロマンスの観客が ON になっていません';return}
+        if(cameraMode==='map'){el.textContent='ロマンス診断: 俯瞰中は左右を判定しません';return}
+        const d=glowFansData[i], g=glowFanMeshes[i], P=glowPoseOf(d);
+        const lines=[`ロマンス診断  ${d.label} [${d.id}]  ポーズ=${d.pose}`];
+        // 本人の右が画面のどちら側か。図形の右方向（ローカル −x）を投影して測る
+        g.getWorldPosition(wp); g.getWorldQuaternion(wq);
+        const orgX=ndcX(wp);
+        const rightX=ndcX(wv.set(-.5,0,0).applyQuaternion(wq).add(wp).clone());
+        const rightIsScreenRight=(orgX!==null&&rightX!==null)?rightX>orgX:null;
+        lines.push(`  本人の右 = 画面の ${rightIsScreenRight===null?'?':(rightIsScreenRight?'右':'左')}`
+          +`   （図形の原点 ${fmt(orgX)} → 右手側 ${fmt(rightX)}）`);
+        // メッシュ R/L のサイリウムが画面のどちら側にあるか
+        const stick={}; const hand={};
+        for(const m of ['R','L']){
+          const st=g.getObjectByName('glowStick'+m), hd=g.getObjectByName('glowHand'+m);
+          stick[m]=st&&st.visible?ndcX(st.getWorldPosition(new THREE.Vector3())):null;
+          hand[m]=hd?hd.getWorldPosition(new THREE.Vector3()).clone():null;
+          lines.push(`  メッシュ${m} のペン: 画面 ${stick[m]===null?'?':sideOf(stick[m])} (ndc ${fmt(stick[m])})`
+            +(hand[m]?`  高さ ${hand[m].y.toFixed(3)}`:''));
+        }
+        // いまの区間（コードの意図）
+        const tt=glowFanTime(t,i), per=P.period, p=((tt%per)+per)%per;
+        const seg=ROMANCE.plan.find(x=>p>=x.start&&p<x.end);
+        const toScreen=n=>rightIsScreenRight===null?'?':((n>0)===rightIsScreenRight?'右':'左');
+        let key='', name='', wantSide=null, gotX=null;
+        if(seg&&seg.kind==='burst'){
+          const span=seg.end-seg.start-ROMANCE_RAMP;
+          const u=Math.min(Math.max((p-seg.start-ROMANCE_RAMP)/span,0),1);
+          const k=Math.min(Math.floor(u*ROMANCE_BURST_STEPS)+1,ROMANCE_BURST_STEPS);
+          name=`小刻み（${ROMANCE_BURST_STEPS}回中 ${k}回目）`; key='b'+seg.start+'-'+k;
+          // 意図: win[2]*sin(3πu) の符号が +1 なら本人の右
+          wantSide=Math.sign(seg.sign*Math.sin(Math.PI*ROMANCE_BURST_STEPS*u))||1;
+          // 実測: 両手の平均が図形の原点からどちらへ寄っているか
+          if(stick.R!==null&&stick.L!==null&&orgX!==null)gotX=(stick.R+stick.L)/2-orgX;
+        }else if(seg){
+          const pt=p<seg.pointEnd;
+          name=(pt?'突き上げ':'引き')+`（本人の${seg.side==='R'?'右':'左'}）`;
+          key='g'+seg.start+(pt?'p':'q');
+          wantSide=seg.side==='R'?1:-1;
+          const x=stick[seg.mesh];
+          if(x!==null&&orgX!==null)gotX=x-orgX;
+        }
+        const wantScr=wantSide===null?'?':toScreen(wantSide);
+        const gotScr=gotX===null?'?':sideOf(gotX);
+        const agree=(wantScr!=='?'&&gotScr!=='?')?(wantScr===gotScr?'一致':'★食い違い'):'';
+        lines.push(`  いま ${p.toFixed(2)}s / ${per.toFixed(1)}s  区間 ${name}`);
+        lines.push(`    コードの意図 = 画面 ${wantScr}   実測 = 画面 ${gotScr} (${gotX===null?'?':f2(gotX)})  ${agree}`);
+        if(key&&key!==lastKey){
+          lastKey=key;
+          log.unshift(`  ${p.toFixed(2)}s ${name}  意図 ${wantScr} / 実測 ${gotScr}  ${agree}`);
+          log.length=Math.min(log.length,7);
+        }
+        lines.push('  直近のできごと（新しい順・タップで停止）');
+        lines.push(...log);
+        el.textContent=lines.join('\n');
+      }};
+    })();
     /* ?diag=perf — 実機の負荷の素の数字。
        この環境では rAF が進まずフレームレートを測れないため、演出を足す前に
        実機で基準値を取るための道具として先に用意する。追加前・追加後で
@@ -10328,6 +10428,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       if(diagMic)diagMic.tick(now);
       if(diagPerf)diagPerf.tick(now);
       if(diagRain)diagRain.tick(clock);
+      if(diagFan)diagFan.tick(clock);
     }
     requestAnimationFrame(loop);
 
