@@ -2240,6 +2240,13 @@
       const n=v.multiplyScalar(1/v.length());
       return [Math.atan2(n.x,n.z)*180/Math.PI, Math.asin(n.y)*180/Math.PI];
     }
+    /* 位置を [方位°, 仰角°, 距離] へ直す。glowDirOf の逆で、側の鏡映も戻す。
+       繋ぎの弧の端点を手書きの定数にせず、出荷している動きから導くために使う。 */
+    function glowDirOfPoint(side,H){
+      const v=H.clone().sub(glowShoulder(side)), d=v.length(), n=v.multiplyScalar(1/d);
+      const sx=side==='L'?-1:1;
+      return [Math.atan2(sx*n.x,n.z)*180/Math.PI, Math.asin(n.y)*180/Math.PI, d];
+    }
     const THUNDER_SPIN_IN=(()=>{
       const S=glowShoulder('L');
       const v=glowElbow90('L',THUNDER_ORBIT[0]*Math.PI/180,THUNDER_ORBIT[1]*Math.PI/180,0).H.sub(S);
@@ -2328,6 +2335,19 @@
       const w=Math.max(e,0), s=w*w*(3-2*w);
       return {E:cur.E,H:from.H.multiplyScalar(1-s).addScaledVector(cur.H,s)};
     }
+    /* サンダースネークの終わり → ロマンスの始まり の繋ぎ（1拍）。
+       端点は両方とも出荷している動きから導くので、どちらを触っても置き去りに
+       ならない。弧なので肩からの距離も滑らかに変わり、手先が飛ばない。 */
+    const THUNDER_TO_ROMANCE=(()=>{
+      const last=THUNDER.segments[THUNDER.segments.length-1], seg={dur:THUNDER_BEAT};
+      for(const m of ['R','L']){
+        const a=glowDirOfPoint(m,ARM_MOVES[last[m][0]].fn(m,1,last[m][1]).H);
+        const b=glowDirOfPoint(m,romanceTarget({period:ROMANCE.period},m,0));
+        seg[m]=['arc',[a[0],a[1],b[0],b[1],a[2],b[2]]];
+      }
+      return {label:'繋ぎ',kind:'segments',sticks:2,overhead:true,
+              period:THUNDER_BEAT,segments:[seg]};
+    })();
     const GLOW_POSES={
       penlight_swing_down:{
         label:'ペンライト振り下ろし',
@@ -2351,6 +2371,15 @@
         bend:THUNDER.bend,          // 前屈の窓（六突きのはじめが最も深い）
         segments:THUNDER.segments,
       },
+    };
+    /* 連結。intro を順に1回ずつ流し、そのあとは loop を繰り返す。
+       時刻の純関数ではなくなるので、glowFansData[i].startAt に「始めた時刻」を
+       持ち、そこからの経過で引く。 */
+    GLOW_POSES.thunder_then_romance={
+      label:'サンダースネーク → ロマンス',
+      kind:'chain', sticks:2, overhead:true,
+      intro:[GLOW_POSES.thunder_snake,THUNDER_TO_ROMANCE],
+      loop:GLOW_POSES.romance_cycle,
     };
     const GLOW_POSE_KEYS=Object.keys(GLOW_POSES);
     const GLOW_POSE_DEFAULT='penlight_swing_down';
@@ -2565,17 +2594,27 @@
       if(p<b.hold)return GLOW_BEND_MAX;                       // 深いまま保つ
       return GLOW_BEND_MAX*(1-sm((p-b.hold)/(b.to-b.hold)));
     }
-    function poseGlowFan(g,P,t,i){
+    function poseGlowFan(g,P,t,i){poseGlowFanAt(g,P,glowFanTime(t,i),t,i)}
+    /* tt は人ごとのずらしを掛けた時刻。rawT / i は振り下ろし（swing）だけが使う
+       ― あちらは glowElbowAngle が別系統のずらし方を持っているので、
+       ここで tt へ寄せると既存の軌跡が変わってしまう。 */
+    function poseGlowFanAt(g,P,tt,rawT,i){
+      if(P.kind==='chain'){
+        /* intro を順に消化し、残りを loop の周期で回す。 */
+        let p=Math.max(tt,0);
+        for(const M of P.intro){if(p<M.period)return poseGlowFanAt(g,M,p,rawT,i); p-=M.period}
+        const L=P.loop;
+        return poseGlowFanAt(g,L,((p%L.period)+L.period)%L.period,rawT,i);
+      }
       const stL=g.getObjectByName('glowStickL');
       if(stL)stL.visible=(P.sticks||1)>=2;
       /* 前屈は「その人・その時刻」の値を入れてから腕を置く。ポーズを切り替えた
          ときに前の値が残らないよう、bend を持たないポーズでは必ず 0 に戻る。 */
-      const per=P.period||1, pp=((glowFanTime(t,i)%per)+per)%per;
+      const per=P.period||1, pp=((tt%per)+per)%per;
       glowBend=glowBendAt(P,pp);
       const body=g.getObjectByName('glowBody');
       if(body)body.rotation.x=glowBend;
       if(P.kind==='romance'){
-        const tt=glowFanTime(t,i);
         const p=((tt%P.period)+P.period)%P.period, win=romanceBurstWindow(p);
         /* 小刻みは順運動学の振り子。立ち上がりの 0.12秒だけは既存のキーフレーム経路で
            中立（ROMANCE_POSE.wipe）へ寄せ、そこから振り始める。中立は振り子の θ=0 と
@@ -2611,7 +2650,6 @@
           });
         }
       }else if(P.kind==='segments'){
-        const tt=glowFanTime(t,i);
         ['R','L'].forEach(side=>{
           const r=segmentArm(P,side,tt);
           // E を返す動き（肘固定）は FK でそのまま置く。無ければ IK が肘を出す
@@ -2619,7 +2657,7 @@
           else   solveGlowArmIK(g,r.H,side,r.pole);
         });
       }else{
-        solveGlowArm(g,P,glowElbowAngle(P,t,i),'R');
+        solveGlowArm(g,P,glowElbowAngle(P,rawT,i),'R');
         solveGlowArm(g,P,GLOW_REST_ELBOW,'L');
       }
     }
@@ -2633,13 +2671,18 @@
     }
     glowFansData.forEach((_,i)=>createGlowFanMesh(i));
     glowFansData.forEach((_,i)=>updateGlowFan(i));
-    /* ポーズ表のとおりに腕を動かす。時刻の純関数なので、他の演出が止まっていても
-       再開時に位置が飛ばない。人ごとに位相と速さをずらす。揃うと機械的に見える。 */
+    /* ポーズ表のとおりに腕を動かす。人ごとに位相と速さをずらす。揃うと機械的に見える。
+       繰り返すポーズは時刻の純関数のままだが、連結（chain）は「始めた時刻」からの
+       経過で引くので、ON にしたときとポーズを変えたときに起点を取り直す。
+       clock は描画が止まると進まないので、止めて再開しても位置は飛ばない。 */
+    let glowClockNow=0;
+    function glowFanRestart(i){const d=glowFansData[i]; if(d)d.startAt=glowClockNow}
     function updateGlowFans(t){
+      glowClockNow=t;
       glowFansData.forEach((d,i)=>{
         if(!d.on)return;
         const g=glowFanMeshes[i]; if(!g)return;
-        poseGlowFan(g,glowPoseOf(d),t,i);
+        poseGlowFan(g,glowPoseOf(d),t-(d.startAt||0),i);
       });
     }
     // UI生成。renderMicStandUI（1793付近）と同じ作り
@@ -2665,6 +2708,7 @@
         b.addEventListener('click',e=>{
           const i=parseInt(e.currentTarget.getAttribute('data-fan-on'));
           glowFansData[i].on=!glowFansData[i].on;
+          glowFanRestart(i);
           updateGlowFan(i); renderGlowFanUI(); saveSettings(); refresh();
         });
       });
@@ -2673,6 +2717,7 @@
           const i=parseInt(e.currentTarget.getAttribute('data-fan-pose'));
           const k=e.currentTarget.value;
           glowFansData[i].pose=GLOW_POSES[k]?k:GLOW_POSE_DEFAULT;
+          glowFanRestart(i);
           updateGlowFan(i); saveSettings(); refresh();
         });
       });
@@ -8625,7 +8670,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       sanitizeExternalSubjectAdjust(s.externalSubjectAdjust||{});syncExternalAdjustUI();
       sanitizeSmallModelCollection(s.smallModel||{});syncSmallModelUI();
       sanitizeMicStands(s.micStands);micStandsData.forEach((_,i)=>updateMicStand(i));renderMicStandUI();
-      sanitizeGlowFans(s.glowFans);glowFansData.forEach((_,i)=>updateGlowFan(i));renderGlowFanUI();
+      // 復元したら連結ポーズの起点も取り直す（前の起点は無意味なため）
+      sanitizeGlowFans(s.glowFans);glowFansData.forEach((_,i)=>{glowFanRestart(i);updateGlowFan(i)});renderGlowFanUI();
       if(POSES[s.pose])pose=s.pose;
       showGlasses=!!s.showGlasses;showSunglasses=!!s.showSunglasses;showCatEars=!!s.showCatEars;
       highlightZebraEnabled=!!s.highlightZebraEnabled;syncHighlightZebraUI();
