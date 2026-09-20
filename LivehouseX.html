@@ -2116,7 +2116,18 @@
     const ROMANCE_WIPER_ABD=15*Math.PI/180;   // 肩の外転。下げたまま
     const ROMANCE_WIPER_AMP=35*Math.PI/180;   // 前腕の振れ幅
     function glowWiperArm(side,th){return glowElbow90(side,ROMANCE_WIPER_ABD,0,th)}
-    // 小刻みの窓に入っているか。入っていれば [開始, 終了] を返す
+    /* 小刻みが終わった直後の経過を 0〜1 で返す（ROMANCE_RAMP 秒ぶん）。外なら null。
+       肘の極を振り子の向きから既定へ戻す区間の判定に使う。 */
+    function romanceBurstExit(p,period){
+      for(const w of ROMANCE_BURSTS){
+        /* 2回目の小刻みは窓の終わりが周期の境界そのものなので、
+           p は既に 0 付近へ巻き戻っている。剰余で経過を測る。 */
+        const d=((p-w[1])%period+period)%period;
+        if(d<ROMANCE_RAMP)return d/ROMANCE_RAMP;
+      }
+      return null;
+    }
+    // 小刻みの窓に入っているか。入っていれば [開始, 終了, 符号] を返す
     function romanceBurstWindow(p){
       for(const w of ROMANCE_BURSTS)if(p>=w[0]&&p<w[1])return w;
       return null;
@@ -2384,7 +2395,10 @@
     }
     /* 2リンクIK。手先の目標 H から肩・肘・手を決める。
        極ベクトルは真下を S→H 軸に直交化したもので固定＝肘は常に下へ張り出す。 */
-    function solveGlowArmIK(g,H,side){
+    /* poleHint を渡すと肘の張り出す向きをそこから作る（既定は真下）。
+       肘の内角は H だけで決まるので、極を変えても曲がり具合は変わらない ―
+       変わるのは肘がどちらへ出るかだけ。順運動学の区間から繋ぐときに使う。 */
+    function solveGlowArmIK(g,H,side,poleHint){
       const S=glowShoulder(side);
       const v=H.clone().sub(S);
       /* 到達できない目標が来たら方向を保ったまま縮める。超えると h=√(L1²−a²) が
@@ -2396,7 +2410,8 @@
       const axis=v.clone().multiplyScalar(1/D);
       const aLen=(GLOW_L1*GLOW_L1-GLOW_L2*GLOW_L2+D*D)/(2*D);
       const h=Math.sqrt(Math.max(GLOW_L1*GLOW_L1-aLen*aLen,0));
-      const pole=new THREE.Vector3(0,-1,0).addScaledVector(axis,axis.y);
+      const pv=poleHint||new THREE.Vector3(0,-1,0);
+      const pole=pv.clone().addScaledVector(axis,-pv.dot(axis));
       // 腕が真下を向くと極が決まらない。そのときだけ前方から作り直す
       if(pole.lengthSq()<1e-8)pole.set(0,0,1).addScaledVector(axis,-axis.z);
       pole.normalize();
@@ -2445,8 +2460,20 @@
             placeGlowArm(g,side,glowShoulder(side),r.E,r.H);
           });
         }else{
-          solveGlowArmIK(g,romanceTarget(P,'R',tt),'R');
-          solveGlowArmIK(g,romanceTarget(P,'L',tt),'L');
+          /* 小刻みが終わる瞬間、手先は動かないのに肘だけが 76mm 飛んでいた。
+             小刻み中は順運動学（上腕を外転15°に固定）、直後は逆運動学（極は真下）と
+             肘の決め方が切り替わるため。極を振り子の上腕向きから既定へ
+             ROMANCE_RAMP 秒かけて戻して、腕の向きを連続させる。 */
+          const ex=romanceBurstExit(p,P.period);
+          ['R','L'].forEach(side=>{
+            let hint=null;
+            if(ex!==null){
+              const w=ex*ex*(3-2*ex);
+              hint=glowUpperDir(side,ROMANCE_WIPER_ABD,0).multiplyScalar(1-w)
+                   .addScaledVector(new THREE.Vector3(0,-1,0),w);
+            }
+            solveGlowArmIK(g,romanceTarget(P,side,tt),side,hint);
+          });
         }
       }else if(P.kind==='segments'){
         const tt=t*(1+i*.03)+i*.4;
