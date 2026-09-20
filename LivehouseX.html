@@ -2048,6 +2048,85 @@
     const ROMANCE=buildRomanceKeys();
     const ROMANCE_KEYS=ROMANCE.keys;
     const ROMANCE_RAMP=.12;   // 立ち上がりの秒数。残りはその位置で止める＝ポーズが決まる
+    /* サンダースネーク。ヲタ芸の技で、構成は
+       「手を合わせて体の前で2回転 →（2回転目を左上で止める）→ 左右交互に
+         だんだん上へ6回突く（下段・中段・上段に各2回）」。
+       特徴は直線的な動きと伸ばし切った肘。導入はユーザー判断で片腕回しにしてある。
+       **この技だけ万歳と肘の伸び切りを許す**（技の定義そのもののため）。
+       他のポーズは従来どおり頭頂 1.660m を超えない。 */
+    const THUNDER_RAMP=.12;     // aim / thrust の立ち上がり秒数。残りはその位置で静止
+    const THUNDER_REACH=.575;   // 突きの到達[m]。L1+L2=.58 の手前で止める ―
+                                // 伸ばし切ると IK の h=√(L1²−a²) が 0 に落ちて特異点に乗る
+    // 角度から手先の1点を作る。romanceKeyPos と同じ計算をここへ括り出した
+    function glowAimPos(side,abdDeg,fwdDeg,reach,lift){
+      const S=glowShoulder(side);
+      const dir=glowUpperDir(side,abdDeg*Math.PI/180,fwdDeg*Math.PI/180);
+      return S.addScaledVector(dir,GLOW_L1).add(new THREE.Vector3(0,lift,reach));
+    }
+    /* 突き。肩から THUNDER_REACH の位置へ、方位 az（正=自分の側、負=体を横切る）と
+       仰角 el で出す。方向ベクトルは長さ厳密に1。 */
+    function glowThrustPos(side,azDeg,elDeg){
+      const sx=side==='L'?-1:1;
+      const az=azDeg*Math.PI/180, el=elDeg*Math.PI/180;
+      const d=new THREE.Vector3(sx*Math.sin(az)*Math.cos(el),Math.sin(el),Math.cos(az)*Math.cos(el));
+      return glowShoulder(side).addScaledVector(d,THUNDER_REACH);
+    }
+    /* 腕の動き。区間内の進み u(0〜1) から {E?,H} を返す。
+       E を返す動きは肘を固定できる（FK）。省くと solveGlowArmIK が肘を出す。
+       continuous な動きは立ち上がりを掛けず u をそのまま使う。 */
+    const ARM_MOVES={
+      aim   :{fn:(side,u,a)=>({H:glowAimPos(side,a[0],a[1],a[2],a[3])})},
+      thrust:{fn:(side,u,a)=>({H:glowThrustPos(side,a[0],a[1])})},
+      spin  :{continuous:true,fn:(side,u,a)=>{
+        /* 肘を固定し、前腕だけ回す。a=[外転°,前方挙上°,回転数,横比,縦比,前の中心,前の振れ]。
+           後ろ4つは長さではなく**比**（正規化して前腕長を掛けるため）。 */
+        const sx=side==='L'?-1:1;
+        const E=glowShoulder(side).addScaledVector(glowUpperDir(side,a[0]*Math.PI/180,a[1]*Math.PI/180),GLOW_L1);
+        const ang=u*Math.PI*2*a[2];
+        const v=new THREE.Vector3(sx*Math.cos(ang)*a[3],Math.sin(ang)*a[4],a[5]+Math.cos(ang)*a[6]).normalize();
+        return {E,H:E.clone().addScaledVector(v,GLOW_L2)};
+      }},
+    };
+    /* 六突き: [突く腕, 仰角°]。左右交互・だんだん上へ・下段/中段/上段に各2回。
+       方位は負＝体を横切る向き（「右腕を左方に突き出す」）。 */
+    const THUNDER_THRUSTS=[['R',-20],['L',-20],['R',10],['L',10],['R',40],['L',40]];
+    const THUNDER_AZ=-35;         // 突きの方位。負で体を横切る
+    const THUNDER_UPLEFT=[75,0,.05,.22];   // 左上で止める構え（外転75°）
+    const THUNDER_GUARD =[15,5,.08,-.05];  // 突いていない側の構え（胸元）
+    function buildThunderSegments(){
+      const seg=[
+        // 導入: 左腕は上横へ指差し、右腕は肘を支点に2回転
+        {dur:1.30, R:['spin',[15,10,2,.10,.10,.12,.05]], L:['aim',THUNDER_UPLEFT]},
+        // 2回転目の終わりに両腕を左上で止める
+        {dur:0.30, R:['aim',THUNDER_UPLEFT], L:['aim',THUNDER_UPLEFT]},
+      ];
+      for(const [side,el] of THUNDER_THRUSTS){
+        const other=side==='R'?'L':'R';
+        const s={dur:0.50};
+        s[side]=['thrust',[THUNDER_AZ,el]];
+        s[other]=['aim',THUNDER_GUARD];
+        seg.push(s);
+      }
+      return {segments:seg,period:seg.reduce((a,x)=>a+x.dur,0)};   // 1.30+0.30+0.50*6 = 4.60
+    }
+    const THUNDER=buildThunderSegments();
+    /* 区間表から腕の姿勢を出す。continuous でない動きは romance と同じ
+       「短い立ち上がり＋保持」― 前の区間の終端（前の動きを u=1 で評価）から
+       THUNDER_RAMP 秒で smoothstep し、残りは静止する。添字は周回で剰余。 */
+    function segmentArm(P,side,t){
+      const S=P.segments, n=S.length, period=P.period;
+      const p=((t%period)+period)%period;
+      let i=0,start=0;
+      while(i<n-1 && p>=start+S[i].dur){start+=S[i].dur;i++}
+      const seg=S[i], [name,arg]=seg[side], mv=ARM_MOVES[name];
+      if(mv.continuous)return mv.fn(side,(p-start)/seg.dur,arg);
+      const cur=mv.fn(side,1,arg);
+      const e=(p-start)/THUNDER_RAMP;
+      if(e>=1)return cur;
+      const pv=S[(i+n-1)%n][side], from=ARM_MOVES[pv[0]].fn(side,1,pv[1]);
+      const w=Math.max(e,0), s=w*w*(3-2*w);
+      return {E:cur.E,H:from.H.multiplyScalar(1-s).addScaledVector(cur.H,s)};
+    }
     const GLOW_POSES={
       penlight_swing_down:{
         label:'ペンライト振り下ろし',
@@ -2062,6 +2141,13 @@
         label:'ロマンス周期 右→左→小刻み→左→小刻み',
         kind:'romance', sticks:2,   // 両手に持つ
         period:ROMANCE.period,      // 生成結果から取る。右左6回×0.75 + 小刻み3回×2.5 = 12.0秒
+      },
+      thunder_snake:{
+        label:'サンダースネーク 2回転→六突き',
+        kind:'segments', sticks:2,
+        overhead:true,              // この技だけ万歳・肘の伸び切りを許す
+        period:THUNDER.period,      // 導入1.30 + 止め0.30 + 突き0.50×6 = 4.60秒
+        segments:THUNDER.segments,
       },
     };
     const GLOW_POSE_KEYS=Object.keys(GLOW_POSES);
@@ -2183,11 +2269,8 @@
       placeGlowArm(g,side,S,S.clone().addScaledVector(axis,aLen).addScaledVector(pole,h),H);
     }
     // キー1行から手先の目標を作る。cm 指定ではなく角度から組む原則は保つ
-    function romanceKeyPos(side,k){
-      const S=glowShoulder(side);
-      const dir=glowUpperDir(side,k[1]*Math.PI/180,k[2]*Math.PI/180);
-      return S.addScaledVector(dir,GLOW_L1).add(new THREE.Vector3(0,k[4],k[3]));
-    }
+    // k = [時刻, 外転°, 前方挙上°, reach, lift]
+    function romanceKeyPos(side,k){return glowAimPos(side,k[1],k[2],k[3],k[4])}
     /* 周期内の時刻 t から手先の目標を返す。区間の頭 ROMANCE_RAMP 秒で
        前の区間の位置から smoothstep し、残りは静止する。
        最初の区間の「前」は最後の区間なので、添字は剰余で回す。 */
@@ -2214,6 +2297,14 @@
         const tt=t*(1+i*.03)+i*.4;   // 人ごとに速さと位相をずらす。揃うと機械的に見える
         solveGlowArmIK(g,romanceTarget(P,'R',tt),'R');
         solveGlowArmIK(g,romanceTarget(P,'L',tt),'L');
+      }else if(P.kind==='segments'){
+        const tt=t*(1+i*.03)+i*.4;
+        ['R','L'].forEach(side=>{
+          const r=segmentArm(P,side,tt);
+          // E を返す動き（肘固定）は FK でそのまま置く。無ければ IK が肘を出す
+          if(r.E)placeGlowArm(g,side,glowShoulder(side),r.E,r.H);
+          else   solveGlowArmIK(g,r.H,side);
+        });
       }else{
         solveGlowArm(g,P,glowElbowAngle(P,t,i),'R');
         solveGlowArm(g,P,GLOW_REST_ELBOW,'L');
