@@ -2054,29 +2054,56 @@
        特徴は直線的な動きと伸ばし切った肘。導入はユーザー判断で片腕回しにしてある。
        **この技だけ万歳と肘の伸び切りを許す**（技の定義そのもののため）。
        他のポーズは従来どおり頭頂 1.660m を超えない。 */
-    const THUNDER_RAMP=.12;     // aim / thrust の立ち上がり秒数。残りはその位置で静止
-    const THUNDER_REACH=.575;   // 突きの到達[m]。L1+L2=.58 の手前で止める ―
-                                // 伸ばし切ると IK の h=√(L1²−a²) が 0 に落ちて特異点に乗る
+    const THUNDER_RAMP=.12;       // aim / thrust の立ち上がり秒数。残りはその位置で静止
+    const GLOW_REACH_MAX=.575;    // 手先の到達上限[m]。L1+L2=.58 の手前で止める ―
+                                  // 伸ばし切ると IK の h=√(L1²−a²) が 0 に落ちて特異点に乗る
     // 角度から手先の1点を作る。romanceKeyPos と同じ計算をここへ括り出した
     function glowAimPos(side,abdDeg,fwdDeg,reach,lift){
       const S=glowShoulder(side);
       const dir=glowUpperDir(side,abdDeg*Math.PI/180,fwdDeg*Math.PI/180);
       return S.addScaledVector(dir,GLOW_L1).add(new THREE.Vector3(0,lift,reach));
     }
-    /* 突き。肩から THUNDER_REACH の位置へ、方位 az（正=自分の側、負=体を横切る）と
-       仰角 el で出す。方向ベクトルは長さ厳密に1。 */
-    function glowThrustPos(side,azDeg,elDeg){
+    /* 方位 az（正=自分の側、負=体を横切る）と仰角 el の単位ベクトル。
+       長さは厳密に1になる。 */
+    function glowDirOf(side,azDeg,elDeg){
       const sx=side==='L'?-1:1;
       const az=azDeg*Math.PI/180, el=elDeg*Math.PI/180;
-      const d=new THREE.Vector3(sx*Math.sin(az)*Math.cos(el),Math.sin(el),Math.cos(az)*Math.cos(el));
-      return glowShoulder(side).addScaledVector(d,THUNDER_REACH);
+      return new THREE.Vector3(sx*Math.sin(az)*Math.cos(el),Math.sin(el),Math.cos(az)*Math.cos(el));
+    }
+    /* 突き。肩から一定距離の球面上に置くので、IK は必ず解ける。
+       肘からの相対オフセットで目標を作ると肩からの距離が制御できず、
+       到達上限を超えて腕が伸び縮みする。 */
+    function glowThrustPos(side,azDeg,elDeg,dist){
+      return glowShoulder(side).addScaledVector(glowDirOf(side,azDeg,elDeg),dist||GLOW_REACH_MAX);
     }
     /* 腕の動き。区間内の進み u(0〜1) から {E?,H} を返す。
        E を返す動きは肘を固定できる（FK）。省くと solveGlowArmIK が肘を出す。
        continuous な動きは立ち上がりを掛けず u をそのまま使う。 */
     const ARM_MOVES={
       aim   :{fn:(side,u,a)=>({H:glowAimPos(side,a[0],a[1],a[2],a[3])})},
-      thrust:{fn:(side,u,a)=>({H:glowThrustPos(side,a[0],a[1])})},
+      thrust:{fn:(side,u,a)=>({H:glowThrustPos(side,a[0],a[1],a[2])})},
+      /* 方向を仰角で上下に振る。距離が一定なので到達不能にならない。
+         a=[距離, 方位°, 仰角の中心°, 仰角の振れ°, 周波数Hz, 位相°] */
+      shake :{continuous:true,fn:(side,u,a)=>{
+        const ph=(a[5]||0)*Math.PI/180;
+        const el=a[2]+a[3]*Math.sin(u*a[4]*2*Math.PI+ph);
+        return {H:glowThrustPos(side,a[1],el,a[0])};
+      }},
+      /* 中心方向のまわりを半開き角で回る（円錐を掃く）。距離は一定。
+         a=[距離, 中心方位°, 中心仰角°, 半開き角°, 回転数, 位相°] */
+      circle:{continuous:true,fn:(side,u,a)=>{
+        const c=glowDirOf(side,a[1],a[2]);
+        // 中心に直交する2軸。中心が真上に近いと真上から作れないので前方から作り直す
+        let t1=new THREE.Vector3(0,1,0).addScaledVector(c,-c.y);
+        if(t1.lengthSq()<1e-6)t1=new THREE.Vector3(0,0,1).addScaledVector(c,-c.z);
+        t1.normalize();
+        const t2=new THREE.Vector3().crossVectors(c,t1);
+        const half=a[3]*Math.PI/180, ang=u*2*Math.PI*a[4]+(a[5]||0)*Math.PI/180;
+        const v=c.clone().multiplyScalar(Math.cos(half))
+          .addScaledVector(t1,Math.sin(half)*Math.cos(ang))
+          .addScaledVector(t2,Math.sin(half)*Math.sin(ang));
+        return {H:glowShoulder(side).addScaledVector(v,a[0])};
+      }},
       spin  :{continuous:true,fn:(side,u,a)=>{
         /* 肘を固定し、前腕だけ回す。a=[外転°,前方挙上°,回転数,横比,縦比,前の中心,前の振れ]。
            後ろ4つは長さではなく**比**（正規化して前腕長を掛けるため）。 */
@@ -2087,29 +2114,28 @@
         return {E,H:E.clone().addScaledVector(v,GLOW_L2)};
       }},
     };
-    /* 六突き: [突く腕, 仰角°]。左右交互・だんだん上へ・下段/中段/上段に各2回。
-       方位は負＝体を横切る向き（「右腕を左方に突き出す」）。 */
-    const THUNDER_THRUSTS=[['R',-20],['L',-20],['R',10],['L',10],['R',40],['L',40]];
-    const THUNDER_AZ=-35;         // 突きの方位。負で体を横切る
-    const THUNDER_UPLEFT=[75,0,.05,.22];   // 左上で止める構え（外転75°）
-    const THUNDER_GUARD =[15,5,.08,-.05];  // 突いていない側の構え（胸元）
-    function buildThunderSegments(){
-      const seg=[
-        // 導入: 左腕は上横へ指差し、右腕は肘を支点に2回転
-        {dur:1.30, R:['spin',[15,10,2,.10,.10,.12,.05]], L:['aim',THUNDER_UPLEFT]},
-        // 2回転目の終わりに両腕を左上で止める
-        {dur:0.30, R:['aim',THUNDER_UPLEFT], L:['aim',THUNDER_UPLEFT]},
-      ];
-      for(const [side,el] of THUNDER_THRUSTS){
-        const other=side==='R'?'L':'R';
-        const s={dur:0.50};
-        s[side]=['thrust',[THUNDER_AZ,el]];
-        s[other]=['aim',THUNDER_GUARD];
-        seg.push(s);
-      }
-      return {segments:seg,period:seg.reduce((a,x)=>a+x.dur,0)};   // 1.30+0.30+0.50*6 = 4.60
-    }
-    const THUNDER=buildThunderSegments();
+    /* サンダースネーク 8カウント = 4.0秒（130BPM なら 3.69秒）。
+       Phase1 溜め / Phase2 突き / Phase3 稲妻 / Phase4 ロザリオ。
+       頭上へ出るのは Phase2の斜め上・Phase3・Phase4（ポーズ表の overhead:true）。
+       手先はすべて「方向 × 一定距離」で作るので、到達不能が原理的に起きない。 */
+    const THUNDER_UP  =[35, 30];          // 斜め上へ突く [方位°, 仰角°]
+    const THUNDER_DOWN=[25,-45];          // 斜め下へ突く
+    const THUNDER_SEGMENTS=[
+      // Phase1 溜め: 胸前クロス（方位を負にして体を横切る）で上下に激しく振る
+      {dur:1.00, R:['shake',[.34,-28,-30,20,2.9,0]], L:['shake',[.34,-28,-30,20,2.9,0]]},
+      // Phase2 突き: 斜め上／斜め下を左右交互に4回
+      {dur:0.25, R:['thrust',THUNDER_UP],   L:['thrust',THUNDER_DOWN]},
+      {dur:0.25, R:['thrust',THUNDER_DOWN], L:['thrust',THUNDER_UP]},
+      {dur:0.25, R:['thrust',THUNDER_UP],   L:['thrust',THUNDER_DOWN]},
+      {dur:0.25, R:['thrust',THUNDER_DOWN], L:['thrust',THUNDER_UP]},
+      // Phase3 稲妻: 頭上を含む大きな円。左右は逆位相
+      {dur:1.50, R:['circle',[.55,10,45,40,1.35,  0]],
+                 L:['circle',[.55,10,45,40,1.35,180]]},
+      // Phase4 ロザリオ: 右腕を天へ、左腕は胸前で添える
+      {dur:0.50, R:['thrust',[0,88]], L:['aim',[25,15,.08,-.05]]},
+    ];
+    const THUNDER={segments:THUNDER_SEGMENTS,
+                   period:THUNDER_SEGMENTS.reduce((a,x)=>a+x.dur,0)};   // 1.0+0.25*4+1.5+0.5 = 4.0
     /* 区間表から腕の姿勢を出す。continuous でない動きは romance と同じ
        「短い立ち上がり＋保持」― 前の区間の終端（前の動きを u=1 で評価）から
        THUNDER_RAMP 秒で smoothstep し、残りは静止する。添字は周回で剰余。 */
@@ -2143,10 +2169,10 @@
         period:ROMANCE.period,      // 生成結果から取る。右左6回×0.75 + 小刻み3回×2.5 = 12.0秒
       },
       thunder_snake:{
-        label:'サンダースネーク 2回転→六突き',
+        label:'サンダースネーク 8カウント',
         kind:'segments', sticks:2,
         overhead:true,              // この技だけ万歳・肘の伸び切りを許す
-        period:THUNDER.period,      // 導入1.30 + 止め0.30 + 突き0.50×6 = 4.60秒
+        period:THUNDER.period,      // 溜め1.0 + 突き0.25×4 + 稲妻1.5 + ロザリオ0.5 = 4.0秒
         segments:THUNDER.segments,
       },
     };
@@ -2258,7 +2284,12 @@
     function solveGlowArmIK(g,H,side){
       const S=glowShoulder(side);
       const v=H.clone().sub(S);
-      const D=Math.max(v.length(),1e-5);
+      /* 到達できない目標が来たら方向を保ったまま縮める。超えると h=√(L1²−a²) が
+         0 に落ちて腕が一直線になり、手先が目標に届かないまま前腕が伸び縮みする。
+         縮める必要が無いときは v に触らない ― normalize を通すと丸めで値が動く。 */
+      let D=Math.max(v.length(),1e-5);
+      const Dc=THREE.MathUtils.clamp(D,Math.abs(GLOW_L1-GLOW_L2),GLOW_REACH_MAX);
+      if(Dc!==D){v.multiplyScalar(Dc/D);D=Dc;H=S.clone().add(v)}
       const axis=v.clone().multiplyScalar(1/D);
       const aLen=(GLOW_L1*GLOW_L1-GLOW_L2*GLOW_L2+D*D)/(2*D);
       const h=Math.sqrt(Math.max(GLOW_L1*GLOW_L1-aLen*aLen,0));
