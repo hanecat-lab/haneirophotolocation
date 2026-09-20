@@ -2066,7 +2066,7 @@
        **この技だけ万歳と肘の伸び切りを許す**（技の定義そのもののため）。
        他のポーズは従来どおり頭頂 1.660m を超えない。 */
     const THUNDER_RAMP=.12;       // aim / thrust の立ち上がり秒数。残りはその位置で静止
-    const GLOW_REACH_MAX=.575;    // 手先の到達上限[m]。L1+L2=.58 の手前で止める ―
+    const GLOW_REACH_MAX=.52;     // 手先の到達上限[m]。L1+L2=.58 より 6cm 手前 ―
                                   // 伸ばし切ると IK の h=√(L1²−a²) が 0 に落ちて特異点に乗る
     // 角度から手先の1点を作る。romanceKeyPos と同じ計算をここへ括り出した
     function glowAimPos(side,abdDeg,fwdDeg,reach,lift){
@@ -2093,11 +2093,14 @@
        **肘の内角は全域で厳密に 90°** になる。
        横軸 b は世界の +x 側に固定する（側で鏡映すると左右の腕が逆位相に振れる）。
        θ=0 は前腕が水平前方で、ROMANCE_POSE.wipe と厳密に同じ位置。 */
-    const ROMANCE_WIPER_ABD=15*Math.PI/180;   // 肩の外転。下げたまま
-    const ROMANCE_WIPER_AMP=35*Math.PI/180;   // 前腕の振れ幅
-    function glowWiperArm(side,th){
+    /* 肘を支点に前腕を回す／振る。前腕 f を「肘→肩ベクトル u に直交する円」の上で
+       動かすので、**肘の内角は全域で厳密に 90°**（u·f=0）。
+       a = u に直交する前方軸、b = そこから90°回した横軸。b は世界の +x 側に
+       固定する（側で鏡映すると左右の腕が逆位相に動く）。
+       φ=0 は前腕が a の向き。 */
+    function glowElbow90(side,abd,fwd,phi){
       const S=glowShoulder(side);
-      const d=glowUpperDir(side,ROMANCE_WIPER_ABD,0);
+      const d=glowUpperDir(side,abd,fwd);
       const E=S.clone().addScaledVector(d,GLOW_L1);
       const u=d.clone().multiplyScalar(-1);                       // 肘→肩
       const a=new THREE.Vector3(0,0,1).addScaledVector(u,-u.z);   // u に直交する前方
@@ -2105,9 +2108,14 @@
       a.normalize();
       const b=new THREE.Vector3().crossVectors(u,a);              // u,a の両方に直交
       if(b.x<0)b.multiplyScalar(-1);                              // 左右とも世界の +x 側へ
-      const f=a.clone().multiplyScalar(Math.cos(th)).addScaledVector(b,Math.sin(th));
+      const f=a.clone().multiplyScalar(Math.cos(phi)).addScaledVector(b,Math.sin(phi));
       return {E,H:E.clone().addScaledVector(f,GLOW_L2)};
     }
+    /* ロマンスの小刻み。肩を下げたまま前腕だけを左右へ振る振り子。
+       θ=0 は前腕が水平前方で、ROMANCE_POSE.wipe と厳密に同じ位置。 */
+    const ROMANCE_WIPER_ABD=15*Math.PI/180;   // 肩の外転。下げたまま
+    const ROMANCE_WIPER_AMP=35*Math.PI/180;   // 前腕の振れ幅
+    function glowWiperArm(side,th){return glowElbow90(side,ROMANCE_WIPER_ABD,0,th)}
     // 小刻みの窓に入っているか。入っていれば [開始, 終了] を返す
     function romanceBurstWindow(p){
       for(const w of ROMANCE_BURSTS)if(p>=w[0]&&p<w[1])return w;
@@ -2143,6 +2151,21 @@
           .addScaledVector(t2,Math.sin(half)*Math.sin(ang));
         return {H:glowShoulder(side).addScaledVector(v,a[0])};
       }},
+      /* 方向を補間して肩からの距離を保ったまま弧を描く。位置を直線補間すると
+         真上→真下のような大きな移動で手先が肩の近くを通り、腕が畳まれてしまう。
+         a=[開始方位°, 開始仰角°, 終了方位°, 終了仰角°, 距離] */
+      arc   :{continuous:true,fn:(side,u,a)=>{
+        const e=u*u*(3-2*u);
+        return {H:glowThrustPos(side,a[0]+(a[2]-a[0])*e,a[1]+(a[3]-a[1])*e,a[4])};
+      }},
+      /* 肘を支点に前腕が円を描く。肘の内角は厳密に 90°。
+         a=[外転°, 前方挙上°, 開始位相°, 回転数] */
+      orbit :{continuous:true,fn:(side,u,a)=>
+        glowElbow90(side,a[0]*Math.PI/180,a[1]*Math.PI/180,(a[2]+360*a[3]*u)*Math.PI/180)},
+      /* 肘を支点に前腕が振れる。肘の内角は厳密に 90°。
+         a=[外転°, 前方挙上°, 中心位相°, 振れ幅°, 振り数]。中心位相90°で縦に振れる */
+      swing :{continuous:true,fn:(side,u,a)=>
+        glowElbow90(side,a[0]*Math.PI/180,a[1]*Math.PI/180,(a[2]+a[3]*Math.sin(Math.PI*a[4]*u))*Math.PI/180)},
       spin  :{continuous:true,fn:(side,u,a)=>{
         /* 肘を固定し、前腕だけ回す。a=[外転°,前方挙上°,回転数,横比,縦比,前の中心,前の振れ]。
            後ろ4つは長さではなく**比**（正規化して前腕長を掛けるため）。 */
@@ -2153,28 +2176,69 @@
         return {E,H:E.clone().addScaledVector(v,GLOW_L2)};
       }},
     };
-    /* サンダースネーク 8カウント = 4.0秒（130BPM なら 3.69秒）。
-       Phase1 溜め / Phase2 突き / Phase3 稲妻 / Phase4 ロザリオ。
-       頭上へ出るのは Phase2の斜め上・Phase3・Phase4（ポーズ表の overhead:true）。
-       手先はすべて「方向 × 一定距離」で作るので、到達不能が原理的に起きない。 */
-    const THUNDER_UP  =[35, 30];          // 斜め上へ突く [方位°, 仰角°]
-    const THUNDER_DOWN=[25,-45];          // 斜め下へ突く
-    const THUNDER_SEGMENTS=[
-      // Phase1 溜め: 胸前クロス（方位を負にして体を横切る）で上下に激しく振る
-      {dur:1.00, R:['shake',[.34,-28,-30,20,2.9,0]], L:['shake',[.34,-28,-30,20,2.9,0]]},
-      // Phase2 突き: 斜め上／斜め下を左右交互に4回
-      {dur:0.25, R:['thrust',THUNDER_UP],   L:['thrust',THUNDER_DOWN]},
-      {dur:0.25, R:['thrust',THUNDER_DOWN], L:['thrust',THUNDER_UP]},
-      {dur:0.25, R:['thrust',THUNDER_UP],   L:['thrust',THUNDER_DOWN]},
-      {dur:0.25, R:['thrust',THUNDER_DOWN], L:['thrust',THUNDER_UP]},
-      // Phase3 稲妻: 頭上を含む大きな円。左右は逆位相
-      {dur:1.50, R:['circle',[.55,10,45,40,1.35,  0]],
-                 L:['circle',[.55,10,45,40,1.35,180]]},
-      // Phase4 ロザリオ: 右腕を天へ、左腕は胸前で添える
-      {dur:0.50, R:['thrust',[0,88]], L:['aim',[25,15,.08,-.05]]},
-    ];
-    const THUNDER={segments:THUNDER_SEGMENTS,
-                   period:THUNDER_SEGMENTS.reduce((a,x)=>a+x.dur,0)};   // 1.0+0.25*4+1.5+0.5 = 4.0
+    /* サンダースネーク。教科書の流れは
+       「左右の手を時間差で右から左に出す → 同時に右へ戻す → 体の前で腕を2〜3回回転
+         → 左上で止め → 左右の腕を時間差で右下へ → 六突き（右手を左側に左手を右側に、
+         交互に下段・中段・上段）→ ロザリオ（片腕を頭の真上、肘から回して地面へ）」。
+       尺はサビ8小節の前半＝16拍。BPM を変えれば丸ごと伸び縮みする。
+       回転は肘90°（古参Aの「肘を支点に」）、突きは伸ばす（最古参Cの「伸ばし切り」）と
+       読み分けた。六突きの中段・上段とロザリオは頭上へ出る（ポーズ表の overhead:true）。 */
+    const THUNDER_BPM=130;                // 曲のBPM。16拍で1周
+    const THUNDER_BEAT=60/THUNDER_BPM;    // 1拍の秒数
+    const THUNDER_ORBIT=[15,45];          // 回転の上腕 [外転°, 前方挙上°]。45°で正面から円に見える
+    const THUNDER_UP  =[40, 25];          // 斜め上へ突く [方位°, 仰角°]
+    const THUNDER_DOWN=[30,-45];          // 斜め下へ突く
+    const THUNDER_SWEEP=.40;              // 溜め・払いの手先の距離[m]
+    const THUNDER_GUARD=[15,5,.08,-.05];  // 突いていない側の構え（胸元）
+    const THUNDER_CROSS=-38;              // 六突きの方位。負で体を横切る
+    /* 六突き: [突く腕（本人の左右）, 仰角°]。右手を左側へ・左手を右側へ、交互に
+       下段・中段・上段。 */
+    const THUNDER_THRUSTS=[['R',-22],['L',-22],['R',6],['L',6],['R',34],['L',34]];
+    function buildThunderSegments(){
+      const seg=[];
+      /* 振り付けは本人の左右で書き、メッシュ名へはここで一度だけ写す。
+         メッシュの 'R'/'L' は左右が逆（GLOW_MESH の説明を参照）。 */
+      const add=(beats,pR,pL)=>{
+        const o={}; o[GLOW_MESH.R]=pR; o[GLOW_MESH.L]=pL;
+        seg.push({dur:beats*THUNDER_BEAT,R:o.R,L:o.L});
+      };
+      // 払い。m は動かす腕、to は向ける側（本人の左右）。自分の側なら +、横切るなら −
+      const sweep=(m,to,el)=>['thrust',[(m===to?1:-1)*45,el,THUNDER_SWEEP]];
+      // 払いを弧で繋ぐ。肩からの距離が一定なので腕が畳まれない
+      const arc=(m,to0,el0,to1,el1,d)=>['arc',[(m===to0?1:-1)*45,el0,(m===to1?1:-1)*45,el1,d||THUNDER_SWEEP]];
+      const guard=['aim',THUNDER_GUARD];
+      // Phase1 溜め 4拍: 右手が先に右→左、0.5拍遅れて左手が追う
+      add(0.5, sweep('R','L',0), sweep('L','R',0));   // 右手だけ左へ
+      add(0.5, sweep('R','L',0), sweep('L','L',0));   // 左手が追う
+      add(1.0, sweep('R','L',0), sweep('L','L',0));   // 両手そろえて保持
+      // 胸前クロスで上下に小刻み ×4。肘90°、中心位相90°で縦に振れる
+      add(2.0, ['swing',[-10,45,90,26,4]], ['swing',[-10,45,90,26,4]]);
+      // Phase2 雷 3拍: 両手同時に右へ戻す → 斜め上／斜め下を左右交互に4回
+      add(1.0, sweep('R','R',0), sweep('L','R',0));
+      for(let n=0;n<4;n++){
+        const up=n%2===0;                              // 偶数回は本人の右が上
+        add(0.5, ['thrust',up?THUNDER_UP:THUNDER_DOWN], ['thrust',up?THUNDER_DOWN:THUNDER_UP]);
+      }
+      // Phase3 稲妻 4拍: 前腕の円 ×2 → 左上で止め → 時間差で右下へ斬り落とし
+      add(2.5, ['orbit',[...THUNDER_ORBIT,0,2]], ['orbit',[...THUNDER_ORBIT,0,2]]);
+      add(0.5, sweep('R','L',34), sweep('L','L',34));            // 左上で止め
+      add(0.5, arc('R','L',34,'R',-40), sweep('L','L',34));      // 右手が先に右下へ斬り落とし
+      add(0.5, sweep('R','R',-40), arc('L','L',34,'R',-40));     // 左手が追う
+      // Phase4 六突き 3拍
+      for(const [who,el] of THUNDER_THRUSTS){
+        const t=['thrust',[THUNDER_CROSS,el]];
+        add(0.5, who==='R'?t:guard, who==='L'?t:guard);
+      }
+      /* ロザリオ 2拍: 片腕を頭の真上へ → もう片方と一緒に肘から大きく回しながら
+         下ろし、地面へ突き刺して止める。位置の直線補間だと真上→真下で手先が
+         肩の近くを通って腕が畳まれるので、方向を補間する弧にする。 */
+      add(1.0, ['arc',[THUNDER_CROSS,34,0,88,GLOW_REACH_MAX]],
+               ['arc',[THUNDER_CROSS,34,-12,70,GLOW_REACH_MAX]]);
+      add(1.0, ['arc',[0,88,10,-78,GLOW_REACH_MAX]],
+               ['arc',[-12,70,-4,-72,GLOW_REACH_MAX]]);
+      return {segments:seg,period:seg.reduce((a,x)=>a+x.dur,0)};   // 16拍
+    }
+    const THUNDER=buildThunderSegments();
     /* 区間表から腕の姿勢を出す。continuous でない動きは romance と同じ
        「短い立ち上がり＋保持」― 前の区間の終端（前の動きを u=1 で評価）から
        THUNDER_RAMP 秒で smoothstep し、残りは静止する。添字は周回で剰余。 */
@@ -2208,10 +2272,10 @@
         period:ROMANCE.period,      // 生成結果から取る。右左6回×0.75 + 小刻み3回×2.5 = 12.0秒
       },
       thunder_snake:{
-        label:'サンダースネーク 8カウント',
+        label:'サンダースネーク 16拍',
         kind:'segments', sticks:2,
         overhead:true,              // この技だけ万歳・肘の伸び切りを許す
-        period:THUNDER.period,      // 溜め1.0 + 突き0.25×4 + 稲妻1.5 + ロザリオ0.5 = 4.0秒
+        period:THUNDER.period,      // 16拍 @130BPM = 7.3846秒
         segments:THUNDER.segments,
       },
     };
