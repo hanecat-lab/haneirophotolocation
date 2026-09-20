@@ -2011,27 +2011,25 @@
       point:[48,25,.32, .18],       // 斜め上指し。肩を +10° 上げた（元 38°）
       pull :[15, 5,.08,-.05],       // 胸元へ引く
       rest :[15, 0,.10, 0  ],       // 休止（相手の腕が主役のとき）
-      up   :[20,10,.18, .08],       // 小刻みの上げ
-      down :[15, 0,.12, .02],       // 小刻みの戻し
+      // 小刻みの中立。振り子（glowWiperArm）の θ=0 と厳密に同じ位置になるので、
+      // 立ち上がりでここへ寄せてから順運動学へ引き継げる
+      wipe :[15, 0,.28, 0  ],
     };
     const ROMANCE_GESTURE=.45, ROMANCE_PULL=.30;        // 指し / 引き の秒数
     const ROMANCE_BURST=2.5, ROMANCE_BURST_STEPS=3;    // 小刻み1回の秒数と刻み数
     // 右→左→小刻み→左→右→小刻み→右→左→小刻み。周期 12.0秒
     const ROMANCE_ORDER=['R','L','burst','L','R','burst','R','L','burst'];
     function buildRomanceKeys(){
-      const K={R:[],L:[]};
+      const K={R:[],L:[]}, bursts=[];
       let t=0, lead='R';   // lead は直前に主役だった腕
       const push=(time,r,l)=>{K.R.push([time,...r]);K.L.push([time,...l])};
       for(const step of ROMANCE_ORDER){
         if(step==='burst'){
-          // 直前の主役の逆から入る。1刻みごとに上げ／戻しを入れ替える
-          let side=lead==='R'?'L':'R';
-          for(let n=0;n<ROMANCE_BURST_STEPS;n++){
-            t+=ROMANCE_BURST/ROMANCE_BURST_STEPS;
-            push(t, side==='R'?ROMANCE_POSE.up:ROMANCE_POSE.down,
-                    side==='L'?ROMANCE_POSE.up:ROMANCE_POSE.down);
-            side=side==='R'?'L':'R';
-          }
+          /* 小刻みは手先の目標では表せない（肘の角度が保証できない）ので、
+             キーは中立1点だけ置いて窓を記録し、描画側で順運動学の振り子へ渡す。 */
+          bursts.push([t,t+ROMANCE_BURST]);
+          t+=ROMANCE_BURST;
+          push(t,ROMANCE_POSE.wipe,ROMANCE_POSE.wipe);
         }else{
           const lead_=step;
           t+=ROMANCE_GESTURE;
@@ -2043,10 +2041,10 @@
           lead=lead_;
         }
       }
-      return {keys:K,period:t};
+      return {keys:K,period:t,bursts};
     }
     const ROMANCE=buildRomanceKeys();
-    const ROMANCE_KEYS=ROMANCE.keys;
+    const ROMANCE_KEYS=ROMANCE.keys, ROMANCE_BURSTS=ROMANCE.bursts;
     const ROMANCE_RAMP=.12;   // 立ち上がりの秒数。残りはその位置で止める＝ポーズが決まる
     /* サンダースネーク。ヲタ芸の技で、構成は
        「手を合わせて体の前で2回転 →（2回転目を左上で止める）→ 左右交互に
@@ -2076,11 +2074,39 @@
     function glowThrustPos(side,azDeg,elDeg,dist){
       return glowShoulder(side).addScaledVector(glowDirOf(side,azDeg,elDeg),dist||GLOW_REACH_MAX);
     }
+    /* 小刻み（ワイパー）: 肩を下げたまま肘の内角を 90° に保ち、前腕だけを左右へ振る。
+       手先の目標を与える逆運動学では肘の角度を保証できないので、順運動学で組む。
+       前腕 f を「肘→肩ベクトル u に直交する円」の上で動かすので、
+       **肘の内角は全域で厳密に 90°** になる。
+       横軸 b は世界の +x 側に固定する（側で鏡映すると左右の腕が逆位相に振れる）。
+       θ=0 は前腕が水平前方で、ROMANCE_POSE.wipe と厳密に同じ位置。 */
+    const ROMANCE_WIPER_ABD=15*Math.PI/180;   // 肩の外転。下げたまま
+    const ROMANCE_WIPER_AMP=35*Math.PI/180;   // 前腕の振れ幅
+    function glowWiperArm(side,th){
+      const S=glowShoulder(side);
+      const d=glowUpperDir(side,ROMANCE_WIPER_ABD,0);
+      const E=S.clone().addScaledVector(d,GLOW_L1);
+      const u=d.clone().multiplyScalar(-1);                       // 肘→肩
+      const a=new THREE.Vector3(0,0,1).addScaledVector(u,-u.z);   // u に直交する前方
+      if(a.lengthSq()<1e-8)a.set(0,1,0).addScaledVector(u,-u.y);
+      a.normalize();
+      const b=new THREE.Vector3().crossVectors(u,a);              // u,a の両方に直交
+      if(b.x<0)b.multiplyScalar(-1);                              // 左右とも世界の +x 側へ
+      const f=a.clone().multiplyScalar(Math.cos(th)).addScaledVector(b,Math.sin(th));
+      return {E,H:E.clone().addScaledVector(f,GLOW_L2)};
+    }
+    // 小刻みの窓に入っているか。入っていれば [開始, 終了] を返す
+    function romanceBurstWindow(p){
+      for(const w of ROMANCE_BURSTS)if(p>=w[0]&&p<w[1])return w;
+      return null;
+    }
     /* 腕の動き。区間内の進み u(0〜1) から {E?,H} を返す。
        E を返す動きは肘を固定できる（FK）。省くと solveGlowArmIK が肘を出す。
        continuous な動きは立ち上がりを掛けず u をそのまま使う。 */
     const ARM_MOVES={
       aim   :{fn:(side,u,a)=>({H:glowAimPos(side,a[0],a[1],a[2],a[3])})},
+      // a=[振れ幅°, 振り数]。両腕とも同じ位相で左右に振れる
+      wiper :{continuous:true,fn:(side,u,a)=>glowWiperArm(side,a[0]*Math.PI/180*Math.sin(Math.PI*a[1]*u))},
       thrust:{fn:(side,u,a)=>({H:glowThrustPos(side,a[0],a[1],a[2])})},
       /* 方向を仰角で上下に振る。距離が一定なので到達不能にならない。
          a=[距離, 方位°, 仰角の中心°, 仰角の振れ°, 周波数Hz, 位相°] */
@@ -2326,8 +2352,24 @@
       if(stL)stL.visible=(P.sticks||1)>=2;
       if(P.kind==='romance'){
         const tt=t*(1+i*.03)+i*.4;   // 人ごとに速さと位相をずらす。揃うと機械的に見える
-        solveGlowArmIK(g,romanceTarget(P,'R',tt),'R');
-        solveGlowArmIK(g,romanceTarget(P,'L',tt),'L');
+        const p=((tt%P.period)+P.period)%P.period, win=romanceBurstWindow(p);
+        /* 小刻みは順運動学の振り子。立ち上がりの 0.12秒だけは既存のキーフレーム経路で
+           中立（ROMANCE_POSE.wipe）へ寄せ、そこから振り始める。中立は振り子の θ=0 と
+           厳密に同じ位置なので、手先は途切れない。
+           sin(π·n·u) は u=0 と u=1 の両方で 0 に戻るので、出入りが中立で揃う。 */
+        if(win&&p-win[0]>=ROMANCE_RAMP){
+          /* 振り子の時計は立ち上がりの終わりから始める。窓の頭から数えると
+             受け渡しの時点で位相が 0 でなく、手先が 7.5cm 飛ぶ。 */
+          const u=(p-win[0]-ROMANCE_RAMP)/(win[1]-win[0]-ROMANCE_RAMP);
+          const th=ROMANCE_WIPER_AMP*Math.sin(Math.PI*ROMANCE_BURST_STEPS*u);
+          ['R','L'].forEach(side=>{
+            const r=glowWiperArm(side,th);
+            placeGlowArm(g,side,glowShoulder(side),r.E,r.H);
+          });
+        }else{
+          solveGlowArmIK(g,romanceTarget(P,'R',tt),'R');
+          solveGlowArmIK(g,romanceTarget(P,'L',tt),'L');
+        }
       }else if(P.kind==='segments'){
         const tt=t*(1+i*.03)+i*.4;
         ['R','L'].forEach(side=>{
