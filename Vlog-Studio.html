@@ -3549,6 +3549,37 @@ function App(){
   },[syncCanvasSize]);
 
     const handleVideoUpload = useCallback(async (files)=>{
+    const prepareFirstFrame=(video)=>new Promise(resolve=>{
+      const target=Math.min(0.1,Math.max(0,(video.duration||1)-0.05));
+      let done=false,frameRequest=null,settleTimer=null;
+      const finish=()=>{
+        if(done) return;
+        done=true;
+        video.removeEventListener('seeked',onReady);
+        video.removeEventListener('loadeddata',onReady);
+        clearTimeout(timeout); clearTimeout(settleTimer);
+        if(frameRequest!==null && video.cancelVideoFrameCallback){
+          try{ video.cancelVideoFrameCallback(frameRequest); }catch{}
+        }
+        try{ video.pause(); }catch{}
+        resolve();
+      };
+      const onReady=()=>{
+        if(video.readyState>=2 && settleTimer===null) settleTimer=setTimeout(finish,180);
+      };
+      video.addEventListener('seeked',onReady);
+      video.addEventListener('loadeddata',onReady);
+      const timeout=setTimeout(finish,2500);
+      try{
+        video.currentTime=target;
+        if(typeof video.requestVideoFrameCallback==='function'){
+          frameRequest=video.requestVideoFrameCallback(()=>finish());
+        }
+        const playResult=video.play();
+        if(playResult?.catch) playResult.catch(()=>{});
+        onReady();
+      }catch{ finish(); }
+    });
     const arr = Array.from(files);
     const newClips=[];
     for(const file of arr){
@@ -3580,12 +3611,34 @@ function App(){
         v.src=url;
         v.muted=true; v.playsInline=true; v.preload='auto';
         v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
+        if(clipsRef.current.length===0 && newClips.length===0){
+          try{ const playResult=v.play(); if(playResult?.catch) playResult.catch(()=>{}); }catch{}
+        }
         await new Promise(res=>{
           let done=false; const fin=()=>{ if(!done){ done=true; res(); } };
-          v.onloadedmetadata=fin; v.onerror=fin; setTimeout(fin,3000);
+        v.onloadedmetadata=fin; v.onerror=fin; setTimeout(fin,3000);
         });
         videoRefs.current.set(id, v);
         const dur = (isFinite(v.duration) && v.duration>0) ? v.duration : 3;
+        if(clipsRef.current.length===0 && newClips.length===0){
+          await prepareFirstFrame(v);
+          if(v.currentTime>0.25){
+            await new Promise(resolve=>{
+              let done=false;
+              const finish=()=>{ if(done) return; done=true; v.removeEventListener('seeked',finish); resolve(); };
+              v.addEventListener('seeked',finish);
+              setTimeout(finish,800);
+              try{ v.currentTime=0.1; }catch{ finish(); }
+            });
+          }
+          if(v.readyState<2){
+            v.addEventListener('loadeddata',()=>{
+              if(clipsRef.current[0]?.id===id && !playingRef.current){
+                requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+              }
+            },{once:true});
+          }
+        }
         newClips.push({
           id,
           type:'video',
@@ -3599,6 +3652,7 @@ function App(){
     }
     const combined=[...clipsRef.current, ...newClips];
     const recomputed=recomputeStarts(combined);
+    clipsRef.current=recomputed;
     setClips(recomputed);
     const maxEnd=recomputed.length ? Math.max(...recomputed.map(c=>c.timelineStart+c.duration)) : 3;
     setDuration(maxEnd);
@@ -3660,19 +3714,23 @@ function App(){
 
   // 比較画面には取り込み済みのvideoを直接表示する。iPhoneのcanvas静止画はシーク後も古いフレームを返すことがある。
   const seekConnectionVideo=(clip,side,cut)=>{
-    if(!clip || clip.type==='photo') return;
+    if(!clip || clip.type==='photo') return Promise.resolve();
     const video=videoRefs.current.get(clip.id);
-    if(!video) return;
+    if(!video) return Promise.resolve();
     const base=clip._connectionBase || {duration:clip.duration,trimStart:clip.trimStart||0};
     const raw=side==='left' ? base.trimStart+base.duration-cut-0.05 : base.trimStart+cut;
     const maxTime=isFinite(video.duration) && video.duration>0 ? video.duration-0.05 : raw;
     const target=Math.max(0,Math.min(raw,maxTime));
     const last=connectionTargetRef.current.get(clip.id);
-    if(last!==undefined && Math.abs(last-target)<0.005) return;
+    if(last!==undefined && Math.abs(last-target)<0.005){
+      return connectionSeekTasksRef.current.get(clip.id)?.promise || Promise.resolve();
+    }
     connectionSeekTasksRef.current.get(clip.id)?.stop();
     connectionTargetRef.current.set(clip.id,target);
     let stopped=false,started=false,frameRequest=null;
     let limitTimer=null;
+    let finishTask;
+    const promise=new Promise(resolve=>{ finishTask=resolve; });
     const stop=()=>{
       if(stopped) return;
       stopped=true;
@@ -3684,6 +3742,7 @@ function App(){
       clearTimeout(limitTimer);
       try{ video.pause(); }catch{}
       if(connectionSeekTasksRef.current.get(clip.id)?.stop===stop) connectionSeekTasksRef.current.delete(clip.id);
+      finishTask();
     };
     const onSeeked=()=>{
       if(stopped || started || video.seeking) return;
@@ -3708,7 +3767,7 @@ function App(){
     const onMetadata=()=>{ try{ video.currentTime=target; }catch{} };
     video.addEventListener('seeked',onSeeked);
     video.addEventListener('loadedmetadata',onMetadata);
-    connectionSeekTasksRef.current.set(clip.id,{stop});
+    connectionSeekTasksRef.current.set(clip.id,{stop,promise});
     limitTimer=setTimeout(()=>{
       if(!stopped){
         stop();
@@ -3725,6 +3784,7 @@ function App(){
         if(alreadyThere) onSeeked();
       } else video.load();
     }catch{ stop(); }
+    return promise;
   };
 
   useEffect(()=>{
@@ -3751,7 +3811,13 @@ function App(){
         connectionSeekTasksRef.current.get(clip.id)?.stop();
         if(video.parentNode===slot) slot.removeChild(video);
         video.style.cssText=previousStyle;
-        try{ video.currentTime=previousTime; }catch{}
+        const redraw=()=>{
+          video.removeEventListener('seeked',redraw);
+          if(!playingRef.current) requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+        };
+        video.addEventListener('seeked',redraw,{once:true});
+        try{ video.currentTime=previousTime; }catch{ redraw(); }
+        setTimeout(redraw,200);
         connectionTargetRef.current.delete(clip.id);
       });
     };
@@ -3760,8 +3826,13 @@ function App(){
   useEffect(()=>{
     if(!connectionEditor) return;
     const list=clipsRef.current;
-    seekConnectionVideo(list.find(c=>c.id===connectionEditor.leftId),'left',connectionEditor.outCut);
-    seekConnectionVideo(list.find(c=>c.id===connectionEditor.rightId),'right',connectionEditor.inCut);
+    let cancelled=false;
+    (async()=>{
+      await seekConnectionVideo(list.find(c=>c.id===connectionEditor.leftId),'left',connectionEditor.outCut);
+      if(cancelled) return;
+      await seekConnectionVideo(list.find(c=>c.id===connectionEditor.rightId),'right',connectionEditor.inCut);
+    })();
+    return ()=>{ cancelled=true; };
   },[connectionEditor]);
 
   const openConnection=(leftId)=>{
