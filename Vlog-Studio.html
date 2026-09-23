@@ -2684,6 +2684,8 @@ function App(){
   const [draggingClipBar, setDraggingClipBar] = useState(null);
   const [selectedTextId, setSelectedTextId] = useState(null);
   const [selectedClipIds, setSelectedClipIds] = useState([]);
+  const [connectionEditor, setConnectionEditor] = useState(null);
+  const [connectionFrames, setConnectionFrames] = useState({left:null, right:null, loading:false});
   const [photoDuration, setPhotoDuration] = useState(2.5);
   const [bulkPhotoDuration, setBulkPhotoDuration] = useState(2.5);
   const [selectedTransition, setSelectedTransition] = useState(null);
@@ -3652,6 +3654,89 @@ function App(){
       setTimeout(()=>{ if(!done){ done=true; video.removeEventListener('seeked', onSeeked); res(); } }, 600);
     });
   },[]);
+
+  // 境目の比較画像は専用の動画要素で作り、編集中のプレビューの再生位置を動かさない。
+  useEffect(()=>{
+    if(!connectionEditor) return;
+    let cancelled=false;
+    const timer=setTimeout(async ()=>{
+      setConnectionFrames({left:null, right:null, loading:true});
+      const pair=[connectionEditor.leftId, connectionEditor.rightId].map(id=>clipsRef.current.find(c=>c.id===id));
+      const snapshot=async (clip, atEnd, cut)=>{
+        if(!clip) return null;
+        let media, temporaryVideo;
+        try{
+          if(clip.type==='photo'){
+            media=photoRefs.current.get(clip.id);
+            if(!media || !media.naturalWidth) return null;
+          } else {
+            temporaryVideo=document.createElement('video');
+            media=temporaryVideo;
+            media.preload='auto'; media.muted=true; media.playsInline=true;
+            media.src=clip.url;
+            await new Promise(resolve=>{
+              let done=false;
+              const finish=()=>{ if(done) return; done=true; media.removeEventListener('loadeddata',finish); media.removeEventListener('error',finish); resolve(); };
+              media.addEventListener('loadeddata',finish);
+              media.addEventListener('error',finish);
+              if(media.readyState>=2) finish();
+              setTimeout(finish,3000);
+            });
+            if(cancelled || media.readyState<2) return null;
+            const raw=(clip.trimStart||0)+(atEnd ? clip.duration-cut-0.05 : cut);
+            const maxTime=isFinite(media.duration) && media.duration>0 ? media.duration-0.05 : raw;
+            await seekVideo(media,Math.max(0,Math.min(raw,maxTime)));
+          }
+          if(cancelled) return null;
+          const canvas=document.createElement('canvas');
+          canvas.width=320; canvas.height=320;
+          const ctx=canvas.getContext('2d');
+          const w=media.videoWidth||media.naturalWidth, h=media.videoHeight||media.naturalHeight;
+          if(!ctx || !w || !h) return null;
+          ctx.fillStyle='#09090b'; ctx.fillRect(0,0,320,320);
+          const scale=Math.min(320/w,320/h);
+          ctx.drawImage(media,(320-w*scale)/2,(320-h*scale)/2,w*scale,h*scale);
+          return canvas.toDataURL('image/jpeg',0.82);
+        }catch{ return null; }
+        finally{ if(temporaryVideo){ try{ temporaryVideo.removeAttribute('src'); temporaryVideo.load(); }catch{} } }
+      };
+      const left=await snapshot(pair[0],true,connectionEditor.outCut);
+      const right=await snapshot(pair[1],false,connectionEditor.inCut);
+      if(!cancelled) setConnectionFrames({left,right,loading:false});
+    },120);
+    return ()=>{ cancelled=true; clearTimeout(timer); };
+  },[connectionEditor,seekVideo]);
+
+  const openConnection=(leftId)=>{
+    const list=clipsRef.current;
+    const i=list.findIndex(c=>c.id===leftId);
+    if(i<0) return;
+    handleStop();
+    setConnectionFrames({left:null,right:null,loading:true});
+    setConnectionEditor({leftId, rightId:list[i+1]?.id||null, outCut:0, inCut:0});
+  };
+  const applyConnection=()=>{
+    if(!connectionEditor) return;
+    const list=clipsRef.current;
+    const i=list.findIndex(c=>c.id===connectionEditor.leftId);
+    if(i<0 || list[i+1]?.id!==connectionEditor.rightId){ setConnectionEditor(null); return; }
+    const edited=list.map((c,index)=>{
+      if(index===i && c.type!=='photo') return {...c,duration:Math.max(0.3,c.duration-connectionEditor.outCut)};
+      if(index===i+1 && c.type!=='photo') return {...c,trimStart:(c.trimStart||0)+connectionEditor.inCut,duration:Math.max(0.3,c.duration-connectionEditor.inCut)};
+      return c;
+    });
+    const result=recomputeStarts(edited);
+    clipsRef.current=result;
+    setClips(result);
+    const end=Math.max(...result.map(c=>c.timelineStart+c.duration));
+    durationRef.current=end;
+    setDuration(end);
+    const start=Math.max(result[i].timelineStart,result[i].timelineStart+result[i].duration-1.2);
+    timeRef.current=start;
+    setCurrentTime(start);
+    setConnectionEditor(null);
+    setTimeout(()=>{ drawFrameRef.current(start); handlePlay(); },50);
+  };
 
   const analyzeClipBrightnessContrast = useCallback(async (video, clip)=>{
     const realDur = (video && isFinite(video.duration) && video.duration>0) ? video.duration : (clip.duration + (clip.trimStart||0));
@@ -5596,6 +5681,7 @@ React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
                     onClick:(e)=>{
                       e.stopPropagation();
                       e.preventDefault();
+                      if(i===clips.length-1){ openConnection(c.id); return; }
                       const currentClips = clipsRef.current;
                       const targetClip = currentClips.find(x=> x.id===c.id);
                       if(!targetClip) return;
@@ -5657,7 +5743,8 @@ React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
                         }
                       },10);
                     },
-                    className:`w-8 h-6 rounded-full text-[10px] flex items-center justify-center ${hasTrans?'bg-green-600/30 border border-green-500/40 text-green-200':'bg-white/10 text-white/40'}`
+                    className:`w-8 h-6 rounded-full text-[10px] flex items-center justify-center ${hasTrans?'bg-green-600/30 border border-green-500/40 text-green-200':'bg-white/10 text-white/40'}`,
+                    title:i===clips.length-1 ? 'このカットのラストを見て次を撮る' : 'トランジションを設定'
                   }, hasTrans ? (trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→':'◎') : '+'),
                   React.createElement('button', {
                     onClick:()=>{
@@ -5678,7 +5765,7 @@ React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
                   }, '🗑')
                 )
               ),
-              i<clips.length-1 && React.createElement('div', {className:'flex items-center justify-center -my-0.5'},
+              i<clips.length-1 && React.createElement('div', {className:'flex items-center justify-center -my-0.5 relative'},
                 React.createElement('div', {className:'flex items-center gap-1'},
                   React.createElement('div', {className:'w-6 h-px bg-white/10'}),
                   React.createElement('button', {
@@ -5755,7 +5842,12 @@ React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
                     hasTrans ? `${trans.type==='fade'?'◐':trans.type==='white'?'◑':trans.type==='slide-left'?'→':trans.type==='slide-right'?'←':trans.type==='zoom'?'◎':'✂️'} ${trans.type} ${trans.duration.toFixed(1)}s` : '+ トランジション追加'
                   ),
                   React.createElement('div', {className:'w-6 h-px bg-white/10'})
-                )
+                ),
+                React.createElement('button', {
+                  onClick:()=>openConnection(c.id),
+                  className:'absolute right-0 top-1/2 -translate-y-1/2 text-[9px] px-2 py-1 rounded-full border border-white/10 bg-[#1a1a1d] text-white/60 hover:text-white',
+                  title:'前のラストと次の冒頭を見比べる'
+                }, 'つながりを見る')
               )
             );
           }),
@@ -6670,6 +6762,64 @@ React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
         )
       )
     ),
+    connectionEditor && (()=>{
+      const list=clipsRef.current;
+      const left=list.find(c=>c.id===connectionEditor.leftId);
+      const right=list.find(c=>c.id===connectionEditor.rightId);
+      if(!left || (connectionEditor.rightId && !right)) return null;
+      const overlap=left._transitionToNext?.type && left._transitionToNext.type!=='none' ? (left._transitionToNext.duration||0.5) : 0;
+      const leftMax=left.type==='photo' ? 0 : Math.max(0,Math.floor(Math.min(2,left.duration-Math.max(0.3,overlap+0.1))*10)/10);
+      const rightMax=!right || right.type==='photo' ? 0 : Math.max(0,Math.floor(Math.min(2,right.duration-0.3)*10)/10);
+      return React.createElement('div', {
+        className:'fixed inset-0 z-[120] bg-black/80 flex items-center justify-center p-4',
+        onClick:()=>setConnectionEditor(null)
+      }, React.createElement('div', {
+        role:'dialog', 'aria-modal':true, 'aria-label':'カットのつながりを確認',
+        className:'w-full max-w-md rounded-2xl border border-white/15 bg-[#111113] p-4 shadow-2xl',
+        onClick:e=>e.stopPropagation()
+      },
+        React.createElement('div', {className:'text-[14px] font-bold'}, '次につながるカットを探す'),
+        React.createElement('div', {className:'text-[11px] text-white/50 mt-1 mb-3'}, right ? '前のラストと次の冒頭を見比べて、境目を決める。' : 'このラストにつながる、次の一枚を撮ってみる。'),
+        React.createElement('div', {className:right ? 'grid grid-cols-2 gap-2' : 'grid grid-cols-1 gap-2'},
+          (right ? [[left,connectionFrames.left,'前のラスト'],[right,connectionFrames.right,'次の冒頭']] : [[left,connectionFrames.left,'このカットのラスト']]).map(([clip,frame,label])=>
+            React.createElement('div', {key:clip.id, className:'min-w-0'},
+              React.createElement('div', {className:'aspect-square bg-black rounded-lg overflow-hidden flex items-center justify-center text-[10px] text-white/40'},
+                frame ? React.createElement('img', {src:frame, alt:label, className:'w-full h-full object-contain'}) : connectionFrames.loading ? 'フレームを読み込み中…' : 'フレームを表示できません'
+              ),
+              React.createElement('div', {className:'text-[11px] text-white/75 mt-1'}, label),
+              React.createElement('div', {className:'text-[10px] text-white/40 truncate'}, clip.name)
+            )
+          )
+        ),
+        right && leftMax>0 && React.createElement('label', {className:'block text-[11px] text-white/70 mt-4'},
+          `前の終わりを ${connectionEditor.outCut.toFixed(1)} 秒早める`,
+          React.createElement('input', {
+            type:'range', min:0, max:leftMax, step:0.1, value:connectionEditor.outCut,
+            onChange:e=>setConnectionEditor(prev=>({...prev,outCut:Number(e.target.value)})),
+            className:'w-full accent-violet-500', 'aria-label':'前の終わりを早める'
+          })
+        ),
+        right && rightMax>0 && React.createElement('label', {className:'block text-[11px] text-white/70 mt-2'},
+          `次の始まりを ${connectionEditor.inCut.toFixed(1)} 秒遅らせる`,
+          React.createElement('input', {
+            type:'range', min:0, max:rightMax, step:0.1, value:connectionEditor.inCut,
+            onChange:e=>setConnectionEditor(prev=>({...prev,inCut:Number(e.target.value)})),
+            className:'w-full accent-violet-500', 'aria-label':'次の始まりを遅らせる'
+          })
+        ),
+        React.createElement('div', {className:'flex gap-2 mt-4'},
+          React.createElement('button', {onClick:()=>setConnectionEditor(null), className:'flex-1 h-10 rounded-full bg-white/10 text-[12px]'}, '戻る'),
+          right ? React.createElement('button', {onClick:applyConnection, className:'flex-1 h-10 rounded-full bg-white text-black text-[12px] font-bold'}, 'この境目から試写') : React.createElement('label', {className:'flex-1 h-10 rounded-full bg-white text-black text-[12px] font-bold flex items-center justify-center cursor-pointer'},
+            '次の動画を追加',
+            React.createElement('input', {type:'file', accept:'video/*', className:'hidden', onChange:e=>{ if(e.target.files?.length){ setConnectionEditor(null); handleVideoUpload(e.target.files); e.target.value=''; } }})
+          )
+        ),
+        !right && React.createElement('label', {className:'mt-2 w-full h-9 rounded-full border border-white/20 text-white/75 text-[11px] flex items-center justify-center cursor-pointer'},
+          '次の写真を追加',
+          React.createElement('input', {type:'file', accept:'image/*', className:'hidden', onChange:e=>{ if(e.target.files?.length){ setConnectionEditor(null); handleVideoUpload(e.target.files); e.target.value=''; } }})
+        )
+      ));
+    })(),
     // きら - 保存成功時のミント粒子
     ...kiraParticles.map(p=> [React.createElement('div', {
       key:p.id,
@@ -6886,4 +7036,3 @@ root.render(React.createElement(App));
 </script>
 </body>
 </html>
-
