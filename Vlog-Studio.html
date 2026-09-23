@@ -2685,7 +2685,10 @@ function App(){
   const [selectedTextId, setSelectedTextId] = useState(null);
   const [selectedClipIds, setSelectedClipIds] = useState([]);
   const [connectionEditor, setConnectionEditor] = useState(null);
-  const [connectionFrames, setConnectionFrames] = useState({left:null, right:null, loading:false});
+  const connectionLeftSlotRef = useRef(null);
+  const connectionRightSlotRef = useRef(null);
+  const connectionSeekTasksRef = useRef(new Map());
+  const connectionTargetRef = useRef(new Map());
   const [photoDuration, setPhotoDuration] = useState(2.5);
   const [bulkPhotoDuration, setBulkPhotoDuration] = useState(2.5);
   const [selectedTransition, setSelectedTransition] = useState(null);
@@ -3655,90 +3658,117 @@ function App(){
     });
   },[]);
 
-  // 比較フレームは取り込み済みの動画から取得し、取得後に再生位置を戻す。
+  // 比較画面には取り込み済みのvideoを直接表示する。iPhoneのcanvas静止画はシーク後も古いフレームを返すことがある。
+  const seekConnectionVideo=(clip,side,cut)=>{
+    if(!clip || clip.type==='photo') return;
+    const video=videoRefs.current.get(clip.id);
+    if(!video) return;
+    const base=clip._connectionBase || {duration:clip.duration,trimStart:clip.trimStart||0};
+    const raw=side==='left' ? base.trimStart+base.duration-cut-0.05 : base.trimStart+cut;
+    const maxTime=isFinite(video.duration) && video.duration>0 ? video.duration-0.05 : raw;
+    const target=Math.max(0,Math.min(raw,maxTime));
+    const last=connectionTargetRef.current.get(clip.id);
+    if(last!==undefined && Math.abs(last-target)<0.005) return;
+    connectionSeekTasksRef.current.get(clip.id)?.stop();
+    connectionTargetRef.current.set(clip.id,target);
+    let stopped=false,started=false,frameRequest=null;
+    let limitTimer=null;
+    const stop=()=>{
+      if(stopped) return;
+      stopped=true;
+      video.removeEventListener('seeked',onSeeked);
+      video.removeEventListener('loadedmetadata',onMetadata);
+      if(frameRequest!==null && video.cancelVideoFrameCallback){
+        try{ video.cancelVideoFrameCallback(frameRequest); }catch{}
+      }
+      clearTimeout(limitTimer);
+      try{ video.pause(); }catch{}
+      if(connectionSeekTasksRef.current.get(clip.id)?.stop===stop) connectionSeekTasksRef.current.delete(clip.id);
+    };
+    const onSeeked=()=>{
+      if(stopped || started || video.seeking) return;
+      started=true;
+      // 入力操作中にミュート再生で実際のフレームを描画させ、そのフレームで止める。
+      try{ const playResult=video.play(); if(playResult?.catch) playResult.catch(()=>{}); }catch{}
+      if(typeof video.requestVideoFrameCallback==='function'){
+        const onPresented=(_now,metadata)=>{
+          if(stopped) return;
+          if(Math.abs(metadata.mediaTime-target)<0.3) stop();
+          else frameRequest=video.requestVideoFrameCallback(onPresented);
+        };
+        frameRequest=video.requestVideoFrameCallback(onPresented);
+      } else {
+        clearTimeout(limitTimer);
+        limitTimer=setTimeout(()=>{
+          stop();
+          if(Math.abs(video.currentTime-target)>0.15){ try{ video.currentTime=target; }catch{} }
+        },160);
+      }
+    };
+    const onMetadata=()=>{ try{ video.currentTime=target; }catch{} };
+    video.addEventListener('seeked',onSeeked);
+    video.addEventListener('loadedmetadata',onMetadata);
+    connectionSeekTasksRef.current.set(clip.id,{stop});
+    limitTimer=setTimeout(()=>{
+      if(!stopped){
+        stop();
+        // callbackが使えない端末でも、表示中のvideoを指定位置に止める。
+        if(Math.abs(video.currentTime-target)>0.15){ try{ video.currentTime=target; }catch{} }
+      }
+    },900);
+    try{
+      video.muted=true;
+      video.playsInline=true;
+      if(video.readyState>=1){
+        const alreadyThere=Math.abs(video.currentTime-target)<0.04 && !video.seeking;
+        video.currentTime=target;
+        if(alreadyThere) onSeeked();
+      } else video.load();
+    }catch{ stop(); }
+  };
+
   useEffect(()=>{
     if(!connectionEditor) return;
-    let cancelled=false;
-    const captureAbort=new AbortController();
-    const timer=setTimeout(async ()=>{
-      setConnectionFrames({left:null, right:null, loading:true});
-      const pair=[connectionEditor.leftId, connectionEditor.rightId].map(id=>clipsRef.current.find(c=>c.id===id));
-      const snapshot=async (clip, atEnd, cut)=>{
-        if(!clip || cancelled) return null;
-        let media, previousTime;
-        try{
-          if(clip.type==='photo'){
-            media=photoRefs.current.get(clip.id);
-            if(!media || !media.naturalWidth) return null;
-          } else {
-            // iPhoneでは同じ .mov の二重デコードが止まりやすい。取り込み済みの要素を使う。
-            media=videoRefs.current.get(clip.id);
-            if(!media) return null;
-            previousTime=media.currentTime;
-            const base=clip._connectionBase || {duration:clip.duration,trimStart:clip.trimStart||0};
-            const raw=atEnd ? base.trimStart+base.duration-cut-0.05 : base.trimStart+cut;
-            const maxTime=isFinite(media.duration) && media.duration>0 ? media.duration-0.05 : raw;
-            const target=Math.max(0,Math.min(raw,maxTime));
-            const ready=await new Promise(resolve=>{
-              let done=false;
-              const events=['seeked','loadeddata','canplay','timeupdate','playing','error'];
-              const finish=ok=>{
-                if(done) return;
-                done=true;
-                events.forEach(name=>media.removeEventListener(name,onFrame));
-                captureAbort.signal.removeEventListener('abort',onAbort);
-                clearTimeout(kickTimer); clearTimeout(limitTimer);
-                try{ media.pause(); }catch{}
-                resolve(ok);
-              };
-              const onAbort=()=>finish(false);
-              const onFrame=()=>{
-                if(cancelled) return finish(false);
-                if(media.error) return finish(false);
-                if(media.readyState>=2 && media.videoWidth>0 && Math.abs(media.currentTime-target)<0.2) finish(true);
-              };
-              events.forEach(name=>media.addEventListener(name,onFrame));
-              captureAbort.signal.addEventListener('abort',onAbort,{once:true});
-              const kickTimer=setTimeout(()=>{
-                if(done) return;
-                try{ const p=media.play(); if(p?.catch) p.catch(()=>{}); }catch{}
-              },500);
-              const limitTimer=setTimeout(()=>finish(false),5000);
-              try{ media.currentTime=target; onFrame(); }catch{ finish(false); }
-            });
-            if(!ready) return null;
-          }
-          if(cancelled) return null;
-          const canvas=document.createElement('canvas');
-          canvas.width=320; canvas.height=320;
-          const ctx=canvas.getContext('2d');
-          const w=media.videoWidth||media.naturalWidth, h=media.videoHeight||media.naturalHeight;
-          if(!ctx || !w || !h) return null;
-          ctx.fillStyle='#09090b'; ctx.fillRect(0,0,320,320);
-          const scale=Math.min(320/w,320/h);
-          ctx.drawImage(media,(320-w*scale)/2,(320-h*scale)/2,w*scale,h*scale);
-          return canvas.toDataURL('image/jpeg',0.82);
-        }catch{ return null; }
-        finally{
-          if(media && previousTime!==undefined && !cancelled){
-            try{ media.currentTime=previousTime; }catch{}
-          }
-        }
-      };
-      const left=await snapshot(pair[0],true,connectionEditor.outCut);
-      if(cancelled) return;
-      const right=await snapshot(pair[1],false,connectionEditor.inCut);
-      if(!cancelled) setConnectionFrames({left,right,loading:false});
-    },120);
-    return ()=>{ cancelled=true; clearTimeout(timer); captureAbort.abort(); };
-  },[connectionEditor,seekVideo]);
+    const clipsNow=clipsRef.current;
+    const pair=[
+      [clipsNow.find(c=>c.id===connectionEditor.leftId),connectionLeftSlotRef.current],
+      [clipsNow.find(c=>c.id===connectionEditor.rightId),connectionRightSlotRef.current]
+    ];
+    const attached=[];
+    pair.forEach(([clip,slot])=>{
+      if(!clip || clip.type==='photo' || !slot) return;
+      const video=videoRefs.current.get(clip.id);
+      if(!video) return;
+      const previousTime=video.currentTime;
+      const previousStyle=video.style.cssText;
+      video.style.width='100%'; video.style.height='100%';
+      video.style.objectFit='contain'; video.style.display='block';
+      slot.appendChild(video);
+      attached.push({clip,slot,video,previousTime,previousStyle});
+    });
+    return ()=>{
+      attached.forEach(({clip,slot,video,previousTime,previousStyle})=>{
+        connectionSeekTasksRef.current.get(clip.id)?.stop();
+        if(video.parentNode===slot) slot.removeChild(video);
+        video.style.cssText=previousStyle;
+        try{ video.currentTime=previousTime; }catch{}
+        connectionTargetRef.current.delete(clip.id);
+      });
+    };
+  },[connectionEditor?.leftId,connectionEditor?.rightId]);
+
+  useEffect(()=>{
+    if(!connectionEditor) return;
+    const list=clipsRef.current;
+    seekConnectionVideo(list.find(c=>c.id===connectionEditor.leftId),'left',connectionEditor.outCut);
+    seekConnectionVideo(list.find(c=>c.id===connectionEditor.rightId),'right',connectionEditor.inCut);
+  },[connectionEditor]);
 
   const openConnection=(leftId)=>{
     const list=clipsRef.current;
     const i=list.findIndex(c=>c.id===leftId);
     if(i<0) return;
     handleStop();
-    setConnectionFrames({left:null,right:null,loading:true});
     setConnectionEditor({
       leftId, rightId:list[i+1]?.id||null,
       outCut:list[i]._connectionOutCut||0,
@@ -6837,10 +6867,13 @@ React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
         ),
         React.createElement('div', {className:'text-[11px] text-white/50 mt-1 mb-3'}, right ? '前のラストと次の冒頭を見比べて、境目を決める。' : 'このラストにつながる、次の一枚を撮ってみる。'),
         React.createElement('div', {className:right ? 'grid grid-cols-2 gap-2' : 'grid grid-cols-1 gap-2'},
-          (right ? [[left,connectionFrames.left,'前のラスト'],[right,connectionFrames.right,'次の冒頭']] : [[left,connectionFrames.left,'このカットのラスト']]).map(([clip,frame,label])=>
+          (right ? [[left,'left','前のラスト'],[right,'right','次の冒頭']] : [[left,'left','このカットのラスト']]).map(([clip,side,label])=>
             React.createElement('div', {key:clip.id, className:'min-w-0'},
               React.createElement('div', {className:'aspect-square bg-black rounded-lg overflow-hidden flex items-center justify-center text-[10px] text-white/40'},
-                frame ? React.createElement('img', {src:frame, alt:label, className:'w-full h-full object-contain'}) : connectionFrames.loading ? 'フレームを読み込み中…' : 'フレームを表示できません'
+                clip.type==='photo' ? React.createElement('img', {src:clip.url, alt:label, className:'w-full h-full object-contain'}) : React.createElement('div', {
+                  ref:side==='left' ? connectionLeftSlotRef : connectionRightSlotRef,
+                  className:'w-full h-full'
+                })
               ),
               React.createElement('div', {className:'text-[11px] text-white/75 mt-1'}, label),
               React.createElement('div', {className:'text-[10px] text-white/40 truncate'}, clip.name)
@@ -6851,7 +6884,11 @@ React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
           `前の終わりを ${connectionEditor.outCut.toFixed(1)} 秒早める`,
           React.createElement('input', {
             type:'range', min:0, max:leftMax, step:0.1, value:connectionEditor.outCut,
-            onChange:e=>setConnectionEditor(prev=>({...prev,outCut:Number(e.target.value)})),
+            onChange:e=>{
+              const cut=Number(e.target.value);
+              seekConnectionVideo(left,'left',cut);
+              setConnectionEditor(prev=>({...prev,outCut:cut}));
+            },
             className:'w-full accent-violet-500', 'aria-label':'前の終わりを早める'
           })
         ),
@@ -6859,7 +6896,11 @@ React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
           `次の始まりを ${connectionEditor.inCut.toFixed(1)} 秒遅らせる`,
           React.createElement('input', {
             type:'range', min:0, max:rightMax, step:0.1, value:connectionEditor.inCut,
-            onChange:e=>setConnectionEditor(prev=>({...prev,inCut:Number(e.target.value)})),
+            onChange:e=>{
+              const cut=Number(e.target.value);
+              seekConnectionVideo(right,'right',cut);
+              setConnectionEditor(prev=>({...prev,inCut:cut}));
+            },
             className:'w-full accent-violet-500', 'aria-label':'次の始まりを遅らせる'
           })
         ),
