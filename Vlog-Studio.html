@@ -3659,33 +3659,53 @@ function App(){
   useEffect(()=>{
     if(!connectionEditor) return;
     let cancelled=false;
+    const captureAbort=new AbortController();
     const timer=setTimeout(async ()=>{
       setConnectionFrames({left:null, right:null, loading:true});
       const pair=[connectionEditor.leftId, connectionEditor.rightId].map(id=>clipsRef.current.find(c=>c.id===id));
       const snapshot=async (clip, atEnd, cut)=>{
-        if(!clip) return null;
-        let media, temporaryVideo;
+        if(!clip || cancelled) return null;
+        let media, previousTime;
         try{
           if(clip.type==='photo'){
             media=photoRefs.current.get(clip.id);
             if(!media || !media.naturalWidth) return null;
           } else {
-            temporaryVideo=document.createElement('video');
-            media=temporaryVideo;
-            media.preload='auto'; media.muted=true; media.playsInline=true;
-            media.src=clip.url;
-            await new Promise(resolve=>{
-              let done=false;
-              const finish=()=>{ if(done) return; done=true; media.removeEventListener('loadeddata',finish); media.removeEventListener('error',finish); resolve(); };
-              media.addEventListener('loadeddata',finish);
-              media.addEventListener('error',finish);
-              if(media.readyState>=2) finish();
-              setTimeout(finish,3000);
-            });
-            if(cancelled || media.readyState<2) return null;
+            // iPhoneでは同じ .mov の二重デコードが止まりやすい。取り込み済みの要素を使う。
+            media=videoRefs.current.get(clip.id);
+            if(!media) return null;
+            previousTime=media.currentTime;
             const raw=(clip.trimStart||0)+(atEnd ? clip.duration-cut-0.05 : cut);
             const maxTime=isFinite(media.duration) && media.duration>0 ? media.duration-0.05 : raw;
-            await seekVideo(media,Math.max(0,Math.min(raw,maxTime)));
+            const target=Math.max(0,Math.min(raw,maxTime));
+            const ready=await new Promise(resolve=>{
+              let done=false;
+              const events=['seeked','loadeddata','canplay','timeupdate','playing','error'];
+              const finish=ok=>{
+                if(done) return;
+                done=true;
+                events.forEach(name=>media.removeEventListener(name,onFrame));
+                captureAbort.signal.removeEventListener('abort',onAbort);
+                clearTimeout(kickTimer); clearTimeout(limitTimer);
+                try{ media.pause(); }catch{}
+                resolve(ok);
+              };
+              const onAbort=()=>finish(false);
+              const onFrame=()=>{
+                if(cancelled) return finish(false);
+                if(media.error) return finish(false);
+                if(media.readyState>=2 && media.videoWidth>0 && Math.abs(media.currentTime-target)<0.2) finish(true);
+              };
+              events.forEach(name=>media.addEventListener(name,onFrame));
+              captureAbort.signal.addEventListener('abort',onAbort,{once:true});
+              const kickTimer=setTimeout(()=>{
+                if(done) return;
+                try{ const p=media.play(); if(p?.catch) p.catch(()=>{}); }catch{}
+              },500);
+              const limitTimer=setTimeout(()=>finish(false),5000);
+              try{ media.currentTime=target; onFrame(); }catch{ finish(false); }
+            });
+            if(!ready) return null;
           }
           if(cancelled) return null;
           const canvas=document.createElement('canvas');
@@ -3698,13 +3718,18 @@ function App(){
           ctx.drawImage(media,(320-w*scale)/2,(320-h*scale)/2,w*scale,h*scale);
           return canvas.toDataURL('image/jpeg',0.82);
         }catch{ return null; }
-        finally{ if(temporaryVideo){ try{ temporaryVideo.removeAttribute('src'); temporaryVideo.load(); }catch{} } }
+        finally{
+          if(media && previousTime!==undefined && !cancelled){
+            try{ media.currentTime=previousTime; }catch{}
+          }
+        }
       };
       const left=await snapshot(pair[0],true,connectionEditor.outCut);
+      if(cancelled) return;
       const right=await snapshot(pair[1],false,connectionEditor.inCut);
       if(!cancelled) setConnectionFrames({left,right,loading:false});
     },120);
-    return ()=>{ cancelled=true; clearTimeout(timer); };
+    return ()=>{ cancelled=true; clearTimeout(timer); captureAbort.abort(); };
   },[connectionEditor,seekVideo]);
 
   const openConnection=(leftId)=>{
