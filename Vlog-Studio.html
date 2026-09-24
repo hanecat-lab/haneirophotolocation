@@ -2513,6 +2513,34 @@ const STORY_TEMPLATES = [
 ];
 
 
+const openCameraLocalDb=()=>new Promise((resolve,reject)=>{
+  if(!window.indexedDB){ reject(new Error('local-storage-unavailable')); return; }
+  const request=indexedDB.open('haneiro-camera-captures',1);
+  request.onupgradeneeded=()=>{
+    const db=request.result;
+    if(!db.objectStoreNames.contains('captures')) db.createObjectStore('captures',{keyPath:'id'});
+  };
+  request.onsuccess=()=>resolve(request.result);
+  request.onerror=()=>reject(request.error||new Error('local-storage-error'));
+});
+const cameraLocalAction=async (mode,record)=>{
+  const db=await openCameraLocalDb();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction('captures',mode==='list'?'readonly':'readwrite');
+    const store=tx.objectStore('captures');
+    const records=[];
+    const request=mode==='save' ? store.put(record) : mode==='delete' ? store.delete(record) : store.openCursor(null,'prev');
+    request.onsuccess=()=>{
+      if(mode!=='list') return;
+      const cursor=request.result;
+      if(cursor && records.length<12){ records.push(cursor.value); cursor.continue(); }
+    };
+    tx.oncomplete=()=>{ db.close(); resolve(mode==='list'?records:undefined); };
+    tx.onerror=()=>{ db.close(); reject(tx.error||new Error('local-storage-error')); };
+    tx.onabort=()=>{ db.close(); reject(tx.error||new Error('local-storage-aborted')); };
+  });
+};
+
 function App(){
   const canvasRef = useRef(null);
   const previewWrapRef = useRef(null);
@@ -2689,6 +2717,32 @@ function App(){
   const connectionRightSlotRef = useRef(null);
   const connectionSeekTasksRef = useRef(new Map());
   const connectionTargetRef = useRef(new Map());
+  const [cameraMode, setCameraMode] = useState(null);
+  const [cameraStatus, setCameraStatus] = useState('idle');
+  const [cameraError, setCameraError] = useState('');
+  const [cameraFacing, setCameraFacing] = useState('environment');
+  const [cameraCaptured, setCameraCaptured] = useState(null);
+  const [cameraSavedRecords, setCameraSavedRecords] = useState([]);
+  const [cameraTargetSeconds, setCameraTargetSeconds] = useState(()=>{
+    try{ const n=Number(localStorage.getItem('haneiro_camera_target')||0); return Number.isFinite(n)&&n>=5&&n<=60?n:0; }
+    catch{ return 0; }
+  });
+  const [cameraTargetOpen, setCameraTargetOpen] = useState(false);
+  const [cameraElapsed, setCameraElapsed] = useState(0);
+  const [cameraClock, setCameraClock] = useState(()=>new Date().toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',hour12:false}));
+  const [cameraWarning, setCameraWarning] = useState('normal');
+  const cameraPreviewRef = useRef(null);
+  const cameraRecordingCanvasRef = useRef(null);
+  const cameraStreamRef = useRef(null);
+  const cameraRecorderRef = useRef(null);
+  const cameraRecordingRenderRef = useRef(0);
+  const cameraRecordingOutputRef = useRef(null);
+  const cameraTimerRef = useRef(0);
+  const cameraTimerStartRef = useRef(0);
+  const cameraWarnedSoonRef = useRef(false);
+  const cameraWarnedReachedRef = useRef(false);
+  const cameraOpenSeqRef = useRef(0);
+  const cameraCaptureUrlRef = useRef(null);
   const [photoDuration, setPhotoDuration] = useState(2.5);
   const [bulkPhotoDuration, setBulkPhotoDuration] = useState(2.5);
   const [selectedTransition, setSelectedTransition] = useState(null);
@@ -3686,6 +3740,305 @@ function App(){
     setTimeout(()=>{ syncCanvasSize(true); drawFrameRef.current(0); },300);
   },[syncCanvasSize, autoVerticalDetect]);
 
+  const formatCameraTime=(seconds)=>{
+    const whole=Math.max(0,Math.floor(Number(seconds)||0));
+    return `${String(Math.floor(whole/60)).padStart(2,'0')}:${String(whole%60).padStart(2,'0')}`;
+  };
+  const setCameraTarget=(seconds)=>{
+    const value=Number(seconds)||0;
+    const safe=value>=5&&value<=60?Math.round(value):0;
+    setCameraTargetSeconds(safe);
+    setCameraTargetOpen(false);
+    setCameraError('');
+    try{ localStorage.setItem('haneiro_camera_target',String(safe)); }catch{}
+  };
+  const chooseCustomCameraTarget=()=>{
+    const entered=prompt('警告を出す秒数を入力してください（5〜60秒）',String(cameraTargetSeconds||15));
+    if(entered===null) return;
+    const value=Number(entered);
+    if(!Number.isFinite(value)||value<5||value>60){
+      setCameraError('撮影時間は5〜60秒で指定してください。');
+      return;
+    }
+    setCameraTarget(value);
+  };
+  const stopCameraTimer=()=>{
+    if(cameraTimerRef.current){ clearInterval(cameraTimerRef.current); cameraTimerRef.current=0; }
+  };
+  const startCameraTimer=()=>{
+    stopCameraTimer();
+    cameraTimerStartRef.current=performance.now();
+    cameraWarnedSoonRef.current=false;
+    cameraWarnedReachedRef.current=false;
+    setCameraElapsed(0);
+    setCameraWarning('normal');
+    const target=cameraTargetSeconds;
+    const tick=()=>{
+      const elapsed=(performance.now()-cameraTimerStartRef.current)/1000;
+      setCameraElapsed(elapsed);
+      if(!target){ setCameraWarning('normal'); return; }
+      if(elapsed>=target){
+        setCameraWarning(elapsed>=target+1?'over':'reached');
+        if(!cameraWarnedReachedRef.current){
+          cameraWarnedReachedRef.current=true;
+          try{ navigator.vibrate?.([80,60,80]); }catch{}
+        }
+      }else if(elapsed>=target-3){
+        setCameraWarning('soon');
+        if(!cameraWarnedSoonRef.current){
+          cameraWarnedSoonRef.current=true;
+          try{ navigator.vibrate?.(50); }catch{}
+        }
+      }else setCameraWarning('normal');
+    };
+    tick();
+    cameraTimerRef.current=setInterval(tick,100);
+  };
+
+  const refreshCameraSaved=async()=>{
+    try{
+      const records=await cameraLocalAction('list');
+      setCameraSavedRecords(records.sort((a,b)=>b.createdAt-a.createdAt).slice(0,12));
+    }catch{ setCameraSavedRecords([]); }
+  };
+  const stopCameraRecordingOutput=()=>{
+    if(cameraRecordingRenderRef.current){
+      cancelAnimationFrame(cameraRecordingRenderRef.current);
+      cameraRecordingRenderRef.current=0;
+    }
+    const output=cameraRecordingOutputRef.current;
+    cameraRecordingOutputRef.current=null;
+    if(output) output.getVideoTracks().forEach(track=>{ try{ track.stop(); }catch{} });
+  };
+  const stopCameraTracks=()=>{
+    stopCameraRecordingOutput();
+    const stream=cameraStreamRef.current;
+    cameraStreamRef.current=null;
+    if(stream) stream.getTracks().forEach(track=>{ try{ track.stop(); }catch{} });
+    if(cameraPreviewRef.current) cameraPreviewRef.current.srcObject=null;
+  };
+  const closeCamera=()=>{
+    if(cameraRecorderRef.current?.state==='recording'){
+      stopCameraTimer();
+      try{ cameraRecorderRef.current.stop(); setCameraStatus('saving'); }catch{}
+      return;
+    }
+    cameraOpenSeqRef.current++;
+    stopCameraTimer();
+    stopCameraTracks();
+    if(cameraCaptureUrlRef.current) URL.revokeObjectURL(cameraCaptureUrlRef.current);
+    cameraCaptureUrlRef.current=null;
+    setCameraCaptured(null);
+    setCameraMode(null);
+    setCameraStatus('idle');
+    setCameraError('');
+    setCameraTargetOpen(false);
+    setCameraElapsed(0);
+    setCameraWarning('normal');
+  };
+  const openCamera=async(kind,facing=cameraFacing)=>{
+    const seq=++cameraOpenSeqRef.current;
+    stopCameraTracks();
+    if(cameraCaptureUrlRef.current) URL.revokeObjectURL(cameraCaptureUrlRef.current);
+    cameraCaptureUrlRef.current=null;
+    setCameraCaptured(null);
+    setCameraTargetOpen(false);
+    setCameraElapsed(0);
+    setCameraWarning('normal');
+    setCameraMode(kind);
+    setCameraFacing(facing);
+    setCameraStatus('opening');
+    setCameraError('');
+    refreshCameraSaved();
+    handleStop();
+    if(!navigator.mediaDevices?.getUserMedia){
+      setCameraError('この環境ではカメラを開けません。HTTPSのページでお試しください。');
+      setCameraStatus('error');
+      return;
+    }
+    const video={facingMode:{ideal:facing},width:{ideal:1920},height:{ideal:1080},aspectRatio:{ideal:16/9},resizeMode:'none'};
+    let stream;
+    try{
+      try{ stream=await navigator.mediaDevices.getUserMedia({video,audio:kind==='video'}); }
+      catch(e){
+        if(kind!=='video') throw e;
+        stream=await navigator.mediaDevices.getUserMedia({video,audio:false});
+        setCameraError('マイクを使えないため、音声なしで撮影します。');
+      }
+      if(seq!==cameraOpenSeqRef.current){ stream.getTracks().forEach(t=>t.stop()); return; }
+      cameraStreamRef.current=stream;
+      setCameraStatus('ready');
+    }catch(e){
+      if(seq!==cameraOpenSeqRef.current) return;
+      setCameraError(e?.name==='NotAllowedError' ? 'カメラへのアクセスが許可されていません。ブラウザの設定を確認してください。' : 'カメラを開けませんでした。ほかのアプリで使用中でないか確認してください。');
+      setCameraStatus('error');
+    }
+  };
+  useEffect(()=>{
+    const video=cameraPreviewRef.current;
+    if(!video) return;
+    const active=cameraStatus==='ready' || cameraStatus==='recording';
+    const nextStream=active ? cameraStreamRef.current : null;
+    if(video.srcObject!==nextStream) video.srcObject=nextStream;
+    if(active && video.paused){ const p=video.play(); if(p?.catch) p.catch(()=>{}); }
+  },[cameraMode,cameraStatus]);
+  useEffect(()=>{
+    const moodSelector=document.getElementById('moodSelector');
+    if(moodSelector) moodSelector.style.display=cameraMode?'none':'flex';
+    return()=>{ if(moodSelector) moodSelector.style.display='flex'; };
+  },[cameraMode]);
+  useEffect(()=>{
+    if(!cameraMode) return;
+    const updateClock=()=>setCameraClock(new Date().toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',hour12:false}));
+    updateClock();
+    const timer=setInterval(updateClock,1000);
+    return()=>clearInterval(timer);
+  },[cameraMode]);
+  useEffect(()=>()=>{
+    cameraOpenSeqRef.current++;
+    if(cameraTimerRef.current) clearInterval(cameraTimerRef.current);
+    if(cameraRecordingRenderRef.current) cancelAnimationFrame(cameraRecordingRenderRef.current);
+    cameraRecordingOutputRef.current?.getVideoTracks().forEach(track=>{ try{ track.stop(); }catch{} });
+    cameraStreamRef.current?.getTracks().forEach(track=>{ try{ track.stop(); }catch{} });
+    if(cameraCaptureUrlRef.current) URL.revokeObjectURL(cameraCaptureUrlRef.current);
+  },[]);
+  const finishCameraCapture=async(file)=>{
+    stopCameraTimer();
+    stopCameraTracks();
+    const url=URL.createObjectURL(file);
+    if(cameraCaptureUrlRef.current) URL.revokeObjectURL(cameraCaptureUrlRef.current);
+    cameraCaptureUrlRef.current=url;
+    const id=`camera-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setCameraCaptured({id,file,url,saved:false});
+    setCameraStatus('saving');
+    try{
+      await cameraLocalAction('save',{id,name:file.name,type:file.type,blob:file,createdAt:Date.now()});
+      setCameraCaptured(prev=>prev?.id===id ? {...prev,saved:true} : prev);
+      await refreshCameraSaved();
+    }catch{
+      setCameraError('ブラウザ内への保存に失敗しました。「端末に保存」から書き出してください。');
+    }
+    setCameraStatus('review');
+  };
+  const takeCameraPhoto=()=>{
+    const video=cameraPreviewRef.current;
+    if(!video || video.videoWidth<2 || video.videoHeight<2){ setCameraError('映像の準備中です。少し待ってから撮影してください。'); return; }
+    const canvas=document.createElement('canvas');
+    canvas.width=1080; canvas.height=1920;
+    try{
+      const sw=video.videoWidth, sh=video.videoHeight, target=canvas.width/canvas.height;
+      let sx=0, sy=0, sourceWidth=sw, sourceHeight=sh;
+      if(sw/sh>target){ sourceWidth=sh*target; sx=(sw-sourceWidth)/2; }
+      else{ sourceHeight=sw/target; sy=(sh-sourceHeight)/2; }
+      canvas.getContext('2d').drawImage(video,sx,sy,sourceWidth,sourceHeight,0,0,canvas.width,canvas.height);
+    }
+    catch{ setCameraError('写真を撮影できませんでした。'); return; }
+    setCameraStatus('saving');
+    canvas.toBlob(blob=>{
+      if(!blob){ setCameraStatus('ready'); setCameraError('写真を保存できませんでした。'); return; }
+      const name=`Haneiro-${new Date().toISOString().replace(/[:.]/g,'-')}.jpg`;
+      finishCameraCapture(new File([blob],name,{type:'image/jpeg'}));
+    },'image/jpeg',0.92);
+  };
+  const startCameraRecording=()=>{
+    const stream=cameraStreamRef.current;
+    if(!stream || typeof MediaRecorder==='undefined'){
+      setCameraError('このブラウザではアプリ内での動画録画に対応していません。'); return;
+    }
+    let recordingStream=stream;
+    if(typeof HTMLCanvasElement!=='undefined' && HTMLCanvasElement.prototype.captureStream){
+      try{
+        const canvas=cameraRecordingCanvasRef.current || document.createElement('canvas');
+        canvas.width=720; canvas.height=1280;
+        const ctx=canvas.getContext('2d');
+        const draw=()=>{
+          const video=cameraPreviewRef.current;
+          if(video && video.videoWidth>1 && video.videoHeight>1){
+            const sw=video.videoWidth, sh=video.videoHeight, target=canvas.width/canvas.height;
+            let sx=0, sy=0, sourceWidth=sw, sourceHeight=sh;
+            if(sw/sh>target){ sourceWidth=sh*target; sx=(sw-sourceWidth)/2; }
+            else{ sourceHeight=sw/target; sy=(sh-sourceHeight)/2; }
+            ctx.drawImage(video,sx,sy,sourceWidth,sourceHeight,0,0,canvas.width,canvas.height);
+          }
+          cameraRecordingRenderRef.current=requestAnimationFrame(draw);
+        };
+        draw();
+        const canvasStream=canvas.captureStream(30);
+        recordingStream=new MediaStream([...canvasStream.getVideoTracks(),...stream.getAudioTracks()]);
+        cameraRecordingOutputRef.current=recordingStream;
+      }catch{
+        stopCameraRecordingOutput();
+        recordingStream=stream;
+      }
+    }
+    const preferred=['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4','video/webm;codecs=vp8,opus','video/webm'];
+    const mime=preferred.find(type=>MediaRecorder.isTypeSupported?.(type));
+    let recorder;
+    try{ recorder=new MediaRecorder(recordingStream,mime?{mimeType:mime}:undefined); }
+    catch{ stopCameraRecordingOutput(); setCameraError('動画録画を開始できませんでした。'); return; }
+    const chunks=[];
+    cameraRecorderRef.current=recorder;
+    recorder.ondataavailable=e=>{ if(e.data?.size) chunks.push(e.data); };
+    recorder.onerror=()=>{ stopCameraTimer(); setCameraError('録画中にエラーが発生しました。'); };
+    recorder.onstop=()=>{
+      cameraRecorderRef.current=null;
+      stopCameraRecordingOutput();
+      const type=recorder.mimeType || mime || 'video/mp4';
+      const blob=new Blob(chunks,{type});
+      if(!blob.size){ stopCameraTracks(); setCameraStatus('error'); setCameraError('動画を保存できませんでした。'); return; }
+      const ext=type.includes('webm')?'webm':'mp4';
+      const name=`Haneiro-${new Date().toISOString().replace(/[:.]/g,'-')}.${ext}`;
+      finishCameraCapture(new File([blob],name,{type}));
+    };
+    try{
+      recorder.start(1000);
+      setCameraTargetOpen(false);
+      setCameraStatus('recording');
+      setCameraError('');
+      startCameraTimer();
+    }
+    catch{ cameraRecorderRef.current=null; stopCameraRecordingOutput(); setCameraError('動画録画を開始できませんでした。'); }
+  };
+  const stopCameraRecording=()=>{
+    const recorder=cameraRecorderRef.current;
+    if(recorder?.state==='recording'){
+      stopCameraTimer();
+      setCameraStatus('saving');
+      try{ recorder.stop(); }catch{ setCameraStatus('error'); setCameraError('録画を停止できませんでした。'); }
+    }
+  };
+  const exportCameraFile=async(file)=>{
+    if(!file) return;
+    try{
+      if(navigator.share && navigator.canShare?.({files:[file]})){
+        await navigator.share({files:[file],title:file.name});
+        return;
+      }
+      const url=URL.createObjectURL(file);
+      const a=document.createElement('a');
+      a.href=url; a.download=file.name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url),60000);
+    }catch(e){
+      if(e?.name!=='AbortError') setCameraError('端末への書き出しに失敗しました。もう一度お試しください。');
+    }
+  };
+  const importCameraFile=async(file)=>{
+    if(!file) return;
+    stopCameraTracks();
+    setCameraStatus('adding');
+    try{ await handleVideoUpload([file]); closeCamera(); }
+    catch{ setCameraStatus('review'); setCameraError('素材への追加に失敗しました。'); }
+  };
+  const deleteCameraRecord=async(id)=>{
+    if(!confirm('この端末に保存した撮影データを削除しますか？')) return;
+    try{
+      await cameraLocalAction('delete',id);
+      setCameraCaptured(prev=>prev?.id===id ? {...prev,saved:false} : prev);
+      await refreshCameraSaved();
+    }
+    catch{ setCameraError('削除できませんでした。'); }
+  };
 
   const recomputeStarts=(arr)=>{ 
   let cur=0; 
@@ -5372,25 +5725,44 @@ function App(){
         React.createElement('div', {className:'text-[11px] font-mono bg-black/50 px-2 py-1 rounded min-w-[44px] text-center'}, `${filterIntensity}%`)
       )
     ),
-React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
-          React.createElement('label', {
-            className:'group border-[2px] border-dashed border-white/20 rounded-[18px] h-[108px] flex flex-col items-center justify-center gap-1.5 cursor-pointer hover:border-[var(--haneiro-mint)]/50 bg-[#0e0e10] hover:bg-[#111113] transition-all',
-            onClick:triggerPikon
-          },
-            React.createElement('div', {className:'text-[28px] group-hover:scale-110 transition-transform'}, '📹'),
-            React.createElement('div', {className:'text-[13px] font-bold', style:{fontFamily:'Zen Maru Gothic, sans-serif'}}, '動画を追加'),
-            React.createElement('div', {className:'text-[11px] text-white/50'}, '複数可'),
-            React.createElement('input', {type:'file', multiple:true, accept:'video/*', className:'hidden', onChange:e=>{ if(e.target.files){ handleVideoUpload(e.target.files); e.target.value=''; } }})
+React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
+          React.createElement('div', {className:'relative h-[108px]'},
+            React.createElement('label', {
+              className:'group absolute inset-0 border-[2px] border-dashed border-white/20 rounded-[18px] h-full flex flex-col items-center justify-center gap-1.5 cursor-pointer hover:border-[var(--haneiro-mint)]/50 bg-[#0e0e10] hover:bg-[#111113] transition-all',
+              onClick:triggerPikon
+            },
+              React.createElement('div', {className:'text-[28px] group-hover:scale-110 transition-transform'}, '📹'),
+              React.createElement('div', {className:'text-[13px] font-bold', style:{fontFamily:'Zen Maru Gothic, sans-serif'}}, '動画を追加'),
+              React.createElement('div', {className:'text-[11px] text-white/50'}, '複数可'),
+              React.createElement('input', {type:'file', multiple:true, accept:'video/*', className:'hidden', onChange:e=>{ if(e.target.files){ handleVideoUpload(e.target.files); e.target.value=''; } }})
+            ),
+            React.createElement('button', {
+              type:'button', 'aria-label':'アプリで動画を撮る', className:'absolute top-2 right-2 z-20 rounded-full text-[10px] font-bold flex items-center justify-center active:scale-95 transition-transform',
+              style:{position:'absolute',top:'8px',right:'8px',zIndex:20,padding:'4px 6px',borderRadius:'9999px',backgroundColor:'#A7F3D0',color:'#0a0a0b',fontSize:'10px',fontWeight:700,lineHeight:'1rem',border:'1px solid rgba(255,255,255,0.45)',boxShadow:'0 4px 12px rgba(167,243,208,0.28)',display:'inline-flex',visibility:'visible',opacity:1,pointerEvents:'auto',WebkitTapHighlightColor:'transparent'},
+              onClick:e=>{ e.preventDefault(); e.stopPropagation(); openCamera('video'); },
+              onKeyDown:e=>{ if(e.key==='Enter' || e.key===' '){ e.preventDefault(); e.stopPropagation(); openCamera('video'); } }
+            }, '◎ 撮る')
           ),
-          React.createElement('label', {
-            className:'group border-[2px] border-dashed border-white/20 rounded-[18px] h-[108px] flex flex-col items-center justify-center gap-1.5 cursor-pointer hover:border-[var(--haneiro-mint)]/50 bg-[#0e0e10] hover:bg-[#111113] transition-all',
-            onClick:triggerPikon
-          },
-            React.createElement('div', {className:'text-[28px] group-hover:scale-110 transition-transform'}, '🖼️'),
-            React.createElement('div', {className:'text-[13px] font-bold text-white', style:{fontFamily:'Zen Maru Gothic, sans-serif'}}, '写真を追加'),
-            React.createElement('div', {className:'text-[11px] text-white/50'}, '複数可'),
-            React.createElement('input', {type:'file', multiple:true, accept:'image/*', className:'hidden', onChange:e=>{ if(e.target.files){ handleVideoUpload(e.target.files); e.target.value=''; } }})
-          )
+          React.createElement('div', {className:'relative h-[108px]'},
+            React.createElement('label', {
+              className:'group absolute inset-0 border-[2px] border-dashed border-white/20 rounded-[18px] h-full flex flex-col items-center justify-center gap-1.5 cursor-pointer hover:border-[var(--haneiro-mint)]/50 bg-[#0e0e10] hover:bg-[#111113] transition-all',
+              onClick:triggerPikon
+            },
+              React.createElement('div', {className:'text-[28px] group-hover:scale-110 transition-transform'}, '🖼️'),
+              React.createElement('div', {className:'text-[13px] font-bold text-white', style:{fontFamily:'Zen Maru Gothic, sans-serif'}}, '写真を追加'),
+              React.createElement('div', {className:'text-[11px] text-white/50'}, '複数可'),
+              React.createElement('input', {type:'file', multiple:true, accept:'image/*', className:'hidden', onChange:e=>{ if(e.target.files){ handleVideoUpload(e.target.files); e.target.value=''; } }})
+            ),
+            React.createElement('button', {
+              type:'button', 'aria-label':'アプリで写真を撮る', className:'absolute top-2 right-2 z-20 rounded-full text-[10px] font-bold flex items-center justify-center active:scale-95 transition-transform',
+              style:{position:'absolute',top:'8px',right:'8px',zIndex:20,padding:'4px 6px',borderRadius:'9999px',backgroundColor:'#A7F3D0',color:'#0a0a0b',fontSize:'10px',fontWeight:700,lineHeight:'1rem',border:'1px solid rgba(255,255,255,0.45)',boxShadow:'0 4px 12px rgba(167,243,208,0.28)',display:'inline-flex',visibility:'visible',opacity:1,pointerEvents:'auto',WebkitTapHighlightColor:'transparent'},
+              onClick:e=>{ e.preventDefault(); e.stopPropagation(); openCamera('photo'); },
+              onKeyDown:e=>{ if(e.key==='Enter' || e.key===' '){ e.preventDefault(); e.stopPropagation(); openCamera('photo'); } }
+            }, '◎ 撮る')
+          ),
+          React.createElement('div', {
+            className:'absolute left-0 right-0 top-full pt-1 text-center text-[8px] leading-none text-white/35 pointer-events-none whitespace-nowrap'
+          }, '※追加メニューの「ビデオを撮る」は写真アプリに保存されません')
         ),
             React.createElement('div', {className:'mx-3 my-2 h-10 min-h-[44px] rounded-[18px] bg-[#111113] border border-white/10 flex items-center px-3 gap-2 shrink-0'},
       React.createElement('span', {className:'text-[16px]'}, '⏱'),
@@ -6911,6 +7283,91 @@ React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-4'},
           ),
           React.createElement('button', {onClick:()=> setModeSafe('normal'), className:'mt-6 w-full h-12 rounded-full bg-white text-black font-bold'}, '✓ 完了してメインに戻る'),
           React.createElement('div', {className:'h-[20px] bg-[#0a0a0b]'})
+        )
+      )
+    ),
+    cameraMode && React.createElement('div', {className:cameraStatus==='opening'||cameraStatus==='ready'||cameraStatus==='recording' ? 'fixed inset-0 z-[130] bg-black/90 p-0' : 'fixed inset-0 z-[130] bg-black/90 flex items-center justify-center p-3'},
+      React.createElement('div', {role:'dialog', 'aria-modal':true, 'aria-label':'アプリ内カメラ', className:cameraStatus==='opening'||cameraStatus==='ready'||cameraStatus==='recording' ? 'w-full h-[100dvh] overflow-y-auto bg-[#111113] p-4 shadow-2xl' : 'w-full max-w-md max-h-[94vh] overflow-y-auto rounded-2xl border border-white/15 bg-[#111113] p-4 shadow-2xl', style:cameraStatus==='opening'||cameraStatus==='ready'||cameraStatus==='recording' ? {paddingTop:'max(16px, env(safe-area-inset-top))',paddingBottom:'max(16px, env(safe-area-inset-bottom))'} : undefined},
+        React.createElement('div', {className:'relative grid items-center mb-3', style:{gridTemplateColumns:'minmax(0,1fr) auto minmax(0,1fr)'}},
+          React.createElement('div', {className:'min-w-0'},
+            React.createElement('div', {className:`text-[13px] font-bold truncate ${cameraStatus==='recording'&&cameraWarning==='soon'?'text-amber-300':cameraStatus==='recording'&&(cameraWarning==='reached'||cameraWarning==='over')?'text-red-400':'text-white'}`},
+              cameraStatus==='recording' ? `● REC ${formatCameraTime(cameraElapsed)}${cameraTargetSeconds?` / ${formatCameraTime(cameraTargetSeconds)}`:''}` : (cameraMode==='photo'?'写真を撮る':'動画を撮る')
+            ),
+            React.createElement('div', {className:'text-[10px] text-white/50 mt-0.5 truncate'},
+              `${cameraClock}${cameraStatus==='recording'&&cameraWarning==='soon'?` · あと${Math.max(1,Math.ceil(cameraTargetSeconds-cameraElapsed))}秒`:cameraStatus==='recording'&&cameraWarning==='reached'?' · 目安に到達':cameraStatus==='recording'&&cameraWarning==='over'?` · 目安+${formatCameraTime(cameraElapsed-cameraTargetSeconds)}`:''}`
+            )
+          ),
+          cameraMode==='video' && (cameraStatus==='ready'||cameraStatus==='recording') ? React.createElement('div', {className:'relative'},
+            React.createElement('button', {
+              onClick:()=>setCameraTargetOpen(v=>!v), disabled:cameraStatus==='recording',
+              className:'h-8 px-3 rounded-full bg-white/10 text-[10px] text-white/80 disabled:opacity-70',
+              'aria-label':'撮影時間の目安を設定', 'aria-expanded':cameraTargetOpen
+            }, `尺 ${cameraTargetSeconds?`${cameraTargetSeconds}秒`:'自由'}`),
+            cameraTargetOpen && cameraStatus==='ready' && React.createElement('div', {className:'absolute z-50 top-10 left-1/2 -translate-x-1/2 w-[260px] rounded-xl border border-white/15 bg-[#18181b] p-2 shadow-2xl'},
+              React.createElement('div', {className:'text-[10px] text-white/55 px-1 pb-2'}, '指定秒数で警告（録画は継続）'),
+              React.createElement('div', {className:'grid grid-cols-5 gap-1'},
+                [0,7,15,30].map(value=>React.createElement('button', {
+                  key:value, onClick:()=>setCameraTarget(value),
+                  className:`h-8 rounded-lg text-[10px] ${cameraTargetSeconds===value?'bg-white text-black':'bg-white/10 text-white'}`
+                }, value?`${value}秒`:'自由')),
+                React.createElement('button', {
+                  onClick:chooseCustomCameraTarget,
+                  className:`h-8 rounded-lg text-[10px] ${cameraTargetSeconds>0&&![7,15,30].includes(cameraTargetSeconds)?'bg-white text-black':'bg-white/10 text-white'}`
+                }, '指定')
+              )
+            )
+          ) : React.createElement('div'),
+          React.createElement('button', {onClick:closeCamera, disabled:cameraStatus==='saving'||cameraStatus==='adding', className:'justify-self-end text-[12px] text-white/70 px-2 py-1 disabled:opacity-40', 'aria-label':'カメラを閉じる'}, '閉じる ×')
+        ),
+        React.createElement('div', {className:cameraStatus==='opening'||cameraStatus==='ready'||cameraStatus==='recording' ? 'relative w-full bg-black rounded-xl overflow-hidden flex items-center justify-center' : 'relative w-full aspect-[9/16] max-h-[52vh] bg-black rounded-xl overflow-hidden flex items-center justify-center', style:cameraStatus==='opening'||cameraStatus==='ready'||cameraStatus==='recording' ? {height:'calc(100dvh - 164px - env(safe-area-inset-top) - env(safe-area-inset-bottom))',minHeight:'220px'} : undefined},
+          (cameraStatus==='ready'||cameraStatus==='recording'||cameraStatus==='opening') && React.createElement('video', {
+            ref:cameraPreviewRef, autoPlay:true, muted:true, playsInline:true,
+            className:'w-full h-full object-cover', style:{width:'100%',height:'100%',objectFit:'cover',display:'block'}, 'aria-label':'カメラの映像'
+          }),
+          (cameraStatus==='ready'||cameraStatus==='recording') && React.createElement('canvas', {
+            ref:cameraRecordingCanvasRef, width:720, height:1280, 'aria-hidden':true,
+            style:{position:'absolute',inset:0,width:'100%',height:'100%',objectFit:'cover',display:cameraStatus==='recording'?'block':'none'}
+          }),
+          cameraStatus==='review' && cameraCaptured && (cameraCaptured.file.type.startsWith('image/') ?
+            React.createElement('img', {src:cameraCaptured.url, alt:'撮影した写真', className:'w-full h-full object-contain'}) :
+            React.createElement('video', {src:cameraCaptured.url, controls:true, playsInline:true, className:'w-full h-full object-contain', 'aria-label':'撮影した動画'})
+          ),
+          cameraStatus==='recording' && cameraWarning!=='normal' && React.createElement('div', {
+            className:`absolute inset-0 z-30 rounded-xl pointer-events-none ${cameraWarning==='reached'?'animate-pulse':''}`,
+            style:{boxShadow:`inset 0 0 0 6px ${cameraWarning==='soon'?'#f59e0b':'#ef4444'}${cameraWarning==='reached'?', inset 0 0 34px rgba(239,68,68,0.55)':''}`}
+          }),
+          cameraStatus==='recording' && cameraWarning!=='normal' && React.createElement('div', {
+            className:`absolute z-40 top-4 left-1/2 -translate-x-1/2 rounded-full font-bold shadow-2xl ${cameraWarning==='soon'?'bg-amber-400 text-black text-[26px] min-w-[48px] h-12 flex items-center justify-center':cameraWarning==='reached'?'bg-red-500 text-white text-[14px] px-5 h-11 flex items-center justify-center animate-pulse':'bg-red-500/90 text-white text-[13px] px-4 h-9 flex items-center justify-center'}`
+          }, cameraWarning==='soon' ? String(Math.max(1,Math.ceil(cameraTargetSeconds-cameraElapsed))) : cameraWarning==='reached' ? '目安時間です' : `+${formatCameraTime(cameraElapsed-cameraTargetSeconds)}`),
+          cameraStatus==='opening' && React.createElement('div', {className:'absolute text-[12px] text-white/70'}, 'カメラを起動中…'),
+          (cameraStatus==='saving'||cameraStatus==='adding') && React.createElement('div', {className:'text-[12px] text-white/70'}, cameraStatus==='adding'?'素材に追加中…':'保存中…'),
+          cameraStatus==='error' && React.createElement('div', {className:'text-[12px] text-white/70'}, 'カメラを利用できません')
+        ),
+        cameraError && React.createElement('div', {className:'text-[11px] text-amber-200 mt-2'}, cameraError),
+        cameraStatus==='ready' && React.createElement('div', {className:'flex gap-2 mt-4'},
+          React.createElement('button', {onClick:()=>openCamera(cameraMode,cameraFacing==='environment'?'user':'environment'), className:'h-10 px-3 rounded-full bg-white/10 text-[12px]'}, 'カメラ切替'),
+          React.createElement('button', {onClick:cameraMode==='photo'?takeCameraPhoto:startCameraRecording, className:'flex-1 h-10 rounded-full bg-white text-black text-[12px] font-bold'}, cameraMode==='photo'?'撮影する':'録画する')
+        ),
+        cameraStatus==='recording' && React.createElement('button', {
+          onClick:stopCameraRecording,
+          className:`w-full h-10 mt-4 rounded-full text-[12px] font-bold transition-colors ${cameraWarning==='soon'?'bg-amber-400 text-black':cameraWarning==='reached'?'bg-red-500 text-white animate-pulse':cameraWarning==='over'?'bg-red-500 text-white':'bg-white text-black'}`
+        }, cameraWarning==='soon' ? `あと${Math.max(1,Math.ceil(cameraTargetSeconds-cameraElapsed))}秒` : cameraWarning==='reached' ? '目安時間です' : cameraWarning==='over' ? `+${formatCameraTime(cameraElapsed-cameraTargetSeconds)}　録画を停止` : '● 録画を停止'),
+        cameraStatus==='review' && cameraCaptured && React.createElement(React.Fragment,null,
+          React.createElement('div', {className:'text-[11px] text-white/60 mt-2'}, cameraCaptured.saved?'このブラウザ内に保存しました':'端末への保存が必要です'),
+          React.createElement('div', {className:'flex gap-2 mt-3'},
+            React.createElement('button', {onClick:()=>importCameraFile(cameraCaptured.file), className:'flex-1 h-10 rounded-full bg-white text-black text-[12px] font-bold'}, '素材に追加'),
+            React.createElement('button', {onClick:()=>exportCameraFile(cameraCaptured.file), className:'flex-1 h-10 rounded-full bg-white/10 text-[12px]'}, '端末に保存')
+          ),
+          React.createElement('button', {onClick:()=>openCamera(cameraMode,cameraFacing), className:'w-full mt-2 h-9 rounded-full border border-white/15 text-[11px] text-white/70'}, '新しく撮る')
+        ),
+        cameraSavedRecords.length>0 && React.createElement('div', {className:'mt-4 border-t border-white/10 pt-3'},
+          React.createElement('div', {className:'text-[11px] text-white/60 mb-2'}, 'このブラウザ内の撮影データ'),
+          cameraSavedRecords.map(record=>React.createElement('div', {key:record.id, className:'flex items-center gap-2 py-1.5 border-b border-white/5'},
+            React.createElement('div', {className:'flex-1 min-w-0 text-[10px] text-white/70 truncate'}, record.name),
+            React.createElement('button', {onClick:()=>importCameraFile(new File([record.blob],record.name,{type:record.type})), className:'text-[10px] px-2 py-1 rounded-full bg-white/10'}, '追加'),
+            React.createElement('button', {onClick:()=>exportCameraFile(new File([record.blob],record.name,{type:record.type})), className:'text-[10px] px-2 py-1 rounded-full bg-white/10'}, '保存'),
+            React.createElement('button', {onClick:()=>deleteCameraRecord(record.id), className:'text-[10px] px-2 py-1 rounded-full text-red-300'}, '削除')
+          ))
         )
       )
     ),
