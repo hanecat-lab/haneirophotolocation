@@ -2522,6 +2522,9 @@ html[data-mood] .polaroid-wrapper #main-canvas{
 .soft-editorial-ui button:disabled{
   background-image:none;
 }
+.soft-editorial-ui{
+  overflow-anchor:none;
+}
 .haneiro-btn,
 .soft-editorial-ui [class~="bg-[#111113]"][class~="border"]{
   box-shadow:
@@ -2748,6 +2751,18 @@ const FILTERS = [
   {id:'emerald', name:'エメラルド', desc:'緑が鮮やか・自然・濃い', css:'brightness(1.15) contrast(1.25) saturate(2) hue-rotate(45deg)', dot:'🌿', previewBg:'linear-gradient(135deg,#6ee7b7,#065f46)'},
 ];
 
+const getClipPreviewFilter=(clip,fallbackFilter='none',intensity=100)=>{
+  const filterId=clip?._filter || clip?._filterId || fallbackFilter;
+  const filter=FILTERS.find(item=>item.id===filterId);
+  let css='none';
+  if(filter && filter.id!=='none' && intensity>0){
+    if(intensity===100) css=filter.css;
+    else if(intensity/100>=0.08) css=filter.css;
+  }
+  const moodCss=getMoodImageFilter();
+  return `${css==='none'?'':css} ${moodCss}`.trim() || 'none';
+};
+
 const STORY_TEMPLATES = [
   {
     id:'night_walk',
@@ -2907,6 +2922,7 @@ function App(){
   const photoRefs = useRef(new Map());
   const bgmAudioRef = useRef(null);
   const rafTickRef = useRef(0);
+  const playScrollGuardRef = useRef(0);
   const playingRef = useRef(false);
   const timeRef = useRef(0);
   const aspectRef = useRef(16/9);
@@ -3702,6 +3718,43 @@ function App(){
     drawFrameRef.current(timeRef.current);
     rafTickRef.current=requestAnimationFrame(tick);
   },[playbackRate, bgmTrack]);
+
+  const preserveScrollAfterPlay=useCallback((top,left)=>{
+    const token=++playScrollGuardRef.current;
+    const started=performance.now();
+    const scrollRoot=document.scrollingElement||document.documentElement;
+    let frame=0;
+    let finishTimer=0;
+    const cleanup=()=>{
+      if(frame) cancelAnimationFrame(frame);
+      clearTimeout(finishTimer);
+      window.removeEventListener('touchstart',cancelByUser);
+      window.removeEventListener('pointerdown',cancelByUser);
+      window.removeEventListener('wheel',cancelByUser);
+    };
+    const cancelByUser=()=>{
+      if(playScrollGuardRef.current===token) playScrollGuardRef.current++;
+      cleanup();
+    };
+    const restore=()=>{
+      if(playScrollGuardRef.current!==token || modeRef.current!=='normal'){
+        cleanup();
+        return;
+      }
+      try{
+        scrollRoot.scrollTop=top;
+        scrollRoot.scrollLeft=left;
+        window.scrollTo(left,top);
+      }catch{}
+      if(performance.now()-started<1200) frame=requestAnimationFrame(restore);
+      else cleanup();
+    };
+    window.addEventListener('touchstart',cancelByUser,{passive:true});
+    window.addEventListener('pointerdown',cancelByUser,{passive:true});
+    window.addEventListener('wheel',cancelByUser,{passive:true});
+    finishTimer=setTimeout(cleanup,1300);
+    frame=requestAnimationFrame(restore);
+  },[]);
 
   const handlePlay = useCallback((e)=>{
     if(e){ try{ e.preventDefault(); e.stopPropagation(); }catch{} }
@@ -5809,10 +5862,12 @@ function App(){
       if(!thumbCtx) return clip?.type==='photo' ? clip.url : '';
       thumbCtx.fillStyle=getMoodPaperColor();
       thumbCtx.fillRect(0,0,thumbCanvas.width,thumbCanvas.height);
+      thumbCtx.filter=getClipPreviewFilter(clip,activeFilterRef.current,filterIntensityRef.current);
       const scale=Math.min(thumbCanvas.width/sourceWidth,thumbCanvas.height/sourceHeight);
       const drawW=sourceWidth*scale;
       const drawH=sourceHeight*scale;
       thumbCtx.drawImage(source,(thumbCanvas.width-drawW)/2,(thumbCanvas.height-drawH)/2,drawW,drawH);
+      thumbCtx.filter='none';
       return thumbCanvas.toDataURL('image/jpeg',0.68);
     }catch{
       return clip?.type==='photo' ? clip.url : '';
@@ -6280,19 +6335,11 @@ function App(){
             e.preventDefault();
             e.stopPropagation();
             try{ e.currentTarget.blur(); }catch{}
-            isPlaying ? handleStop() : handlePlay(e);
-            const restoreScroll=()=>{
-              if(modeRef.current!=='normal') return;
-              try{
-                scrollRoot.scrollTop=keepTop;
-                scrollRoot.scrollLeft=keepLeft;
-                window.scrollTo(keepLeft,keepTop);
-              }catch{}
-            };
-            requestAnimationFrame(restoreScroll);
-            setTimeout(restoreScroll,60);
-            setTimeout(restoreScroll,180);
-            setTimeout(restoreScroll,360);
+            if(isPlaying) handleStop();
+            else{
+              handlePlay(e);
+              preserveScrollAfterPlay(keepTop,keepLeft);
+            }
           },
           className:`standard-play-button ${isPlaying?'playing':'idle'}`,
           'aria-label':isPlaying?'プレビューを一時停止':'プレビューを再生',
@@ -8033,6 +8080,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
       const adjusted=(clip.trimStart||0)>0 || (clip._connectionInCut||0)>0 || (clip._connectionOutCut||0)>0;
       const start=Math.max(0,clip.trimStart||0);
       const end=start+Math.max(0.3,clip.duration||0.3);
+      const quickPeekFilter=getClipPreviewFilter(clip,activeFilter,filterIntensity);
       return React.createElement('div', {
         className:'fixed inset-0 z-[110] bg-black/50 flex items-center justify-center p-5',
         onClick:e=>{ if(e.target===e.currentTarget) closeQuickPeek(); }
@@ -8051,10 +8099,12 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
           },
             isPhoto ? React.createElement('img', {
               src:clip.url, alt:clip.name, draggable:false,
-              className:'w-full h-full object-contain'
+              className:'w-full h-full object-contain',
+              style:{filter:quickPeekFilter}
             }) : React.createElement('video', {
               key:clip.id, ref:quickPeekVideoRef, src:clip.url, muted:true, playsInline:true, autoPlay:true,
               className:'w-full h-full object-contain',
+              style:{filter:quickPeekFilter},
               onLoadedMetadata:e=>beginQuickPeekSample(e.currentTarget,clip),
               onPlay:()=>setQuickPeekPlaying(true),
               onPause:()=>setQuickPeekPlaying(false),
