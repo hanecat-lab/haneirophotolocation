@@ -2691,6 +2691,14 @@ html[data-mood="emo"] .material-current-clip{
   .timeline-clip,
   .material-quick-peek-card{ transition:none !important; }
 }
+.desk-polaroid.current{
+  z-index:12;
+  box-shadow:
+    2px 7px 16px rgba(0,0,0,0.38),
+    0 0 0 1px var(--editorial-rim),
+    0 0 15px var(--editorial-glow),
+    inset 1px 1px 0 rgba(255,255,255,0.68) !important;
+}
 
 
 </style>
@@ -5223,6 +5231,7 @@ function App(){
   },[swipeIndex, setModeSafe]);
 
   const handleSwipeDiscard = useCallback(()=>{
+    const originalCount=clipsRef.current.length;
     const id = clipsRef.current[swipeIndex]?.id;
     if(id){
       const v=videoRefs.current.get(id);
@@ -5230,12 +5239,16 @@ function App(){
       const filtered = clipsRef.current.filter(c=> c.id!==id);
       const recomputed = recomputeStarts(filtered);
       setClips(recomputed);
+      clipsRef.current=recomputed;
+      setLastViewedClipId(prev=>prev===id?null:prev);
+      setSelectedClipIds(prev=>prev.filter(clipId=>clipId!==id));
+      window.dispatchEvent(new CustomEvent('haneiro:removerecentmaterial',{detail:{clipId:id}}));
       const maxEnd=recomputed.length ? Math.max(...recomputed.map(c=>c.timelineStart+c.duration)) : 3;
       setDuration(maxEnd);
       durationRef.current=maxEnd;
     }
     const next = swipeIndex;
-    if(next>=clipsRef.current.length-1){
+    if(next>=originalCount-1){
       setShowSwipe(false);
       setModeSafe('normal');
     } else {
@@ -5710,10 +5723,52 @@ function App(){
     if(video){ try{ video.pause(); }catch{} }
     setQuickPeekPlaying(false);
   };
+  const makeRecentMaterialThumb=(clip)=>{
+    const source=clip?.type==='photo'
+      ? (photoRefs.current.get(clip.id)||canvasRef.current)
+      : (quickPeekVideoRef.current||videoRefs.current.get(clip?.id)||canvasRef.current);
+    const sourceWidth=source?.videoWidth||source?.naturalWidth||source?.width||0;
+    const sourceHeight=source?.videoHeight||source?.naturalHeight||source?.height||0;
+    if(!source || !sourceWidth || !sourceHeight) return clip?.type==='photo' ? clip.url : '';
+    try{
+      const thumbCanvas=document.createElement('canvas');
+      thumbCanvas.width=108;
+      thumbCanvas.height=100;
+      const thumbCtx=thumbCanvas.getContext('2d');
+      if(!thumbCtx) return clip?.type==='photo' ? clip.url : '';
+      thumbCtx.fillStyle=getMoodPaperColor();
+      thumbCtx.fillRect(0,0,thumbCanvas.width,thumbCanvas.height);
+      const scale=Math.min(thumbCanvas.width/sourceWidth,thumbCanvas.height/sourceHeight);
+      const drawW=sourceWidth*scale;
+      const drawH=sourceHeight*scale;
+      thumbCtx.drawImage(source,(thumbCanvas.width-drawW)/2,(thumbCanvas.height-drawH)/2,drawW,drawH);
+      return thumbCanvas.toDataURL('image/jpeg',0.68);
+    }catch{
+      return clip?.type==='photo' ? clip.url : '';
+    }
+  };
+  const rememberQuickPeekMaterial=(clip)=>{
+    if(!clip) return;
+    const mood=document.documentElement.getAttribute('data-mood')||'quiet';
+    window.dispatchEvent(new CustomEvent('haneiro:recentmaterial',{detail:{
+      clipId:clip.id,
+      name:clip.name||'素材',
+      type:clip.type||'video',
+      timelineStart:clip.timelineStart||0,
+      duration:clip.duration||0,
+      thumb:makeRecentMaterialThumb(clip),
+      mood,
+      label:clip.type==='photo' ? 'PHOTO' : `${Math.max(0,clip.duration||0).toFixed(1)}s`
+    }}));
+  };
   const closeQuickPeek=(remember=true)=>{
     const closingId=quickPeekId;
+    const closingClip=closingId ? clipsRef.current.find(item=>item.id===closingId) : null;
     stopQuickPeekVideo();
-    if(remember!==false && closingId) setLastViewedClipId(closingId);
+    if(remember!==false && closingId){
+      setLastViewedClipId(closingId);
+      rememberQuickPeekMaterial(closingClip);
+    }
     setQuickPeekId(null);
   };
   const showQuickPeek=(clipId)=>{
@@ -5787,6 +5842,26 @@ function App(){
     setTimeout(()=>{ quickPeekSkipTapRef.current=false; },0);
   };
   useEffect(()=>()=>clearTimeout(quickPeekAutoStopRef.current),[]);
+  useEffect(()=>{
+    const openRecentMaterial=(event)=>{
+      const clipId=event.detail?.clipId;
+      if(!clipId) return;
+      const clip=clipsRef.current.find(item=>item.id===clipId);
+      if(!clip){
+        window.dispatchEvent(new CustomEvent('haneiro:removerecentmaterial',{detail:{clipId}}));
+        return;
+      }
+      if(modeRef.current!=='normal') setModeSafe('normal');
+      setActiveTab('material');
+      showQuickPeek(clipId);
+      setTimeout(()=>{
+        const row=[...document.querySelectorAll('[data-clip-id]')].find(el=>el.getAttribute('data-clip-id')===String(clipId));
+        row?.scrollIntoView({behavior:'smooth',block:'center'});
+      },100);
+    };
+    window.addEventListener('haneiro:openrecentmaterial',openRecentMaterial);
+    return()=>window.removeEventListener('haneiro:openrecentmaterial',openRecentMaterial);
+  },[]);
 
   return React.createElement('div', {className:'soft-editorial-ui min-h-[100vh] bg-[#0a0a0b] text-white flex flex-col select-none', style:{fontFamily:'-apple-system,BlinkMacSystemFont,sans-serif'}},
     React.createElement('header', {className:'h-16 bg-[#0a0a0b] border-b border-white/10 flex items-center px-3 gap-2 shrink-0'},
@@ -6614,7 +6689,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
             const trans = c._transitionToNext;
             const hasTrans = trans && trans.type!=='none';
             return React.createElement('div', {key:c.id, className:'flex flex-col gap-1'},
-              React.createElement('div', {className:`h-[72px] shrink-0 rounded-xl border flex items-center px-2 gap-2 relative timeline-clip ${isSelected?'bg-violet-600/20 border-violet-500/50 ring-1 ring-violet-500/30 active' : isPhoto ? 'bg-[#1a102a] border-violet-500/30' : 'bg-[#111113] border-white/10'} ${isLastViewed?'material-current-clip':''} ${ghost && ghost.id===c.id ? 'dragging' : ''}`, onMouseEnter:e=>{ e.currentTarget.style.willChange='transform'; }, onMouseLeave:e=>{ e.currentTarget.style.willChange='auto'; }},
+              React.createElement('div', {'data-clip-id':c.id, className:`h-[72px] shrink-0 rounded-xl border flex items-center px-2 gap-2 relative timeline-clip ${isSelected?'bg-violet-600/20 border-violet-500/50 ring-1 ring-violet-500/30 active' : isPhoto ? 'bg-[#1a102a] border-violet-500/30' : 'bg-[#111113] border-white/10'} ${isLastViewed?'material-current-clip':''} ${ghost && ghost.id===c.id ? 'dragging' : ''}`, onMouseEnter:e=>{ e.currentTarget.style.willChange='transform'; }, onMouseLeave:e=>{ e.currentTarget.style.willChange='auto'; }},
                 React.createElement('button', {
                   onClick:()=>{
                     setSelectedClipIds(prev=> prev.includes(c.id) ? prev.filter(id=>id!==c.id) : [...prev, c.id]);
@@ -6776,10 +6851,12 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       if(img){ try{ URL.revokeObjectURL(c.url || img.src); }catch{} photoRefs.current.delete(c.id); }
                       if(quickPeekId===c.id) closeQuickPeek(false);
                       if(lastViewedClipId===c.id) setLastViewedClipId(null);
+                      window.dispatchEvent(new CustomEvent('haneiro:removerecentmaterial',{detail:{clipId:c.id}}));
                       setSelectedClipIds(prev=> prev.filter(id=>id!==c.id));
                       const filtered=clips.filter(x=> x.id!==c.id);
                       const rec = recomputeStarts(filtered);
                       setClips(rec);
+                      clipsRef.current=rec;
                       const maxEnd=rec.length ? Math.max(...rec.map(x=>x.timelineStart+x.duration)) : 3;
                       setDuration(maxEnd);
                       durationRef.current=maxEnd;
@@ -6887,7 +6964,9 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 photoRefs.current.clear();
                 closeQuickPeek(false);
                 setLastViewedClipId(null);
+                window.dispatchEvent(new CustomEvent('haneiro:clearrecentmaterials'));
                 setClips([]);
+                clipsRef.current=[];
                 setSelectedClipIds([]);
                 setDuration(3);
                 durationRef.current=3;
@@ -8089,6 +8168,45 @@ root.render(React.createElement(App));
     g.gain.setValueAtTime(0.28,ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.3);
     o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+0.32);
   }
+  function mechanicalCardClick(){
+    const ctx=getCtx(); if(!ctx) return;
+    try{ if(ctx.state==='suspended') ctx.resume(); }catch{}
+    const now=ctx.currentTime;
+
+    // 金属スイッチが落ちる短い「カチ」
+    const tick=ctx.createOscillator(), tickGain=ctx.createGain();
+    tick.type='square';
+    tick.frequency.setValueAtTime(1350,now);
+    tick.frequency.exponentialRampToValueAtTime(380,now+0.024);
+    tickGain.gain.setValueAtTime(0.095,now);
+    tickGain.gain.exponentialRampToValueAtTime(0.0001,now+0.032);
+    tick.connect(tickGain); tickGain.connect(ctx.destination);
+    tick.start(now); tick.stop(now+0.036);
+
+    // 接点の小さな摩擦音
+    const noiseLength=Math.max(1,Math.floor(ctx.sampleRate*0.014));
+    const noiseBuffer=ctx.createBuffer(1,noiseLength,ctx.sampleRate);
+    const noiseData=noiseBuffer.getChannelData(0);
+    for(let i=0;i<noiseLength;i++) noiseData[i]=(Math.random()*2-1)*(1-i/noiseLength);
+    const noise=ctx.createBufferSource(), noiseFilter=ctx.createBiquadFilter(), noiseGain=ctx.createGain();
+    noise.buffer=noiseBuffer;
+    noiseFilter.type='highpass';
+    noiseFilter.frequency.setValueAtTime(1700,now);
+    noiseGain.gain.setValueAtTime(0.045,now);
+    noiseGain.gain.exponentialRampToValueAtTime(0.0001,now+0.018);
+    noise.connect(noiseFilter); noiseFilter.connect(noiseGain); noiseGain.connect(ctx.destination);
+    noise.start(now); noise.stop(now+0.02);
+
+    // スイッチが戻る低い「コト」
+    const latch=ctx.createOscillator(), latchGain=ctx.createGain();
+    latch.type='triangle';
+    latch.frequency.setValueAtTime(190,now+0.032);
+    latch.frequency.exponentialRampToValueAtTime(105,now+0.073);
+    latchGain.gain.setValueAtTime(0.05,now+0.032);
+    latchGain.gain.exponentialRampToValueAtTime(0.0001,now+0.078);
+    latch.connect(latchGain); latchGain.connect(ctx.destination);
+    latch.start(now+0.032); latch.stop(now+0.082);
+  }
 
   // Mood - with direct visual feedback
   const saved=localStorage.getItem('haneiro_mood')||'quiet';
@@ -8139,18 +8257,85 @@ root.render(React.createElement(App));
   }
   devOverlay.addEventListener('click', ()=>devOverlay.classList.remove('active'));
 
-  // Desk stack from canvas
+  // 最近確認した素材トレイ
   const desk=document.getElementById('deskStack');
   let deskItems=[];
-  try{ const s=localStorage.getItem('haneiro_desk'); if(s) deskItems=JSON.parse(s); }catch{}
+  let activeDeskClipId=null;
+  try{
+    const s=localStorage.getItem('haneiro_desk');
+    if(s){
+      const parsed=JSON.parse(s);
+      // 旧版の画像だけの装飾カードは、素材へ戻れないため引き継がない。
+      if(Array.isArray(parsed)) deskItems=parsed.filter(item=>item&&item.clipId&&item.thumb).slice(-6);
+    }
+  }catch{}
+  activeDeskClipId=deskItems.length ? deskItems[deskItems.length-1].clipId : null;
+  function saveDesk(){
+    try{ localStorage.setItem('haneiro_desk',JSON.stringify(deskItems.slice(-6))); }catch{}
+  }
   function renderDesk(){
+    desk.replaceChildren();
     if(deskItems.length===0){
       desk.innerHTML='<div class="desk-polaroid" style="--r:-2deg"><div class="mini" style="background:linear-gradient(180deg,#FFFEFB,#FFFBF5)"></div><div class="mini-label">NO FILM</div></div>';
       return;
     }
-    desk.innerHTML=deskItems.slice(-6).map((it,i)=>`<div class="desk-polaroid" style="--r:${(i-2)*3}deg" data-idx="${i}"><div class="mini" style="background-image:url(${it.thumb});background-size:cover"></div><div class="mini-label">${it.date}</div></div>`).join('');
-    desk.querySelectorAll('.desk-polaroid').forEach(el=>el.addEventListener('click', ()=>plop()));
+    deskItems.slice(-6).forEach((item,index)=>{
+      const card=document.createElement('div');
+      card.className=`desk-polaroid${item.clipId===activeDeskClipId?' current':''}`;
+      card.style.setProperty('--r',`${(index-2)*3}deg`);
+      card.dataset.clipId=String(item.clipId);
+      card.setAttribute('role','button');
+      card.setAttribute('tabindex','0');
+      card.setAttribute('aria-label',`${item.name||'素材'}を確認`);
+      const mini=document.createElement('div');
+      mini.className='mini';
+      mini.style.backgroundImage=`url(${item.thumb})`;
+      mini.style.backgroundSize='cover';
+      mini.style.backgroundPosition='center';
+      const label=document.createElement('div');
+      label.className='mini-label';
+      label.textContent=item.label||(item.type==='photo'?'PHOTO':'VIDEO');
+      card.append(mini,label);
+      const open=()=>{
+        const current=deskItems.find(entry=>String(entry.clipId)===String(item.clipId));
+        if(!current) return;
+        deskItems=[...deskItems.filter(entry=>String(entry.clipId)!==String(item.clipId)),current].slice(-6);
+        activeDeskClipId=current.clipId;
+        saveDesk();
+        renderDesk();
+        mechanicalCardClick();
+        window.dispatchEvent(new CustomEvent('haneiro:openrecentmaterial',{detail:{clipId:current.clipId}}));
+      };
+      card.addEventListener('click',open);
+      card.addEventListener('keydown',event=>{
+        if(event.key==='Enter'||event.key===' '){ event.preventDefault(); open(); }
+      });
+      desk.appendChild(card);
+    });
   }
+  window.addEventListener('haneiro:recentmaterial',event=>{
+    const item=event.detail;
+    if(!item?.clipId||!item.thumb) return;
+    deskItems=[...deskItems.filter(entry=>String(entry.clipId)!==String(item.clipId)),item].slice(-6);
+    activeDeskClipId=item.clipId;
+    saveDesk();
+    renderDesk();
+  });
+  window.addEventListener('haneiro:removerecentmaterial',event=>{
+    const clipId=event.detail?.clipId;
+    if(!clipId) return;
+    deskItems=deskItems.filter(item=>String(item.clipId)!==String(clipId));
+    if(String(activeDeskClipId)===String(clipId)) activeDeskClipId=deskItems.length ? deskItems[deskItems.length-1].clipId : null;
+    saveDesk();
+    renderDesk();
+  });
+  window.addEventListener('haneiro:clearrecentmaterials',()=>{
+    deskItems=[];
+    activeDeskClipId=null;
+    saveDesk();
+    renderDesk();
+  });
+  saveDesk();
   renderDesk();
 
   // Polaroid physics - wait for polaroid wrapper
@@ -8190,42 +8375,12 @@ root.render(React.createElement(App));
       wrap.classList.remove('dragging','touching');
       wrap.style.transform='';
       plop();
-      // capture thumb for desk
-      try{
-        const canvas=document.getElementById('main-canvas')||document.querySelector('canvas');
-        if(canvas){
-          const thumb=canvas.toDataURL('image/jpeg',0.22);
-          const date=new Date().toLocaleDateString('ja-JP',{month:'short',day:'numeric'});
-          const mood=document.documentElement.getAttribute('data-mood')||'quiet';
-          deskItems=[...deskItems.slice(-5), {thumb, date, mood}];
-          localStorage.setItem('haneiro_desk', JSON.stringify(deskItems));
-          renderDesk();
-        }
-      }catch{}
     };
     wrap.addEventListener('pointerup', endDrag);
     wrap.addEventListener('pointercancel', endDrag);
     wrap.addEventListener('click', ()=>{ if(!dragging) focusBeep(); });
   }
   attachPhysics();
-
-  // Hook into existing canvas draw to add thumb occasionally
-  setInterval(()=>{
-    const canvas=document.getElementById('main-canvas')||document.querySelector('canvas');
-    if(!canvas) return;
-    // if canvas has content and desk empty, add one
-    if(deskItems.length===0 && canvas.width>0){
-      try{
-        const thumb=canvas.toDataURL('image/jpeg',0.18);
-        if(thumb.length>1000){
-          const date=new Date().toLocaleDateString('ja-JP',{month:'short',day:'numeric'});
-          deskItems=[{thumb, date, mood:saved}];
-          localStorage.setItem('haneiro_desk', JSON.stringify(deskItems));
-          renderDesk();
-        }
-      }catch{}
-    }
-  },3000);
 })();
 </script>
 </body>
