@@ -4954,6 +4954,73 @@ body:has(.polaroid-wrapper.hikariyomi-mode) #moodSelector{
   white-space: nowrap;
   max-width: 100%;
 }
+.polaroid-wrapper.finder-mode .mode-header .mode-state{
+  color: rgba(35,35,35,0.62);
+}
+.polaroid-wrapper.finder-mode .mode-dock .finder-bottom-right .zoom{
+  color: #181818 !important;
+  background: rgba(255,255,255,0.84) !important;
+  border-color: rgba(0,0,0,0.06) !important;
+}
+.polaroid-wrapper.finder-mode .mode-header .finder-guide-hold{
+  position: absolute;
+  right: 52px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid rgba(30,30,30,0.14);
+  border-radius: 50%;
+  background: rgba(255,255,255,0.42);
+  color: rgba(35,35,35,0.68);
+  font-size: 9px;
+  letter-spacing: 0;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  z-index: 1;
+}
+.polaroid-wrapper.finder-mode .mode-header .finder-guide-hold.held{
+  background: rgba(35,35,35,0.72);
+  color: white;
+}
+.polaroid-wrapper.finder-mode.finder-guides-quiet .safe-area-overlay,
+.polaroid-wrapper.finder-mode.finder-guides-quiet .viewfinder-overlay,
+.polaroid-wrapper.finder-mode.finder-guides-quiet .finder-corners{
+  visibility: hidden !important;
+}
+.polaroid-wrapper.hikariyomi-mode .mode-header .luma-histogram{
+  position: absolute;
+  left: 0;
+  top: calc(100% + 7px);
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  width: 82px;
+  height: 28px;
+  padding: 4px 5px;
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.05);
+  pointer-events: none;
+}
+.polaroid-wrapper.hikariyomi-mode .mode-header .luma-histogram-bar{
+  flex: 1;
+  min-width: 0;
+  background: rgba(242,245,244,0.78);
+  border-radius: 1px 1px 0 0;
+}
+.polaroid-wrapper.hikariyomi-mode .mode-header .hikariyomi-exposure{
+  position: relative;
+}
+@media (max-height: 680px){
+  .polaroid-wrapper.hikariyomi-mode .mode-header .luma-histogram{
+    display: none;
+  }
+}
 
 </style>
 </head>
@@ -5224,6 +5291,9 @@ function App(){
   const peakingCanvasRef = useRef(null);
   const zebraCanvasRef = useRef(null);
   const [exposureStatus, setExposureStatus] = useState('unknown'); // dark, ok, bright, unknown
+  const [lumaHistogram, setLumaHistogram] = useState(null);
+  const lumaClipIdRef = useRef(null);
+  const [finderGuidesHeld, setFinderGuidesHeld] = useState(false);
   const loupeTimeoutRef = useRef(null);
   const isLongPressRef = useRef(false);
   const loupeCanvasRef = useRef(null);
@@ -5294,6 +5364,22 @@ function App(){
       setExposureStatus('unknown');
     }
   },[mode, currentTime, hasPreviewMaterial, clips]);
+
+  useEffect(()=>{
+    if(mode==='finder') return;
+    setFinderGuidesHeld(false);
+  },[mode]);
+  useEffect(()=>{
+    if(!finderGuidesHeld) return;
+    const release=()=>setFinderGuidesHeld(false);
+    const onVisibility=()=>{ if(document.hidden) release(); };
+    window.addEventListener('blur',release);
+    document.addEventListener('visibilitychange',onVisibility);
+    return ()=>{
+      window.removeEventListener('blur',release);
+      document.removeEventListener('visibilitychange',onVisibility);
+    };
+  },[finderGuidesHeld]);
 
   // ゼブラは素材のプレビュー画素で白飛びに近い領域だけを描く。
   useEffect(()=>{
@@ -5642,6 +5728,81 @@ function App(){
   const [finderHighlightWarning, setFinderHighlightWarning] = useState(false);
   const [aspectMode, setAspectMode] = useState('9:16');
   const [fitMode, setFitMode] = useState('contain');
+
+  // ひかりよみ: 既存プレビューの実画素だけで輝度分布を描く。余白は素材の寸法から除外する。
+  useEffect(()=>{
+    if(mode!=='hikariyomi' || !hasPreviewMaterial){ lumaClipIdRef.current=null; setLumaHistogram(null); return; }
+    let disposed=false;
+    let lastSignature='';
+    let sameFrameSamples=0;
+    const sample=()=>{
+      try{
+        const canvas=canvasRef.current;
+        if(!canvas || canvas.width<10 || canvas.height<10){ setLumaHistogram(null); return; }
+        const t=timeRef.current;
+        const active=clipsRef.current.find(c=>t>=c.timelineStart && t<c.timelineStart+c.duration) || clipsRef.current[clipsRef.current.length-1];
+        if(!active){ setLumaHistogram(null); return; }
+        if(lumaClipIdRef.current!==active.id){ lumaClipIdRef.current=active.id; setLumaHistogram(null); return; }
+        const photo=active.type==='photo';
+        const media=photo ? photoRefs.current.get(active.id) : videoRefs.current.get(active.id);
+        if(photo ? !(media?.complete && media.naturalWidth>1) : !(media?.readyState>=2 && media.videoWidth>0)){ setLumaHistogram(null); return; }
+        const signature=`${active.id}:${t}:${canvas.width}x${canvas.height}:${fitMode}:${activeFilterRef.current}:${filterIntensityRef.current}`;
+        if(!isPlaying && signature===lastSignature && sameFrameSamples>=2) return;
+        const ratio=photo ? media.naturalWidth/media.naturalHeight : media.videoWidth/media.videoHeight;
+        if(!Number.isFinite(ratio) || ratio<=0){ setLumaHistogram(null); return; }
+        const w=canvas.width, h=canvas.height, frameRatio=w/h;
+        const verticalMode=active._verticalMode || 'contain-black';
+        let scale=1;
+        let panOffsetX=0, panOffsetY=0;
+        if(photo){
+          scale=active._photoZoom || 1;
+          const progress=Math.max(0,Math.min(1,(t-active.timelineStart)/Math.max(0.1,active.duration)));
+          if(active._photoPan==='kenburns-in' || active._photoPan==='kenburns-out'){
+            scale=active._photoPan==='kenburns-in' ? 1+progress*0.15 : 1.15-progress*0.15;
+            panOffsetX=(progress-0.5)*w*0.05;
+            panOffsetY=(progress-0.5)*h*0.05;
+          }
+        }
+        let pictureW=w, pictureH=h;
+        if(ratio>=1 && verticalMode==='contain-black'){
+          pictureW=w*scale;
+          pictureH=pictureW/ratio;
+        }else if(ratio>=1 && verticalMode==='blur-bg'){
+          pictureW=w*0.92*scale;
+          pictureH=pictureW/ratio;
+        }else if(!(ratio>=1 && verticalMode==='vertical-crop') && fitMode!=='cover'){
+          if(ratio>frameRatio){ pictureW=w*scale; pictureH=pictureW/ratio; }
+          else { pictureH=h*scale; pictureW=pictureH*ratio; }
+        }
+        const x=Math.max(0,Math.floor((w-pictureW)/2+panOffsetX)+1);
+        const y=Math.max(0,Math.floor((h-pictureH)/2+panOffsetY)+1);
+        const width=Math.min(w-x,Math.ceil(pictureW)-2);
+        const height=Math.min(h-y,Math.ceil(pictureH)-2);
+        if(width<10 || height<10){ setLumaHistogram(null); return; }
+        const data=canvas.getContext('2d',{willReadFrequently:true}).getImageData(x,y,width,height).data;
+        const bins=new Array(24).fill(0);
+        const stepX=Math.max(1,Math.floor(width/56));
+        const stepY=Math.max(1,Math.floor(height/36));
+        for(let py=0;py<height;py+=stepY){
+          for(let px=0;px<width;px+=stepX){
+            const i=(py*width+px)*4;
+            const luminance=data[i]*0.2126 + data[i+1]*0.7152 + data[i+2]*0.0722;
+            bins[Math.min(23,Math.floor(luminance*24/256))]++;
+          }
+        }
+        const peak=Math.max(...bins);
+        if(!disposed && peak>0){
+          setLumaHistogram(bins.map(count=>count/peak));
+          sameFrameSamples=signature===lastSignature ? sameFrameSamples+1 : 1;
+          lastSignature=signature;
+        }
+      }catch{ if(!disposed) setLumaHistogram(null); }
+    };
+    const frame=requestAnimationFrame(sample);
+    const timer=setInterval(sample,300);
+    return ()=>{ disposed=true; cancelAnimationFrame(frame); clearInterval(timer); };
+  },[mode,hasPreviewMaterial,fitMode,isPlaying]);
+
   const [verticalPriority, setVerticalPriority] = useState(true);
   const [autoVerticalDetect, setAutoVerticalDetect] = useState(true);
   const [timelineZoom, setTimelineZoom] = useState(80); // タイムライン拡大縮小
@@ -8830,7 +8991,7 @@ function App(){
     ),
     React.createElement('div', {
       ref: polaroidRef,
-      className:`polaroid-wrapper ${mode==='fullscreen' ? 'theater-mode' : mode==='finder' ? 'finder-mode' : mode==='hikariyomi' ? 'hikariyomi-mode' : (!isPlaying ? `yurayura living ${yurayuraStopped ? 'stopped' : ''}` : 'paused')} ${theaterIsDragging ? 'dragging' : ''} ${isDeveloping ? 'developing-container' : ''}`,
+      className:`polaroid-wrapper ${mode==='fullscreen' ? 'theater-mode' : mode==='finder' ? 'finder-mode' : mode==='hikariyomi' ? 'hikariyomi-mode' : (!isPlaying ? `yurayura living ${yurayuraStopped ? 'stopped' : ''}` : 'paused')} ${mode==='finder' && finderGuidesHeld ? 'finder-guides-quiet' : ''} ${theaterIsDragging ? 'dragging' : ''} ${isDeveloping ? 'developing-container' : ''}`,
       'data-aspect': aspectMode,
       style:{
         width: mode==='fullscreen' ? undefined : mode==='finder' ? 'min(92vw, calc(56vh * var(--aspect, 1.777)))' : 'min(92vw, calc(58vh * var(--aspect, 9/16) + 28px))',
@@ -8917,7 +9078,12 @@ function App(){
             React.createElement('span', {className:'mode-title'}, mode==='finder' ? 'ファインダー' : 'ひかりよみ'),
             mode==='hikariyomi' && hasPreviewMaterial && exposureStatus!=='unknown' && React.createElement('div', {className:`hikariyomi-exposure ${exposureStatus}`},
               React.createElement('div', {className:'dot'}),
-              React.createElement('span', null, exposureStatus==='dark' ? '☁️ 中央が暗め' : exposureStatus==='bright' ? '☀️ 中央が明るめ' : '☀️ 中央は中間')
+              React.createElement('span', null, exposureStatus==='dark' ? '☁️ 中央が暗め' : exposureStatus==='bright' ? '☀️ 中央が明るめ' : '☀️ 中央は中間'),
+              lumaHistogram && React.createElement('div', {
+                className:'luma-histogram', role:'img', 'aria-label':'現在のプレビュー画素から計算した輝度分布'
+              }, ...lumaHistogram.map((value,i)=>React.createElement('div', {
+                key:i, className:'luma-histogram-bar', style:{height:`${Math.max(1,value*100)}%`}
+              })))
             ),
             mode==='hikariyomi' && showLoupe && clips.length>0 && React.createElement('div', {className:'hikariyomi-hint'}, 'ドラッグでピント位置移動 • 長押しでゼブラ'),
             mode==='finder' && (clips.length>0 || (cameraMode==='video' && cameraStatus==='recording')) && React.createElement('span', {className:'mode-state'},
@@ -8925,6 +9091,20 @@ function App(){
             ),
             mode==='finder' && finderHighlightWarning && React.createElement('div', {className:'finder-highlight-warning', role:'status'}, '白飛び注意')
           ),
+          mode==='finder' && hasPreviewMaterial && React.createElement('button', {
+            type:'button',
+            className:`finder-guide-hold ${finderGuidesHeld ? 'held' : ''}`,
+            'aria-label':'押している間ガイドを隠す',
+            'aria-pressed':finderGuidesHeld,
+            onPointerDown:(e)=>{ e.preventDefault(); e.stopPropagation(); try{ e.currentTarget.setPointerCapture(e.pointerId); }catch{} setFinderGuidesHeld(true); },
+            onPointerUp:(e)=>{ e.stopPropagation(); setFinderGuidesHeld(false); },
+            onPointerCancel:()=>setFinderGuidesHeld(false),
+            onLostPointerCapture:()=>setFinderGuidesHeld(false),
+            onClick:(e)=>e.stopPropagation(),
+            onContextMenu:(e)=>e.preventDefault(),
+            onKeyDown:(e)=>{ if(e.key===' ' || e.key==='Enter'){ e.preventDefault(); setFinderGuidesHeld(true); } },
+            onKeyUp:(e)=>{ if(e.key===' ' || e.key==='Enter'){ e.preventDefault(); setFinderGuidesHeld(false); } }
+          }, 'ガイド'),
           React.createElement('button', {
             type:'button',
             onClick:(e)=>{ e.stopPropagation(); setModeSafe('normal'); },
