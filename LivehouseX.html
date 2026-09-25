@@ -2289,9 +2289,18 @@
       let i=0,start=0;
       while(i<n-1 && p>=start+S[i].dur){start+=S[i].dur;i++}
       const seg=S[i], [name,arg]=seg[side], mv=ARM_MOVES[name];
-      if(mv.continuous)return mv.fn(side,(p-start)/seg.dur,arg);
-      const cur=mv.fn(side,1,arg);
       const e=(p-start)/THUNDER_RAMP;
+      /* continuous な動きは立ち上がりを掛けない ― u=0 が前の区間の終わりと
+         一致している前提だから。一致しない繋ぎ方をする区間では blend:true を
+         立て、前の区間の終わりから同じ立ち上がりで寄せる（揺れ自体は保つ）。 */
+      if(mv.continuous){
+        const cur=mv.fn(side,(p-start)/seg.dur,arg);
+        if(!seg.blend||e>=1)return cur;
+        const pv=S[(i+n-1)%n][side], from=ARM_MOVES[pv[0]].fn(side,1,pv[1]);
+        const w=Math.max(e,0), s=w*w*(3-2*w);
+        return {E:cur.E,H:from.H.multiplyScalar(1-s).addScaledVector(cur.H,s)};
+      }
+      const cur=mv.fn(side,1,arg);
       if(e>=1)return cur;
       const pv=S[(i+n-1)%n][side], from=ARM_MOVES[pv[0]].fn(side,1,pv[1]);
       const w=Math.max(e,0), s=w*w*(3-2*w);
@@ -2304,37 +2313,67 @@
        ・上半身ごと片側へ倒し、その側の腕を伸ばし切って斜め上へ（1拍・保持）
        ・その間、反対の腕は胸元で 1拍に2回 上下する（ここが「左左」の役）
        ・半拍で両手が腰の高さを横に薙いで、上げる側を入れ替える
-       1周 = (1拍 + 半拍) × 2 = 3拍。 */
+       ・左右の大振りのあと、両手を揃えたまま 本人の左→右 へ半拍ずつ大きく振る
+         （伸ばし切らない小振り 1拍）。ここが次の左大振りへの渡しも兼ねる
+       1周 = (1拍 + 半拍) × 2 + 1拍 = 4拍。 */
     const ROMANCE_BPM=130, ROMANCE_BEAT=60/ROMANCE_BPM;
     const ROMANCE_REACH=[35,62,GLOW_REACH_MAX];  // 伸ばし切り [方位°, 仰角°, 距離]（正の方位＝自分の側）
     const ROMANCE_CHEST=[20,-5,.30];             // 胸元の構え [方位°, 仰角°, 距離]
     const ROMANCE_PUMP=[25,2];                   // 胸元の連打 [仰角の振れ°, 1拍あたりの回数]
     const ROMANCE_LOW=[10,-38,.44];              // 横薙ぎで両手が通る腰の高さ
     const ROMANCE_LEAN=[40,12];                  // 上げる側への体幹の傾き [側屈°, 前屈°]
+    const ROMANCE_SWING=[55,24,.46];             // 小振り [方位°, 仰角°, 距離]。伸ばし切らないが大きい
+    const ROMANCE_SWING_LEAN=18;                 // 小振りで振った側への側屈°
     function buildRomanceSegments(){
       const R=d=>d*Math.PI/180, seg=[];
       const reach=['thrust',ROMANCE_REACH];
       const pump=['shake',[ROMANCE_CHEST[2],ROMANCE_CHEST[0],ROMANCE_CHEST[1],ROMANCE_PUMP[0],ROMANCE_PUMP[1],0]];
-      // 腰の高さへ下ろす／腰の高さから運ぶ。距離も補間するので手先が飛ばない
-      const toLow=f=>['arc',[f[0],f[1],ROMANCE_LOW[0],ROMANCE_LOW[1],f[2],ROMANCE_LOW[2]]];
-      const fromLow=t=>['arc',[ROMANCE_LOW[0],ROMANCE_LOW[1],t[0],t[1],ROMANCE_LOW[2],t[2]]];
+      // 方向と距離を補間する弧。位置を直線補間すると手先が肩へ寄って腕が畳まれる
+      const arc2=(f,t)=>['arc',[f[0],f[1],t[0],t[1],f[2],t[2]]];
+      const toLow=f=>arc2(f,ROMANCE_LOW), fromLow=t=>arc2(ROMANCE_LOW,t);
+      /* 小振りの向き。両手を同じ世界の向きへ揃える。glowDirOf は側で x を
+         鏡映するので、同じ向きを指すには方位の符号をメッシュごとに逆にする。
+         本人の左＝ローカル +x なので、メッシュ 'R' は正、'L' は負。 */
+      const swingAt=(toL,mesh)=>[(toL?1:-1)*(mesh==='R'?1:-1)*ROMANCE_SWING[0],
+                                ROMANCE_SWING[1],ROMANCE_SWING[2]];
       /* 振り付けは本人の左右で書き、メッシュ名へはここで一度だけ写す。
          側屈は正で本人の右へ倒れる。 */
-      const add=(beats,up,pUp,pDn,lean)=>{
+      /* diag は ?diag=fan が読む区間の名札。診断側で区間の性格を推し量ると
+         二重管理になるので、組み立てているここで付ける。
+         side は本人のどちら側が主役か（+1=右 / −1=左 / null=どちらでもない）。 */
+      const add=(beats,up,pUp,pDn,lean,diag)=>{
         const o={}; o[GLOW_MESH[up]]=pUp; o[GLOW_MESH[up==='L'?'R':'L']]=pDn;
-        seg.push({dur:beats*ROMANCE_BEAT,R:o.R,L:o.L,lean});
+        seg.push({dur:beats*ROMANCE_BEAT,R:o.R,L:o.L,lean,diag});
       };
       for(const up of ['L','R']){
         const sg=up==='R'?1:-1, dn=up==='L'?'R':'L';
         // 伸ばし切り 1拍。上げた側へ倒したまま保ち、反対の腕は胸元で2連打
-        add(1.0, up, reach, pump, [sg*R(ROMANCE_LEAN[0]), R(ROMANCE_LEAN[1])]);
+        const lab=up==='R'?'右':'左';
+        add(1.0, up, reach, pump, [sg*R(ROMANCE_LEAN[0]), R(ROMANCE_LEAN[1])],
+            {name:`大振り（本人の${lab}を伸ばし切り）＋胸元2連打`, side:sg});
         // 渡し 半拍。前半で両手を腰の高さへ（体は起きる）
-        add(0.25, up, toLow(ROMANCE_REACH), toLow(ROMANCE_CHEST), [0, R(ROMANCE_LEAN[1])*.4]);
+        add(0.25, up, toLow(ROMANCE_REACH), toLow(ROMANCE_CHEST), [0, R(ROMANCE_LEAN[1])*.4],
+            {name:'渡し（腰の高さを横へ）', side:null});
         // 後半で役を入れ替える。次に上げる側へ倒し始める
         add(0.25, up, fromLow(ROMANCE_CHEST), fromLow(ROMANCE_REACH),
-            [-sg*R(ROMANCE_LEAN[0])*.5, R(ROMANCE_LEAN[1])*.7]);
+            [-sg*R(ROMANCE_LEAN[0])*.5, R(ROMANCE_LEAN[1])*.7],
+            {name:'渡し（役を入れ替える）', side:null});
       }
-      return {segments:seg,period:seg.reduce((a,x)=>a+x.dur,0)};   // 3拍
+      /* 小振り 1拍。両手を揃えて 本人の左 → 本人の右 へ半拍ずつ。
+         直前の渡しは「メッシュR が伸ばし切り／メッシュL が胸元」で終わっているので、
+         弧の始点をそこに合わせると境目で手先が飛ばない。 */
+      seg.push({dur:.5*ROMANCE_BEAT, R:arc2(ROMANCE_REACH,swingAt(true,'R')),
+                L:arc2(ROMANCE_CHEST,swingAt(true,'L')),
+                lean:[-R(ROMANCE_SWING_LEAN), R(ROMANCE_LEAN[1])*.5],
+                diag:{name:'小振り（両手そろえて本人の左へ）', side:-1}});
+      seg.push({dur:.5*ROMANCE_BEAT, R:arc2(swingAt(true,'R'),swingAt(false,'R')),
+                L:arc2(swingAt(true,'L'),swingAt(false,'L')),
+                lean:[R(ROMANCE_SWING_LEAN), R(ROMANCE_LEAN[1])*.5],
+                diag:{name:'小振り（両手そろえて本人の右へ）', side:1}});
+      /* 小振りの終わりは胸元でも伸ばし切りでもないので、戻った先頭の区間は
+         立ち上がりを掛けて寄せる（連打は continuous なので既定では掛からない）。 */
+      seg[0].blend=true;
+      return {segments:seg,period:seg.reduce((a,x)=>a+x.dur,0)};   // 4拍
     }
     const ROMANCE_SEG=buildRomanceSegments();
     const THUNDER_TO_ROMANCE=(()=>{
@@ -9934,22 +9973,18 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         }
         // いまの区間（コードの意図）
         const tt=glowFanTime(t,i), per=P.period, p=((tt%per)+per)%per;
-        /* 区間表から「いま伸ばし切っている腕」を読む。伸ばし切りは thrust、
-           胸元の連打は shake、渡しは arc なので、動きの名前で見分けられる。 */
+        /* 区間の性格は表に付けた名札（diag）から読む。診断側で動きの名前から
+           推し量ると、振り付けを変えたときに置き去りになる。 */
         let acc=0, si=0;
         while(si<P.segments.length-1&&p>=acc+P.segments[si].dur){acc+=P.segments[si].dur;si++}
         const sg=P.segments[si], mv=m=>sg[m][0];
-        let key='s'+si, name='', wantSide=null, gotX=null;
+        let key='s'+si, gotX=null;
+        const dg=sg.diag||{name:'区間'+si, side:null};
+        const name=dg.name, wantSide=dg.side;
+        // 伸ばし切りの区間はその腕のペンで、それ以外は両手の中点で測る
         const upMesh=mv('R')==='thrust'?'R':(mv('L')==='thrust'?'L':null);
-        if(upMesh){
-          const upPerson=GLOW_MESH.R===upMesh?'R':'L';   // メッシュ名 → 本人の左右
-          name=`伸ばし切り（本人の${upPerson==='R'?'右':'左'}）＋胸元2連打`;
-          wantSide=upPerson==='R'?1:-1;
-          if(stick[upMesh]!==null&&orgX!==null)gotX=stick[upMesh]-orgX;
-        }else{
-          name='渡し（腰の高さを横へ）';
-          if(stick.R!==null&&stick.L!==null&&orgX!==null)gotX=(stick.R+stick.L)/2-orgX;
-        }
+        if(upMesh&&stick[upMesh]!==null&&orgX!==null)gotX=stick[upMesh]-orgX;
+        else if(stick.R!==null&&stick.L!==null&&orgX!==null)gotX=(stick.R+stick.L)/2-orgX;
         const toScreen=n=>rightIsScreenRight===null?'?':((n>0)===rightIsScreenRight?'右':'左');
         const wantScr=wantSide===null?'?':toScreen(wantSide);
         const gotScr=gotX===null?'?':sideOf(gotX);
