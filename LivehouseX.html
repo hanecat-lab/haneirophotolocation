@@ -2102,6 +2102,16 @@
       const f=a.clone().multiplyScalar(Math.cos(phi)).addScaledVector(b,Math.sin(phi));
       return {E,H:E.clone().addScaledVector(f,GLOW_L2)};
     }
+    /* 区間内の進み u に緩急を付ける。省略時は smoothstep で、両端とも速度 0
+       ＝どの区間も同じ「ふわっと出てふわっと止まる」になる。緩急はここで作る。
+       'out' は速く出て収まる（運びの終わりに溜めができる）、
+       'in'  は止まったところから加速して止まり際が最速（突きの伸ばし）。 */
+    function glowEase(u,kind){
+      const w=Math.min(Math.max(u,0),1);
+      if(kind==='in')return w*w;
+      if(kind==='out')return 1-(1-w)*(1-w);
+      return w*w*(3-2*w);
+    }
     /* 腕の動き。区間内の進み u(0〜1) から {E?,H} を返す。
        E を返す動きは肘を固定できる（FK）。省くと solveGlowArmIK が肘を出す。
        continuous な動きは立ち上がりを掛けず u をそのまま使う。 */
@@ -2134,7 +2144,7 @@
          真上→真下のような大きな移動で手先が肩の近くを通り、腕が畳まれてしまう。
          a=[開始方位°, 開始仰角°, 終了方位°, 終了仰角°, 距離, 終了距離?] */
       arc   :{continuous:true,fn:(side,u,a)=>{
-        const e=u*u*(3-2*u);
+        const e=glowEase(u,a[6]);
         // a[5] を省くと距離は一定（従来どおり）。省かなければ距離も補間する
         const d0=a[4], d1=a[5]===undefined?a[4]:a[5];
         return {H:glowThrustPos(side,a[0]+(a[2]-a[0])*e,a[1]+(a[3]-a[1])*e,d0+(d1-d0)*e)};
@@ -2307,15 +2317,16 @@
        ・その間、反対の腕は胸元で 1拍に2回 上下する（ここが「左左」の役）
        ・半拍で両手が腰の高さを横に薙いで、上げる側を入れ替える
        ・左右の大振りのあと、両手を揃えたまま 本人の左→右 へ半拍ずつ大きく振る
-         （伸ばし切らない小振り）。最後の半拍で肘を曲げ、曲げたまま大振り側へ運ぶ
-       1周 = (1拍 + 半拍) × 2 + 半拍 × 3 = 4.5拍。 */
+         （伸ばし切らない小振り）。そのあと 肘を曲げる→曲げたまま運ぶ→溜め で
+         大振りへ入る。運びと溜めが「緩」、伸ばしが「急」
+       1周 = (1拍 + 半拍) × 2 + 1拍 + 1拍 = 5拍。 */
     const ROMANCE_BPM=120, ROMANCE_BEAT=60/ROMANCE_BPM;
     const ROMANCE_REACH=[35,62,GLOW_REACH_MAX];  // 伸ばし切り [方位°, 仰角°, 距離]（正の方位＝自分の側）
     const ROMANCE_CHEST=[20,-5,.30];             // 胸元の構え [方位°, 仰角°, 距離]
     const ROMANCE_PUMP=[25,2];                   // 胸元の連打 [仰角の振れ°, 1拍あたりの回数]
     const ROMANCE_LOW=[10,-38,.44];              // 横薙ぎで両手が通る腰の高さ
     const ROMANCE_LEAN=[40,0];                   // 大振りの体幹 [側屈°, 前屈°]。大振りは前屈しない
-    const ROMANCE_PASS_BEND=[4.8,8.4];           // 渡しの前屈°[前半, 後半]。小振りの前屈へ向けた入り
+    const ROMANCE_PASS_BEND=4.8;                 // 渡しでいちばん低いところの前屈°
     const ROMANCE_SWING=[55,24,.46];             // 小振り [方位°, 仰角°, 距離]。伸ばし切らないが大きい
     const ROMANCE_SWING_LEAN=18;                 // 小振りで振った側への側屈°
     const ROMANCE_SWING_BEND=40;                 // 小振りの間の前屈°（腰を前へ折る）
@@ -2326,9 +2337,11 @@
     function buildRomanceSegments(){
       const R=d=>d*Math.PI/180, seg=[];
       // 方向と距離を補間する弧。位置を直線補間すると手先が肩へ寄って腕が畳まれる
-      const arc2=(f,t)=>['arc',[f[0],f[1],t[0],t[1],f[2],t[2]]];
+      const arc2=(f,t,ease)=>['arc',[f[0],f[1],t[0],t[1],f[2],t[2],ease]];
       const reach=['thrust',ROMANCE_REACH];
-      const extend=arc2(ROMANCE_REACH_BENT,ROMANCE_REACH);
+      /* 伸ばしは 'in'＝止まったところから加速し、伸ばし切った瞬間が最速。
+         溜め→突き の緩急はこの曲線が作る。 */
+      const extend=arc2(ROMANCE_REACH_BENT,ROMANCE_REACH,'in');
       /* 胸元の連打。a[4] は「その区間で何周するか」なので、大振りを
          伸ばし/保持 に割ったぶん周数と位相を分けて、1拍に2回のまま繋ぐ。
          伸ばし 0.25拍で半周（位相 0→π）、保持 0.75拍で1.5周（π→4π）。
@@ -2361,11 +2374,13 @@
         add(hold, up, reach, pumpAt(cyc*hold*.5,180*(cyc*ROMANCE_EXTEND%2)), lean,
             {name:`大振り（本人の${lab}を伸ばし切り）＋胸元2連打`, side:sg});
         // 渡し 半拍。前半で両手を腰の高さへ（体は起きる）
-        add(0.25, up, toLow(ROMANCE_REACH), toLow(ROMANCE_CHEST), [0, R(ROMANCE_PASS_BEND[0])],
+        add(0.25, up, toLow(ROMANCE_REACH), toLow(ROMANCE_CHEST), [0, R(ROMANCE_PASS_BEND)],
             {name:'渡し（腰の高さを横へ）', side:null});
         // 後半で役を入れ替える。次に上げる側へ倒し始める
+        /* 体幹は渡しのうちに次の大振りの傾きまで行き切る。伸ばしの区間で体が
+           まだ動いていると、腕の加速が体の動きに埋もれて緩急が出ない。 */
         add(0.25, up, fromLow(ROMANCE_CHEST), fromLow(ROMANCE_REACH_BENT),
-            [-sg*R(ROMANCE_LEAN[0])*.5, R(ROMANCE_PASS_BEND[1])],
+            [-sg*R(ROMANCE_LEAN[0]), R(ROMANCE_LEAN[1])],
             {name:'渡し（役を入れ替える）', side:null});
       }
       /* 小振り 1拍。両手を揃えて 本人の左 → 本人の右 へ半拍ずつ。
@@ -2386,13 +2401,21 @@
       const back=swingAt(false,'R'), backL=swingAt(false,'L');
       const bentBack=[back[0],back[1],ROMANCE_REACH_BENT[2]];   // 振り切った位置で肘だけ曲げる
       const midL=backL.map((v,k)=>(v+ROMANCE_CHEST[k])*.5);     // 胸元へ戻る途中
-      seg.push({dur:.25*ROMANCE_BEAT, R:arc2(back,bentBack), L:arc2(backL,midL),
+      seg.push({dur:.25*ROMANCE_BEAT, R:arc2(back,bentBack,'out'), L:arc2(backL,midL,'out'),
                 lean:[0, R(ROMANCE_SWING_BEND)*.75],
                 diag:{name:'戻り（肘を曲げる）', side:null}});
-      seg.push({dur:.25*ROMANCE_BEAT, R:arc2(bentBack,ROMANCE_REACH_BENT), L:arc2(midL,ROMANCE_CHEST),
-                lean:[-R(ROMANCE_SWING_LEAN), R(ROMANCE_SWING_BEND)*.5],
+      /* 運びは半拍かけ、'out'＝速く出て収まる。終わりがゆっくりになるので、
+         次の溜めと合わせて「止まっている時間」が実機で読める長さになる。 */
+      const leadLean=[-R(ROMANCE_LEAN[0]), R(ROMANCE_LEAN[1])];   // 次の大振り（本人の左）の傾き
+      seg.push({dur:.5*ROMANCE_BEAT, R:arc2(bentBack,ROMANCE_REACH_BENT,'out'), L:arc2(midL,ROMANCE_CHEST,'out'),
+                lean:leadLean,
                 diag:{name:'戻り（曲げたまま大振り側へ振る）', side:-1}});
-      return {segments:seg,period:seg.reduce((a,x)=>a+x.dur,0)};   // 4.5拍
+      /* 溜め 4分の1拍。腕も体幹も完全に静止する。緩急の「緩」はここ。
+         傾きを運びで行き切らせてあるので、この区間は本当に止まる。 */
+      seg.push({dur:.25*ROMANCE_BEAT, R:['thrust',ROMANCE_REACH_BENT], L:['thrust',ROMANCE_CHEST],
+                lean:leadLean,
+                diag:{name:'溜め（曲げたまま止まる）', side:-1}});
+      return {segments:seg,period:seg.reduce((a,x)=>a+x.dur,0)};   // 5拍
     }
     const ROMANCE_SEG=buildRomanceSegments();
     const THUNDER_TO_ROMANCE=(()=>{
