@@ -6216,6 +6216,9 @@ function App(){
   const [analyzeReason, setAnalyzeReason] = useState('');
   const [analysisReview, setAnalysisReview] = useState([]);
   const [analysisPreviewId, setAnalysisPreviewId] = useState(null);
+  const [good3Adjust, setGood3Adjust] = useState(null);
+  const [good3AdjustNotice, setGood3AdjustNotice] = useState('');
+  const good3AdjustVideoRef = useRef(null);
   const analysisBusyRef = useRef(false);
   const [bgmTrack, setBgmTrack] = useState('none');
   const [bgmOffset, setBgmOffset] = useState(0);
@@ -6244,6 +6247,7 @@ function App(){
   const [connectionCompareOriginal, setConnectionCompareOriginal] = useState(false);
   const [connectionTrialSide, setConnectionTrialSide] = useState(null);
   const [connectionCandidateNotice, setConnectionCandidateNotice] = useState('');
+  const [connectionFrameStatus, setConnectionFrameStatus] = useState({left:'loading',right:'loading'});
   const connectionTrialTokenRef = useRef(0);
   const [finderMarksOpen, setFinderMarksOpen] = useState(false);
   const [finderMarkBusy, setFinderMarkBusy] = useState(false);
@@ -6259,7 +6263,6 @@ function App(){
   const connectionLeftSlotRef = useRef(null);
   const connectionRightSlotRef = useRef(null);
   const connectionSeekTasksRef = useRef(new Map());
-  const connectionTargetRef = useRef(new Map());
   const [cameraMode, setCameraMode] = useState(null);
   const [cameraStatus, setCameraStatus] = useState('idle');
   const [cameraError, setCameraError] = useState('');
@@ -7065,6 +7068,13 @@ function App(){
         }catch{}
       }
     });
+    // タップ操作の中で先に再生を要求する。タイマー内だけの play() は iOS で拒否されうる。
+    const activeAtStart=clipsRef.current.find(clip=>clip.type==='video' &&
+      timeRef.current>=clip.timelineStart && timeRef.current<clip.timelineStart+clip.duration);
+    const firstVideo=activeAtStart && videoRefs.current.get(activeAtStart.id);
+    if(firstVideo){
+      try{ const p=firstVideo.play(); if(p?.catch) p.catch(()=>{}); }catch{}
+    }
     if(bgmAudioRef.current && bgmTrack!=='none'){
       try{ bgmAudioRef.current.play().catch(()=>{}); }catch{}
     }
@@ -7691,6 +7701,7 @@ function App(){
           url,
           name:file.name,
           duration: dur,
+          _sourceDuration: dur,
           timelineStart:0,
           trimStart:0
         });
@@ -8281,65 +8292,63 @@ const recomputeStarts=(arr)=>{
   const seekConnectionVideo=(clip,side,cut,markedTime=null)=>{
     if(!clip || clip.type==='photo') return Promise.resolve();
     const video=videoRefs.current.get(clip.id);
-    if(!video) return Promise.resolve();
+    if(!video){ setConnectionFrameStatus(prev=>({...prev,[side]:'retry'})); return Promise.resolve(); }
     const base=clip._connectionBase || {duration:clip.duration,trimStart:clip.trimStart||0};
     const raw=markedTime===null ? (side==='left' ? base.trimStart+base.duration-cut-0.05 : base.trimStart+cut) : markedTime;
     const maxTime=isFinite(video.duration) && video.duration>0 ? video.duration-0.05 : raw;
     const target=Math.max(0,Math.min(raw,maxTime));
-    const last=connectionTargetRef.current.get(clip.id);
-    if(last!==undefined && Math.abs(last-target)<0.005){
-      return connectionSeekTasksRef.current.get(clip.id)?.promise || Promise.resolve();
-    }
-    connectionSeekTasksRef.current.get(clip.id)?.stop();
-    connectionTargetRef.current.set(clip.id,target);
+    const activeTask=connectionSeekTasksRef.current.get(clip.id);
+    if(activeTask && Math.abs(activeTask.target-target)<0.005) return activeTask.promise;
+    activeTask?.stop(null);
+    setConnectionFrameStatus(prev=>prev[side]==='loading'?prev:{...prev,[side]:'loading'});
     let stopped=false,started=false,frameRequest=null;
     let limitTimer=null;
     let finishTask;
     const promise=new Promise(resolve=>{ finishTask=resolve; });
-    const stop=()=>{
+    const stop=(status='retry',pauseVideo=true)=>{
       if(stopped) return;
       stopped=true;
       video.removeEventListener('seeked',onSeeked);
       video.removeEventListener('loadedmetadata',onMetadata);
+      video.removeEventListener('error',onError);
       if(frameRequest!==null && video.cancelVideoFrameCallback){
         try{ video.cancelVideoFrameCallback(frameRequest); }catch{}
       }
       clearTimeout(limitTimer);
-      try{ video.pause(); }catch{}
-      if(connectionSeekTasksRef.current.get(clip.id)?.stop===stop) connectionSeekTasksRef.current.delete(clip.id);
+      if(pauseVideo){ try{ video.pause(); }catch{} }
+      if(connectionSeekTasksRef.current.get(clip.id)?.stop===stop){
+        connectionSeekTasksRef.current.delete(clip.id);
+        if(status) setConnectionFrameStatus(prev=>({...prev,[side]:status}));
+      }
       finishTask();
     };
+    const onError=()=>stop('retry');
     const onSeeked=()=>{
       if(stopped || started || video.seeking) return;
       started=true;
-      // 入力操作中にミュート再生で実際のフレームを描画させ、そのフレームで止める。
-      try{ const playResult=video.play(); if(playResult?.catch) playResult.catch(()=>{}); }catch{}
+      // seeked だけでは iOS で黒画面になるため、表示されたフレームまで待つ。
       if(typeof video.requestVideoFrameCallback==='function'){
         const onPresented=(_now,metadata)=>{
           if(stopped) return;
-          if(Math.abs(metadata.mediaTime-target)<0.3) stop();
+          if(Math.abs(metadata.mediaTime-target)<0.3) stop('ready');
+          else if(metadata.mediaTime>target+0.3) stop('retry');
           else frameRequest=video.requestVideoFrameCallback(onPresented);
         };
         frameRequest=video.requestVideoFrameCallback(onPresented);
       } else {
         clearTimeout(limitTimer);
         limitTimer=setTimeout(()=>{
-          stop();
-          if(Math.abs(video.currentTime-target)>0.15){ try{ video.currentTime=target; }catch{} }
-        },160);
+          stop(video.readyState>=2 && !video.seeking && Math.abs(video.currentTime-target)<0.2 ? 'ready':'retry');
+        },220);
       }
+      try{ const playResult=video.play(); if(playResult?.catch) playResult.catch(()=>{}); }catch{}
     };
     const onMetadata=()=>{ try{ video.currentTime=target; }catch{} };
     video.addEventListener('seeked',onSeeked);
     video.addEventListener('loadedmetadata',onMetadata);
-    connectionSeekTasksRef.current.set(clip.id,{stop,promise});
-    limitTimer=setTimeout(()=>{
-      if(!stopped){
-        stop();
-        // callbackが使えない端末でも、表示中のvideoを指定位置に止める。
-        if(Math.abs(video.currentTime-target)>0.15){ try{ video.currentTime=target; }catch{} }
-      }
-    },900);
+    video.addEventListener('error',onError);
+    connectionSeekTasksRef.current.set(clip.id,{stop,promise,target});
+    limitTimer=setTimeout(()=>stop('retry'),1500);
     try{
       video.muted=true;
       video.playsInline=true;
@@ -8348,7 +8357,7 @@ const recomputeStarts=(arr)=>{
         video.currentTime=target;
         if(alreadyThere) onSeeked();
       } else video.load();
-    }catch{ stop(); }
+    }catch{ stop('retry'); }
     return promise;
   };
   const connectionCutLimits=(left,right)=>{
@@ -8368,7 +8377,8 @@ const recomputeStarts=(arr)=>{
     if(!clip || clip.type==='photo') return {min:0,max:0};
     const video=videoRefs.current.get(clip.id);
     const sourceEnd=Number.isFinite(video?.duration) && video.duration>0
-      ? video.duration : (clip.trimStart||0)+clip.duration;
+      ? video.duration : Number.isFinite(clip._sourceDuration) && clip._sourceDuration>0
+        ? clip._sourceDuration : (clip.trimStart||0)+clip.duration;
     const start=clip.trimStart||0;
     const end=start+clip.duration;
     // 長さを変えずに窓全体を動かす。元動画の先頭・末尾を越える値は選ばせない。
@@ -8426,7 +8436,25 @@ const recomputeStarts=(arr)=>{
         return;
       }
       const video=videoRefs.current.get(clip.id);
-      if(!video || video.readyState<2) throw new Error('video-not-ready');
+      if(!video) throw new Error('video-not-ready');
+      if(video.readyState<2){
+        try{ video.load(); }catch{}
+        await new Promise(resolve=>{
+          let done=false;
+          const finish=()=>{
+            if(done) return;
+            done=true;
+            clearTimeout(timer);
+            video.removeEventListener('loadeddata',finish);
+            video.removeEventListener('canplay',finish);
+            resolve();
+          };
+          video.addEventListener('loadeddata',finish,{once:true});
+          video.addEventListener('canplay',finish,{once:true});
+          const timer=setTimeout(finish,1600);
+        });
+      }
+      if(video.readyState<2) throw new Error('video-not-ready');
       const base=clip._connectionBase || {trimStart:clip.trimStart||0,duration:clip.duration};
       const boundary=side==='left' ? base.trimStart+base.duration-cut : base.trimStart+cut;
       const windowStart=connectionEditor.keepDuration
@@ -8468,8 +8496,9 @@ const recomputeStarts=(arr)=>{
     }finally{
       if(token===connectionTrialTokenRef.current){
         setConnectionTrialSide(null);
-        await seekConnectionVideo(left,'left',outCut);
-        if(token===connectionTrialTokenRef.current) await seekConnectionVideo(right,'right',inCut);
+        // 一方の表示待ちが長引いても、もう一方のフレーム復帰を止めない。
+        seekConnectionVideo(left,'left',outCut);
+        seekConnectionVideo(right,'right',inCut);
       }
     }
   };
@@ -8496,9 +8525,11 @@ const recomputeStarts=(arr)=>{
     return ()=>{
       connectionTrialTokenRef.current++;
       attached.forEach(({clip,slot,video,previousTime,previousStyle})=>{
-        connectionSeekTasksRef.current.get(clip.id)?.stop();
+        const previewStarting=playingRef.current;
+        connectionSeekTasksRef.current.get(clip.id)?.stop(null,!previewStarting);
         if(video.parentNode===slot) slot.removeChild(video);
         video.style.cssText=previousStyle;
+        if(previewStarting) return;
         const redraw=()=>{
           video.removeEventListener('seeked',redraw);
           if(!playingRef.current) requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
@@ -8506,7 +8537,6 @@ const recomputeStarts=(arr)=>{
         video.addEventListener('seeked',redraw,{once:true});
         try{ video.currentTime=previousTime; }catch{ redraw(); }
         setTimeout(redraw,200);
-        connectionTargetRef.current.delete(clip.id);
       });
     };
   },[connectionEditor?.leftId,connectionEditor?.rightId]);
@@ -8514,19 +8544,15 @@ const recomputeStarts=(arr)=>{
   useEffect(()=>{
     if(!connectionEditor) return;
     const list=clipsRef.current;
-    let cancelled=false;
-    (async()=>{
-      const left=list.find(c=>c.id===connectionEditor.leftId);
-      const leftMark=connectionMarkPeek?.clipId===left?.id ? (left?._finderMarks||[]).find(m=>m.id===connectionMarkPeek.markId) : null;
-      await seekConnectionVideo(left,'left',connectionCompareOriginal ? connectionEditor.initialOutCut : connectionEditor.outCut,
-        leftMark && markInClip(left,leftMark) ? leftMark.sourceTime : null);
-      if(cancelled) return;
-      const right=list.find(c=>c.id===connectionEditor.rightId);
-      const rightMark=connectionMarkPeek?.clipId===right?.id ? (right?._finderMarks||[]).find(m=>m.id===connectionMarkPeek.markId) : null;
-      await seekConnectionVideo(right,'right',connectionCompareOriginal ? connectionEditor.initialInCut : connectionEditor.inCut,
-        rightMark && markInClip(right,rightMark) ? rightMark.sourceTime : null);
-    })();
-    return ()=>{ cancelled=true; };
+    const left=list.find(c=>c.id===connectionEditor.leftId);
+    const leftMark=connectionMarkPeek?.clipId===left?.id ? (left?._finderMarks||[]).find(m=>m.id===connectionMarkPeek.markId) : null;
+    const right=list.find(c=>c.id===connectionEditor.rightId);
+    const rightMark=connectionMarkPeek?.clipId===right?.id ? (right?._finderMarks||[]).find(m=>m.id===connectionMarkPeek.markId) : null;
+    // 片側のシーク待ちで反対側が更新されない状態を防ぐ。
+    seekConnectionVideo(left,'left',connectionCompareOriginal ? connectionEditor.initialOutCut : connectionEditor.outCut,
+      leftMark && markInClip(left,leftMark) ? leftMark.sourceTime : null);
+    seekConnectionVideo(right,'right',connectionCompareOriginal ? connectionEditor.initialInCut : connectionEditor.inCut,
+      rightMark && markInClip(right,rightMark) ? rightMark.sourceTime : null);
   },[connectionEditor,connectionMarkPeek,connectionCompareOriginal,clips]);
 
   const openConnection=(leftId)=>{
@@ -8540,6 +8566,7 @@ const recomputeStarts=(arr)=>{
     setConnectionCandidate(null);
     setConnectionCompareOriginal(false);
     setConnectionCandidateNotice('');
+    setConnectionFrameStatus({left:'loading',right:'loading'});
     setConnectionEditor({
       leftId, rightId:list[i+1]?.id||null,
       outCut:list[i]._connectionOutCut||0,
@@ -8611,10 +8638,11 @@ const recomputeStarts=(arr)=>{
     setConnectionEditor(null);
     const changingMode=modeRef.current!=='normal';
     if(changingMode) setModeSafe('normal');
+    // iPhoneではタップ操作から離れたタイマー内の play() が拒否される場合がある。
+    handlePlay();
     setTimeout(()=>{
       previewWrapRef.current?.scrollIntoView({behavior:'smooth',block:'start'});
       drawFrameRef.current(start);
-      setTimeout(()=>handlePlay(),350);
     },changingMode?350:50);
   };
   const applyConnection=()=>commitConnection(connectionEditor.outCut,connectionEditor.inCut,true);
@@ -8993,7 +9021,10 @@ const recomputeStarts=(arr)=>{
     const before=editSnapshot();
     handleStop();
     const next=recomputeStarts(clipsRef.current.map(c=>c.id===review.clipId ?
-      {...c,trimStart:start,duration:3,_analyzeReason:review.selectedIndex<0?'manual':review.candidates[review.selectedIndex]?.reason} : c));
+      {...c,trimStart:start,duration:3,
+        _good3SourceRange:{start:review.originalStart,end:review.originalStart+review.originalDuration},
+        _good3Candidates:review.candidates.map(candidate=>({start:candidate.start,reason:candidate.reason})),
+        _analyzeReason:review.selectedIndex<0?'manual':review.candidates[review.selectedIndex]?.reason} : c));
     clipsRef.current=next;
     setClips(next);
     recordEdit(before);
@@ -9010,7 +9041,63 @@ const recomputeStarts=(arr)=>{
     drawFrameRef.current(timeRef.current);
     setAnalysisReview(prev=>prev.filter(item=>item.clipId!==review.clipId));
     setAnalysisPreviewId(null);
-    setAnalyzeText(`${review.name} の3秒を採用しました。↶ 戻すで元に戻せます`);
+    setAnalyzeText(`${review.name} の3秒を採用しました。素材一覧の「3秒を調整」から位置を変えられます`);
+  };
+
+  const good3AdjustBounds=(clip)=>{
+    const video=videoRefs.current.get(clip.id);
+    const sourceDuration=Number.isFinite(video?.duration) && video.duration>0 ? video.duration
+      : Number.isFinite(clip._sourceDuration) && clip._sourceDuration>0 ? clip._sourceDuration
+      : (clip.trimStart||0)+clip.duration;
+    const sourceStart=clip._good3SourceRange?.start??0;
+    const sourceEnd=Math.min(clip._good3SourceRange?.end??sourceDuration,sourceDuration);
+    const inCut=clip._connectionInCut||0;
+    const outCut=clip._connectionOutCut||0;
+    return {min:Math.max(sourceStart,inCut),max:Math.min(sourceEnd-3,sourceDuration-3-outCut)};
+  };
+  const openGood3Adjustment=(clipId)=>{
+    const clip=clipsRef.current.find(c=>c.id===clipId);
+    if(!clip || clip.type==='photo' || Math.abs(clip.duration-3)>0.01) return;
+    const bounds=good3AdjustBounds(clip);
+    if(bounds.max<bounds.min-0.001){ setAnalyzeText('この素材は3秒を動かせる範囲がありません'); return; }
+    handleStop();
+    closeQuickPeek(false);
+    setGood3Adjust({clipId,start:Math.max(bounds.min,Math.min(bounds.max,clip.trimStart||0))});
+    setGood3AdjustNotice('');
+  };
+  const applyGood3Adjustment=()=>{
+    if(!good3Adjust) return;
+    const clip=clipsRef.current.find(c=>c.id===good3Adjust.clipId);
+    if(!clip || clip.type==='photo' || Math.abs(clip.duration-3)>0.01){
+      setGood3AdjustNotice('素材の長さが変わりました。もう一度開いてください');
+      return;
+    }
+    const bounds=good3AdjustBounds(clip);
+    const start=good3Adjust.start;
+    if(!Number.isFinite(start) || start<bounds.min-0.001 || start>bounds.max+0.001){
+      setGood3AdjustNotice('元動画の範囲外です');
+      return;
+    }
+    if(Math.abs(start-(clip.trimStart||0))<0.001){ setGood3Adjust(null); return; }
+    const before=editSnapshot();
+    handleStop();
+    const next=recomputeStarts(clipsRef.current.map(c=>{
+      if(c.id!==clip.id) return c;
+      const nextIn=c._connectionInCut||0, nextOut=c._connectionOutCut||0;
+      return {...c,trimStart:start,duration:3,_analyzeReason:'manual',
+        ...(nextIn || nextOut ? {_connectionBase:{trimStart:start-nextIn,duration:3+nextIn+nextOut}} : {})};
+    }));
+    clipsRef.current=next;setClips(next);recordEdit(before);
+    const edited=next.find(c=>c.id===clip.id);
+    timeRef.current=edited.timelineStart;setCurrentTime(timeRef.current);
+    const video=videoRefs.current.get(clip.id);
+    if(video){
+      video.addEventListener('seeked',()=>drawFrameRef.current(timeRef.current),{once:true});
+      try{ video.currentTime=start; }catch{}
+    }
+    drawFrameRef.current(timeRef.current);
+    setGood3Adjust(null);
+    setAnalyzeText(`${clip.name} の3秒の位置を調整しました。↶ 戻すで元に戻せます`);
   };
 
   const handleApplyTemplate = useCallback((tpl)=>{
@@ -9385,7 +9472,10 @@ const recomputeStarts=(arr)=>{
             newClipsMap.set(c.id,{...c,_analyzeReason:'read-failed'});
             continue;
           }
-          newClipsMap.set(c.id, {...c, trimStart:candidate.start, duration:3, _analyzeReason:candidate.reason});
+          newClipsMap.set(c.id, {...c, trimStart:candidate.start, duration:3,
+            _good3SourceRange:{start:c.trimStart||0,end:(c.trimStart||0)+c.duration},
+            _good3Candidates:[{start:candidate.start,reason:candidate.reason}],
+            _analyzeReason:candidate.reason});
           if(candidate.avg>130) brightCount++;
           else if(candidate.avg<70) darkCount++;
           if(candidate.contrast>30) vividCount++;
@@ -11610,6 +11700,13 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   }, '🗑')
                 )
               ),
+              c.type==='video' && Math.abs(c.duration-3)<0.01 &&
+                (c._good3SourceRange || (c._analyzeReason && !['short','read-failed'].includes(c._analyzeReason))) &&
+                React.createElement('button', {
+                  type:'button',onClick:()=>openGood3Adjustment(c.id),
+                  className:'self-start ml-2 px-3 py-1.5 rounded-full border border-violet-400/35 bg-violet-500/15 text-violet-100 text-[10px]',
+                  'aria-label':`${c.name}で採用した3秒の位置を調整`
+                }, '✨ 3秒を調整'),
               i<clips.length-1 && React.createElement('div', {className:'flex items-center justify-center -my-0.5 relative'},
                 React.createElement('div', {className:'flex items-center gap-1'},
                   React.createElement('div', {className:'w-6 h-px bg-white/10'}),
@@ -12758,6 +12855,73 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         )
       );
     })(),
+    good3Adjust && (()=>{
+      const clip=clipsRef.current.find(c=>c.id===good3Adjust.clipId);
+      if(!clip) return null;
+      const bounds=good3AdjustBounds(clip);
+      const start=good3Adjust.start;
+      const seekDraft=(value)=>{
+        const next=Math.max(bounds.min,Math.min(bounds.max,value));
+        const video=good3AdjustVideoRef.current;
+        if(video){ try{ video.pause();video.currentTime=next; }catch{} }
+        setGood3Adjust(prev=>prev ? {...prev,start:next} : prev);
+        setGood3AdjustNotice('');
+      };
+      return React.createElement('div', {
+        className:'fixed inset-0 z-[120] bg-black/80 flex items-center justify-center p-4',
+        onClick:()=>setGood3Adjust(null)
+      }, React.createElement('div', {
+        role:'dialog','aria-modal':true,'aria-label':'採用した3秒の位置を調整',
+        className:'w-full max-w-md rounded-2xl border border-violet-400/30 bg-[#111113] p-4 shadow-2xl',
+        style:{maxHeight:'calc(100dvh - 32px)',overflowY:'auto'},onClick:e=>e.stopPropagation()
+      },
+        React.createElement('div', {className:'text-[15px] font-bold'}, '採用した3秒を調整'),
+        React.createElement('div', {className:'text-[11px] text-white/55 mt-1 truncate'}, clip.name),
+        React.createElement('div', {className:'text-[11px] text-white/65 mt-2'},
+          `現在 ${Number(clip.trimStart||0).toFixed(1)}秒から ／ 試案 ${start.toFixed(1)}秒から（長さは3.0秒）`),
+        (clip._good3Candidates||[]).length>1 && React.createElement('div', {className:'flex gap-2 mt-3'},
+          ...clip._good3Candidates.map((candidate,i)=>React.createElement('button', {
+            key:i,type:'button',disabled:candidate.start<bounds.min-0.001||candidate.start>bounds.max+0.001,
+            onClick:()=>seekDraft(candidate.start),
+            className:`flex-1 min-h-9 rounded-full text-[11px] ${Math.abs(start-candidate.start)<0.05?'bg-violet-600':'bg-white/10'} disabled:opacity-40`,
+            title:candidate.reason||''
+          }, `候補${i+1} · ${candidate.start.toFixed(1)}秒`))
+        ),
+        React.createElement('video', {
+          ref:good3AdjustVideoRef,src:clip.url,muted:true,playsInline:true,preload:'metadata',controls:true,
+          className:'w-full mt-3 rounded-xl bg-black',style:{maxHeight:'40dvh',aspectRatio:'16/9',objectFit:'contain'},
+          onLoadedMetadata:e=>{ try{ e.currentTarget.currentTime=start; }catch{} },
+          onPlay:e=>{ const v=e.currentTarget;if(v.currentTime<start-0.05||v.currentTime>=start+3) v.currentTime=start; },
+          onTimeUpdate:e=>{ const v=e.currentTarget;if(v.currentTime>=start+3){v.pause();v.currentTime=start;} }
+        }),
+        React.createElement('div', {className:'text-[11px] text-white/75 mt-3'}, `開始位置 ${start.toFixed(1)}秒`),
+        React.createElement('input', {
+          type:'range',min:bounds.min,max:bounds.max,step:0.1,value:start,
+          disabled:bounds.max-bounds.min<0.05,
+          'aria-label':'採用した3秒の開始位置',className:'w-full accent-violet-500 mt-2',
+          onChange:e=>seekDraft(Number(e.target.value))
+        }),
+        React.createElement('div', {className:'flex justify-between text-[11px] text-white/60 mt-1'},
+          React.createElement('button', {type:'button',disabled:start<=bounds.min+0.01,
+            onClick:()=>seekDraft(Number((start-0.1).toFixed(2)))}, '← 0.1秒'),
+          React.createElement('span', null, `${bounds.min.toFixed(1)}〜${bounds.max.toFixed(1)}秒`),
+          React.createElement('button', {type:'button',disabled:start>=bounds.max-0.01,
+            onClick:()=>seekDraft(Number((start+0.1).toFixed(2)))}, '0.1秒 →')
+        ),
+        bounds.max-bounds.min<0.05 && React.createElement('div', {className:'text-[10px] text-amber-200 mt-2'},
+          '元動画に3秒を動かせる余裕がありません'),
+        good3AdjustNotice && React.createElement('div', {role:'status',className:'text-[10px] text-amber-200 mt-2'},good3AdjustNotice),
+        React.createElement('button', {type:'button',className:'w-full mt-3 h-10 rounded-full bg-white/10 text-[11px]',
+          onClick:()=>{const v=good3AdjustVideoRef.current;if(!v)return;try{v.currentTime=start;v.play()?.catch?.(()=>setGood3AdjustNotice('動画を再生できません。もう一度試してください'));}catch{setGood3AdjustNotice('動画を再生できません');}}},
+          'この3秒を試写'),
+        React.createElement('div', {className:'flex gap-2 mt-3'},
+          React.createElement('button', {type:'button',onClick:()=>setGood3Adjust(null),
+            className:'flex-1 h-10 rounded-full bg-white/10 text-[12px]'}, '変更せず戻る'),
+          React.createElement('button', {type:'button',onClick:applyGood3Adjustment,
+            className:'flex-1 h-10 rounded-full bg-violet-600 text-white text-[12px] font-bold'}, 'この3秒に変更')
+        )
+      ));
+    })(),
     connectionEditor && (()=>{
       const list=clipsRef.current;
       const left=list.find(c=>c.id===connectionEditor.leftId);
@@ -12836,11 +13000,31 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         React.createElement('div', {className:right ? 'grid grid-cols-2 gap-2' : 'grid grid-cols-1 gap-2'},
           (right ? [[left,'left','前のラスト'],[right,'right','次の冒頭']] : [[left,'left','このカットのラスト']]).map(([clip,side,label])=>
             React.createElement('div', {key:clip.id, className:'min-w-0'},
-              React.createElement('div', {className:`aspect-square bg-black rounded-lg overflow-hidden flex items-center justify-center text-[10px] text-white/40 ${connectionTrialSide===side?'ring-2 ring-blue-300':''}`},
+              React.createElement('div', {className:`relative aspect-square bg-black rounded-lg overflow-hidden flex items-center justify-center text-[10px] text-white/40 ${connectionTrialSide===side?'ring-2 ring-blue-300':''}`},
                 clip.type==='photo' ? React.createElement('img', {src:clip.url, alt:label, className:'w-full h-full object-contain'}) : React.createElement('div', {
                   ref:side==='left' ? connectionLeftSlotRef : connectionRightSlotRef,
                   className:'w-full h-full'
-                })
+                }),
+                clip.type==='video' && !connectionTrialSide && connectionFrameStatus[side]!=='ready' && React.createElement('div',
+                  {className:'absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/80 text-white/75 text-[10px] text-center px-2'},
+                  connectionFrameStatus[side]==='retry' ? '映像を表示できませんでした' : '映像を準備中…',
+                  connectionFrameStatus[side]==='retry' && React.createElement('button', {
+                    type:'button',className:'rounded-full bg-white/20 px-3 py-2 text-white',
+                    onClick:()=>{
+                      const mark=connectionMarkPeek?.clipId===clip.id
+                        ? (clip._finderMarks||[]).find(m=>m.id===connectionMarkPeek.markId) : null;
+                      const cut=side==='left'
+                        ? (connectionCompareOriginal?connectionEditor.initialOutCut:connectionEditor.outCut)
+                        : (connectionCompareOriginal?connectionEditor.initialInCut:connectionEditor.inCut);
+                      seekConnectionVideo(clip,side,cut,mark && markInClip(clip,mark)?mark.sourceTime:null);
+                    }
+                  }, 'もう一度表示')
+                ),
+                clip.type==='video' && !connectionTrialSide && connectionFrameStatus[side]==='ready' && React.createElement('button', {
+                  type:'button', 'aria-label':`${label}の映像を再表示`,
+                  className:'absolute top-1 right-1 rounded-full bg-black/65 text-white px-2 py-1 text-[10px]',
+                  onClick:()=>seekConnectionVideo(clip,side,side==='left'?connectionEditor.outCut:connectionEditor.inCut)
+                }, '↻')
               ),
               React.createElement('div', {className:'text-[11px] text-white/75 mt-1'}, `${label}${connectionTrialSide===side?' · 試写中':''}`),
               React.createElement('div', {className:'text-[10px] text-white/40 truncate'}, clip.name),
