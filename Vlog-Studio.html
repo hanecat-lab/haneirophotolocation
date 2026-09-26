@@ -5140,6 +5140,78 @@ body:has(.polaroid-wrapper.hikariyomi-mode) #moodSelector{
   pointer-events:none;
 }
 
+.polaroid-wrapper.hikariyomi-mode .hikari-light-panel{
+  box-sizing:border-box;
+  position:fixed;
+  left:12px;
+  right:12px;
+  bottom:max(12px,env(safe-area-inset-bottom,0px));
+  z-index:125;
+  max-height:min(25dvh,190px);
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  padding:10px 12px 12px;
+  border:1px solid rgba(225,238,243,0.24);
+  border-radius:18px;
+  color:#f8fafb;
+  background:rgba(14,17,21,0.94);
+  box-shadow:0 14px 38px rgba(0,0,0,0.38);
+  backdrop-filter:blur(18px);
+  -webkit-backdrop-filter:blur(18px);
+}
+.hikari-light-panel .light-range-row{
+  display:grid;
+  grid-template-columns:84px minmax(0,1fr) 32px;
+  align-items:center;
+  gap:9px;
+  min-height:42px;
+  font-size:12px;
+}
+.hikari-light-panel .light-control-tabs{
+  display:flex;
+  gap:5px;
+  overflow-x:auto;
+  scrollbar-width:none;
+  margin:6px 0 3px;
+}
+.hikari-light-panel .light-control-tabs::-webkit-scrollbar{display:none;}
+.hikari-light-panel .light-control-tabs button{
+  flex:none;
+  padding:5px 8px;
+  border:1px solid rgba(255,255,255,0.18);
+  border-radius:999px;
+  color:rgba(255,255,255,0.7);
+  font-size:10px;
+  white-space:nowrap;
+}
+.hikari-light-panel .light-control-tabs button[aria-pressed="true"]{
+  background:rgba(196,233,223,0.9);
+  color:#152026;
+}
+.hikari-light-panel .light-range-row input{width:100%;min-width:0;accent-color:#b7e9de;}
+.hikari-light-panel button:focus-visible{outline:2px solid #b7e9de;outline-offset:2px;}
+.hikari-light-panel .light-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:4px;}
+.hikari-light-panel .light-actions button{
+  min-width:0;
+  min-height:32px;
+  padding:4px 1px;
+  border:1px solid rgba(255,255,255,0.24);
+  border-radius:999px;
+  color:#f8fafb;
+  font-size:10px;
+  white-space:nowrap;
+}
+.hikari-light-panel .light-actions button:disabled{opacity:0.38;}
+.polaroid-wrapper.hikariyomi-mode .light-reference-image{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  object-fit:fill;
+  z-index:8;
+  pointer-events:none;
+}
+
 </style>
 </head>
 <body class="bg-[#0a0a0b] text-white">
@@ -5186,6 +5258,38 @@ const FILTERS = [
   {id:'sakura', name:'サクラ', desc:'桜色・ふんわり・ピンク強め', css:'brightness(1.3) contrast(0.85) saturate(1.8) hue-rotate(-20deg) sepia(0.18)', dot:'🌸', previewBg:'linear-gradient(135deg,#fbcfe8,#ec4899)'},
   {id:'emerald', name:'エメラルド', desc:'緑が鮮やか・自然・濃い', css:'brightness(1.15) contrast(1.25) saturate(2) hue-rotate(45deg)', dot:'🌿', previewBg:'linear-gradient(135deg,#6ee7b7,#065f46)'},
 ];
+
+const LIGHT_CONTROLS = [
+  {key:'brightness', label:'明るさ', min:-100, max:100},
+  {key:'highlights', label:'ハイライト', min:-100, max:100},
+  {key:'shadows', label:'シャドウ', min:-100, max:100},
+  {key:'temperature', label:'色温度', min:-100, max:100},
+  {key:'tint', label:'色かぶり', min:-100, max:100}
+];
+const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.key])!==0 && Number.isFinite(Number(light?.[item.key])));
+// 表示用RGBの補正量。EV・Kelvinなど撮影時の測定値を表すものではない。
+const correctLightPixels=(pixels, light)=>{
+  const data=pixels.data;
+  const brightness=Math.max(-100,Math.min(100,Number(light.brightness)||0));
+  const highlights=Math.max(-100,Math.min(100,Number(light.highlights)||0));
+  const shadows=Math.max(-100,Math.min(100,Number(light.shadows)||0));
+  const temperature=Math.max(-100,Math.min(100,Number(light.temperature)||0));
+  const tint=Math.max(-100,Math.min(100,Number(light.tint)||0));
+  const gain=1+brightness/200;
+  const clamp=v=>Math.max(0,Math.min(255,v));
+  for(let i=0;i<data.length;i+=4){
+    if(data[i+3]===0) continue;
+    const r=data[i],g=data[i+1],b=data[i+2];
+    const luma=(0.2126*r+0.7152*g+0.0722*b)/255;
+    const shadowLift=shadows*0.36*(1-luma)*(1-luma);
+    const highlightShift=highlights*0.36*luma*luma;
+    const tone=shadowLift+highlightShift;
+    data[i]=clamp(r*gain+tone+temperature*0.28+tint*0.14);
+    data[i+1]=clamp(g*gain+tone-tint*0.28);
+    data[i+2]=clamp(b*gain+tone-temperature*0.28+tint*0.14);
+  }
+  return pixels;
+};
 
 const getClipPreviewFilter=(clip,fallbackFilter='none',intensity=100)=>{
   const filterId=clip?._filter || clip?._filterId || fallbackFilter;
@@ -5397,6 +5501,9 @@ function App(){
   const modeRef = useRef('normal');
   const durationRef = useRef(3);
   const drawFrameRef = useRef(()=>{});
+  const lightFrameCanvasRef = useRef(null);
+  const lightCompareHeldRef = useRef(false);
+  const lightCompareClipIdRef = useRef(null);
   const lastFrameHasVideoRef = useRef(false);
   const activeFilterRef = useRef('none');
   const filterIntensityRef = useRef(100);
@@ -5424,6 +5531,11 @@ function App(){
   const [showZebra, setShowZebra] = useState(false);
   const [showPeaking, setShowPeaking] = useState(false);
   const [showHikariGrid, setShowHikariGrid] = useState(true);
+  const [showLightPanel, setShowLightPanel] = useState(false);
+  const [selectedLightControl, setSelectedLightControl] = useState('brightness');
+  const [lightCompareHeld, setLightCompareHeld] = useState(false);
+  const [lightReference, setLightReference] = useState(null);
+  const [lightReferenceHeld, setLightReferenceHeld] = useState(false);
   const peakingCanvasRef = useRef(null);
   const zebraCanvasRef = useRef(null);
   const [exposureStatus, setExposureStatus] = useState('unknown'); // dark, ok, bright, unknown
@@ -6101,6 +6213,12 @@ function App(){
   const [defaultTransition, setDefaultTransition] = useState({type:'fade', duration:0.5});
 
   useEffect(()=>{ clipsRef.current = clips; },[clips]);
+  useEffect(()=>{
+    if(lightReference && !clips.some(clip=>clip.id===lightReference.clipId)){
+      setLightReference(null);
+      setLightReferenceHeld(false);
+    }
+  },[clips.map(clip=>clip.id).join('|'),lightReference?.clipId]);
   useEffect(()=>{ textsRef.current = texts; },[texts]);
   useEffect(()=>{
     const top=editHistoryRef.current[editHistoryRef.current.length-1];
@@ -6259,11 +6377,49 @@ function App(){
     const drawSingleClip = (clip, lTime, alpha=1, offsetX=0, offsetY=0, scale=1)=>{
       if(!clip) return false;
       const isPhoto = clip.type==='photo';
+      const outputCtx=c.getContext('2d',{alpha:false});
+      const creativeFilter=outputCtx.filter;
+      const light=clip._light;
+      const correcting=hasLightCorrection(light) && !(modeRef.current==='hikariyomi' && lightCompareHeldRef.current && lightCompareClipIdRef.current===clip.id);
+      let lightCanvas=null;
+      let ctx=outputCtx;
       try{
+        if(correcting){
+          lightCanvas=lightFrameCanvasRef.current || document.createElement('canvas');
+          lightFrameCanvasRef.current=lightCanvas;
+          if(lightCanvas.width!==cw || lightCanvas.height!==ch){ lightCanvas.width=cw; lightCanvas.height=ch; }
+          ctx=lightCanvas.getContext('2d',{willReadFrequently:true});
+          ctx.clearRect(0,0,cw,ch);
+          ctx.filter='none';
+        }
+        const finishClip=()=>{
+          if(correcting){
+            try{
+              const pixels=ctx.getImageData(0,0,cw,ch);
+              ctx.putImageData(correctLightPixels(pixels,light),0,0);
+            }catch{} // 画素の読み取りができない素材でも元のフレームは表示する。
+            outputCtx.save();
+            outputCtx.filter=creativeFilter;
+            outputCtx.globalAlpha=1;
+            outputCtx.drawImage(lightCanvas,0,0);
+            outputCtx.restore();
+          }
+          return true;
+        };
+        const paintMargins=(top,height)=>{
+          const marginCtx=correcting ? outputCtx : ctx;
+          marginCtx.save();
+          marginCtx.filter='none';
+          marginCtx.globalAlpha=alpha;
+          marginCtx.fillStyle=paperColor;
+          marginCtx.fillRect(0,0,cw,top);
+          marginCtx.fillRect(0,top+height,cw,ch-(top+height));
+          marginCtx.restore();
+        };
         ctx.globalAlpha=alpha;
         if(isPhoto){
           const img=photoRefs.current.get(clip.id);
-          if(!img || !img.complete || !img.naturalWidth || img.naturalWidth<2){ try{ ctx.fillStyle=paperColor; ctx.fillRect(0,0,cw,ch); }catch{} return true; }
+          if(!img || !img.complete || !img.naturalWidth || img.naturalWidth<2){ try{ outputCtx.fillStyle=paperColor; outputCtx.fillRect(0,0,cw,ch); }catch{} return true; }
           let zoom = clip._photoZoom||1.0;
           let pan = clip._photoPan||'center';
           const progress = lTime / Math.max(0.1, clip.duration);
@@ -6285,12 +6441,7 @@ function App(){
           if(isVerticalFrame && isHorizontalContent){
             if(verticalMode==='contain-black'){
               dw=cw*zoom; dh=cw/ir*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY;
-              ctx.save();
-              ctx.filter='none';
-              ctx.fillStyle = paperColor;
-              ctx.fillRect(0,0,cw,dy);
-              ctx.fillRect(0,dy+dh,cw,ch-(dy+dh));
-              ctx.restore();
+              paintMargins(dy,dh);
             } else if(verticalMode==='blur-bg'){
               const bgZoom = Math.max(cw/iw, ch/ih) * 1.2;
               const bgW = iw*bgZoom; const bgH = ih*bgZoom;
@@ -6309,7 +6460,7 @@ function App(){
               else { sw = iw; sh = iw / targetAspect; sx = 0; sy = (ih - sh)/2; }
               dw=cw*zoom; dh=ch*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY;
               ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
-              return true;
+              return finishClip();
             } else {
               if(ir>cr){ dh=ch*zoom; dw=ch*ir*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY; }
               else{ dw=cw*zoom; dh=cw/ir*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY; }
@@ -6328,10 +6479,10 @@ function App(){
             dy += (progress-0.5)*ch*0.05;
           }
           ctx.drawImage(img,dx,dy,dw,dh);
-          return true;
+          return finishClip();
         } else {
           const v=videoRefs.current.get(clip.id);
-          if(!v || v.readyState<1){ try{ ctx.fillStyle=paperColor; ctx.fillRect(0,0,cw,ch); }catch{} return true; }
+          if(!v || v.readyState<1){ try{ outputCtx.fillStyle=paperColor; outputCtx.fillRect(0,0,cw,ch); }catch{} return true; }
           try{
             const trimStart = clip.trimStart || 0;
             const targetTime = trimStart + lTime;
@@ -6352,12 +6503,7 @@ function App(){
           if(isVerticalFrame && isHorizontalContent){
             if(verticalMode==='contain-black'){
               dw=cw*scale; dh=cw/vr*scale; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY;
-              ctx.save();
-              ctx.filter='none';
-              ctx.fillStyle = paperColor;
-              ctx.fillRect(0,0,cw,dy);
-              ctx.fillRect(0,dy+dh,cw,ch-(dy+dh));
-              ctx.restore();
+              paintMargins(dy,dh);
             } else if(verticalMode==='blur-bg'){
               const bgZoom = Math.max(cw/(v.videoWidth||16), ch/(v.videoHeight||9)) * 1.2;
               const bgW = (v.videoWidth||16)*bgZoom; const bgH = (v.videoHeight||9)*bgZoom;
@@ -6377,7 +6523,7 @@ function App(){
               if(vr > targetAspect){ sh = vh; sw = vh * targetAspect; sx = (vw - sw)/2; sy = 0; }
               else { sw = vw; sh = vw / targetAspect; sx = 0; sy = (vh - sh)/2; }
               ctx.drawImage(v, sx, sy, sw, sh, dx, dy, dw, dh);
-              return true;
+              return finishClip();
             } else {
               if(vr>cr){ dh=ch*scale; dw=ch*vr*scale; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY; }
               else{ dw=cw*scale; dh=cw/vr*scale; dx=0 + offsetX; dy=(ch-dh)/2 + offsetY; }
@@ -6392,7 +6538,7 @@ function App(){
             }
           }
           ctx.drawImage(v,dx,dy,dw,dh);
-          return true;
+          return finishClip();
         }
       }catch(e){
         return false;
@@ -6913,6 +7059,13 @@ function App(){
   const setModeSafe = useCallback((m)=>{
     modeRef.current=m;
     setMode(m);
+    if(m!=='hikariyomi'){
+      setShowLightPanel(false);
+      setLightReferenceHeld(false);
+      lightCompareHeldRef.current=false;
+      lightCompareClipIdRef.current=null;
+      setLightCompareHeld(false);
+    }
     console.log('Mode switch:', m);
     if(m==='fullscreen'){
       theaterLockedAspectRef.current = 9/16;
@@ -7666,6 +7819,41 @@ const recomputeStarts=(arr)=>{
     const before=rangeEditRef.current;
     rangeEditRef.current=null;
     recordEdit(before);
+  };
+  const changeLightCorrection=(clipId,key,value)=>{
+    const next=clipsRef.current.map(clip=>clip.id===clipId ?
+      {...clip,_light:{...(clip._light||{}),[key]:value}} : clip);
+    clipsRef.current=next;
+    setClips(next);
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
+  const resetLightCorrection=(clipId)=>{
+    const before=editSnapshot();
+    const next=clipsRef.current.map(clip=>{
+      if(clip.id!==clipId) return clip;
+      const {_light,...rest}=clip;
+      return rest;
+    });
+    clipsRef.current=next;
+    setClips(next);
+    recordEdit(before);
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
+  const setLightComparison=(held,clipId=null)=>{
+    lightCompareHeldRef.current=held;
+    lightCompareClipIdRef.current=held ? clipId : null;
+    setLightCompareHeld(held);
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
+  const captureLightReference=()=>{
+    const clip=clipsRef.current.find(c=>timeRef.current>=c.timelineStart && timeRef.current<c.timelineStart+c.duration);
+    const canvas=canvasRef.current;
+    if(!clip || !canvas || canvas.width<10 || canvas.height<10) return;
+    handleStop();
+    try{
+      setLightReference({clipId:clip.id,name:clip.name,localTime:Math.max(0,timeRef.current-clip.timelineStart),image:canvas.toDataURL('image/png')});
+      setLightReferenceHeld(false);
+    }catch{}
   };
   const reorderMaterial=(clipId,toIndex)=>{
     const old=clipsRef.current;
@@ -9425,7 +9613,8 @@ const recomputeStarts=(arr)=>{
         (mode==='finder' || mode==='hikariyomi') && React.createElement('div', {className:'mode-header', onTouchStart:(e)=>e.stopPropagation(), onTouchEnd:(e)=>e.stopPropagation()},
           React.createElement('div', {className:'mode-heading'},
             React.createElement('span', {className:'mode-title'}, mode==='finder' ? 'ファインダー' : 'ひかりよみ'),
-            mode==='hikariyomi' && hasPreviewMaterial && exposureStatus!=='unknown' && React.createElement('div', {className:`hikariyomi-exposure ${exposureStatus}`},
+            mode==='hikariyomi' && lightReferenceHeld && lightReference && React.createElement('span', {className:'mode-state'}, `基準：${lightReference.name}`),
+            mode==='hikariyomi' && !lightReferenceHeld && hasPreviewMaterial && exposureStatus!=='unknown' && React.createElement('div', {className:`hikariyomi-exposure ${exposureStatus}`},
               React.createElement('div', {className:'dot'}),
               React.createElement('span', null, exposureStatus==='dark' ? '☁️ 中央が暗め' : exposureStatus==='bright' ? '☀️ 中央が明るめ' : '☀️ 中央は中間'),
               lumaHistogram && React.createElement('div', {
@@ -9491,6 +9680,9 @@ const recomputeStarts=(arr)=>{
           }, 
           style:{width:'100%',height:'100%',background:'#0a0a0b', touchAction:'none'}
         }),
+        mode==='hikariyomi' && lightReferenceHeld && lightReference && React.createElement('img', {
+          className:'light-reference-image', src:lightReference.image, alt:`光の基準：${lightReference.name}`
+        }),
         outlineStyle && React.createElement('div', {className:'text-selection-outline', style:outlineStyle, 'aria-hidden':true}),
         // SAFE AREA OVERLAY
         showSafeArea && React.createElement('div', {className:'safe-area-overlay'},
@@ -9510,14 +9702,14 @@ const recomputeStarts=(arr)=>{
           React.createElement('div', {className:'hikariyomi-grid-line h'}),
           aspectMode==='9:16' && React.createElement('div', {className:'hikariyomi-grid-line h extra'})
         ),
-        mode==='hikariyomi' && showZebra && hasPreviewMaterial && React.createElement('div', {className:'hikariyomi-zebra'},
+        mode==='hikariyomi' && !lightReferenceHeld && showZebra && hasPreviewMaterial && React.createElement('div', {className:'hikariyomi-zebra'},
           React.createElement('canvas', {ref:zebraCanvasRef, className:'hikariyomi-zebra-canvas', 'aria-hidden':true})
         ),
-        mode==='hikariyomi' && showPeaking && hasPreviewMaterial && React.createElement('div', {className:'hikariyomi-peaking'},
+        mode==='hikariyomi' && !lightReferenceHeld && showPeaking && hasPreviewMaterial && React.createElement('div', {className:'hikariyomi-peaking'},
           React.createElement('canvas', {ref: peakingCanvasRef, className:'hikariyomi-peaking-canvas'}),
           React.createElement('div', {className:'hikariyomi-peaking-label'}, 'PEAK ● ピント強調')
         ),
-        mode==='hikariyomi' && showLoupe && hasPreviewMaterial && React.createElement('div', {
+        mode==='hikariyomi' && !lightReferenceHeld && showLoupe && hasPreviewMaterial && React.createElement('div', {
           className:'hikariyomi-loupe',
           style:{left: `${loupePos.x}%`, top: `${loupePos.y}%`},
           onPointerDown: (e)=>{
@@ -9695,7 +9887,15 @@ const recomputeStarts=(arr)=>{
               'aria-pressed':showLoupe,
               'aria-label':showLoupe ? `むしめがね ${loupeZoom}倍。もう一度押して切り替え` : 'むしめがねを表示',
               disabled:clips.length===0
-            }, showLoupe ? `${loupeZoom}X ✕` : '🔍')
+            }, showLoupe ? `${loupeZoom}X ✕` : '🔍'),
+            React.createElement('button', {
+              type:'button',
+              onClick:(e)=>{e.stopPropagation();handleStop();setShowLightPanel(v=>!v);},
+              className:`hikariyomi-tool ${showLightPanel?'active':''}`,
+              'aria-label':showLightPanel?'光の基本補正を閉じる':'光の基本補正を開く',
+              'aria-pressed':showLightPanel,
+              disabled:!hasPreviewMaterial
+            }, '光')
           ),
           React.createElement('div', {className:'mode-primary-row'},
             React.createElement('button', {
@@ -9711,6 +9911,76 @@ const recomputeStarts=(arr)=>{
               'aria-label':'ファインダーへ切り替え'
             }, 'ファインダー')
           )
+        ),
+        mode==='hikariyomi' && showLightPanel && previewClip && React.createElement('div', {
+          className:'hikari-light-panel', role:'region', 'aria-label':'素材別の光の基本補正',
+          onClick:e=>e.stopPropagation(),
+          onTouchStart:e=>e.stopPropagation(), onTouchEnd:e=>e.stopPropagation()
+        },
+          React.createElement('div', {className:'flex items-center gap-2 mb-2'},
+            React.createElement('div', {className:'text-[13px] font-semibold flex-1 min-w-0 truncate'}, `光の基本補正 · ${previewClip.name}`),
+            React.createElement('button', {type:'button', onClick:()=>setShowLightPanel(false), className:'text-[16px] w-8 h-8 rounded-full border border-white/20', 'aria-label':'光の基本補正を閉じる'}, '×')
+          ),
+          React.createElement('div', {className:'text-[10px] text-white/55 truncate'}, lightReference ? `基準：${lightReference.name} · ${lightReference.localTime.toFixed(1)}s` : '選んだ素材にだけ適用 · 値は調整量'),
+          React.createElement('div', {className:'light-control-tabs', role:'group', 'aria-label':'補正項目'},
+            ...LIGHT_CONTROLS.map(control=>React.createElement('button', {
+              key:control.key,type:'button',
+              'aria-pressed':selectedLightControl===control.key,
+              onClick:()=>setSelectedLightControl(control.key)
+            },control.label))
+          ),
+          (()=>{
+            const control=LIGHT_CONTROLS.find(item=>item.key===selectedLightControl)||LIGHT_CONTROLS[0];
+            return React.createElement('label', {className:'light-range-row'},
+              React.createElement('span',null,control.label),
+              React.createElement('input', {
+                type:'range', min:control.min, max:control.max, step:1,
+                value:Number(previewClip._light?.[control.key])||0,
+                'aria-label':`${previewClip.name}の${control.label}`,
+                onPointerDown:beginRangeEdit, onPointerUp:finishRangeEdit, onPointerCancel:finishRangeEdit,
+                onFocus:beginRangeEdit,onBlur:finishRangeEdit,
+                onChange:e=>{beginRangeEdit();changeLightCorrection(previewClip.id,control.key,Number(e.target.value));}
+              }),
+              React.createElement('span',{className:'text-right font-mono text-[10px]'},`${Number(previewClip._light?.[control.key])>0?'+':''}${Number(previewClip._light?.[control.key])||0}`)
+            );
+          })(),
+          React.createElement('div', {className:'light-actions'},
+            React.createElement('button', {
+              type:'button',
+              onPointerDown:e=>{e.preventDefault();e.stopPropagation();handleStop();try{e.currentTarget.setPointerCapture(e.pointerId);}catch{}setLightComparison(true,previewClip.id);},
+              onPointerUp:e=>{e.stopPropagation();setLightComparison(false);},
+              onPointerCancel:()=>setLightComparison(false),
+              onLostPointerCapture:()=>setLightComparison(false),
+              onKeyDown:e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();setLightComparison(true,previewClip.id);}},
+              onKeyUp:e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();setLightComparison(false);}},
+              onClick:e=>e.stopPropagation(),
+              onContextMenu:e=>e.preventDefault(),
+              'aria-label':'押している間、この素材の基本補正前を表示',
+              'aria-pressed':lightCompareHeld,
+            }, lightCompareHeld?'元表示中':'補正前'),
+            React.createElement('button', {
+              type:'button', disabled:!hasLightCorrection(previewClip._light),
+              onClick:()=>resetLightCorrection(previewClip.id),
+              'aria-label':'この素材の光補正をリセット'
+            }, 'リセット'),
+            React.createElement('button', {
+              type:'button', onClick:captureLightReference,
+              'aria-label':lightReference?'光の基準を更新':'この光を基準にする'
+            }, lightReference?'基準更新':'基準にする'),
+            React.createElement('button', {
+              type:'button',disabled:!lightReference,
+              onPointerDown:e=>{e.preventDefault();e.stopPropagation();handleStop();try{e.currentTarget.setPointerCapture(e.pointerId);}catch{}setLightReferenceHeld(true);},
+              onPointerUp:e=>{e.stopPropagation();setLightReferenceHeld(false);},
+              onPointerCancel:()=>setLightReferenceHeld(false),
+              onLostPointerCapture:()=>setLightReferenceHeld(false),
+              onKeyDown:e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();setLightReferenceHeld(true);}},
+              onKeyUp:e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();setLightReferenceHeld(false);}},
+              onClick:e=>e.stopPropagation(),onContextMenu:e=>e.preventDefault(),
+              'aria-label':'押している間、固定した光の基準を表示',
+              'aria-pressed':lightReferenceHeld
+            }, lightReferenceHeld?'基準表示中':'基準を見る')
+          ),
+          React.createElement('div',{className:'text-[10px] text-white/45 mt-1'},'白く潰れた部分の細部は戻せません。')
         )
       ),
 
