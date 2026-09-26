@@ -6214,6 +6214,9 @@ function App(){
   const [analyzeProgress, setAnalyzeProgress] = useState(0);
   const [analyzeText, setAnalyzeText] = useState('');
   const [analyzeReason, setAnalyzeReason] = useState('');
+  const [analysisReview, setAnalysisReview] = useState([]);
+  const [analysisPreviewId, setAnalysisPreviewId] = useState(null);
+  const analysisBusyRef = useRef(false);
   const [bgmTrack, setBgmTrack] = useState('none');
   const [bgmOffset, setBgmOffset] = useState(0);
   const [bgmVolume, setBgmVolume] = useState(0.5);
@@ -7002,6 +7005,7 @@ function App(){
 
   const handlePlay = useCallback((e)=>{
     if(e){ try{ e.preventDefault(); e.stopPropagation(); }catch{} }
+    if(analysisBusyRef.current) return;
     // スクロールバグ対策: デフォルト動作と伝播を停止
     if(e){
       try{ e.preventDefault(); e.stopPropagation(); }catch{}
@@ -8651,111 +8655,286 @@ const recomputeStarts=(arr)=>{
     return {trimStart:newTrim, reason, score:bestScore, avg:bestAvg, contrast:bestContrast, bestTime};
   },[seekVideo]);
 
+  // いいとこ3秒専用: 画面に提示された時刻を確認してから画素を読む。
+  const analyzeGood3SecClip = useCallback(async (video, clip, onProgress)=>{
+    const sourceStart=clip.trimStart||0;
+    const realDuration=Number.isFinite(video.duration) && video.duration>0 ? video.duration : sourceStart+clip.duration;
+    const span=Math.min(clip.duration,realDuration-sourceStart);
+    if(!Number.isFinite(span) || span<=0) return {status:'error',reason:'動画の再生範囲を確認できません',candidates:[],attempted:0,valid:0,verified:0};
+    if(span<=3.1) return {status:'short',reason:'3秒以下のため現在の長さを維持',candidates:[],attempted:0,valid:0,verified:0};
+    if(video.error || !(video.currentSrc || video.src)) return {status:'error',reason:'動画を読み込めません',candidates:[],attempted:0,valid:0,verified:0};
+    const canvas=document.createElement('canvas');
+    canvas.width=32; canvas.height=32;
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});
+    if(!ctx) return {status:'error',reason:'映像の画素を読み取れません',candidates:[],attempted:0,valid:0,verified:0};
+    const previousMuted=video.muted;
+    video.muted=true;
+    video.playsInline=true;
+    let frameCallbackWorks=typeof video.requestVideoFrameCallback==='function';
+    const cache=new Map();
+    const stats={attempted:0,valid:0,verified:0};
+    const waitFor=(event,limit)=>new Promise((resolve,reject)=>{
+      let finished=false;
+      const finish=(error)=>{
+        if(finished) return;
+        finished=true;
+        clearTimeout(timer);
+        video.removeEventListener(event,onReady);
+        video.removeEventListener('error',onError);
+        error?reject(error):resolve();
+      };
+      const onReady=()=>finish();
+      const onError=()=>finish(new Error('動画の読み込みエラー'));
+      const timer=setTimeout(()=>finish(new Error('映像の準備が時間切れになりました')),limit);
+      video.addEventListener(event,onReady);
+      video.addEventListener('error',onError);
+    });
+    const readAt=async(localTime)=>{
+      const t=Math.max(0,Math.min(span-0.03,localTime));
+      const key=Math.round(t*1000);
+      if(cache.has(key)) return cache.get(key);
+      stats.attempted++;
+      onProgress(stats);
+      let result=null;
+      for(let attempt=0;attempt<2 && !result;attempt++){
+        try{
+          if(video.error) throw new Error('動画の読み込みエラー');
+          if(video.readyState<2){
+            const loaded=waitFor('loadeddata',2400);
+            if(video.networkState===0) video.load();
+            await loaded;
+          }
+          const target=sourceStart+t;
+          if(Math.abs(video.currentTime-target)>0.025 || video.seeking){
+            const seeked=waitFor('seeked',1800);
+            video.currentTime=target;
+            await seeked;
+          }
+          if(video.readyState<2 || !video.videoWidth || !video.videoHeight || video.seeking) throw new Error('映像フレームが未準備です');
+          let verified=false;
+          if(frameCallbackWorks){
+            try{ await new Promise((resolve,reject)=>{
+              let finished=false,frameId=null;
+              const finish=(error)=>{
+                if(finished) return;
+                finished=true;
+                clearTimeout(timer);
+                if(frameId!==null && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(frameId);
+                error?reject(error):resolve();
+              };
+              const frame=(_now,metadata)=>{
+                frameId=null;
+                if(Math.abs(metadata.mediaTime-target)<=0.15){ verified=true; finish(); }
+                else if(metadata.mediaTime>target+0.15) finish(new Error('別の時刻のフレームです'));
+                else frameId=video.requestVideoFrameCallback(frame);
+              };
+              const timer=setTimeout(()=>finish(new Error('frame-callback-timeout')),750);
+              frameId=video.requestVideoFrameCallback(frame);
+              try{ const playing=video.play(); playing?.catch?.(finish); }catch(error){ finish(error); }
+            }); }catch(error){
+              if(error?.message!=='frame-callback-timeout') throw error;
+              // 画面外videoでコールバックが届かない端末は時刻未検証の経路へ。
+              frameCallbackWorks=false;
+              video.pause();
+              if(Math.abs(video.currentTime-target)>0.025 || video.seeking){
+                const seeked=waitFor('seeked',1800);
+                video.currentTime=target;
+                await seeked;
+              }
+            }
+          }
+          if(!frameCallbackWorks){
+            // 古いブラウザでは seeked と描画準備を確認し、時刻未検証として結果に明示する。
+            if(!video.paused) video.pause();
+            await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+            if(video.readyState<2 || Math.abs(video.currentTime-target)>0.18) throw new Error('映像フレームが未準備です');
+          }
+          ctx.clearRect(0,0,32,32);
+          ctx.drawImage(video,0,0,32,32);
+          const pixels=ctx.getImageData(0,0,32,32).data;
+          const luma=new Uint8Array(1024);
+          let sum=0,sumSq=0,detail=0,clipped=0;
+          for(let i=0;i<1024;i++){
+            const p=i*4;
+            const y=Math.round(pixels[p]*0.299+pixels[p+1]*0.587+pixels[p+2]*0.114);
+            luma[i]=y; sum+=y; sumSq+=y*y;
+            if(y<5 || y>250) clipped++;
+            if(i%32 && i>=32) detail+=Math.abs(y-luma[i-1])+Math.abs(y-luma[i-32]);
+          }
+          const avg=sum/1024;
+          result={t,avg,contrast:Math.sqrt(Math.max(0,sumSq/1024-avg*avg)),detail:detail/1900,
+            clipped:clipped/1024,luma,verified};
+        }catch(error){
+          if(error?.name==='SecurityError' || video.error) break;
+        }finally{ try{ video.pause(); }catch{} }
+      }
+      cache.set(key,result);
+      if(result){ stats.valid++; if(result.verified) stats.verified++; }
+      onProgress(stats);
+      return result;
+    };
+    try{
+      const coarseStep=Math.max(0.5,span/80);
+      const coarseTimes=[];
+      for(let t=0;t<span;t+=coarseStep) coarseTimes.push(t);
+      const coarse=[];
+      for(const t of coarseTimes){ const sample=await readAt(t); if(sample) coarse.push(sample); }
+      if(coarse.length<Math.max(4,Math.ceil(coarseTimes.length*0.5))){
+        return {...stats,status:'error',reason:'読み取れた映像が足りません。素材を再生できるか確認してください',candidates:[]};
+      }
+      const sortedBrightness=coarse.map(s=>s.avg).sort((a,b)=>a-b);
+      const medianBrightness=sortedBrightness[Math.floor(sortedBrightness.length/2)];
+      const sortedDetail=coarse.map(s=>s.detail).sort((a,b)=>a-b);
+      const medianDetail=sortedDetail[Math.floor(sortedDetail.length/2)];
+      const maxStart=span-3;
+      const marks=(clip._finderMarks||[]).filter(mark=>Number.isFinite(mark.sourceTime) &&
+        mark.sourceTime>=sourceStart && mark.sourceTime<sourceStart+span);
+      const markStarts=marks.map(mark=>Math.max(0,Math.min(maxStart,mark.sourceTime-sourceStart-1.5)));
+      const rank=(samples,starts,minCount)=>starts.map(start=>{
+        const frames=samples.filter(s=>s && s.t>=start-0.01 && s.t<start+3-0.01).sort((a,b)=>a.t-b.t);
+        if(frames.length<minCount) return null;
+        const average=(field)=>frames.reduce((sum,s)=>sum+s[field],0)/frames.length;
+        const clipped=average('clipped'), detail=average('detail');
+        if(clipped>0.78 && detail<3) return null;
+        const differences=[];
+        for(let i=1;i<frames.length;i++){
+          if(frames[i].t-frames[i-1].t>0.75) continue;
+          let diff=0;
+          for(let p=0;p<1024;p+=4) diff+=Math.abs(frames[i].luma[p]-frames[i-1].luma[p]);
+          differences.push(diff/256);
+        }
+        const motion=differences.length ? differences.reduce((a,b)=>a+b,0)/differences.length : 0;
+        const abrupt=differences.filter(v=>v>Math.max(42,motion*2.4)).length;
+        if(abrupt || (medianDetail>4 && detail<medianDetail*0.3 && motion>30)) return null;
+        const brightnessDrift=Math.abs(average('avg')-medianBrightness);
+        const score=average('contrast')*0.8+detail*0.6-clipped*60-brightnessDrift*0.18+
+          Math.min(motion,25)*0.12-Math.max(0,motion-45)*0.35-abrupt*15;
+        const marked=marks.some(mark=>mark.sourceTime>=sourceStart+start+0.1 && mark.sourceTime<=sourceStart+start+2.9);
+        const reason=marked ? 'しおりの瞬間を含む' : abrupt===0 && motion>5 ? '動きが続き、急な切り替わりが少ない' :
+          detail>8 ? '輪郭と明暗が比較的はっきりしている' : 'この素材内で見やすい明暗';
+        return {start,score,marked,reason,frames:frames.length,avg:average('avg'),contrast:average('contrast')};
+      }).filter(Boolean).sort((a,b)=>b.score-a.score);
+      const coarseStarts=coarseTimes.filter(t=>t<=maxStart+0.001);
+      coarseStarts.push(maxStart,...markStarts);
+      const coarseRank=rank(coarse,coarseStarts,Math.max(3,Math.floor(3/coarseStep*0.5)));
+      const seeds=[];
+      for(const candidate of [...coarseRank.filter(c=>c.marked),...coarseRank]){
+        if(seeds.every(s=>Math.abs(s-candidate.start)>0.7)) seeds.push(candidate.start);
+        if(seeds.length>=3) break;
+      }
+      if(!seeds.length) return {...stats,status:'error',reason:'3秒続けて確認できる映像がありません',candidates:[]};
+      const refinedStarts=[];
+      for(const seed of seeds){
+        const lower=Math.max(0,seed-0.4),upper=Math.min(maxStart,seed+0.4);
+        for(let start=lower;start<=upper+0.01;start+=0.2) refinedStarts.push(Math.min(maxStart,start));
+        for(let t=lower;t<upper+3;t+=0.2) await readAt(t);
+      }
+      refinedStarts.push(...seeds,...markStarts);
+      const all=[...cache.values()].filter(Boolean);
+      const ranked=rank(all,refinedStarts,8);
+      if(!ranked.length) return {...stats,status:'error',reason:'候補の3秒間を十分に読み取れません',candidates:[]};
+      const chosen=[];
+      for(const candidate of [...ranked.filter(c=>c.marked),...ranked]){
+        if(chosen.every(c=>Math.abs(c.start-candidate.start)>0.8)) chosen.push(candidate);
+        if(chosen.length>=2) break;
+      }
+      return {...stats,status:stats.verified===0?'limited':'ready',
+        reason:stats.verified===0?'フレーム時刻を確認できない端末です。候補を試写してください':'取得したフレームから候補を選びました',
+        candidates:chosen.map(c=>({start:sourceStart+c.start,reason:c.reason,marked:c.marked,frames:c.frames,avg:c.avg,contrast:c.contrast}))};
+    }finally{
+      try{ video.pause(); video.muted=previousMuted; }catch{}
+    }
+  },[]);
+
   const handleGood3Sec = useCallback(async ()=>{
     if(clipsRef.current.length===0) return;
-    if(isAnalyzing) return;
-    // 選択されたものだけを対象に、選択がなければ全件
+    if(isAnalyzing || analysisBusyRef.current) return;
     const targetClips = selectedClipIds.length>0 ? clipsRef.current.filter(c=> selectedClipIds.includes(c.id)) : clipsRef.current;
     if(targetClips.length===0) return;
+    analysisBusyRef.current=true;
+    handleStop();
+    drawFrameRef.current(timeRef.current);
+    setAnalysisReview([]);
+    setAnalysisPreviewId(null);
     setIsAnalyzing(true);
     setAnalyzeProgress(0);
-    setAnalyzeText('明るさ+コントラストを解析中...');
+    setAnalyzeText('映像フレームを確認しています...');
     setAnalyzeReason('');
-    const newClipsMap = new Map();
-    let reasons=[];
-    // まず全クリップをマップに保持
-    clipsRef.current.forEach(c=> newClipsMap.set(c.id, {...c}));
-    for(let idx=0; idx<targetClips.length; idx++){
-      const c = targetClips[idx];
-      const v = videoRefs.current.get(c.id);
-      setAnalyzeText(`解析中 ${idx+1}/${clipsRef.current.length}: ${c.name.slice(0,12)}...`);
-      setAnalyzeProgress(Math.round((idx/clipsRef.current.length)*100));
-      if(!v || c.duration<=3.1){
-        newClipsMap.set(c.id, {...c, _analyzeReason:'short'});
-        reasons.push('short');
-        setAnalyzeProgress(Math.round(((idx+1)/targetClips.length)*100));
-        continue;
-      }
-      try{
-        try{ v.pause(); }catch{}
-        const result = await analyzeClipBrightnessContrast(v, c);
-        newClipsMap.set(c.id, {...c, trimStart: result.trimStart, duration:3, _analyzeReason: result.reason, _analyzeScore: result.score});
-        reasons.push(result.reason);
-        if(idx===0){
-          setAnalyzeReason(result.reason);
-        }
-      }catch(e){
-        const mid = c.duration/2;
-        let newTrim = (c.trimStart||0) + mid - 1.5;
-        const realDur = (v && isFinite(v.duration) && v.duration>0) ? v.duration : (c.duration + (c.trimStart||0));
-        newTrim = Math.max(0, Math.min(newTrim, Math.max(0, realDur-3)));
-        newClipsMap.set(c.id, {...c, trimStart:newTrim, duration:3, _analyzeReason:'fallback-center'});
-        reasons.push('fallback');
-      }
-      setAnalyzeProgress(Math.round(((idx+1)/targetClips.length)*100));
-    }
-    // 選択されたものだけ更新、他はそのまま、順序は元を維持
-    const updatedList = clipsRef.current.map(c=> newClipsMap.get(c.id) || c);
-    const recomputed = recomputeStarts(updatedList);
-    recomputed.forEach(nc=>{
-      const v = videoRefs.current.get(nc.id);
-      if(v){
-        try{ v.currentTime = nc.trimStart||0; if(!v.paused) v.pause(); }catch{}
-      }
-    });
-    setClips(recomputed);
-    const maxEnd=recomputed.length ? Math.max(...recomputed.map(c=>c.timelineStart+c.duration)) : 3;
-    setDuration(maxEnd);
-    durationRef.current=maxEnd;
-    timeRef.current=0;
-    setCurrentTime(0);
-    lastFrameHasVideoRef.current=false;
-    setAnalyzeProgress(100);
-    // 理由表示
-    const reasonMap = {
-      'bright':'☀️ 最も明るい瞬間',
-      'bright-sunny':'☀️ 窓際クリーンな明るさ',
-      'contrast':'✨ 明暗差が大きいエモい瞬間',
-      'contrast-lantern':'🏮 ランタンみたいに暗い中に光る瞬間',
-      'uniform-center':'真ん中（明るさが均一だったため）',
-      'short':'短いのでそのまま',
-      'fallback-center':'中央（解析失敗のフォールバック）'
-    };
-    const mainReason = reasons[0] || 'bright';
-    setAnalyzeText(`完了: ${reasonMap[mainReason]||mainReason} を3秒抽出`);
-    // 再生停止バグ修正: 解析後は全videoを確実にpauseしてseekを完了させ、再生状態をリセット
-    playingRef.current=false;
-    setIsPlaying(false);
-    cancelAnimationFrame(rafTickRef.current);
-    // videoのseekを確実に完了させるため少し待ってから0秒にシーク
-    setTimeout(()=> { 
-      recomputed.forEach(nc=>{
-        const v = videoRefs.current.get(nc.id);
-        if(v){
+    const originalTime=timeRef.current;
+    const reviews=[];
+    try{
+      for(let idx=0;idx<targetClips.length;idx++){
+        const clip=targetClips[idx];
+        const video=videoRefs.current.get(clip.id);
+        let result;
+        if(clip.type==='photo') result={status:'short',reason:'写真は解析対象外です',candidates:[],attempted:0,valid:0,verified:0};
+        else if(!video) result={status:'error',reason:'動画を読み込めません',candidates:[],attempted:0,valid:0,verified:0};
+        else{
           try{
-            v.pause();
-            v.currentTime = nc.trimStart||0;
-            // iOS対策: loadを呼ばずにpreloadを確保
-            v.preload='auto';
-          }catch{}
+            result=await analyzeGood3SecClip(video,clip,stats=>{
+              if(stats.attempted%4===0 || stats.attempted===1){
+                setAnalyzeText(`解析中 ${idx+1}/${targetClips.length}: ${clip.name.slice(0,12)} 読取 ${stats.valid}/${stats.attempted}`);
+              }
+            });
+          }catch(error){
+            result={status:'error',reason:error?.message || '映像の読み取りに失敗しました',candidates:[],attempted:0,valid:0,verified:0};
+          }
         }
-      });
-      drawFrameRef.current(0);
-    }, 50);
-    setTimeout(()=> { 
-      drawFrameRef.current(0);
-      syncCanvasSize(true);
-      // 再度0秒にシークして確実に最初のフレームを表示
-      recomputed.forEach(nc=>{
-        const v = videoRefs.current.get(nc.id);
-        if(v){
-          try{ v.currentTime = nc.trimStart||0; }catch{}
-        }
-      });
-      drawFrameRef.current(0);
+        reviews.push({clipId:clip.id,name:clip.name,originalStart:clip.trimStart||0,originalDuration:clip.duration,
+          url:clip.url,...result,selectedIndex:0,start:result.candidates[0]?.start??null});
+        setAnalyzeProgress(Math.round((idx+1)/targetClips.length*100));
+      }
+      setAnalysisReview(reviews);
+      const ready=reviews.filter(r=>r.candidates.length).length;
+      const failures=reviews.filter(r=>r.status==='error').length;
+      setAnalyzeText(`${targetClips.length}件確認: 候補${ready}件・読取失敗${failures}件。採用前に試写できます`);
+      setAnalyzeReason(reviews.find(r=>r.candidates.length)?.reason || '元の素材は変更していません');
+    }finally{
+      videoRefs.current.forEach(video=>{ try{ video.pause(); }catch{} });
+      timeRef.current=originalTime;
+      setCurrentTime(originalTime);
+      const active=clipsRef.current.find(c=>originalTime>=c.timelineStart && originalTime<c.timelineStart+c.duration);
+      const video=active && videoRefs.current.get(active.id);
+      if(video){
+        video.addEventListener('seeked',()=>drawFrameRef.current(timeRef.current),{once:true});
+        try{ video.currentTime=(active.trimStart||0)+originalTime-active.timelineStart; }catch{}
+      }
+      drawFrameRef.current(originalTime);
       setIsAnalyzing(false);
-    }, 400);
-  },[syncCanvasSize, isAnalyzing, analyzeClipBrightnessContrast]);
+      analysisBusyRef.current=false;
+    }
+  },[isAnalyzing, selectedClipIds, analyzeGood3SecClip, handleStop]);
+
+  const adoptGood3Sec=(review)=>{
+    const current=clipsRef.current.find(c=>c.id===review.clipId);
+    if(!current || current.duration!==review.originalDuration || (current.trimStart||0)!==review.originalStart){
+      setAnalyzeText('素材が変更されています。もう一度解析してください');
+      return;
+    }
+    const start=review.start;
+    if(!Number.isFinite(start) || start<review.originalStart-0.001 || start>review.originalStart+review.originalDuration-3+0.001) return;
+    const before=editSnapshot();
+    handleStop();
+    const next=recomputeStarts(clipsRef.current.map(c=>c.id===review.clipId ?
+      {...c,trimStart:start,duration:3,_analyzeReason:review.selectedIndex<0?'manual':review.candidates[review.selectedIndex]?.reason} : c));
+    clipsRef.current=next;
+    setClips(next);
+    recordEdit(before);
+    const end=Math.max(...next.map(c=>c.timelineStart+c.duration));
+    durationRef.current=end; setDuration(end);
+    const selected=next.find(c=>c.id===review.clipId);
+    timeRef.current=selected.timelineStart;
+    setCurrentTime(timeRef.current);
+    const video=videoRefs.current.get(review.clipId);
+    if(video){
+      video.addEventListener('seeked',()=>drawFrameRef.current(timeRef.current),{once:true});
+      try{ video.currentTime=start; }catch{}
+    }
+    drawFrameRef.current(timeRef.current);
+    setAnalysisReview(prev=>prev.filter(item=>item.clipId!==review.clipId));
+    setAnalysisPreviewId(null);
+    setAnalyzeText(`${review.name} の3秒を採用しました。↶ 戻すで元に戻せます`);
+  };
 
   const handleApplyTemplate = useCallback((tpl)=>{
     if(!tpl) return;
@@ -9096,10 +9275,12 @@ const recomputeStarts=(arr)=>{
       alert('動画を追加してください');
       return;
     }
-    if(isAnalyzing || isFiveShotAnalyzing){
+    if(isAnalyzing || isFiveShotAnalyzing || analysisBusyRef.current){
       return;
     }
     // おまかせ編集: いいとこ3秒 + フィルター自動選択 + BGM + テンプレート適用
+    analysisBusyRef.current=true;
+    handleStop();
     setIsAnalyzing(true);
     setAnalyzeProgress(0);
     setAnalyzeText('おまかせ編集中... 最高の瞬間を探しています');
@@ -9108,25 +9289,32 @@ const recomputeStarts=(arr)=>{
       const targetClips = clipsRef.current;
       const newClipsMap = new Map();
       clipsRef.current.forEach(c=> newClipsMap.set(c.id, {...c}));
-      let totalScore=0, brightCount=0, darkCount=0, vividCount=0;
+      let brightCount=0, darkCount=0, vividCount=0, unreadable=0;
       for(let idx=0; idx<targetClips.length; idx++){
         const c = targetClips[idx];
         const v = videoRefs.current.get(c.id);
         setAnalyzeText(`おまかせ編集中 ${idx+1}/${targetClips.length}: 解析中...`);
         setAnalyzeProgress(Math.round((idx/targetClips.length)*40));
-        if(!v || c.duration<=3.1){
+        if(c.type==='photo' || c.duration<=3.1){
           newClipsMap.set(c.id, {...c, _analyzeReason:'short'});
           continue;
         }
+        if(!v){ unreadable++; newClipsMap.set(c.id,{...c,_analyzeReason:'read-failed'}); continue; }
         try{
-          const result = await analyzeClipBrightnessContrast(v, c);
-          newClipsMap.set(c.id, {...c, trimStart: result.trimStart, duration:3, _analyzeReason: result.reason, _analyzeScore: result.score});
-          totalScore+=result.score||0;
-          if(result.avg>130) brightCount++;
-          else if(result.avg<70) darkCount++;
-          if(result.contrast>30) vividCount++;
+          const result = await analyzeGood3SecClip(v,c,()=>{});
+          const candidate=result.candidates[0];
+          if(!candidate){
+            unreadable++;
+            newClipsMap.set(c.id,{...c,_analyzeReason:'read-failed'});
+            continue;
+          }
+          newClipsMap.set(c.id, {...c, trimStart:candidate.start, duration:3, _analyzeReason:candidate.reason});
+          if(candidate.avg>130) brightCount++;
+          else if(candidate.avg<70) darkCount++;
+          if(candidate.contrast>30) vividCount++;
         }catch(e){
-          newClipsMap.set(c.id, {...c, _analyzeReason:'fallback'});
+          unreadable++;
+          newClipsMap.set(c.id, {...c, _analyzeReason:'read-failed'});
         }
       }
       const updatedList = clipsRef.current.map(c=> newClipsMap.get(c.id) || c);
@@ -9199,7 +9387,7 @@ const recomputeStarts=(arr)=>{
       lastFrameHasVideoRef.current=false;
 
       setAnalyzeProgress(100);
-      setAnalyzeText(`おまかせ編集完了: ${chosenFilter} + ${chosenBgm} BGM`);
+      setAnalyzeText(`おまかせ編集完了: ${chosenFilter} + ${chosenBgm} BGM${unreadable?`（映像未確認 ${unreadable}件は元のまま）`:''}`);
       playingRef.current=false;
       setIsPlaying(false);
       cancelAnimationFrame(rafTickRef.current);
@@ -9225,8 +9413,10 @@ const recomputeStarts=(arr)=>{
       console.error('おまかせ編集エラー', e);
       setAnalyzeText('おまかせ編集でエラーが発生しました');
       setIsAnalyzing(false);
+    }finally{
+      analysisBusyRef.current=false;
     }
-  },[isAnalyzing, isFiveShotAnalyzing, analyzeClipBrightnessContrast, syncCanvasSize]);
+  },[isAnalyzing, isFiveShotAnalyzing, analyzeGood3SecClip, syncCanvasSize, handleStop]);
 
 
 
@@ -10766,8 +10956,54 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
           },
             React.createElement('span', null, isAnalyzing?'🔍':'✨'),
             isAnalyzing ? `${analyzeProgress}% ${analyzeText.slice(0,14)}` : 'いいとこ3秒',
-            !isAnalyzing && React.createElement('span', {className:'text-[10px] text-white/50 ml-1'}, selectedClipIds.length>0 ? `${selectedClipIds.length}件のみ解析` : '明るさ+コントラスト')
+            !isAnalyzing && React.createElement('span', {className:'text-[10px] text-white/50 ml-1'}, selectedClipIds.length>0 ? `${selectedClipIds.length}件のみ解析` : '映像としおり')
           )
+        ),
+        analysisReview.length>0 && React.createElement('div', {className:'mb-3 p-3 rounded-xl bg-[#111113] border border-violet-500/30', 'aria-label':'いいとこ3秒の解析結果'},
+          React.createElement('div', {className:'flex items-center justify-between mb-2'},
+            React.createElement('div', {className:'text-[12px] font-bold'}, 'いいとこ3秒の候補'),
+            React.createElement('button', {onClick:()=>{ setAnalysisReview([]); setAnalysisPreviewId(null); }, className:'text-[10px] px-2 py-1 rounded-full bg-white/10'}, '閉じる')
+          ),
+          ...analysisReview.map(review=>React.createElement('div', {key:review.clipId,className:'py-2 border-t border-white/10'},
+            React.createElement('div', {className:'text-[11px] font-bold truncate'}, review.name),
+            React.createElement('div', {className:'text-[10px] text-white/60 mt-1'}, review.reason),
+            review.attempted>0 && React.createElement('div', {className:'text-[10px] text-white/50 mt-1'},
+              `フレーム読取 ${review.valid}/${review.attempted} ・時刻確認 ${review.verified}/${review.valid}`),
+            review.candidates.length>0 && React.createElement(React.Fragment,null,
+              React.createElement('div', {className:'flex gap-2 mt-2'},
+                ...review.candidates.map((candidate,i)=>React.createElement('button', {key:i,
+                  onClick:()=>setAnalysisReview(prev=>prev.map(item=>item.clipId===review.clipId ? {...item,selectedIndex:i,start:candidate.start} : item)),
+                  className:`px-3 py-1 rounded-full text-[11px] ${review.selectedIndex===i?'bg-violet-600':'bg-white/10'}`
+                }, `候補${i+1}`))
+              ),
+              React.createElement('div', {className:'text-[10px] text-white/70 mt-2'},
+                review.selectedIndex<0 ? '開始位置を手動調整' : review.candidates[review.selectedIndex]?.reason,
+                ` ・開始 ${Number(review.start).toFixed(1)}秒`),
+              React.createElement('input', {
+                type:'range',min:review.originalStart,max:review.originalStart+review.originalDuration-3,step:0.1,value:review.start,
+                'aria-label':`${review.name}の3秒候補の開始位置`,className:'w-full accent-violet-500 mt-2',
+                onChange:e=>setAnalysisReview(prev=>prev.map(item=>item.clipId===review.clipId ?
+                  {...item,start:Number(e.target.value),selectedIndex:-1} : item))
+              }),
+              React.createElement('div', {className:'flex gap-2 mt-2'},
+                React.createElement('button', {onClick:()=>setAnalysisPreviewId(analysisPreviewId===review.clipId?null:review.clipId),
+                  className:'flex-1 h-9 rounded-full bg-white/10 text-[11px]'}, analysisPreviewId===review.clipId?'試写を閉じる':'3秒を試写'),
+                React.createElement('button', {onClick:()=>adoptGood3Sec(review),
+                  className:'flex-1 h-9 rounded-full bg-violet-600 text-[11px] font-bold'}, 'この3秒を採用')
+              ),
+              analysisPreviewId===review.clipId && React.createElement('video', {
+                key:`${review.clipId}-${review.start}`,src:review.url,controls:true,muted:true,playsInline:true,preload:'metadata',
+                className:'w-full mt-2 rounded-lg bg-black',style:{maxHeight:'220px',objectFit:'contain'},
+                onLoadedMetadata:e=>{ try{ e.currentTarget.currentTime=review.start; }catch{} },
+                onPlay:e=>{ const v=e.currentTarget; if(v.currentTime<review.start-0.05 || v.currentTime>=review.start+3) v.currentTime=review.start; },
+                onTimeUpdate:e=>{ const v=e.currentTarget; if(v.currentTime>=review.start+3){ v.pause(); v.currentTime=review.start; } }
+              })
+            ),
+            React.createElement('button', {onClick:()=>{
+              setAnalysisReview(prev=>prev.filter(item=>item.clipId!==review.clipId));
+              if(analysisPreviewId===review.clipId) setAnalysisPreviewId(null);
+            },className:'text-[10px] text-white/50 mt-2'}, '元のまま')
+          ))
         ),
         React.createElement('div', {className:'mb-4'},
           React.createElement('div', {className:'flex items-center justify-between mb-2'},
@@ -10928,7 +11164,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
         ),
         isAnalyzing && React.createElement('div', {className:'mb-3 p-3 rounded-xl bg-violet-600/20 border border-violet-500/30'},
           React.createElement('div', {className:'flex items-center justify-between mb-2'},
-            React.createElement('div', {className:'text-[11px] font-bold text-violet-200'}, '🔍 明るさ+コントラスト解析中'),
+            React.createElement('div', {className:'text-[11px] font-bold text-violet-200'}, '🔍 映像フレーム解析中'),
             React.createElement('div', {className:'text-[10px] bg-violet-600 text-white px-2 py-1 rounded-full'}, `${analyzeProgress}%`)
           ),
           React.createElement('div', {className:'w-full h-1.5 bg-black/50 rounded-full overflow-hidden mb-2'},
