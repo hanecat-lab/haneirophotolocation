@@ -8673,6 +8673,8 @@ const recomputeStarts=(arr)=>{
     let frameCallbackWorks=typeof video.requestVideoFrameCallback==='function';
     const cache=new Map();
     const stats={attempted:0,valid:0,verified:0};
+    let consecutiveFailures=0;
+    let lastFailure='';
     const waitFor=(event,limit)=>new Promise((resolve,reject)=>{
       let finished=false;
       const finish=(error)=>{
@@ -8690,7 +8692,8 @@ const recomputeStarts=(arr)=>{
       video.addEventListener('error',onError);
     });
     const readAt=async(localTime)=>{
-      const t=Math.max(0,Math.min(span-0.03,localTime));
+      // 先頭の厳密な 0 秒は Safari でまだフレームが存在しない場合がある。
+      const t=Math.max(0.08,Math.min(span-0.03,localTime));
       const key=Math.round(t*1000);
       if(cache.has(key)) return cache.get(key);
       stats.attempted++;
@@ -8702,12 +8705,15 @@ const recomputeStarts=(arr)=>{
           if(video.readyState<2){
             const loaded=waitFor('loadeddata',2400);
             if(video.networkState===0) video.load();
+            // paused のままでは iOS の画面外 video がデコードを始めない端末がある。
+            try{ video.play()?.catch?.(()=>{}); }catch{}
             await loaded;
           }
           const target=sourceStart+t;
           if(Math.abs(video.currentTime-target)>0.025 || video.seeking){
             const seeked=waitFor('seeked',1800);
             video.currentTime=target;
+            try{ video.play()?.catch?.(()=>{}); }catch{}
             await seeked;
           }
           if(video.readyState<2 || !video.videoWidth || !video.videoHeight || video.seeking) throw new Error('映像フレームが未準備です');
@@ -8765,11 +8771,15 @@ const recomputeStarts=(arr)=>{
           result={t,avg,contrast:Math.sqrt(Math.max(0,sumSq/1024-avg*avg)),detail:detail/1900,
             clipped:clipped/1024,luma,verified};
         }catch(error){
+          lastFailure=video.error ? `動画の読み込みエラー (${video.error.code})` :
+            error?.message==='frame-callback-timeout' ? 'フレームの表示待ちが時間切れになりました' :
+            error?.message || '映像の読み取りに失敗しました';
           if(error?.name==='SecurityError' || video.error) break;
         }finally{ try{ video.pause(); }catch{} }
       }
       cache.set(key,result);
-      if(result){ stats.valid++; if(result.verified) stats.verified++; }
+      if(result){ stats.valid++; consecutiveFailures=0; if(result.verified) stats.verified++; }
+      else consecutiveFailures++;
       onProgress(stats);
       return result;
     };
@@ -8778,7 +8788,12 @@ const recomputeStarts=(arr)=>{
       const coarseTimes=[];
       for(let t=0;t<span;t+=coarseStep) coarseTimes.push(t);
       const coarse=[];
-      for(const t of coarseTimes){ const sample=await readAt(t); if(sample) coarse.push(sample); }
+      for(const t of coarseTimes){
+        const sample=await readAt(t);
+        if(sample) coarse.push(sample);
+        // 同じ素材の全時刻でタイムアウトを繰り返さない。次の素材は続けて調べる。
+        if(consecutiveFailures>=3) return {...stats,status:'error',reason:`映像フレームを取得できません: ${lastFailure}`,candidates:[]};
+      }
       if(coarse.length<Math.max(4,Math.ceil(coarseTimes.length*0.5))){
         return {...stats,status:'error',reason:'読み取れた映像が足りません。素材を再生できるか確認してください',candidates:[]};
       }
@@ -8827,7 +8842,10 @@ const recomputeStarts=(arr)=>{
       for(const seed of seeds){
         const lower=Math.max(0,seed-0.4),upper=Math.min(maxStart,seed+0.4);
         for(let start=lower;start<=upper+0.01;start+=0.2) refinedStarts.push(Math.min(maxStart,start));
-        for(let t=lower;t<upper+3;t+=0.2) await readAt(t);
+        for(let t=lower;t<upper+3;t+=0.2){
+          await readAt(t);
+          if(consecutiveFailures>=3) return {...stats,status:'error',reason:`映像フレームを取得できません: ${lastFailure}`,candidates:[]};
+        }
       }
       refinedStarts.push(...seeds,...markStarts);
       const all=[...cache.values()].filter(Boolean);
