@@ -5802,17 +5802,21 @@ function changedMaterialSeams(before,after,movedId){
 }
 
 // サムネイルは表示に必要な境目だけを順番に取り出す。元の再生用videoはシークしない。
-async function captureMaterialEdge(clip,edge){
+async function captureMaterialEdge(clip,edge,signal){
   if(clip.type==='photo') return clip.url;
+  if(signal?.aborted) throw new Error('capture-cancelled');
   const video=document.createElement('video');
   video.muted=true; video.playsInline=true; video.preload='auto';
   const wait=(events,ms)=>new Promise((resolve,reject)=>{
     let timer;
-    const clear=()=>{clearTimeout(timer);events.forEach(name=>video.removeEventListener(name,ready));video.removeEventListener('error',fail);};
+    const clear=()=>{clearTimeout(timer);events.forEach(name=>video.removeEventListener(name,ready));video.removeEventListener('error',fail);signal?.removeEventListener('abort',abort);};
     const ready=()=>{clear();resolve();};
     const fail=()=>{clear();reject(new Error('frame-error'));};
+    const abort=()=>{clear();reject(new Error('capture-cancelled'));};
     events.forEach(name=>video.addEventListener(name,ready));
     video.addEventListener('error',fail);
+    signal?.addEventListener('abort',abort,{once:true});
+    if(signal?.aborted){abort();return;}
     timer=setTimeout(fail,ms);
   });
   try{
@@ -5820,6 +5824,7 @@ async function captureMaterialEdge(clip,edge){
     const loaded=video.readyState>=2 ? null : wait(['loadeddata','canplay'],3200);
     video.load();
     if(loaded) await loaded;
+    if(signal?.aborted) throw new Error('capture-cancelled');
     if(video.readyState<2 || !video.videoWidth) throw new Error('frame-unavailable');
     const raw=(clip.trimStart||0)+(edge==='last'?Math.max(0,clip.duration-0.08):Math.min(0.08,clip.duration/2));
     const target=Math.max(0,Math.min(raw,Number.isFinite(video.duration)?Math.max(0,video.duration-0.04):raw));
@@ -5828,6 +5833,7 @@ async function captureMaterialEdge(clip,edge){
       video.currentTime=target;
       await seeked;
     }
+    if(signal?.aborted) throw new Error('capture-cancelled');
     if(video.readyState<2 || video.seeking || Math.abs(video.currentTime-target)>0.2) throw new Error('frame-unavailable');
     const canvas=document.createElement('canvas');
     canvas.width=168; canvas.height=100;
@@ -5845,19 +5851,32 @@ async function captureMaterialEdge(clip,edge){
 
 function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
   const [sourceId,setSourceId]=useState(initialSourceId||null);
-  const [slot,setSlot]=useState(null);
+  const [draftIndex,setDraftIndex]=useState(()=>initialSourceId?clips.findIndex(c=>c.id===initialSourceId):null);
   const [frames,setFrames]=useState({});
   const [trial,setTrial]=useState(null);
   const [trialNotice,setTrialNotice]=useState('');
   const trialVideoRef=useRef(null);
   const trialTokenRef=useRef(0);
-  const frameQueueRef=useRef(Promise.resolve());
   const frameCacheRef=useRef(new Map());
   const source=clips.find(c=>c.id===sourceId);
+  const originalIndex=source?clips.findIndex(c=>c.id===sourceId):-1;
+  const currentIndex=source?(draftIndex===null||draftIndex<0?originalIndex:draftIndex):-1;
   const remaining=source ? clips.filter(c=>c.id!==sourceId) : clips;
-  const plan=source && slot!==null ? planMaterialMove(clips,sourceId,slot) : null;
+  // 元の並びから毎回導出する。途中の移動で切り替え効果を消してしまわない。
+  const plan=source && currentIndex!==originalIndex ? planMaterialMove(clips,sourceId,currentIndex) : null;
+  const draftItems=plan?.items||clips;
+  const beforeClip=source&&draftItems[currentIndex-1];
+  const afterClip=source&&draftItems[currentIndex+1];
+  const beforeSeam=beforeClip&&{key:`${beforeClip.id}|${source.id}`,left:beforeClip,right:source,label:'移動先の前'};
+  const afterSeam=afterClip&&{key:`${source.id}|${afterClip.id}`,left:source,right:afterClip,label:'移動先の後'};
+  const previewSeams=[beforeSeam,afterSeam].filter(Boolean);
   const seams=plan ? changedMaterialSeams(clips,plan.items,sourceId) : [];
+  const oldGap=seams.find(seam=>seam.label==='元の位置');
   const sourceFrameKey=source && `${source.id}|${source.url}|${source.trimStart||0}|${source.duration}|first`;
+  const selectedRowRef=useRef(null);
+  const reorderScrollRef=useRef(null);
+  const previewStickyRef=useRef(null);
+  const lastFollowRef=useRef(null);
   const cancelTrial=()=>{
     trialTokenRef.current++;
     try{trialVideoRef.current?.pause();}catch{}
@@ -5865,37 +5884,63 @@ function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
   };
   useEffect(()=>{
     let active=true;
-    setFrames({});
+    const controller=new AbortController();
     const requests=[];
     if(source){
       const key=`${source.id}|${source.url}|${source.trimStart||0}|${source.duration}|first`;
       requests.push({key,clip:source,edge:'first'});
     }
-    for(const seam of seams){
+    for(const seam of [...previewSeams,...(oldGap?[oldGap]:[])]){
       for(const [clip,edge] of [[seam.left,'last'],[seam.right,'first']]){
         const key=`${clip.id}|${clip.url}|${clip.trimStart||0}|${clip.duration}|${edge}`;
         if(!requests.some(r=>r.key===key)) requests.push({key,clip,edge});
       }
     }
-    frameQueueRef.current=frameQueueRef.current.catch(()=>{}).then(async()=>{
-      for(const {key,clip,edge} of requests){
-        if(!active) break;
+    const pending=[...requests];
+    const worker=async()=>{
+      while(pending.length&&active&&!controller.signal.aborted){
+        const {key,clip,edge}=pending.shift();
         let value=frameCacheRef.current.get(key);
         if(value===undefined){
-          try{value=await captureMaterialEdge(clip,edge);}catch{value=null;}
-          frameCacheRef.current.set(key,value);
-          if(frameCacheRef.current.size>24) frameCacheRef.current.delete(frameCacheRef.current.keys().next().value);
+          try{value=await captureMaterialEdge(clip,edge,controller.signal);}
+          catch{if(controller.signal.aborted)break;value=null;}
+          if(!controller.signal.aborted){
+            frameCacheRef.current.set(key,value);
+            if(frameCacheRef.current.size>24) frameCacheRef.current.delete(frameCacheRef.current.keys().next().value);
+          }
         }
-        if(active) setFrames(prev=>({...prev,[key]:value}));
+        if(active&&!controller.signal.aborted) setFrames(prev=>({...prev,[key]:value}));
       }
+    };
+    Promise.all(Array.from({length:Math.min(2,pending.length)},worker)).catch(()=>{});
+    return ()=>{active=false;controller.abort();};
+  },[sourceId,currentIndex,clips]);
+  useEffect(()=>{
+    if(!source){lastFollowRef.current=null;return;}
+    if(lastFollowRef.current!==sourceId){lastFollowRef.current=sourceId;return;}
+    const frame=requestAnimationFrame(()=>{
+      const container=reorderScrollRef.current,row=selectedRowRef.current;
+      if(!container||!row)return;
+      const bounds=container.getBoundingClientRect(),item=row.getBoundingClientRect();
+      const top=Math.max(bounds.top,(previewStickyRef.current?.getBoundingClientRect().bottom||bounds.top)+8);
+      if(item.bottom>bounds.bottom-8) container.scrollBy({top:item.bottom-bounds.bottom+12,behavior:'smooth'});
+      else if(item.top<top) container.scrollBy({top:item.top-top-8,behavior:'smooth'});
     });
-    return ()=>{active=false;};
-  },[sourceId,slot,clips]);
+    return()=>cancelAnimationFrame(frame);
+  },[sourceId,currentIndex]);
   useEffect(()=>()=>{
     trialTokenRef.current++;
     try{trialVideoRef.current?.pause();}catch{}
   },[]);
-  const chooseSlot=index=>{cancelTrial();setSlot(index);};
+  const chooseSlot=index=>{
+    if(!source||index<0||index>=clips.length)return;
+    cancelTrial();setDraftIndex(index);
+  };
+  const stepDraft=delta=>{
+    if(!source)return;
+    cancelTrial();
+    setDraftIndex(index=>Math.max(0,Math.min(clips.length-1,(index??originalIndex)+delta)));
+  };
   const frame=(clip,edge)=>{
     const key=`${clip.id}|${clip.url}|${clip.trimStart||0}|${clip.duration}|${edge}`;
     const image=frames[key]===null?null:clip.type==='photo'?clip.url:frames[key];
@@ -5966,58 +6011,81 @@ function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
     }
   };
   const durationChange=plan ? materialTimelineEnd(plan.items)-materialTimelineEnd(clips) : 0;
+  const seamCard=seam=>React.createElement('div',{key:seam.key,className:'rounded-xl border border-white/15 bg-[#151517] p-3 mb-3'},
+    React.createElement('div',{className:'flex items-center justify-between mb-2'},
+      React.createElement('div',{className:'text-xs font-bold'},seam.label),
+      React.createElement('button',{type:'button',onClick:()=>playSeam(seam),className:'px-3 py-1.5 rounded-full bg-white/10 text-xs'},'▶ 短く試写')),
+    React.createElement('div',{className:'grid grid-cols-2 gap-2'},frame(seam.left,'last'),frame(seam.right,'first')));
+  const gapButton=index=>React.createElement('button',{
+    key:`gap-${index}`,type:'button',onClick:()=>chooseSlot(index),disabled:index===currentIndex,
+    className:`w-full text-left rounded-lg border border-dashed px-3 py-2 my-1 text-xs disabled:opacity-60 ${index===currentIndex?'border-violet-400 bg-violet-500/20 text-violet-100':'border-violet-400/40 text-violet-200'}`},
+    index===currentIndex?`◆ 仮置き中 · ${index+1}番目`:`＋ ここに入れる · ${index+1}番目`);
+  const selectedRow=()=>React.createElement('div',{key:`moving-${sourceId}`,ref:selectedRowRef,
+    className:'rounded-xl border-2 border-violet-400 bg-violet-500/20 px-3 py-3 my-1 text-xs flex items-center gap-2'},
+    React.createElement('span',{className:'font-bold text-violet-100'},`${currentIndex+1}. 移動中`),
+    React.createElement('span',{className:'truncate flex-1'},source.name),
+    React.createElement('span',{className:'text-white/55'},`${source.duration.toFixed(1)}秒`));
   return React.createElement('div', {className:'fixed inset-0 z-[1100] bg-[#0a0a0b] text-white flex flex-col',role:'dialog','aria-modal':true,'aria-label':'素材の並び順を変更'},
     React.createElement('div', {className:'shrink-0 px-4 py-3 border-b border-white/15 flex items-center gap-3'},
       React.createElement('div',{className:'font-bold text-sm flex-1'},'素材の順番を変える'),
-      React.createElement('button',{onClick:()=>{cancelTrial();onClose();},className:'px-3 py-2 rounded-full bg-white/10 text-xs'},'閉じる')),
-    React.createElement('div',{className:'shrink-0 px-4 py-3 bg-violet-500/10 border-b border-violet-400/20 text-xs'},
+      React.createElement('button',{type:'button',onClick:()=>{cancelTrial();onClose();},className:'px-3 py-2 rounded-full bg-white/10 text-xs'},plan?'取り消して閉じる':'閉じる')),
+    React.createElement('div',{className:'shrink-0 px-4 py-2 bg-violet-500/10 border-b border-violet-400/20 text-xs'},
       source ? React.createElement(React.Fragment,null,
-        React.createElement('div',{className:'text-white/55 mb-1'},'移動する素材'),
         React.createElement('div',{className:'flex items-center gap-2'},
-          React.createElement('div',{className:'w-12 h-12 shrink-0 rounded-md bg-black overflow-hidden flex items-center justify-center text-[9px] text-white/50 text-center'},
+          React.createElement('div',{className:'w-10 h-10 shrink-0 rounded-md bg-black overflow-hidden flex items-center justify-center text-[9px] text-white/50 text-center'},
             frames[sourceFrameKey]===null ? '画像を確認できません'
               : (source.type==='photo'?source.url:frames[sourceFrameKey])
                 ? React.createElement('img',{src:source.type==='photo'?source.url:frames[sourceFrameKey],alt:source.name,onError:()=>setFrames(prev=>({...prev,[sourceFrameKey]:null})),className:'w-full h-full object-cover'})
                 : '映像を準備中'),
-          React.createElement('div',{className:'font-bold truncate'},`${clips.findIndex(c=>c.id===sourceId)+1}. ${source.name}`)),
-        React.createElement('div',{className:'flex gap-2 mt-2'},
-          React.createElement('button',{disabled:clips.findIndex(c=>c.id===sourceId)===0,onClick:()=>chooseSlot(clips.findIndex(c=>c.id===sourceId)-1),className:'rounded-full bg-white/10 px-3 py-1.5 disabled:opacity-30'},'↑ ひとつ前へ'),
-          React.createElement('button',{disabled:clips.findIndex(c=>c.id===sourceId)===clips.length-1,onClick:()=>chooseSlot(clips.findIndex(c=>c.id===sourceId)+1),className:'rounded-full bg-white/10 px-3 py-1.5 disabled:opacity-30'},'↓ ひとつ後へ'),
-          React.createElement('button',{onClick:()=>{cancelTrial();setSourceId(null);setSlot(null);},className:'ml-auto text-white/60 underline'},'選び直す')))
+          React.createElement('div',{className:'min-w-0 flex-1'},
+            React.createElement('div',{className:'text-[10px] text-violet-200'},`移動中 · 元${originalIndex+1}番目 → 仮${currentIndex+1}番目 / ${clips.length}件`),
+            React.createElement('div',{className:'font-bold truncate'},source.name)),
+          React.createElement('button',{type:'button',onClick:()=>{cancelTrial();setSourceId(null);setDraftIndex(null);},className:'shrink-0 text-white/60 underline'},'選び直す')))
         : 'まず移動する素材を選んでください。'),
-    !plan ? React.createElement('div',{className:'flex-1 overflow-y-auto px-4 py-3 overscroll-contain'},
-      source && React.createElement('div',{className:'text-xs text-white/60 mb-3'},'「ここへ移動」を押すと、新しい境目を確認できます。'),
-      remaining.flatMap((clip,i)=>[
-        source && React.createElement('button',{key:`slot-${i}`,onClick:()=>chooseSlot(i),disabled:i===clips.findIndex(c=>c.id===sourceId),className:'w-full text-left border border-dashed border-violet-400/50 rounded-xl px-3 py-2 my-1 text-xs text-violet-200 disabled:opacity-30'},i===clips.findIndex(c=>c.id===sourceId)?'元の位置':`ここへ移動 · ${i+1}番目`),
-        React.createElement('button',{key:clip.id,onClick:()=>{cancelTrial();setSourceId(clip.id);setSlot(null);},className:`w-full text-left rounded-xl border px-3 py-3 my-1 text-sm flex gap-3 ${sourceId===clip.id?'border-violet-400 bg-violet-500/20':'border-white/15 bg-white/5'}`},
-          React.createElement('span',{className:'text-white/45'},`${clips.findIndex(c=>c.id===clip.id)+1}.`),
-          React.createElement('span',{className:'truncate flex-1'},clip.name),
-          React.createElement('span',{className:'text-white/50'},`${clip.duration.toFixed(1)}秒`))
-      ]),
-      source && React.createElement('button',{onClick:()=>chooseSlot(remaining.length),disabled:remaining.length===clips.findIndex(c=>c.id===sourceId),className:'w-full text-left border border-dashed border-violet-400/50 rounded-xl px-3 py-2 my-1 text-xs text-violet-200 disabled:opacity-30'},remaining.length===clips.findIndex(c=>c.id===sourceId)?'元の位置':`ここへ移動 · ${remaining.length+1}番目`)
-    ) : React.createElement(React.Fragment,null,
-      React.createElement('div',{className:'flex-1 overflow-y-auto px-4 py-3 overscroll-contain'},
-        React.createElement('div',{className:'text-sm font-bold mb-2'},`${plan.fromIndex+1}番目 → ${slot+1}番目`),
-        React.createElement('div',{className:'text-xs text-white/60 mb-3'},'新しくつながる境目を確認してください。'),
-        seams.map(seam=>React.createElement('div',{key:seam.key,className:'rounded-xl border border-white/15 bg-[#151517] p-3 mb-3'},
-          React.createElement('div',{className:'flex items-center justify-between mb-2'},
-            React.createElement('div',{className:'text-xs font-bold'},seam.label),
-            React.createElement('button',{onClick:()=>playSeam(seam),className:'px-3 py-1.5 rounded-full bg-white/10 text-xs'},'▶ 試写')),
-          React.createElement('div',{className:'grid grid-cols-2 gap-2'},frame(seam.left,'last'),frame(seam.right,'first')))),
-        React.createElement('div',{className:'text-xs text-white/70 rounded-xl bg-white/5 p-3'},
-          plan.removed>0 && React.createElement('div',null,`${plan.removed}か所の切り替え効果を解除します。`),
-          React.createElement('div',null,`動画全体の長さ：${materialTimelineEnd(clips).toFixed(1)}秒 → ${materialTimelineEnd(plan.items).toFixed(1)}秒${Math.abs(durationChange)<0.05?'（変更なし）':''}`),
-          React.createElement('div',{className:'text-white/45 mt-1'},'素材に付いたテキストは素材と一緒に移動します。全体テキストとBGMの時刻は固定です。')),
-        trialNotice && React.createElement('div',{role:'status',className:'text-xs text-amber-200 mt-2'},trialNotice)),
-      React.createElement('div',{className:'shrink-0 px-4 py-3 border-t border-white/15 bg-[#111113]'},
+    React.createElement('div',{ref:reorderScrollRef,className:'flex-1 min-h-0 overflow-y-auto px-4 py-3 overscroll-contain'},
+      source ? React.createElement(React.Fragment,null,
+        React.createElement('div',{ref:previewStickyRef,className:'sticky top-0 z-10 bg-[#0a0a0b] pb-1'},
+          React.createElement('div',{className:'text-xs font-bold mb-2'},'移動先の前後を確認'),
+          beforeSeam?seamCard(beforeSeam):React.createElement('div',{className:'rounded-xl bg-white/5 p-3 mb-3 text-xs text-white/60'},'先頭に置いています · 前の素材はありません'),
+          afterSeam?seamCard(afterSeam):React.createElement('div',{className:'rounded-xl bg-white/5 p-3 mb-3 text-xs text-white/60'},'末尾に置いています · 次の素材はありません')),
+        oldGap && React.createElement('details',{className:'rounded-xl bg-white/5 px-3 py-2 mb-3 text-xs'},
+          React.createElement('summary',{className:'cursor-pointer text-white/70'},'外した場所のつながりを確認'),
+          React.createElement('div',{className:'mt-2'},seamCard(oldGap))),
+        React.createElement('div',{className:`rounded-xl p-3 mb-3 text-xs ${plan?'bg-violet-500/10 text-white/75':'bg-white/5 text-white/50'}`},
+          plan?.removed>0 && React.createElement('div',{className:'text-amber-200 mb-1'},`切り替え効果 ${plan.removed}か所を解除します。`),
+          React.createElement('div',null,`全体の長さ：${materialTimelineEnd(clips).toFixed(1)}秒 → ${materialTimelineEnd(draftItems).toFixed(1)}秒${Math.abs(durationChange)<0.05?'（変更なし）':''}`),
+          React.createElement('div',{className:'text-white/45 mt-1'},'素材付きテキストは一緒に移動。全体テキストとBGMの時刻は固定。')),
         React.createElement('div',{className:`rounded-xl bg-black mb-2 overflow-hidden ${trial?'h-28':'h-0'}`},
           trial?.clip.type==='photo' && React.createElement('img',{src:trial.clip.url,alt:trial.clip.name,className:'w-full h-full object-contain'}),
           React.createElement('video',{ref:trialVideoRef,muted:true,playsInline:true,className:`w-full h-full object-contain ${trial?.clip.type==='video'?'':'hidden'}`})),
         trial && React.createElement('div',{className:'text-xs text-white/60 mb-2 truncate'},`試写中：${trial.clip.name} ${trial.edge==='last'?'末尾':'冒頭'}`),
-        React.createElement('div',{className:'flex gap-2'},
-          React.createElement('button',{onClick:()=>{cancelTrial();setSlot(null);},className:'flex-1 h-11 rounded-full bg-white/10 text-xs'},'移動先を選び直す'),
-          React.createElement('button',{onClick:()=>{cancelTrial();onCommit(sourceId,slot);onClose();},className:'flex-1 h-11 rounded-full bg-white text-black font-bold text-xs'},'この順番にする')))
-    )
+        trialNotice && React.createElement('div',{role:'status',className:'text-xs text-amber-200 mb-2'},trialNotice),
+        React.createElement('div',{className:'text-xs font-bold mt-4 mb-1'},'仮の並び · 素材の間をタップして移動'),
+        remaining.flatMap((clip,i)=>[
+          gapButton(i),
+          currentIndex===i&&selectedRow(),
+          React.createElement('div',{key:clip.id,className:'w-full rounded-xl border border-white/15 bg-white/5 px-3 py-3 my-1 text-xs flex gap-2'},
+            React.createElement('span',{className:'text-white/45'},`${i+(currentIndex<=i?2:1)}.`),
+            React.createElement('span',{className:'truncate flex-1'},clip.name),
+            React.createElement('span',{className:'text-white/50'},`${clip.duration.toFixed(1)}秒`))
+        ]),
+        gapButton(remaining.length),
+        currentIndex===remaining.length&&selectedRow()
+      ) : React.createElement(React.Fragment,null,
+        React.createElement('div',{className:'text-xs text-white/60 mb-3'},'移動する素材を選んでください。'),
+        clips.map((clip,i)=>React.createElement('button',{key:clip.id,type:'button',onClick:()=>{cancelTrial();setSourceId(clip.id);setDraftIndex(i);},
+          className:'w-full text-left rounded-xl border border-white/15 bg-white/5 px-3 py-3 my-1 text-sm flex gap-3'},
+          React.createElement('span',{className:'text-white/45'},`${i+1}.`),
+          React.createElement('span',{className:'truncate flex-1'},clip.name),
+          React.createElement('span',{className:'text-white/50'},`${clip.duration.toFixed(1)}秒`))))
+    ),
+    source && React.createElement('div',{className:'shrink-0 px-4 pt-3 border-t border-white/15 bg-[#111113]',style:{paddingBottom:'max(12px, env(safe-area-inset-bottom))'}},
+      React.createElement('div',{className:'flex gap-2 mb-2'},
+        React.createElement('button',{type:'button',disabled:currentIndex<=0,onClick:()=>stepDraft(-1),className:'flex-1 h-12 rounded-full bg-white/10 text-sm disabled:opacity-30'},'↑ ひとつ前へ'),
+        React.createElement('button',{type:'button',disabled:currentIndex>=clips.length-1,onClick:()=>stepDraft(1),className:'flex-1 h-12 rounded-full bg-white/10 text-sm disabled:opacity-30'},'↓ ひとつ後へ')),
+      React.createElement('div',{className:'flex gap-2'},
+        React.createElement('button',{type:'button',disabled:!plan,onClick:()=>chooseSlot(originalIndex),className:'w-[38%] h-11 rounded-full bg-white/10 text-xs disabled:opacity-30'},'元の位置に戻す'),
+        React.createElement('button',{type:'button',disabled:!plan,onClick:()=>{cancelTrial();onCommit(sourceId,currentIndex);onClose();},className:'flex-1 h-11 rounded-full bg-white text-black font-bold text-xs disabled:opacity-30'},'この順番にする')))
   );
 }
 
