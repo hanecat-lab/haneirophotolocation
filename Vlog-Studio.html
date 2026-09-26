@@ -5131,6 +5131,15 @@ body:has(.polaroid-wrapper.hikariyomi-mode) #moodSelector{
   }
 }
 
+.preview-wrap .text-selection-outline{
+  position:absolute;
+  z-index:9;
+  box-sizing:border-box;
+  border:1px solid rgba(255,255,255,0.76);
+  box-shadow:0 0 0 1px rgba(25,25,30,0.28);
+  pointer-events:none;
+}
+
 </style>
 </head>
 <body class="bg-[#0a0a0b] text-white">
@@ -5341,6 +5350,20 @@ const cameraLocalAction=async (mode,record)=>{
     tx.onabort=()=>{ db.close(); reject(tx.error||new Error('local-storage-aborted')); };
   });
 };
+
+function getTextCanvasBounds(txt, canvas){
+  const ctx=canvas?.getContext('2d');
+  if(!ctx || !canvas.width || !canvas.height) return null;
+  const fontSize=(txt.fontSize||0.06)*canvas.height;
+  ctx.save();
+  ctx.font=`${txt.bold?'bold ':''}${fontSize}px ${txt.fontFamily||'sans-serif'}`;
+  const width=ctx.measureText(txt.text||'').width;
+  ctx.restore();
+  const pad=8;
+  const x=(txt.x ?? 50)/100*canvas.width;
+  const y=(txt.y ?? 50)/100*canvas.height;
+  return {left:x-width/2-pad, top:y-fontSize/2-pad, width:width+pad*2, height:fontSize+pad*2};
+}
 
 function App(){
   const canvasRef = useRef(null);
@@ -6021,6 +6044,8 @@ function App(){
   const [draggingText, setDraggingText] = useState(null);
   const [draggingClipBar, setDraggingClipBar] = useState(null);
   const [selectedTextId, setSelectedTextId] = useState(null);
+  const [dragPreviewText, setDragPreviewText] = useState(null);
+  const [selectionLayoutTick, setSelectionLayoutTick] = useState(0);
   const [selectedClipIds, setSelectedClipIds] = useState([]);
   const [connectionEditor, setConnectionEditor] = useState(null);
   const [quickPeekId, setQuickPeekId] = useState(null);
@@ -6067,6 +6092,37 @@ function App(){
 
   useEffect(()=>{ clipsRef.current = clips; },[clips]);
   useEffect(()=>{ textsRef.current = texts; },[texts]);
+  // 素材に付いたテキストだけ、素材の並び替え・長さ変更に追従させる。
+  useEffect(()=>{
+    if(!textsRef.current.some(tx=>tx._clipId)) return;
+    const byId=new Map(clips.map(clip=>[clip.id,clip]));
+    let changed=false;
+    const next=textsRef.current.map(tx=>{
+      if(!tx._clipId) return tx;
+      const clip=byId.get(tx._clipId);
+      if(!clip){ changed=true; return {...tx,_clipId:null,_clipStart:null,_clipEnd:null}; }
+      const minLength=Math.min(0.2,clip.duration);
+      const localStart=Math.max(0,Math.min(tx._clipStart,clip.duration-minLength));
+      const localEnd=Math.max(localStart+minLength,Math.min(tx._clipEnd,clip.duration));
+      const start=clip.timelineStart+localStart, end=clip.timelineStart+localEnd;
+      if(Math.abs(start-tx.start)<0.0001 && Math.abs(end-tx.end)<0.0001 &&
+         localStart===tx._clipStart && localEnd===tx._clipEnd) return tx;
+      changed=true;
+      return {...tx,start,end,_clipStart:localStart,_clipEnd:localEnd};
+    });
+    if(changed){
+      const before=textsRef.current.find(tx=>tx.id===selectedTextId);
+      const after=next.find(tx=>tx.id===selectedTextId);
+      if(before && after && timeRef.current>=before.start && timeRef.current<before.end &&
+         (before.start!==after.start || timeRef.current<after.start || timeRef.current>=after.end)){
+        timeRef.current=Math.min(after.end-0.01,after.start+timeRef.current-before.start);
+        setCurrentTime(timeRef.current);
+      }
+      textsRef.current=next;
+      setTexts(next);
+      requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+    }
+  },[clips]);
   useEffect(()=>{ modeRef.current = mode; },[mode]);
   useEffect(()=>{ durationRef.current = duration; },[duration]);
   useEffect(()=>{ timelineZoomRef.current = timelineZoom; },[timelineZoom]);
@@ -6424,8 +6480,8 @@ function App(){
     const activeTexts = textsNow.filter(tx=> t>=tx.start && t<tx.end);
     activeTexts.forEach(txt=>{
       ctx.save();
-      const x = (txt.x||50)/100 * cw;
-      const y = (txt.y||50)/100 * ch;
+      const x = (txt.x ?? 50)/100 * cw;
+      const y = (txt.y ?? 50)/100 * ch;
       const fontSize = (txt.fontSize||0.06) * ch;
       ctx.font=`${txt.bold?'bold ':''}${fontSize}px ${txt.fontFamily||'sans-serif'}`;
       ctx.fillStyle=txt.color||'#fff';
@@ -6591,6 +6647,7 @@ function App(){
         }
       }
       else{ c.style.width=targetW+'px'; c.style.height=targetH+'px'; }
+      setSelectionLayoutTick(v=>v+1);
       drawFrameRef.current(timeRef.current);
       requestAnimationFrame(()=> drawFrameRef.current(timeRef.current));
     }); });
@@ -6965,6 +7022,22 @@ function App(){
     }catch{ return {x: desiredX, y: desiredY}; }
   },[autoLayoutEnabled]);
 
+  const textForActiveClip=useCallback((item)=>{
+    const clip=clipsRef.current.find(c=>timeRef.current>=c.timelineStart && timeRef.current<c.timelineStart+c.duration);
+    if(!clip) return item;
+    const minLength=Math.min(0.2,clip.duration);
+    const start=Math.max(clip.timelineStart,Math.min(item.start,clip.timelineStart+clip.duration-minLength));
+    const end=Math.max(start+minLength,Math.min(item.end,clip.timelineStart+clip.duration));
+    return {...item,start,end,_clipId:clip.id,_clipStart:start-clip.timelineStart,_clipEnd:end-clip.timelineStart};
+  },[]);
+
+  const withTextTiming=useCallback((item,start,end,allowAttach=!!item._clipId)=>{
+    if(!allowAttach) return {...item,start,end};
+    const clip=clipsRef.current.find(c=>start>=c.timelineStart-0.0001 && end<=c.timelineStart+c.duration+0.0001);
+    if(!clip) return {...item,start,end,_clipId:null,_clipStart:null,_clipEnd:null};
+    return {...item,start,end,_clipId:clip.id,_clipStart:start-clip.timelineStart,_clipEnd:end-clip.timelineStart};
+  },[]);
+
   const addCafeVlogKit = useCallback((customName)=>{
     try{
       const total = durationRef.current || 3;
@@ -6993,21 +7066,21 @@ function App(){
     const desiredY = 50 + existingCount*8;
     let safePos = {x:50, y:desiredY};
     try{ safePos = findSafePosition(desiredY, 50); }catch{}
-    const newItem={ 
+    const newItem=textForActiveClip({ 
       id, text:'新しいテキスト', 
       start:Math.max(0,t+offset), end:Math.max(0.2,t+offset+2), 
       x:safePos.x, y:safePos.y, 
       font:0, anim:'fade',
       fontSize:0.06, color:'#ffffff', bgColor:'transparent', 
       fontFamily:'sans', bold:false, outline:true, strokeColor:'rgba(0,0,0,0.8)', align:'center'
-    };
+    });
     setTexts(prev=> [...prev, newItem]);
     setSelectedTextId(id);
     setActiveTab('text');
     modeRef.current='textEdit';
     setMode('textEdit');
     setTimeout(()=>{ drawFrameRef.current(timeRef.current); }, 16);
-  },[autoLayoutEnabled, findSafePosition]);
+  },[autoLayoutEnabled, findSafePosition, textForActiveClip]);
 
   useEffect(()=>{
     const ro = typeof ResizeObserver!=='undefined' ? new ResizeObserver(()=>{ syncCanvasSize(false); }) : null;
@@ -8683,9 +8756,11 @@ function App(){
     if(!container) return;
     const txt = textsRef.current.find(t=> t.id===txtId);
     if(!txt) return;
+    setSelectedTextId(txtId);
     setDraggingText({
       id: txtId,
       type,
+      wasAttached:!!txt._clipId,
       startX: e.clientX,
       origStart: txt.start,
       origEnd: txt.end,
@@ -8699,19 +8774,19 @@ function App(){
     const deltaTime = (deltaX / draggingText.containerWidth) * durationRef.current;
     if(draggingText.type==='left'){
       const newStart = Math.max(0, Math.min(draggingText.origStart + deltaTime, draggingText.origEnd - 0.2));
-      setTexts(prev=> prev.map(t=> t.id===draggingText.id ? {...t, start:newStart} : t));
+      setTexts(prev=> prev.map(t=> t.id===draggingText.id ? withTextTiming(t,newStart,t.end,draggingText.wasAttached) : t));
     } else if(draggingText.type==='right'){
       const newEnd = Math.max(draggingText.origStart + 0.2, Math.min(draggingText.origEnd + deltaTime, durationRef.current));
-      setTexts(prev=> prev.map(t=> t.id===draggingText.id ? {...t, end:newEnd} : t));
+      setTexts(prev=> prev.map(t=> t.id===draggingText.id ? withTextTiming(t,t.start,newEnd,draggingText.wasAttached) : t));
     } else if(draggingText.type==='move'){
       const dur = draggingText.origEnd - draggingText.origStart;
       let newStart = draggingText.origStart + deltaTime;
       newStart = Math.max(0, Math.min(newStart, durationRef.current - dur));
       const newEnd = newStart + dur;
-      setTexts(prev=> prev.map(t=> t.id===draggingText.id ? {...t, start:newStart, end:newEnd} : t));
+      setTexts(prev=> prev.map(t=> t.id===draggingText.id ? withTextTiming(t,newStart,newEnd,draggingText.wasAttached) : t));
     }
     setTimeout(()=> drawFrameRef.current(timeRef.current), 0);
-  },[draggingText]);
+  },[draggingText,withTextTiming]);
   const handleTextPointerUp = useCallback((e)=>{
     if(!draggingText) return;
     try{ e.currentTarget.releasePointerCapture(e.pointerId); }catch{}
@@ -8812,30 +8887,49 @@ function App(){
     setTimeout(()=> drawFrameRef.current(timeRef.current),0);
   },[draggingClipBar]);
 
+  const selectTextForEditing=useCallback((txt)=>{
+    if(playingRef.current) handleStop();
+    setSelectedTextId(txt.id);
+    setActiveTab('text');
+    if(timeRef.current<txt.start || timeRef.current>=txt.end){
+      timeRef.current=Math.min(txt.end-0.01,txt.start+0.01);
+      setCurrentTime(timeRef.current);
+      requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+    }
+  },[handleStop]);
+
   const onPointerDown=useCallback((e)=>{
+    if(modeRef.current==='finder' || modeRef.current==='hikariyomi' || modeRef.current==='fullscreen') return;
     const c=canvasRef.current; if(!c) return;
     const rect=c.getBoundingClientRect(); if(rect.width<5) return;
-    const x=((e.clientX-rect.left)/rect.width)*100;
-    const y=((e.clientY-rect.top)/rect.height)*100;
-    for(const txt of textsRef.current){
-      if(Math.abs(txt.x-x)<16 && Math.abs(txt.y-y)<12){
+    const x=((e.clientX-rect.left)/rect.width)*c.width;
+    const y=((e.clientY-rect.top)/rect.height)*c.height;
+    for(const txt of [...textsRef.current].reverse()){
+      if(timeRef.current<txt.start || timeRef.current>=txt.end) continue;
+      const bounds=getTextCanvasBounds(txt,c);
+      if(bounds && x>=bounds.left && x<=bounds.left+bounds.width && y>=bounds.top && y<=bounds.top+bounds.height){
+        selectTextForEditing(txt);
         isDraggingRef.current=true;
-        dragTargetRef.current={type:'text',id:txt.id,newX:x,newY:y};
+        dragTargetRef.current={type:'text',id:txt.id,newX:txt.x ?? 50,newY:txt.y ?? 50,
+          startX:e.clientX,startY:e.clientY,originX:txt.x ?? 50,originY:txt.y ?? 50};
         try{ e.currentTarget.setPointerCapture(e.pointerId); }catch{}
         return;
       }
     }
-  },[]);
+    if(activeTab==='text') setSelectedTextId(null);
+  },[activeTab,selectTextForEditing]);
   const onPointerMove=useCallback((e)=>{
     if(!isDraggingRef.current) return;
     const c=canvasRef.current; if(!c) return;
     const rect=c.getBoundingClientRect();
-    const x=((e.clientX-rect.left)/rect.width)*100;
-    const y=((e.clientY-rect.top)/rect.height)*100;
     if(dragTargetRef.current?.type==='text'){
+      const target=dragTargetRef.current;
+      const x=Math.max(0,Math.min(100,target.originX+(e.clientX-target.startX)/rect.width*100));
+      const y=Math.max(0,Math.min(100,target.originY+(e.clientY-target.startY)/rect.height*100));
       dragTargetRef.current.newX=x; dragTargetRef.current.newY=y;
+      setDragPreviewText({id:target.id,x,y});
       const t=dragTargetRef.current;
-      const prevTexts=textsRef.current.map(x=> x.id===t.id ? {...x, x:t.newX, y:t.newY} : x);
+      const prevTexts=textsRef.current.map(tx=> tx.id===t.id ? {...tx, x:t.newX, y:t.newY} : tx);
       const orig=textsRef.current;
       textsRef.current=prevTexts;
       drawFrameRef.current(timeRef.current);
@@ -8851,6 +8945,7 @@ function App(){
       setTexts(prev=> prev.map(x=> x.id===t.id ? {...x, x:t.newX, y:t.newY} : x));
       setTimeout(()=> drawFrameRef.current(timeRef.current),0);
     }
+    setDragPreviewText(null);
     dragTargetRef.current=null;
   },[]);
 
@@ -9043,6 +9138,20 @@ function App(){
     const y=(event.clientY-rect.top)*canvas.height/rect.height;
     return x<left || x>left+width || y<top || y>top+height;
   };
+  const selectedTextForOutline=texts.find(tx=>tx.id===selectedTextId);
+  const outlineCanvas=canvasRef.current;
+  const outlineBounds=selectedTextForOutline && outlineCanvas &&
+    activeTab==='text' && !isPlaying && mode!=='finder' && mode!=='hikariyomi' && mode!=='fullscreen' &&
+    currentTime>=selectedTextForOutline.start && currentTime<selectedTextForOutline.end
+      ? getTextCanvasBounds(dragPreviewText?.id===selectedTextId
+          ? {...selectedTextForOutline,x:dragPreviewText.x,y:dragPreviewText.y} : selectedTextForOutline,outlineCanvas)
+      : null;
+  const outlineStyle=outlineBounds && outlineCanvas ? {
+    left:`${outlineCanvas.offsetLeft+outlineBounds.left*outlineCanvas.clientWidth/outlineCanvas.width}px`,
+    top:`${outlineCanvas.offsetTop+outlineBounds.top*outlineCanvas.clientHeight/outlineCanvas.height}px`,
+    width:`${outlineBounds.width*outlineCanvas.clientWidth/outlineCanvas.width}px`,
+    height:`${outlineBounds.height*outlineCanvas.clientHeight/outlineCanvas.height}px`
+  } : null;
   const standardIrisMode=mode==='normal' || mode==='finder';
   const standardPlayIcon=React.createElement('span', {key:'icon', className:'standard-play-icon', 'aria-hidden':true}, isPlaying ? 'Ⅱ' : '▶');
   const standardPlayCopy=React.createElement('span', {key:'copy', className:'standard-play-copy'},
@@ -9291,6 +9400,7 @@ function App(){
           }, 
           style:{width:'100%',height:'100%',background:'#0a0a0b', touchAction:'none'}
         }),
+        outlineStyle && React.createElement('div', {className:'text-selection-outline', style:outlineStyle, 'aria-hidden':true}),
         // SAFE AREA OVERLAY
         showSafeArea && React.createElement('div', {className:'safe-area-overlay'},
           React.createElement('div', {className:'safe-area-zone top-zone'}),
@@ -10612,7 +10722,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
               onClick:()=>{
                 const id=Math.random().toString(36).slice(2);
                 const t=timeRef.current;
-                const newItem={ id, text:p.text, start:Math.max(0,t), end:Math.max(0.2,t+2), x:50, y:50, anim:'fade', ...p.style, strokeColor:'rgba(0,0,0,0.8)', align:'center' };
+                const newItem=textForActiveClip({ id, text:p.text, start:Math.max(0,t), end:Math.max(0.2,t+2), x:50, y:50, anim:'fade', ...p.style, strokeColor:'rgba(0,0,0,0.8)', align:'center' });
                 setTexts(prev=> [...prev, newItem]);
                 setSelectedTextId(id);
                 setTimeout(()=> drawFrameRef.current(timeRef.current),20);
@@ -10687,7 +10797,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               className:`min-h-[56px] rounded-xl border flex items-center px-2 py-2 ${isSel ? 'bg-yellow-500/20 border-yellow-500 ring-1 ring-yellow-500/50' : 'bg-[#111113] border-white/10'}`
             },
               React.createElement('button', {
-                onClick:()=> setSelectedTextId(t.id),
+                onClick:()=> selectTextForEditing(t),
                 className:'flex-1 flex items-center min-w-0 text-left'
               },
                 React.createElement('div', {className:'w-8 h-8 rounded-lg flex items-center justify-center mr-2 text-[12px] shrink-0', style:{background:t.bgColor==='transparent'?'#000':t.bgColor, color:t.color, fontSize:'10px'}}, 'Aa'),
@@ -10874,7 +10984,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   const cur=texts.find(t=>t.id===selectedTextId);
                   if(!cur) return;
                   const nv=Math.min(v, cur.end-0.2);
-                  setTexts(prev=> prev.map(t=> t.id===selectedTextId ? {...t, start:nv} : t));
+                  setTexts(prev=> prev.map(t=> t.id===selectedTextId ? withTextTiming(t,nv,t.end) : t));
                   setTimeout(()=> drawFrameRef.current(timeRef.current),10);
                 },
                 className:'w-full'
@@ -10890,7 +11000,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   const cur=texts.find(t=>t.id===selectedTextId);
                   if(!cur) return;
                   const nv=Math.max(v, cur.start+0.2);
-                  setTexts(prev=> prev.map(t=> t.id===selectedTextId ? {...t, end:nv} : t));
+                  setTexts(prev=> prev.map(t=> t.id===selectedTextId ? withTextTiming(t,t.start,nv) : t));
                   setTimeout(()=> drawFrameRef.current(timeRef.current),10);
                 },
                 className:'w-full'
@@ -10929,7 +11039,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                 const cur=texts.find(t=>t.id===selectedTextId);
                 if(!cur) return;
                 const nid=Math.random().toString(36).slice(2);
-                setTexts(prev=> [...prev, {...cur, id:nid, text:cur.text+' コピー', start:cur.start+0.2, end:cur.end+0.2}]);
+                setTexts(prev=> [...prev, withTextTiming({...cur,id:nid,text:cur.text+' コピー'},cur.start+0.2,cur.end+0.2)]);
               },
               className:'flex-1 h-10 rounded-full bg-white/10 text-[12px]'
             }, '複製'),
