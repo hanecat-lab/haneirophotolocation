@@ -6237,6 +6237,11 @@ function App(){
   const [selectedClipIds, setSelectedClipIds] = useState([]);
   const [connectionEditor, setConnectionEditor] = useState(null);
   const [connectionMarkPeek, setConnectionMarkPeek] = useState(null);
+  const [connectionCandidate, setConnectionCandidate] = useState(null);
+  const [connectionCompareOriginal, setConnectionCompareOriginal] = useState(false);
+  const [connectionTrialSide, setConnectionTrialSide] = useState(null);
+  const [connectionCandidateNotice, setConnectionCandidateNotice] = useState('');
+  const connectionTrialTokenRef = useRef(0);
   const [finderMarksOpen, setFinderMarksOpen] = useState(false);
   const [finderMarkBusy, setFinderMarkBusy] = useState(false);
   const [finderMarkNotice, setFinderMarkNotice] = useState('');
@@ -8132,6 +8137,105 @@ const recomputeStarts=(arr)=>{
     }catch{ stop(); }
     return promise;
   };
+  const connectionCutLimits=(left,right)=>{
+    const leftBase=left._connectionBase || {duration:left.duration,trimStart:left.trimStart||0};
+    const rightBase=right?._connectionBase || (right ? {duration:right.duration,trimStart:right.trimStart||0} : null);
+    const overlap=left._transitionToNext?.type && left._transitionToNext.type!=='none' ? left._transitionToNext.duration||0.5 : 0;
+    const nextOverlap=right?._transitionToNext?.type && right._transitionToNext.type!=='none' ? right._transitionToNext.duration||0.5 : 0;
+    const leftMin=Math.max(0.3,overlap+0.1);
+    const rightMin=Math.max(0.3,nextOverlap+0.1);
+    return {
+      leftBase,rightBase,leftMin,rightMin,
+      leftMax:left.type==='photo' ? 0 : Math.max(0,leftBase.duration-(left._connectionInCut||0)-leftMin),
+      rightMax:!right || right.type==='photo' ? 0 : Math.max(0,rightBase.duration-(right._connectionOutCut||0)-rightMin)
+    };
+  };
+  const beginConnectionCandidate=()=>{
+    if(!connectionEditor || !connectionMarkPeek) return;
+    const list=clipsRef.current;
+    const left=list.find(c=>c.id===connectionEditor.leftId);
+    const right=list.find(c=>c.id===connectionEditor.rightId);
+    if(!left || !right) return;
+    const side=left.id===connectionMarkPeek.clipId ? 'left' : 'right';
+    const clip=side==='left'?left:right;
+    const mark=(clip._finderMarks||[]).find(m=>m.id===connectionMarkPeek.markId);
+    if(!mark || clip.type==='photo' || !markInClip(clip,mark)) return;
+    const limits=connectionCutLimits(left,right);
+    const base=side==='left'?limits.leftBase:limits.rightBase;
+    const cut=side==='left' ? base.trimStart+base.duration-mark.sourceTime : mark.sourceTime-base.trimStart;
+    const max=side==='left'?limits.leftMax:limits.rightMax;
+    if(cut<0 || cut>max+0.001){
+      setConnectionCandidateNotice('このしおりでは素材や切り替えに必要な長さが残りません');
+      return;
+    }
+    connectionTrialTokenRef.current++;
+    setConnectionTrialSide(null);
+    setConnectionEditor(prev=>prev ? {...prev,[side==='left'?'outCut':'inCut']:Math.max(0,Math.min(cut,max))} : prev);
+    setConnectionCandidate({clipId:clip.id,markId:mark.id,side});
+    setConnectionMarkPeek(null);
+    setConnectionCompareOriginal(false);
+    setConnectionCandidateNotice('');
+  };
+  const tryConnectionDraft=async()=>{
+    if(!connectionEditor || connectionTrialSide || connectionMarkPeek) return;
+    const list=clipsRef.current;
+    const left=list.find(c=>c.id===connectionEditor.leftId);
+    const right=list.find(c=>c.id===connectionEditor.rightId);
+    if(!left || !right) return;
+    const outCut=connectionCompareOriginal?connectionEditor.initialOutCut:connectionEditor.outCut;
+    const inCut=connectionCompareOriginal?connectionEditor.initialInCut:connectionEditor.inCut;
+    const token=++connectionTrialTokenRef.current;
+    setConnectionCandidateNotice('');
+    const playSide=async(clip,side,cut)=>{
+      if(token!==connectionTrialTokenRef.current) return;
+      setConnectionTrialSide(side);
+      if(clip.type==='photo'){
+        await new Promise(resolve=>setTimeout(resolve,500));
+        return;
+      }
+      const video=videoRefs.current.get(clip.id);
+      if(!video || video.readyState<2) throw new Error('video-not-ready');
+      const base=clip._connectionBase || {trimStart:clip.trimStart||0,duration:clip.duration};
+      const boundary=side==='left' ? base.trimStart+base.duration-cut : base.trimStart+cut;
+      const start=side==='left' ? Math.max(clip.trimStart||0,boundary-0.8) : boundary;
+      const end=side==='left' ? boundary : Math.min(base.trimStart+base.duration-(clip._connectionOutCut||0),boundary+0.8);
+      if(end-start<=0.02) return;
+      await seekVideo(video,start);
+      if(token!==connectionTrialTokenRef.current) return;
+      if(video.readyState<2 || video.seeking || Math.abs(video.currentTime-start)>0.15) throw new Error('frame-not-ready');
+      video.muted=true;
+      video.playsInline=true;
+      const played=await Promise.race([
+        Promise.resolve().then(()=>video.play()).then(()=>true).catch(()=>false),
+        new Promise(resolve=>setTimeout(()=>resolve(false),500))
+      ]);
+      if(!played){
+        try{ video.pause(); video.currentTime=Math.max(start,end-0.05); }catch{}
+        throw new Error('video-play-blocked');
+      }
+      await new Promise(resolve=>{
+        const finish=()=>{clearTimeout(timer);video.removeEventListener('timeupdate',check);resolve();};
+        const check=()=>{if(video.currentTime>=end-0.04 || token!==connectionTrialTokenRef.current) finish();};
+        const timer=setTimeout(finish,Math.max(450,Math.min(1800,(end-start)*1000+400)));
+        video.addEventListener('timeupdate',check);
+        check();
+      });
+      video.pause();
+    };
+    try{
+      await playSide(left,'left',outCut);
+      if(token!==connectionTrialTokenRef.current) return;
+      await playSide(right,'right',inCut);
+    }catch{
+      if(token===connectionTrialTokenRef.current) setConnectionCandidateNotice('動画を再生できませんでした。左右の静止フレームで確認してください');
+    }finally{
+      if(token===connectionTrialTokenRef.current){
+        setConnectionTrialSide(null);
+        await seekConnectionVideo(left,'left',outCut);
+        if(token===connectionTrialTokenRef.current) await seekConnectionVideo(right,'right',inCut);
+      }
+    }
+  };
 
   useEffect(()=>{
     if(!connectionEditor) return;
@@ -8153,6 +8257,7 @@ const recomputeStarts=(arr)=>{
       attached.push({clip,slot,video,previousTime,previousStyle});
     });
     return ()=>{
+      connectionTrialTokenRef.current++;
       attached.forEach(({clip,slot,video,previousTime,previousStyle})=>{
         connectionSeekTasksRef.current.get(clip.id)?.stop();
         if(video.parentNode===slot) slot.removeChild(video);
@@ -8176,25 +8281,34 @@ const recomputeStarts=(arr)=>{
     (async()=>{
       const left=list.find(c=>c.id===connectionEditor.leftId);
       const leftMark=connectionMarkPeek?.clipId===left?.id ? (left?._finderMarks||[]).find(m=>m.id===connectionMarkPeek.markId) : null;
-      await seekConnectionVideo(left,'left',connectionEditor.outCut,leftMark && markInClip(left,leftMark) ? leftMark.sourceTime : null);
+      await seekConnectionVideo(left,'left',connectionCompareOriginal ? connectionEditor.initialOutCut : connectionEditor.outCut,
+        leftMark && markInClip(left,leftMark) ? leftMark.sourceTime : null);
       if(cancelled) return;
       const right=list.find(c=>c.id===connectionEditor.rightId);
       const rightMark=connectionMarkPeek?.clipId===right?.id ? (right?._finderMarks||[]).find(m=>m.id===connectionMarkPeek.markId) : null;
-      await seekConnectionVideo(right,'right',connectionEditor.inCut,rightMark && markInClip(right,rightMark) ? rightMark.sourceTime : null);
+      await seekConnectionVideo(right,'right',connectionCompareOriginal ? connectionEditor.initialInCut : connectionEditor.inCut,
+        rightMark && markInClip(right,rightMark) ? rightMark.sourceTime : null);
     })();
     return ()=>{ cancelled=true; };
-  },[connectionEditor,connectionMarkPeek,clips]);
+  },[connectionEditor,connectionMarkPeek,connectionCompareOriginal,clips]);
 
   const openConnection=(leftId)=>{
     const list=clipsRef.current;
     const i=list.findIndex(c=>c.id===leftId);
     if(i<0) return;
     handleStop();
+    connectionTrialTokenRef.current++;
+    setConnectionTrialSide(null);
     setConnectionMarkPeek(null);
+    setConnectionCandidate(null);
+    setConnectionCompareOriginal(false);
+    setConnectionCandidateNotice('');
     setConnectionEditor({
       leftId, rightId:list[i+1]?.id||null,
       outCut:list[i]._connectionOutCut||0,
-      inCut:list[i+1]?._connectionInCut||0
+      inCut:list[i+1]?._connectionInCut||0,
+      initialOutCut:list[i]._connectionOutCut||0,
+      initialInCut:list[i+1]?._connectionInCut||0
     });
   };
   const commitConnection=(outCut,inCut,preview)=>{
@@ -8202,6 +8316,12 @@ const recomputeStarts=(arr)=>{
     const list=clipsRef.current;
     const i=list.findIndex(c=>c.id===connectionEditor.leftId);
     if(i<0 || list[i+1]?.id!==connectionEditor.rightId){ setConnectionEditor(null); return; }
+    const limits=connectionCutLimits(list[i],list[i+1]);
+    if(connectionCandidate && (outCut<0 || inCut<0 || outCut>limits.leftMax+0.001 || inCut>limits.rightMax+0.001)){
+      setConnectionCandidateNotice('この位置では素材や切り替えに必要な長さが残りません');
+      return;
+    }
+    const before=editSnapshot();
     const edited=list.map((c,index)=>{
       if(c.type==='photo' || (index!==i && index!==i+1)) return c;
       const base=c._connectionBase || {duration:c.duration,trimStart:c.trimStart||0};
@@ -8217,6 +8337,7 @@ const recomputeStarts=(arr)=>{
     const result=recomputeStarts(edited);
     clipsRef.current=result;
     setClips(result);
+    recordEdit(before);
     const end=Math.max(...result.map(c=>c.timelineStart+c.duration));
     durationRef.current=end;
     setDuration(end);
@@ -12100,40 +12221,58 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       const left=list.find(c=>c.id===connectionEditor.leftId);
       const right=list.find(c=>c.id===connectionEditor.rightId);
       if(!left || (connectionEditor.rightId && !right)) return null;
-      const overlap=left._transitionToNext?.type && left._transitionToNext.type!=='none' ? (left._transitionToNext.duration||0.5) : 0;
-      const leftBase=left._connectionBase || {duration:left.duration};
-      const rightBase=right?._connectionBase || (right ? {duration:right.duration} : null);
-      const leftMax=left.type==='photo' ? 0 : Math.max(0,Math.floor(Math.min(2,leftBase.duration-(left._connectionInCut||0)-Math.max(0.3,overlap+0.1))*10)/10);
-      const rightMax=!right || right.type==='photo' ? 0 : Math.max(0,Math.floor(Math.min(2,rightBase.duration-(right._connectionOutCut||0)-0.3)*10)/10);
+      const limits=connectionCutLimits(left,right);
+      const {leftBase,rightBase}=limits;
+      const candidateMode=!!connectionCandidate && !!right;
+      const leftMax=candidateMode ? limits.leftMax : Math.max(connectionEditor.outCut,Math.floor(Math.min(2,limits.leftMax)*10)/10);
+      const rightMax=candidateMode ? limits.rightMax : Math.max(connectionEditor.inCut,Math.floor(Math.min(2,limits.rightMax)*10)/10);
+      const markedClip=connectionMarkPeek && [left,right].find(c=>c?.id===connectionMarkPeek.clipId);
+      const markedFrame=(markedClip?._finderMarks||[]).find(m=>m.id===connectionMarkPeek?.markId);
+      const markedSide=markedClip?.id===left.id?'left':'right';
+      const markedBase=markedSide==='left'?leftBase:rightBase;
+      const markedCut=markedFrame && markedBase ? (markedSide==='left'
+        ? markedBase.trimStart+markedBase.duration-markedFrame.sourceTime
+        : markedFrame.sourceTime-markedBase.trimStart) : NaN;
+      const markedCutMax=markedSide==='left'?limits.leftMax:limits.rightMax;
+      const canUseMark=!!right && !!markedClip && markedClip.type!=='photo' &&
+        !!markedFrame && markInClip(markedClip,markedFrame) && markedCut>=0 && markedCut<=markedCutMax+0.001;
+      const candidateClip=connectionCandidate && [left,right].find(c=>c?.id===connectionCandidate.clipId);
+      const candidateMark=(candidateClip?._finderMarks||[]).find(m=>m.id===connectionCandidate?.markId);
+      const leftRemaining=leftBase.duration-(left._connectionInCut||0)-connectionEditor.outCut;
+      const rightRemaining=right ? rightBase.duration-(right._connectionOutCut||0)-connectionEditor.inCut : 0;
+      const originalLeftRemaining=leftBase.duration-(left._connectionInCut||0)-connectionEditor.initialOutCut;
+      const originalRightRemaining=right ? rightBase.duration-(right._connectionOutCut||0)-connectionEditor.initialInCut : 0;
       return React.createElement('div', {
         className:'fixed inset-0 z-[120] bg-black/80 flex items-center justify-center p-4',
-        onClick:()=>setConnectionEditor(null)
+        onClick:()=>{connectionTrialTokenRef.current++;setConnectionEditor(null);}
       }, React.createElement('div', {
         role:'dialog', 'aria-modal':true, 'aria-label':'カットのつながりを確認',
         className:'w-full max-w-md rounded-2xl border border-white/15 bg-[#111113] p-4 shadow-2xl',
+        style:{maxHeight:'calc(100dvh - 32px)',overflowY:'auto'},
         onClick:e=>e.stopPropagation()
       },
         React.createElement('div', {className:'flex items-center justify-between gap-2'},
           React.createElement('div', {className:'text-[14px] font-bold'}, '次につながるカットを探す'),
-          right && React.createElement('button', {onClick:resetConnection, className:'shrink-0 text-[10px] text-white/60 underline'}, '調整をリセット')
+          right && !candidateMode && React.createElement('button', {onClick:resetConnection,disabled:!!connectionTrialSide,className:'shrink-0 text-[10px] text-white/60 underline'}, '調整をリセット')
         ),
         React.createElement('div', {className:'text-[11px] text-white/50 mt-1 mb-3'}, right ? '前のラストと次の冒頭を見比べて、境目を決める。' : 'このラストにつながる、次の一枚を撮ってみる。'),
         React.createElement('div', {className:right ? 'grid grid-cols-2 gap-2' : 'grid grid-cols-1 gap-2'},
           (right ? [[left,'left','前のラスト'],[right,'right','次の冒頭']] : [[left,'left','このカットのラスト']]).map(([clip,side,label])=>
             React.createElement('div', {key:clip.id, className:'min-w-0'},
-              React.createElement('div', {className:'aspect-square bg-black rounded-lg overflow-hidden flex items-center justify-center text-[10px] text-white/40'},
+              React.createElement('div', {className:`aspect-square bg-black rounded-lg overflow-hidden flex items-center justify-center text-[10px] text-white/40 ${connectionTrialSide===side?'ring-2 ring-blue-300':''}`},
                 clip.type==='photo' ? React.createElement('img', {src:clip.url, alt:label, className:'w-full h-full object-contain'}) : React.createElement('div', {
                   ref:side==='left' ? connectionLeftSlotRef : connectionRightSlotRef,
                   className:'w-full h-full'
                 })
               ),
-              React.createElement('div', {className:'text-[11px] text-white/75 mt-1'}, label),
+              React.createElement('div', {className:'text-[11px] text-white/75 mt-1'}, `${label}${connectionTrialSide===side?' · 試写中':''}`),
               React.createElement('div', {className:'text-[10px] text-white/40 truncate'}, clip.name),
               (clip._finderMarks||[]).length>0 && React.createElement('label', {className:'block text-[10px] text-white/60 mt-1'},
                 'しおりを確認',
                 React.createElement('select', {
                   value:connectionMarkPeek?.clipId===clip.id ? connectionMarkPeek.markId : '',
-                  onChange:e=>setConnectionMarkPeek(e.target.value?{clipId:clip.id,markId:e.target.value}:null),
+                  disabled:!!connectionTrialSide,
+                  onChange:e=>{setConnectionCompareOriginal(false);setConnectionCandidateNotice('');setConnectionMarkPeek(e.target.value?{clipId:clip.id,markId:e.target.value}:null);},
                   className:'block w-full min-h-[32px] rounded-lg bg-white/10 text-white text-[11px] px-2',
                   'aria-label':`${clip.name}のしおりを確認`
                 },
@@ -12147,35 +12286,81 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           )
         ),
         connectionMarkPeek && React.createElement('div', {className:'text-[10px] text-blue-200 mt-2',role:'status'},
-          'しおりを確認中。長さを調整するときは「境目に戻す」を選択'
+          'しおりのフレームを確認中。素材の長さはまだ変わりません'
         ),
-        right && leftMax>0 && React.createElement('label', {className:'block text-[11px] text-white/70 mt-4'},
-          `前の終わりを ${connectionEditor.outCut.toFixed(1)} 秒早める`,
+        markedFrame && markedClip && right && React.createElement('button', {
+          type:'button', onClick:beginConnectionCandidate,
+          disabled:!canUseMark || !!connectionTrialSide,
+          className:'mt-2 w-full min-h-9 rounded-full border border-blue-300/30 bg-blue-300/10 text-blue-100 text-[11px] disabled:opacity-40'
+        }, markedClip.type==='photo'?'写真は境目の候補にできません':canUseMark?'ここから境目を探す':'必要な素材の長さが残らない位置です'),
+        candidateMode && !connectionMarkPeek && React.createElement('div', {className:'mt-2 rounded-xl border border-blue-300/20 bg-blue-300/5 p-2 text-[10px] text-white/75'},
+          React.createElement('div', {className:'font-semibold text-blue-100'}, 'しおりを起点に境目を調整中 · 確定前'),
+          candidateMark && React.createElement('div', {className:'mt-1'},
+            `${candidateClip.name}の ${candidateMark.sourceTime.toFixed(2)}s${candidateMark.note?` · ${candidateMark.note}`:''}`
+          ),
+          React.createElement('div', {className:'mt-1'},
+            `前の素材 ${originalLeftRemaining.toFixed(2)}s → ${leftRemaining.toFixed(2)}s ／ 次の素材 ${originalRightRemaining.toFixed(2)}s → ${rightRemaining.toFixed(2)}s`
+          ),
+          React.createElement('div', {className:'flex gap-2 mt-2'},
+            React.createElement('button', {type:'button',disabled:!!connectionTrialSide,
+              onClick:()=>setConnectionCompareOriginal(true),
+              className:`flex-1 min-h-8 rounded-full border border-white/20 ${connectionCompareOriginal?'bg-white text-black':'bg-white/10 text-white'}`}, '元の境目'),
+            React.createElement('button', {type:'button',disabled:!!connectionTrialSide,
+              onClick:()=>setConnectionCompareOriginal(false),
+              className:`flex-1 min-h-8 rounded-full border border-white/20 ${!connectionCompareOriginal?'bg-white text-black':'bg-white/10 text-white'}`}, '試案')
+          )
+        ),
+        connectionCandidateNotice && React.createElement('div', {className:'text-[10px] text-amber-200 mt-2',role:'status'}, connectionCandidateNotice),
+        right && leftMax>0 && React.createElement('div', {className:'block text-[11px] text-white/70 mt-4'},
+          `前の終わりを ${connectionEditor.outCut.toFixed(candidateMode?2:1)} 秒早める`,
           React.createElement('input', {
-            type:'range', min:0, max:leftMax, step:0.1, value:connectionEditor.outCut, disabled:!!connectionMarkPeek,
+            type:'range', min:0, max:leftMax, step:candidateMode?0.01:0.1, value:connectionEditor.outCut,
+            disabled:!!connectionMarkPeek || connectionCompareOriginal || !!connectionTrialSide,
             onChange:e=>{
               const cut=Number(e.target.value);
               seekConnectionVideo(left,'left',cut);
               setConnectionEditor(prev=>({...prev,outCut:cut}));
             },
             className:'w-full accent-violet-500', 'aria-label':'前の終わりを早める'
-          })
+          }),
+          candidateMode && React.createElement('div', {className:'flex justify-between text-[10px] text-white/65'},
+            React.createElement('button', {type:'button',disabled:!!connectionMarkPeek||connectionCompareOriginal||!!connectionTrialSide||connectionEditor.outCut>=leftMax,
+              onClick:()=>setConnectionEditor(prev=>({...prev,outCut:Math.min(leftMax,Number((prev.outCut+0.1).toFixed(2)))}))}, '前へ 0.1s'),
+            React.createElement('span', null, `残り ${leftRemaining.toFixed(2)}s`),
+            React.createElement('button', {type:'button',disabled:!!connectionMarkPeek||connectionCompareOriginal||!!connectionTrialSide||connectionEditor.outCut<=0,
+              onClick:()=>setConnectionEditor(prev=>({...prev,outCut:Math.max(0,Number((prev.outCut-0.1).toFixed(2)))}))}, '後へ 0.1s')
+          )
         ),
-        right && rightMax>0 && React.createElement('label', {className:'block text-[11px] text-white/70 mt-2'},
-          `次の始まりを ${connectionEditor.inCut.toFixed(1)} 秒遅らせる`,
+        right && rightMax>0 && React.createElement('div', {className:'block text-[11px] text-white/70 mt-2'},
+          `次の始まりを ${connectionEditor.inCut.toFixed(candidateMode?2:1)} 秒遅らせる`,
           React.createElement('input', {
-            type:'range', min:0, max:rightMax, step:0.1, value:connectionEditor.inCut, disabled:!!connectionMarkPeek,
+            type:'range', min:0, max:rightMax, step:candidateMode?0.01:0.1, value:connectionEditor.inCut,
+            disabled:!!connectionMarkPeek || connectionCompareOriginal || !!connectionTrialSide,
             onChange:e=>{
               const cut=Number(e.target.value);
               seekConnectionVideo(right,'right',cut);
               setConnectionEditor(prev=>({...prev,inCut:cut}));
             },
             className:'w-full accent-violet-500', 'aria-label':'次の始まりを遅らせる'
-          })
+          }),
+          candidateMode && React.createElement('div', {className:'flex justify-between text-[10px] text-white/65'},
+            React.createElement('button', {type:'button',disabled:!!connectionMarkPeek||connectionCompareOriginal||!!connectionTrialSide||connectionEditor.inCut<=0,
+              onClick:()=>setConnectionEditor(prev=>({...prev,inCut:Math.max(0,Number((prev.inCut-0.1).toFixed(2)))}))}, '前へ 0.1s'),
+            React.createElement('span', null, `残り ${rightRemaining.toFixed(2)}s`),
+            React.createElement('button', {type:'button',disabled:!!connectionMarkPeek||connectionCompareOriginal||!!connectionTrialSide||connectionEditor.inCut>=rightMax,
+              onClick:()=>setConnectionEditor(prev=>({...prev,inCut:Math.min(rightMax,Number((prev.inCut+0.1).toFixed(2)))}))}, '後へ 0.1s')
+          )
         ),
+        candidateMode && !connectionMarkPeek && React.createElement('button', {
+          type:'button', onClick:tryConnectionDraft, disabled:!!connectionTrialSide,
+          className:'mt-3 w-full min-h-9 rounded-full border border-white/25 bg-white/10 text-[11px] disabled:opacity-40'
+        }, connectionTrialSide ? `試写中：${connectionTrialSide==='left'?'前の終わり':'次の始まり'}` : `${connectionCompareOriginal?'元の境目':'試案'}を短く試写（無音）`),
         React.createElement('div', {className:'flex gap-2 mt-4'},
-          React.createElement('button', {onClick:()=>setConnectionEditor(null), className:'flex-1 h-10 rounded-full bg-white/10 text-[12px]'}, '戻る'),
-          right ? React.createElement('button', {onClick:applyConnection, disabled:!!connectionMarkPeek, className:'flex-1 h-10 rounded-full bg-white text-black text-[12px] font-bold disabled:opacity-40'}, 'この境目から試写') : React.createElement('label', {className:'flex-1 h-10 rounded-full bg-white text-black text-[12px] font-bold flex items-center justify-center cursor-pointer'},
+          React.createElement('button', {onClick:()=>{connectionTrialTokenRef.current++;setConnectionEditor(null);}, className:'flex-1 h-10 rounded-full bg-white/10 text-[12px]'}, candidateMode?'変更せず戻る':'戻る'),
+          right ? React.createElement('button', {onClick:applyConnection,
+            disabled:!!connectionMarkPeek || connectionCompareOriginal || !!connectionTrialSide,
+            className:'flex-1 h-10 rounded-full bg-white text-black text-[12px] font-bold disabled:opacity-40'},
+            candidateMode?'この境目を採用':'この境目から試写') : React.createElement('label', {className:'flex-1 h-10 rounded-full bg-white text-black text-[12px] font-bold flex items-center justify-center cursor-pointer'},
             '次の動画を追加',
             React.createElement('input', {type:'file', accept:'video/*', className:'hidden', onChange:e=>{ if(e.target.files?.length){ setConnectionEditor(null); handleVideoUpload(e.target.files); e.target.value=''; } }})
           )
