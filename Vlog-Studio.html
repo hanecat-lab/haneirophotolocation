@@ -5521,6 +5521,103 @@ const cameraLocalAction=async (mode,record)=>{
   });
 };
 
+// プロジェクトと元素材は別に保存する。Blob URL は再起動後に使えないため記録しない。
+const VLOG_PROJECT_DB='haneiro-vlog-projects';
+const vlogStorageMessage=error=>error?.name==='QuotaExceededError'
+  ? '端末の保存容量が足りません。不要な作業やファイルを整理して再試行してください。'
+  : error?.message||'端末内に保存できませんでした。';
+const openVlogProjectDb=()=>new Promise((resolve,reject)=>{
+  if(!window.indexedDB){reject(new Error('このブラウザでは途中保存を利用できません。'));return;}
+  const request=indexedDB.open(VLOG_PROJECT_DB,1);
+  request.onupgradeneeded=()=>{
+    const db=request.result;
+    if(!db.objectStoreNames.contains('projects')) db.createObjectStore('projects',{keyPath:'id'});
+    if(!db.objectStoreNames.contains('assets')) db.createObjectStore('assets',{keyPath:'id'});
+  };
+  request.onsuccess=()=>resolve(request.result);
+  request.onerror=()=>reject(request.error||new Error('保存領域を開けません。'));
+  request.onblocked=()=>reject(new Error('別のタブを閉じてから保存をやり直してください。'));
+});
+const vlogDbTask=async(stores,mode,run)=>{
+  const db=await openVlogProjectDb();
+  return new Promise((resolve,reject)=>{
+    let result,finished=false;
+    const tx=db.transaction(stores,mode);
+    const finish=(error)=>{if(finished)return;finished=true;db.close();error?reject(error):resolve(result);};
+    try{run(tx,value=>{result=value;});}catch(error){try{tx.abort();}catch{}finish(error);return;}
+    tx.oncomplete=()=>finish();
+    tx.onerror=()=>finish(tx.error||new Error('保存に失敗しました。'));
+    tx.onabort=()=>finish(tx._vlogConflict
+      ? new Error('別のタブでこの作業が更新されました。そちらのタブを確認してください。')
+      : tx.error||new Error('保存を中断しました。'));
+  });
+};
+const listVlogProjects=()=>vlogDbTask(['projects'],'readonly',(tx,set)=>{
+  tx.objectStore('projects').getAll().onsuccess=e=>set(e.target.result.sort((a,b)=>b.updatedAt-a.updatedAt));
+});
+const readVlogProject=id=>vlogDbTask(['projects'],'readonly',(tx,set)=>{
+  tx.objectStore('projects').get(id).onsuccess=e=>set(e.target.result);
+});
+const createVlogProject=(id,name,snapshot=null)=>vlogDbTask(['projects'],'readwrite',(tx)=>{
+  tx.objectStore('projects').add({id,name,revision:0,snapshot,previousSnapshot:null,updatedAt:Date.now()});
+});
+const deleteVlogProject=id=>vlogDbTask(['projects'],'readwrite',(tx)=>{tx.objectStore('projects').delete(id);});
+const writeVlogAsset=asset=>vlogDbTask(['assets'],'readwrite',tx=>{tx.objectStore('assets').put(asset);});
+const readVlogAssets=ids=>vlogDbTask(['assets'],'readonly',(tx,set)=>{
+  const records=new Map();
+  if(!ids.length){set(records);return;}
+  let remaining=ids.length;
+  ids.forEach(id=>{
+    tx.objectStore('assets').get(id).onsuccess=e=>{
+      if(e.target.result) records.set(id,e.target.result);
+      if(!--remaining) set(records);
+    };
+  });
+});
+const checkVlogAssetIds=ids=>vlogDbTask(['assets'],'readonly',(tx,set)=>{
+  const found=new Set();
+  if(!ids.length){set(found);return;}
+  let remaining=ids.length;
+  ids.forEach(id=>{
+    tx.objectStore('assets').getKey(id).onsuccess=e=>{
+      if(e.target.result!==undefined)found.add(id);
+      if(!--remaining)set(found);
+    };
+  });
+});
+// 前の正常な版を残し、書き込み完了まで現在版を切り替えない。
+const commitVlogProject=(id,snapshot,expectedRevision)=>vlogDbTask(['projects'],'readwrite',(tx,set)=>{
+  const store=tx.objectStore('projects');
+  store.get(id).onsuccess=e=>{
+    const old=e.target.result;
+    if(!old || old.revision!==expectedRevision){
+      tx._vlogConflict=true;
+      try{tx.abort();}catch{}
+      return;
+    }
+    const next={...old,previousSnapshot:old.snapshot,revision:old.revision+1,
+      snapshot,updatedAt:Date.now()};
+    store.put(next);set({...next,cleanupSnapshot:old.previousSnapshot});
+  };
+});
+const cleanupVlogAssetIds=ids=>{
+  const unique=[...new Set(ids.filter(Boolean))];
+  if(!unique.length)return Promise.resolve();
+  return vlogDbTask(['projects','assets'],'readwrite',tx=>{
+    tx.objectStore('projects').getAll().onsuccess=e=>{
+      const used=new Set();
+      e.target.result.forEach(project=>{
+        for(const snapshot of [project.snapshot,project.previousSnapshot]){
+          (snapshot?.clips||[]).forEach(c=>used.add(c.assetId));
+          (snapshot?.customBgms||[]).forEach(b=>used.add(b.assetId));
+        }
+      });
+      const store=tx.objectStore('assets');
+      unique.forEach(id=>{if(!used.has(id))store.delete(id);});
+    };
+  });
+};
+
 function getTextCanvasBounds(txt, canvas){
   const ctx=canvas?.getContext('2d');
   if(!ctx || !canvas.width || !canvas.height) return null;
@@ -5533,6 +5630,278 @@ function getTextCanvasBounds(txt, canvas){
   const x=(txt.x ?? 50)/100*canvas.width;
   const y=(txt.y ?? 50)/100*canvas.height;
   return {left:x-width/2-pad, top:y-fontSize/2-pad, width:width+pad*2, height:fontSize+pad*2};
+}
+
+// 並び替えの仮配置と確定は同じ計算を使う。効果は元の隣接関係が残るときだけ保持する。
+function planMaterialMove(clips,clipId,toIndex){
+  const fromIndex=clips.findIndex(c=>c.id===clipId);
+  if(fromIndex<0 || toIndex<0 || toIndex>=clips.length || fromIndex===toIndex) return null;
+  const arranged=[...clips];
+  const [moved]=arranged.splice(fromIndex,1);
+  arranged.splice(toIndex,0,moved);
+  let removed=0;
+  const items=arranged.map((clip,i)=>{
+    if(!clip._transitionToNext || clip._transitionToNext.type==='none') return clip;
+    const oldIndex=clips.findIndex(c=>c.id===clip.id);
+    if(clips[oldIndex+1]?.id===arranged[i+1]?.id) return clip;
+    removed++;
+    const {_transitionToNext,...rest}=clip;
+    return rest;
+  });
+  return {items,removed,fromIndex};
+}
+
+function materialTimelineEnd(items){
+  let start=0,end=0;
+  items.forEach((clip,i)=>{
+    const length=Math.max(0.3,clip.duration||0.3);
+    end=start+length;
+    const transition=clip._transitionToNext;
+    start+=i<items.length-1 && transition && transition.type!=='none'
+      ? Math.max(0.1,length-(transition.duration||0.5)) : length;
+  });
+  return end;
+}
+
+function changedMaterialSeams(before,after,movedId){
+  const oldPairs=new Set(before.slice(0,-1).map((clip,i)=>`${clip.id}|${before[i+1].id}`));
+  const movedIndex=after.findIndex(c=>c.id===movedId);
+  const oldIndex=before.findIndex(c=>c.id===movedId);
+  const candidates=[
+    [after[movedIndex-1],after[movedIndex],'移動先の前'],
+    [after[movedIndex],after[movedIndex+1],'移動先の後'],
+    [before[oldIndex-1] && after.find(c=>c.id===before[oldIndex-1].id),
+      before[oldIndex+1] && after.find(c=>c.id===before[oldIndex+1].id),'元の位置']
+  ];
+  const found=new Set();
+  return candidates.flatMap(([left,right,label])=>{
+    if(!left || !right) return [];
+    const key=`${left.id}|${right.id}`;
+    const i=after.findIndex(c=>c.id===left.id);
+    if(after[i+1]?.id!==right.id || oldPairs.has(key) || found.has(key)) return [];
+    found.add(key);
+    return [{key,left,right,label}];
+  });
+}
+
+// サムネイルは表示に必要な境目だけを順番に取り出す。元の再生用videoはシークしない。
+async function captureMaterialEdge(clip,edge){
+  if(clip.type==='photo') return clip.url;
+  const video=document.createElement('video');
+  video.muted=true; video.playsInline=true; video.preload='auto';
+  const wait=(events,ms)=>new Promise((resolve,reject)=>{
+    let timer;
+    const clear=()=>{clearTimeout(timer);events.forEach(name=>video.removeEventListener(name,ready));video.removeEventListener('error',fail);};
+    const ready=()=>{clear();resolve();};
+    const fail=()=>{clear();reject(new Error('frame-error'));};
+    events.forEach(name=>video.addEventListener(name,ready));
+    video.addEventListener('error',fail);
+    timer=setTimeout(fail,ms);
+  });
+  try{
+    video.src=clip.url;
+    const loaded=video.readyState>=2 ? null : wait(['loadeddata','canplay'],3200);
+    video.load();
+    if(loaded) await loaded;
+    if(video.readyState<2 || !video.videoWidth) throw new Error('frame-unavailable');
+    const raw=(clip.trimStart||0)+(edge==='last'?Math.max(0,clip.duration-0.08):Math.min(0.08,clip.duration/2));
+    const target=Math.max(0,Math.min(raw,Number.isFinite(video.duration)?Math.max(0,video.duration-0.04):raw));
+    if(Math.abs(video.currentTime-target)>0.04){
+      const seeked=wait(['seeked'],2500);
+      video.currentTime=target;
+      await seeked;
+    }
+    if(video.readyState<2 || video.seeking || Math.abs(video.currentTime-target)>0.2) throw new Error('frame-unavailable');
+    const canvas=document.createElement('canvas');
+    canvas.width=168; canvas.height=100;
+    const context=canvas.getContext('2d');
+    if(!context) throw new Error('frame-unavailable');
+    context.fillStyle='#09090b';context.fillRect(0,0,168,100);
+    const ratio=Math.min(168/video.videoWidth,100/video.videoHeight);
+    const width=video.videoWidth*ratio,height=video.videoHeight*ratio;
+    context.drawImage(video,(168-width)/2,(100-height)/2,width,height);
+    return canvas.toDataURL('image/jpeg',0.7);
+  }finally{
+    video.pause();video.removeAttribute('src');try{video.load();}catch{}
+  }
+}
+
+function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
+  const [sourceId,setSourceId]=useState(initialSourceId||null);
+  const [slot,setSlot]=useState(null);
+  const [frames,setFrames]=useState({});
+  const [trial,setTrial]=useState(null);
+  const [trialNotice,setTrialNotice]=useState('');
+  const trialVideoRef=useRef(null);
+  const trialTokenRef=useRef(0);
+  const frameQueueRef=useRef(Promise.resolve());
+  const frameCacheRef=useRef(new Map());
+  const source=clips.find(c=>c.id===sourceId);
+  const remaining=source ? clips.filter(c=>c.id!==sourceId) : clips;
+  const plan=source && slot!==null ? planMaterialMove(clips,sourceId,slot) : null;
+  const seams=plan ? changedMaterialSeams(clips,plan.items,sourceId) : [];
+  const sourceFrameKey=source && `${source.id}|${source.url}|${source.trimStart||0}|${source.duration}|first`;
+  const cancelTrial=()=>{
+    trialTokenRef.current++;
+    try{trialVideoRef.current?.pause();}catch{}
+    setTrial(null);setTrialNotice('');
+  };
+  useEffect(()=>{
+    let active=true;
+    setFrames({});
+    const requests=[];
+    if(source){
+      const key=`${source.id}|${source.url}|${source.trimStart||0}|${source.duration}|first`;
+      requests.push({key,clip:source,edge:'first'});
+    }
+    for(const seam of seams){
+      for(const [clip,edge] of [[seam.left,'last'],[seam.right,'first']]){
+        const key=`${clip.id}|${clip.url}|${clip.trimStart||0}|${clip.duration}|${edge}`;
+        if(!requests.some(r=>r.key===key)) requests.push({key,clip,edge});
+      }
+    }
+    frameQueueRef.current=frameQueueRef.current.catch(()=>{}).then(async()=>{
+      for(const {key,clip,edge} of requests){
+        if(!active) break;
+        let value=frameCacheRef.current.get(key);
+        if(value===undefined){
+          try{value=await captureMaterialEdge(clip,edge);}catch{value=null;}
+          frameCacheRef.current.set(key,value);
+          if(frameCacheRef.current.size>24) frameCacheRef.current.delete(frameCacheRef.current.keys().next().value);
+        }
+        if(active) setFrames(prev=>({...prev,[key]:value}));
+      }
+    });
+    return ()=>{active=false;};
+  },[sourceId,slot,clips]);
+  useEffect(()=>()=>{
+    trialTokenRef.current++;
+    try{trialVideoRef.current?.pause();}catch{}
+  },[]);
+  const chooseSlot=index=>{cancelTrial();setSlot(index);};
+  const frame=(clip,edge)=>{
+    const key=`${clip.id}|${clip.url}|${clip.trimStart||0}|${clip.duration}|${edge}`;
+    const image=frames[key]===null?null:clip.type==='photo'?clip.url:frames[key];
+    return React.createElement('div', {className:'min-w-0'},
+      React.createElement('div', {className:'aspect-[5/3] rounded-lg bg-black overflow-hidden flex items-center justify-center text-[10px] text-white/55 text-center'},
+        image ? React.createElement('img',{src:image,alt:`${clip.name}の${edge==='last'?'最後':'最初'}`,onError:()=>setFrames(prev=>({...prev,[key]:null})),className:'w-full h-full object-contain'})
+          : image===null ? '画像を確認できません' : '画像を準備中…'),
+      React.createElement('div', {className:'text-[10px] text-white/70 truncate mt-1'},clip.name)
+    );
+  };
+  const playSeam=async(seam)=>{
+    cancelTrial();
+    const token=trialTokenRef.current;
+    const playPart=async(clip,edge)=>{
+      if(token!==trialTokenRef.current) return;
+      setTrial({key:seam.key,clip,edge});
+      if(clip.type==='photo'){
+        await new Promise(resolve=>setTimeout(resolve,550));
+        return;
+      }
+      const video=trialVideoRef.current;
+      if(!video) throw new Error('no-video');
+      video.pause();video.src=clip.url;video.load();
+      const waitReady=()=>new Promise((resolve,reject)=>{
+        if(video.readyState>=2) return resolve();
+        const finish=ok=>{clearTimeout(timer);video.removeEventListener('loadeddata',ready);video.removeEventListener('error',error);ok?resolve():reject(new Error('not-ready'));};
+        const ready=()=>finish(true),error=()=>finish(false);
+        video.addEventListener('loadeddata',ready);video.addEventListener('error',error);
+        const timer=setTimeout(error,2200);
+      });
+      await waitReady();
+      if(token!==trialTokenRef.current) return;
+      const base=clip.trimStart||0;
+      const start=base+(edge==='last'?Math.max(0,clip.duration-0.75):0);
+      const end=base+(edge==='last'?clip.duration:Math.min(0.75,clip.duration));
+      await new Promise((resolve,reject)=>{
+        if(Math.abs(video.currentTime-start)<0.06) return resolve();
+        const finish=ok=>{clearTimeout(timer);video.removeEventListener('seeked',ready);ok?resolve():reject(new Error('seek-failed'));};
+        const ready=()=>finish(true);
+        video.addEventListener('seeked',ready);
+        const timer=setTimeout(()=>finish(false),2200);
+        try{video.currentTime=start;}catch{finish(false);}
+      });
+      if(token!==trialTokenRef.current) return;
+      if(video.readyState<2 || video.seeking) throw new Error('not-ready');
+      video.muted=true;video.playsInline=true;
+      const played=await Promise.race([
+        Promise.resolve().then(()=>video.play()).then(()=>true).catch(()=>false),
+        new Promise(resolve=>setTimeout(()=>resolve(false),1100))
+      ]);
+      if(!played) throw new Error('play-failed');
+      await new Promise(resolve=>{
+        const finish=()=>{clearTimeout(timer);video.removeEventListener('timeupdate',check);resolve();};
+        const check=()=>{if(video.currentTime>=end-0.04 || token!==trialTokenRef.current) finish();};
+        video.addEventListener('timeupdate',check);
+        const timer=setTimeout(finish,1100);
+        check();
+      });
+      video.pause();
+    };
+    try{
+      await playPart(seam.left,'last');
+      if(token===trialTokenRef.current) await playPart(seam.right,'first');
+    }catch{
+      if(token===trialTokenRef.current) setTrialNotice('試写できませんでした。左右の画像で確認してください。');
+    }finally{
+      if(token===trialTokenRef.current){try{trialVideoRef.current?.pause();}catch{} setTrial(null);}
+    }
+  };
+  const durationChange=plan ? materialTimelineEnd(plan.items)-materialTimelineEnd(clips) : 0;
+  return React.createElement('div', {className:'fixed inset-0 z-[1100] bg-[#0a0a0b] text-white flex flex-col',role:'dialog','aria-modal':true,'aria-label':'素材の並び順を変更'},
+    React.createElement('div', {className:'shrink-0 px-4 py-3 border-b border-white/15 flex items-center gap-3'},
+      React.createElement('div',{className:'font-bold text-sm flex-1'},'素材の順番を変える'),
+      React.createElement('button',{onClick:()=>{cancelTrial();onClose();},className:'px-3 py-2 rounded-full bg-white/10 text-xs'},'閉じる')),
+    React.createElement('div',{className:'shrink-0 px-4 py-3 bg-violet-500/10 border-b border-violet-400/20 text-xs'},
+      source ? React.createElement(React.Fragment,null,
+        React.createElement('div',{className:'text-white/55 mb-1'},'移動する素材'),
+        React.createElement('div',{className:'flex items-center gap-2'},
+          React.createElement('div',{className:'w-12 h-12 shrink-0 rounded-md bg-black overflow-hidden flex items-center justify-center text-[9px] text-white/50 text-center'},
+            frames[sourceFrameKey]===null ? '画像を確認できません'
+              : (source.type==='photo'?source.url:frames[sourceFrameKey])
+                ? React.createElement('img',{src:source.type==='photo'?source.url:frames[sourceFrameKey],alt:source.name,onError:()=>setFrames(prev=>({...prev,[sourceFrameKey]:null})),className:'w-full h-full object-cover'})
+                : '映像を準備中'),
+          React.createElement('div',{className:'font-bold truncate'},`${clips.findIndex(c=>c.id===sourceId)+1}. ${source.name}`)),
+        React.createElement('div',{className:'flex gap-2 mt-2'},
+          React.createElement('button',{disabled:clips.findIndex(c=>c.id===sourceId)===0,onClick:()=>chooseSlot(clips.findIndex(c=>c.id===sourceId)-1),className:'rounded-full bg-white/10 px-3 py-1.5 disabled:opacity-30'},'↑ ひとつ前へ'),
+          React.createElement('button',{disabled:clips.findIndex(c=>c.id===sourceId)===clips.length-1,onClick:()=>chooseSlot(clips.findIndex(c=>c.id===sourceId)+1),className:'rounded-full bg-white/10 px-3 py-1.5 disabled:opacity-30'},'↓ ひとつ後へ'),
+          React.createElement('button',{onClick:()=>{cancelTrial();setSourceId(null);setSlot(null);},className:'ml-auto text-white/60 underline'},'選び直す')))
+        : 'まず移動する素材を選んでください。'),
+    !plan ? React.createElement('div',{className:'flex-1 overflow-y-auto px-4 py-3 overscroll-contain'},
+      source && React.createElement('div',{className:'text-xs text-white/60 mb-3'},'「ここへ移動」を押すと、新しい境目を確認できます。'),
+      remaining.flatMap((clip,i)=>[
+        source && React.createElement('button',{key:`slot-${i}`,onClick:()=>chooseSlot(i),disabled:i===clips.findIndex(c=>c.id===sourceId),className:'w-full text-left border border-dashed border-violet-400/50 rounded-xl px-3 py-2 my-1 text-xs text-violet-200 disabled:opacity-30'},i===clips.findIndex(c=>c.id===sourceId)?'元の位置':`ここへ移動 · ${i+1}番目`),
+        React.createElement('button',{key:clip.id,onClick:()=>{cancelTrial();setSourceId(clip.id);setSlot(null);},className:`w-full text-left rounded-xl border px-3 py-3 my-1 text-sm flex gap-3 ${sourceId===clip.id?'border-violet-400 bg-violet-500/20':'border-white/15 bg-white/5'}`},
+          React.createElement('span',{className:'text-white/45'},`${clips.findIndex(c=>c.id===clip.id)+1}.`),
+          React.createElement('span',{className:'truncate flex-1'},clip.name),
+          React.createElement('span',{className:'text-white/50'},`${clip.duration.toFixed(1)}秒`))
+      ]),
+      source && React.createElement('button',{onClick:()=>chooseSlot(remaining.length),disabled:remaining.length===clips.findIndex(c=>c.id===sourceId),className:'w-full text-left border border-dashed border-violet-400/50 rounded-xl px-3 py-2 my-1 text-xs text-violet-200 disabled:opacity-30'},remaining.length===clips.findIndex(c=>c.id===sourceId)?'元の位置':`ここへ移動 · ${remaining.length+1}番目`)
+    ) : React.createElement(React.Fragment,null,
+      React.createElement('div',{className:'flex-1 overflow-y-auto px-4 py-3 overscroll-contain'},
+        React.createElement('div',{className:'text-sm font-bold mb-2'},`${plan.fromIndex+1}番目 → ${slot+1}番目`),
+        React.createElement('div',{className:'text-xs text-white/60 mb-3'},'新しくつながる境目を確認してください。'),
+        seams.map(seam=>React.createElement('div',{key:seam.key,className:'rounded-xl border border-white/15 bg-[#151517] p-3 mb-3'},
+          React.createElement('div',{className:'flex items-center justify-between mb-2'},
+            React.createElement('div',{className:'text-xs font-bold'},seam.label),
+            React.createElement('button',{onClick:()=>playSeam(seam),className:'px-3 py-1.5 rounded-full bg-white/10 text-xs'},'▶ 試写')),
+          React.createElement('div',{className:'grid grid-cols-2 gap-2'},frame(seam.left,'last'),frame(seam.right,'first')))),
+        React.createElement('div',{className:'text-xs text-white/70 rounded-xl bg-white/5 p-3'},
+          plan.removed>0 && React.createElement('div',null,`${plan.removed}か所の切り替え効果を解除します。`),
+          React.createElement('div',null,`動画全体の長さ：${materialTimelineEnd(clips).toFixed(1)}秒 → ${materialTimelineEnd(plan.items).toFixed(1)}秒${Math.abs(durationChange)<0.05?'（変更なし）':''}`),
+          React.createElement('div',{className:'text-white/45 mt-1'},'素材に付いたテキストは素材と一緒に移動します。全体テキストとBGMの時刻は固定です。')),
+        trialNotice && React.createElement('div',{role:'status',className:'text-xs text-amber-200 mt-2'},trialNotice)),
+      React.createElement('div',{className:'shrink-0 px-4 py-3 border-t border-white/15 bg-[#111113]'},
+        React.createElement('div',{className:`rounded-xl bg-black mb-2 overflow-hidden ${trial?'h-28':'h-0'}`},
+          trial?.clip.type==='photo' && React.createElement('img',{src:trial.clip.url,alt:trial.clip.name,className:'w-full h-full object-contain'}),
+          React.createElement('video',{ref:trialVideoRef,muted:true,playsInline:true,className:`w-full h-full object-contain ${trial?.clip.type==='video'?'':'hidden'}`})),
+        trial && React.createElement('div',{className:'text-xs text-white/60 mb-2 truncate'},`試写中：${trial.clip.name} ${trial.edge==='last'?'末尾':'冒頭'}`),
+        React.createElement('div',{className:'flex gap-2'},
+          React.createElement('button',{onClick:()=>{cancelTrial();setSlot(null);},className:'flex-1 h-11 rounded-full bg-white/10 text-xs'},'移動先を選び直す'),
+          React.createElement('button',{onClick:()=>{cancelTrial();onCommit(sourceId,slot);onClose();},className:'flex-1 h-11 rounded-full bg-white text-black font-bold text-xs'},'この順番にする')))
+    )
+  );
 }
 
 function App(){
@@ -5555,7 +5924,6 @@ function App(){
   const dragTargetRef = useRef(null);
   const syncScheduledRef = useRef(false);
   const materialListRef = useRef(null);
-  const materialDragRef = useRef(null);
   const timelineTextsRef = useRef(null);
   const timelineEditHorizontalRef = useRef(null);
   const rangeEditRef = useRef(null);
@@ -5587,6 +5955,29 @@ function App(){
 
   const [clips, setClips] = useState([]);
   const [texts, setTexts] = useState([]);
+  const [projectGate,setProjectGate]=useState(true);
+  const [projectList,setProjectList]=useState([]);
+  const [projectBusy,setProjectBusy]=useState(false);
+  const [projectStatus,setProjectStatus]=useState('確認中');
+  const [projectError,setProjectError]=useState('');
+  const [projectName,setProjectName]=useState('');
+  const [projectMissing,setProjectMissing]=useState([]);
+  const [projectRelinkFiles,setProjectRelinkFiles]=useState([]);
+  const [projectRelinkChoice,setProjectRelinkChoice]=useState({});
+  const [projectPending,setProjectPending]=useState(null);
+  const [projectLastSaved,setProjectLastSaved]=useState(null);
+  const [projectStorage,setProjectStorage]=useState(null);
+  const [projectUnreadableId,setProjectUnreadableId]=useState(null);
+  const projectIdRef=useRef(null);
+  const projectRevisionRef=useRef(0);
+  const projectRestoringRef=useRef(false);
+  const projectAssetMetaRef=useRef(new Map());
+  const projectSaveQueueRef=useRef(Promise.resolve());
+  const projectSaveTimerRef=useRef(null);
+  const projectSaveNowRef=useRef(null);
+  const projectDirtyVersionRef=useRef(0);
+  const projectImportBusyRef=useRef(false);
+  const projectFailedAssetsRef=useRef(new Map());
   const [cafeStoreName, setCafeStoreName] = useState('BLUE BOTTLE');
   const [showSafeArea, setShowSafeArea] = useState(true);
   const [autoLayoutEnabled, setAutoLayoutEnabled] = useState(true);
@@ -6033,8 +6424,6 @@ function App(){
 
   const [bestShot, setBestShot] = useState(null);
   const polaroidRef = useRef(null);
-  const [ghost, setGhost] = useState(null);
-  const [dropIndicator, setDropIndicator] = useState(null);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [showGrid, setShowGrid] = useState(true);
   const [finderShutterShot, setFinderShutterShot] = useState(0);
@@ -6229,7 +6618,6 @@ function App(){
   const [bgmFadeIn, setBgmFadeIn] = useState(1.0);
   const [bgmFadeOut, setBgmFadeOut] = useState(1.0);
   const [draggingBgmBar, setDraggingBgmBar] = useState(null);
-  const [draggingClipId, setDraggingClipId] = useState(null);
   const [draggingText, setDraggingText] = useState(null);
   const [draggingClipBar, setDraggingClipBar] = useState(null);
   const [selectedTextId, setSelectedTextId] = useState(null);
@@ -6241,6 +6629,10 @@ function App(){
   const [dragPreviewText, setDragPreviewText] = useState(null);
   const [selectionLayoutTick, setSelectionLayoutTick] = useState(0);
   const [selectedClipIds, setSelectedClipIds] = useState([]);
+  const [reorderOpen, setReorderOpen] = useState(false);
+  const [reorderInitialId, setReorderInitialId] = useState(null);
+  const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
+  const [exportChoiceScope, setExportChoiceScope] = useState('all');
   const [connectionEditor, setConnectionEditor] = useState(null);
   const [connectionMarkPeek, setConnectionMarkPeek] = useState(null);
   const [connectionCandidate, setConnectionCandidate] = useState(null);
@@ -6386,7 +6778,7 @@ function App(){
   },[]);
 
   
-  const drawFrame = useCallback((t)=>{
+  const drawFrame = useCallback((t,exportClips=null,exportTexts=null)=>{
     const c = canvasRef.current;
     if(!c) return;
     const ctx = c.getContext('2d', {alpha:false});
@@ -6395,8 +6787,8 @@ function App(){
     if(cw<10) { try{ c.width=640; cw=640; }catch{} }
     if(ch<10) { try{ c.height=360; ch=360; }catch{} }
     if(cw<10||ch<10) { cw=640; ch=360; }
-    const clipsNow = clipsRef.current;
-    const textsNow = textsRef.current;
+    const clipsNow = exportClips || clipsRef.current;
+    const textsNow = exportTexts || textsRef.current;
     
     // 背景を常に描画（黒防止）- 通常モードは白枠色、シアター/ファインダーは黒
     ctx.filter='none';
@@ -7138,12 +7530,49 @@ function App(){
     setExportStatus('idle');
     setExportMessage('');
   };
-  const startExport=async()=>{
+  const buildExportSelection=(scope)=>{
+    const source=clipsRef.current.slice();
+    if(scope!=='selected') return {items:source,texts:textsRef.current};
+    const chosen=new Set(selectedClipIds);
+    const originals=source.filter(clip=>chosen.has(clip.id));
+    const sourceIndex=new Map(source.map((clip,index)=>[clip.id,index]));
+    const items=recomputeStarts(originals.map((clip,index)=>{
+      const originalNext=source[sourceIndex.get(clip.id)+1];
+      if(originalNext?.id===originals[index+1]?.id) return {...clip};
+      const {_transitionToNext,...rest}=clip;
+      return rest;
+    }));
+    const newById=new Map(items.map(clip=>[clip.id,clip]));
+    const oldById=new Map(source.map(clip=>[clip.id,clip]));
+    const texts=textsRef.current.flatMap(tx=>{
+      if(tx._clipId){
+        const old=oldById.get(tx._clipId),current=newById.get(tx._clipId);
+        if(!old || !current) return [];
+        const localStart=tx._clipStart??tx.start-old.timelineStart;
+        const localEnd=tx._clipEnd??tx.end-old.timelineStart;
+        return [{...tx,start:current.timelineStart+localStart,end:current.timelineStart+localEnd}];
+      }
+      // 全体テキストは選択した素材に重なる部分だけを新しい時間へ移す。
+      return originals.flatMap(old=>{
+        const current=newById.get(old.id);
+        const from=Math.max(tx.start,old.timelineStart);
+        const to=Math.min(tx.end,old.timelineStart+old.duration);
+        return current && to>from ? [{...tx,start:current.timelineStart+from-old.timelineStart,
+          end:current.timelineStart+to-old.timelineStart}] : [];
+      });
+    });
+    return {items,texts};
+  };
+  const startExport=async(scope='all')=>{
     if(exportJobRef.current) return;
+    setExportChoiceOpen(false);
     if(exportFile?.url){ URL.revokeObjectURL(exportFile.url); setExportFile(null); }
-    const items=clipsRef.current.slice();
+    const {items,texts:exportTexts}=buildExportSelection(scope);
     const canvas=canvasRef.current;
-    if(!items.length || !canvas){ setExportMessage('素材を追加してから書き出してください。'); setExportStatus('error'); return; }
+    if(!items.length || !canvas){
+      setExportMessage(scope==='selected'?'丸で書き出す素材を選んでください。':'素材を追加してから書き出してください。');
+      setExportStatus('error');return;
+    }
     if(typeof MediaRecorder==='undefined' || !canvas.captureStream){
       setExportMessage('このブラウザは動画の書き出しに対応していません。'); setExportStatus('error'); return;
     }
@@ -7236,7 +7665,7 @@ function App(){
       canvas.width=aspectModeRef.current==='16:9'?1280:720;
       canvas.height=aspectModeRef.current==='16:9'?720:1280;
       timeRef.current=0;
-      drawFrameRef.current(0);
+      drawFrameRef.current(0,items,exportTexts);
       const canvasStream=canvas.captureStream(30);
       job.stream=new MediaStream([...canvasStream.getVideoTracks(),...(destination?.stream.getAudioTracks()||[])]);
       const recorder=new MediaRecorder(job.stream,{mimeType:mime});
@@ -7279,7 +7708,7 @@ function App(){
           const factor=t<start || t>=end ? 0 : Math.min(1,fadeIn? (t-start)/fadeIn : 1,fadeOut? (end-t)/fadeOut : 1);
           job.bgmGain.gain.value=bgmVolume*Math.max(0,factor);
         }
-        drawFrameRef.current(t);
+        drawFrameRef.current(t,items,exportTexts);
         if(now-lastProgress>150){ lastProgress=now; setExportProgress(Math.min(100,Math.round(t/total*100))); }
         job.frame=requestAnimationFrame(render);
       };
@@ -7636,13 +8065,25 @@ function App(){
         onReady();
       }catch{ finish(); }
     });
+    projectImportBusyRef.current=true;
+    try{
     const arr = Array.from(files);
     const newClips=[];
-    for(const file of arr){
+    for(let fileIndex=0;fileIndex<arr.length;fileIndex++){
+      const file=arr[fileIndex];
       const isImage = file.type.startsWith('image/');
       const isVideo = file.type.startsWith('video/');
       if(!isImage && !isVideo) continue;
       const id=Math.random().toString(36).slice(2);
+      if(projectIdRef.current){
+        setProjectStatus(`素材を保存中 ${fileIndex+1}/${arr.length}`);
+        try{await storeProjectAsset(id,file);projectFailedAssetsRef.current.delete(id);}
+        catch(error){
+          projectFailedAssetsRef.current.set(id,file);
+          setProjectStatus('保存失敗');
+          setProjectError(`「${file.name}」を端末内に保存できませんでした。${vlogStorageMessage(error)}`);
+        }
+      }
       const url=URL.createObjectURL(file);
       if(isImage){
         const img=new Image();
@@ -7654,6 +8095,7 @@ function App(){
         photoRefs.current.set(id, img);
         newClips.push({
           id,
+          assetId:id,
           type:'photo',
           url,
           name:file.name,
@@ -7697,6 +8139,7 @@ function App(){
         }
         newClips.push({
           id,
+          assetId:id,
           type:'video',
           url,
           name:file.name,
@@ -7741,6 +8184,7 @@ function App(){
     setTimeout(()=>{ syncCanvasSize(true); drawFrameRef.current(0); },60);
     // 2回目の強制再描画で縦画像の表示を確実に
     setTimeout(()=>{ syncCanvasSize(true); drawFrameRef.current(0); },300);
+    }finally{projectImportBusyRef.current=false;}
   },[syncCanvasSize, autoVerticalDetect]);
 
   const formatCameraTime=(seconds)=>{
@@ -8058,6 +8502,369 @@ const recomputeStarts=(arr)=>{
   }); 
 };
 
+  const projectAssetIds=(snapshot)=>[...new Set([
+    ...(snapshot?.clips||[]).map(c=>c.assetId).filter(Boolean),
+    ...(snapshot?.customBgms||[]).map(b=>b.assetId).filter(Boolean)
+  ])];
+  const projectSnapshot=()=>{
+    const savedClips=clipsRef.current.map(({url,...clip})=>({...clip,assetId:clip.assetId||clip._parentId||clip.id}));
+    const savedBgms=customBgms.map(({url,file,...bgm})=>({...bgm,assetId:bgm.assetId||bgm.id}));
+    const ids=[...new Set([...savedClips.map(c=>c.assetId),...savedBgms.map(b=>b.assetId)])];
+    return {version:1,clips:savedClips,texts:textsRef.current.map(t=>({...t})),customBgms:savedBgms,
+      assets:ids.map(id=>projectAssetMetaRef.current.get(id)||(()=>{
+        const file=projectFailedAssetsRef.current.get(id);
+        return file&&{id,name:file.name,type:file.type,size:file.size,lastModified:file.lastModified||0};
+      })()).filter(Boolean),
+      settings:{aspectMode,fitMode,verticalPriority,autoVerticalDetect,activeFilter,filterIntensity,
+        photoDuration,bulkPhotoDuration,defaultTransition,fiveShotMode,fiveShotType,selectedClipIds,
+        bgmTrack,bgmOffset,bgmVolume,bgmTimelineStart,bgmTimelineDuration,bgmFadeIn,bgmFadeOut,
+        showSafeArea,autoLayoutEnabled,cafeStoreName,playhead:timeRef.current}};
+  };
+  const saveCurrentProject=async()=>{
+    clearTimeout(projectSaveTimerRef.current);
+    if(!projectIdRef.current || projectRestoringRef.current) return false;
+    const id=projectIdRef.current;
+    const snapshot=projectSnapshot();
+    const ids=projectAssetIds(snapshot);
+    const sequence=++projectSaveSequenceRef.current;
+    const dirtyVersion=projectDirtyVersionRef.current;
+    setProjectStatus('保存中');
+    const job=projectSaveQueueRef.current.catch(()=>{}).then(async()=>{
+      if(projectIdRef.current!==id) return false;
+      const found=await checkVlogAssetIds(ids);
+      const missing=ids.filter(assetId=>!found.has(assetId));
+      if(missing.length) throw new Error(`元の素材${missing.length}件が保存されていません。`);
+      const saved=await commitVlogProject(id,snapshot,projectRevisionRef.current);
+      if(projectIdRef.current===id){
+        projectRevisionRef.current=saved.revision;
+        if(sequence===projectSaveSequenceRef.current && dirtyVersion===projectDirtyVersionRef.current){
+          setProjectStatus('保存済み');setProjectLastSaved(saved.updatedAt);setProjectError('');
+        }
+      }
+      const oldIds=projectAssetIds(saved.cleanupSnapshot);
+      cleanupVlogAssetIds(oldIds).catch(()=>{});
+      return true;
+    });
+    projectSaveQueueRef.current=job;
+    try{return await job;}catch(error){
+      if(projectIdRef.current===id){setProjectStatus('保存失敗');setProjectError(error?.message||'保存できませんでした。');}
+      return false;
+    }
+  };
+  const projectSaveSequenceRef=useRef(0);
+  projectSaveNowRef.current=saveCurrentProject;
+  const scheduleProjectSave=()=>{
+    if(!projectIdRef.current || projectRestoringRef.current) return;
+    projectDirtyVersionRef.current++;
+    clearTimeout(projectSaveTimerRef.current);
+    setProjectStatus('保存待ち');
+    projectSaveTimerRef.current=setTimeout(()=>projectSaveNowRef.current?.(),850);
+  };
+  useEffect(()=>{scheduleProjectSave();},[
+    clips,texts,customBgms,selectedClipIds,aspectMode,fitMode,verticalPriority,autoVerticalDetect,
+    activeFilter,filterIntensity,photoDuration,bulkPhotoDuration,defaultTransition,fiveShotMode,fiveShotType,
+    bgmTrack,bgmOffset,bgmVolume,bgmTimelineStart,bgmTimelineDuration,bgmFadeIn,bgmFadeOut,
+    showSafeArea,autoLayoutEnabled,cafeStoreName
+  ]);
+  useEffect(()=>{
+    const saveOnHide=()=>{if(document.visibilityState==='hidden') projectSaveNowRef.current?.();};
+    document.addEventListener('visibilitychange',saveOnHide);
+    return()=>{document.removeEventListener('visibilitychange',saveOnHide);clearTimeout(projectSaveTimerRef.current);};
+  },[]);
+  useEffect(()=>{
+    if(!projectGate || !navigator.storage?.estimate)return;
+    let active=true;
+    Promise.all([navigator.storage.estimate(),navigator.storage.persisted?navigator.storage.persisted().catch(()=>false):Promise.resolve(false)]).then(([estimate,persistent])=>{
+      if(active)setProjectStorage({usage:estimate.usage||0,quota:estimate.quota||0,persistent:!!persistent});
+    }).catch(()=>{});
+    return()=>{active=false;};
+  },[projectGate,projectList.length]);
+  const storeProjectAsset=async(id,file)=>{
+    if(!projectIdRef.current) throw new Error('先にプロジェクトを開いてください。');
+    const meta={id,name:file.name,type:file.type,size:file.size,lastModified:file.lastModified||0};
+    await writeVlogAsset({...meta,blob:file});
+    projectAssetMetaRef.current.set(id,meta);
+    return meta;
+  };
+  const refreshProjectList=async()=>{
+    const list=await listVlogProjects();setProjectList(list);return list;
+  };
+  const resetProjectEditor=()=>{
+    handleStop();
+    clearTimeout(projectSaveTimerRef.current);
+    projectFailedAssetsRef.current.clear();
+    const urls=new Set([...clipsRef.current.map(c=>c.url),...customBgms.map(b=>b.url)]);
+    videoRefs.current.forEach(video=>{try{video.pause();video.removeAttribute('src');video.load();}catch{}});
+    videoRefs.current.clear();photoRefs.current.clear();
+    urls.forEach(url=>{if(url?.startsWith('blob:'))try{URL.revokeObjectURL(url);}catch{}});
+    clipsRef.current=[];textsRef.current=[];
+    setClips([]);setTexts([]);setCustomBgms([]);setSelectedClipIds([]);
+    setBgmTrack('none');setDuration(3);durationRef.current=3;
+    timeRef.current=0;setCurrentTime(0);setBestShot(null);
+    editHistoryRef.current=[];setEditHistoryCount(0);
+  };
+  const activateVlogProject=async(record,{skipSave=false}={})=>{
+    setProjectBusy(true);setProjectError('');
+    try{
+      if(projectImportBusyRef.current) throw new Error('素材の取り込み完了後に切り替えてください。');
+      if(!skipSave && projectIdRef.current===record.id){
+        if(!(await projectSaveNowRef.current?.())) throw new Error('今の作業を保存できていません。保存状態を確認してください。');
+        record=await readVlogProject(record.id);
+      }
+      if(!record) throw new Error('作業を読み込めませんでした。');
+      let snapshot=record.snapshot||{clips:[],texts:[],customBgms:[],assets:[],settings:{}};
+      if(snapshot.version && snapshot.version!==1) throw new Error('この編集データは現在のアプリで開けません。');
+      if(!Array.isArray(snapshot.clips)||!Array.isArray(snapshot.texts)||!Array.isArray(snapshot.customBgms)||
+         snapshot.clips.some(c=>!c.id||!c.assetId)||snapshot.customBgms.some(b=>!b.id||!b.assetId))
+        throw new Error('編集情報が壊れています。バックアップから復元してください。');
+      let ids=projectAssetIds(snapshot);
+      let stored=await readVlogAssets(ids);
+      let missing=ids.filter(id=>!stored.get(id)?.blob?.size);
+      let restoredPrevious=false;
+      if(missing.length && record.previousSnapshot?.version===1){
+        const earlier=record.previousSnapshot;
+        const earlierIds=projectAssetIds(earlier);
+        const earlierStored=await readVlogAssets(earlierIds);
+        if(earlierIds.every(id=>earlierStored.get(id)?.blob?.size)){
+          snapshot=earlier;ids=earlierIds;stored=earlierStored;missing=[];restoredPrevious=true;
+        }
+      }
+      if(missing.length){
+        setProjectPending(record);
+        setProjectMissing(missing.map(id=>snapshot.assets?.find(a=>a.id===id)||{id,name:id,size:0,type:''}));
+        setProjectRelinkFiles([]);setProjectRelinkChoice({});
+        setProjectError('素材を確認できません。元素材をまとめて選んでください。');
+        return;
+      }
+      if(projectIdRef.current && projectIdRef.current!==record.id &&
+         !(await projectSaveNowRef.current?.()))
+        throw new Error('今の作業を保存できていません。保存状態を確認してください。');
+      if(restoredPrevious){
+        record=await commitVlogProject(record.id,snapshot,record.revision);
+      }
+      projectRestoringRef.current=true;
+      resetProjectEditor();
+      const urls=new Map(ids.map(id=>[id,URL.createObjectURL(stored.get(id).blob)]));
+      const restored=recomputeStarts((snapshot.clips||[]).map(clip=>({...clip,url:urls.get(clip.assetId)})));
+      for(const [index,clip] of restored.entries()){
+        if(clip.type==='photo'){
+          const image=new Image();image.src=clip.url;photoRefs.current.set(clip.id,image);
+          image.onload=()=>requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+        }else{
+          const video=document.createElement('video');video.src=clip.url;video.muted=true;
+          video.playsInline=true;video.preload=index===0?'auto':'metadata';
+          video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');
+          videoRefs.current.set(clip.id,video);
+          video.addEventListener('loadeddata',()=>requestAnimationFrame(()=>drawFrameRef.current(timeRef.current)),{once:true});
+          video.addEventListener('error',()=>{
+            if(projectIdRef.current===record.id){
+              setProjectStatus('素材読み込み失敗');
+              setProjectError(`「${clip.name}」を再生できません。元素材を確認してください。`);
+              setProjectUnreadableId(clip.assetId);
+            }
+          },{once:true});
+        }
+      }
+      const bgms=(snapshot.customBgms||[]).map(b=>({...b,url:urls.get(b.assetId)}));
+      const settings=snapshot.settings||{};
+      projectAssetMetaRef.current=new Map((snapshot.assets||[]).map(a=>[a.id,a]));
+      clipsRef.current=restored;textsRef.current=(snapshot.texts||[]).map(t=>({...t}));
+      setClips(restored);setTexts(textsRef.current);setCustomBgms(bgms);
+      const end=restored.length?Math.max(...restored.map(c=>c.timelineStart+c.duration)):3;
+      durationRef.current=end;setDuration(end);
+      timeRef.current=Math.max(0,Math.min(settings.playhead||0,end-0.01));setCurrentTime(timeRef.current);
+      setAspectMode(settings.aspectMode||'9:16');aspectModeRef.current=settings.aspectMode||'9:16';
+      setFitMode(settings.fitMode||'contain');
+      setVerticalPriority(settings.verticalPriority??true);
+      setAutoVerticalDetect(settings.autoVerticalDetect??true);
+      setActiveFilter(settings.activeFilter||'none');setFilterIntensity(settings.filterIntensity??100);
+      setPhotoDuration(settings.photoDuration||2.5);setBulkPhotoDuration(settings.bulkPhotoDuration||2.5);
+      setDefaultTransition(settings.defaultTransition||{type:'fade',duration:0.5});
+      setFiveShotMode(!!settings.fiveShotMode);setFiveShotType(settings.fiveShotType||'smart');
+      setSelectedClipIds((settings.selectedClipIds||[]).filter(id=>restored.some(c=>c.id===id)));
+      setBgmTrack(bgms.some(b=>b.id===settings.bgmTrack)||!String(settings.bgmTrack||'').startsWith('custom_')?settings.bgmTrack||'none':'none');
+      setBgmOffset(settings.bgmOffset||0);setBgmVolume(settings.bgmVolume??0.5);
+      setBgmTimelineStart(settings.bgmTimelineStart||0);setBgmTimelineDuration(settings.bgmTimelineDuration||10);
+      setBgmFadeIn(settings.bgmFadeIn??1);setBgmFadeOut(settings.bgmFadeOut??1);
+      setShowSafeArea(settings.showSafeArea??true);setAutoLayoutEnabled(settings.autoLayoutEnabled??true);
+      setCafeStoreName(settings.cafeStoreName||'BLUE BOTTLE');
+      projectIdRef.current=record.id;projectRevisionRef.current=record.revision;
+      setProjectName(record.name);setProjectLastSaved(record.updatedAt);
+      setProjectStatus(restoredPrevious?'前の保存版を復元':record.snapshot?'保存済み':'新規');
+      setProjectPending(null);setProjectMissing([]);setProjectGate(false);
+      setProjectUnreadableId(null);
+      setTimeout(()=>{projectRestoringRef.current=false;syncCanvasSize(true);drawFrameRef.current(timeRef.current);},180);
+    }catch(error){
+      projectRestoringRef.current=false;
+      setProjectError(error?.message||'プロジェクトを開けませんでした。');
+    }
+    finally{setProjectBusy(false);}
+  };
+  const createNewVlogProject=async(name)=>{
+    setProjectBusy(true);setProjectError('');
+    try{
+      if(projectImportBusyRef.current) throw new Error('素材の取り込み完了後に新しく作ってください。');
+      if(projectIdRef.current && !(await projectSaveNowRef.current?.())) throw new Error('現在の作業を保存できていません。保存状態を確認してください。');
+      const id=`project-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const title=name||`Vlog ${new Date().toLocaleString('ja-JP')}`;
+      await createVlogProject(id,title);
+      try{await navigator.storage?.persist?.();}catch{}
+      projectRestoringRef.current=true;resetProjectEditor();
+      projectAssetMetaRef.current=new Map();projectIdRef.current=id;projectRevisionRef.current=0;
+      setProjectName(title);setProjectLastSaved(null);setProjectStatus('新規');
+      setProjectPending(null);setProjectMissing([]);setProjectGate(false);
+      setProjectUnreadableId(null);
+      setTimeout(()=>{projectRestoringRef.current=false;},180);
+    }catch(error){
+      projectRestoringRef.current=false;
+      setProjectError(error?.message||'新規作成に失敗しました。');
+    }
+    finally{setProjectBusy(false);}
+  };
+  const retryProjectAssets=async()=>{
+    if(!projectFailedAssetsRef.current.size) return;
+    setProjectBusy(true);setProjectError('');
+    try{
+      for(const [id,file] of [...projectFailedAssetsRef.current]){
+        await storeProjectAsset(id,file);
+        projectFailedAssetsRef.current.delete(id);
+      }
+      await projectSaveNowRef.current?.();
+    }catch(error){setProjectStatus('保存失敗');setProjectError(error?.message||'素材を保存できませんでした。');}
+    finally{setProjectBusy(false);}
+  };
+  const exportVlogBackup=async()=>{
+    setProjectBusy(true);setProjectError('');
+    try{
+      const saved=await projectSaveNowRef.current?.();
+      const record=saved?await readVlogProject(projectIdRef.current):null;
+      const snapshot=record?.snapshot||projectSnapshot();
+      if(snapshot.assets.length!==projectAssetIds(snapshot).length)
+        throw new Error('一部の素材情報が不足しています。バックアップを作れません。');
+      const backup={format:'haneiro-vlog-project',version:1,exportedAt:new Date().toISOString(),
+        name:record?.name||projectName||'Vlog',snapshot};
+      const file=new File([JSON.stringify(backup)],`Vlog-Studio-${new Date().toISOString().slice(0,10)}.json`,{type:'application/json'});
+      if(navigator.share && navigator.canShare?.({files:[file]})){
+        await navigator.share({files:[file],title:'Vlog編集情報のバックアップ'});
+      }else{
+        const url=URL.createObjectURL(file);
+        const link=document.createElement('a');link.href=url;link.download=file.name;
+        document.body.appendChild(link);link.click();link.remove();
+        setTimeout(()=>URL.revokeObjectURL(url),60000);
+      }
+    }catch(error){if(error?.name!=='AbortError')setProjectError(error?.message||'バックアップを作れませんでした。');}
+    finally{setProjectBusy(false);}
+  };
+  const importVlogBackup=async(file)=>{
+    if(!file)return;
+    setProjectBusy(true);setProjectError('');
+    try{
+      if(file.size>10*1024*1024) throw new Error('編集情報のファイルが大きすぎます。');
+      const data=JSON.parse(await file.text());
+      if(data.format!=='haneiro-vlog-project'||data.version!==1||!Array.isArray(data.snapshot?.clips))
+        throw new Error('Vlog Studioの編集情報ファイルではありません。');
+      const original=data.snapshot;
+      const oldIds=projectAssetIds(original);
+      const metadata=new Map((original.assets||[]).map(item=>[item.id,item]));
+      if(oldIds.some(id=>!metadata.has(id))) throw new Error('素材情報が足りないため復元できません。');
+      // 同じ端末に元プロジェクトがあっても、その素材IDを上書きしない。
+      const remap=new Map(oldIds.map(id=>[id,`asset-${Date.now()}-${Math.random().toString(36).slice(2)}`]));
+      const snapshot={...original,
+        clips:original.clips.map(c=>({...c,assetId:remap.get(c.assetId)})),
+        customBgms:(original.customBgms||[]).map(b=>({...b,assetId:remap.get(b.assetId)})),
+        assets:oldIds.map(oldId=>({...metadata.get(oldId),id:remap.get(oldId)}))};
+      const ids=projectAssetIds(snapshot);
+      const id=`project-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const record={id,name:`${data.name||'復元したVlog'}（復元）`,revision:0,snapshot,
+        updatedAt:Date.now(),fromBackup:true};
+      setProjectPending(record);
+      setProjectMissing(snapshot.assets);
+      setProjectRelinkFiles([]);setProjectRelinkChoice({});
+      if(!ids.length){
+        await createVlogProject(id,record.name,snapshot);
+        await refreshProjectList();await activateVlogProject({...record,fromBackup:false});
+      }else setProjectError('元素材をまとめて選んでください。編集情報に動画・写真は含まれません。');
+    }catch(error){setProjectError(error?.message||'編集情報を読み込めませんでした。');}
+    finally{setProjectBusy(false);}
+  };
+  const selectVlogRelinkFiles=files=>{
+    const arr=Array.from(files||[]);
+    setProjectRelinkFiles(arr);
+    const choices={};
+    projectMissing.forEach(asset=>{
+      const exact=arr.map((f,i)=>({file:f,index:i})).filter(({file})=>
+        file.name===asset.name && file.size===asset.size && (!asset.type||file.type===asset.type));
+      if(exact.length===1) choices[asset.id]=exact[0].index;
+    });
+    setProjectRelinkChoice(choices);
+  };
+  const applyVlogRelink=async()=>{
+    if(!projectPending || !projectMissing.length) return;
+    setProjectBusy(true);setProjectError('');
+    try{
+      if(projectIdRef.current && !(await projectSaveNowRef.current?.()))
+        throw new Error('今の作業を保存できていません。保存状態を確認してください。');
+      const target=projectPending.id===projectIdRef.current && !projectPending.fromBackup
+        ? await readVlogProject(projectPending.id) : projectPending;
+      if(!target) throw new Error('作業を読み込めませんでした。');
+      for(const asset of projectMissing){
+        const index=projectRelinkChoice[asset.id];
+        const file=projectRelinkFiles[index];
+        if(!file?.size) throw new Error(`「${asset.name}」に対応するファイルを選んでください。`);
+        if(asset.type && file.type && asset.type.split('/')[0]!==file.type.split('/')[0])
+          throw new Error(`「${asset.name}」とファイルの種類が違います。`);
+      }
+      for(const asset of projectMissing){
+        const file=projectRelinkFiles[projectRelinkChoice[asset.id]];
+        await writeVlogAsset({id:asset.id,name:asset.name,type:file.type,size:file.size,
+          lastModified:file.lastModified||0,blob:file});
+      }
+      const revisedAssets=(target.snapshot.assets||[]).map(asset=>{
+        const index=projectRelinkChoice[asset.id];
+        const file=projectRelinkFiles[index];
+        return file ? {...asset,type:file.type,size:file.size,lastModified:file.lastModified||0} : asset;
+      });
+      const revisedSnapshot={...target.snapshot,assets:revisedAssets};
+      let pending={...target,snapshot:revisedSnapshot};
+      if(pending.fromBackup){
+        await createVlogProject(pending.id,pending.name,revisedSnapshot);
+      }else{
+        pending=await commitVlogProject(pending.id,revisedSnapshot,pending.revision);
+      }
+      setProjectPending(null);setProjectMissing([]);setProjectRelinkFiles([]);setProjectRelinkChoice({});
+      await refreshProjectList();
+      await activateVlogProject(pending,{skipSave:true});
+    }catch(error){setProjectError(error?.message||'素材を復元できませんでした。');}
+    finally{setProjectBusy(false);}
+  };
+  const removeSavedVlogProject=async(id)=>{
+    if(id===projectIdRef.current){setProjectError('開いている作業は削除できません。先に別の作業を開いてください。');return;}
+    if(!confirm('この作業の編集情報を削除しますか？'))return;
+    setProjectBusy(true);setProjectError('');
+    try{
+      const old=await readVlogProject(id);
+      await deleteVlogProject(id);
+      await cleanupVlogAssetIds([...projectAssetIds(old?.snapshot),...projectAssetIds(old?.previousSnapshot)]);
+      await refreshProjectList();
+    }
+    catch(error){setProjectError(error?.message||'削除できませんでした。');}
+    finally{setProjectBusy(false);}
+  };
+  useEffect(()=>{
+    let active=true;
+    listVlogProjects().then(list=>{
+      if(!active)return;
+      setProjectList(list);
+      if(list.length===0) createNewVlogProject();
+      else{setProjectGate(true);setProjectStatus('再開する作業を選択');}
+    }).catch(error=>{
+      if(!active)return;
+      setProjectStatus('保存不可');setProjectError(error?.message||'保存領域を利用できません。');
+      setProjectGate(false);
+    });
+    return()=>{active=false;};
+  },[]);
+
   const editIdentity=()=>({
     clips:clipsRef.current.map(c=>c.id).sort().join('|'),
     texts:textsRef.current.map(t=>t.id).sort().join('|')
@@ -8244,25 +9051,13 @@ const recomputeStarts=(arr)=>{
   };
   const reorderMaterial=(clipId,toIndex)=>{
     const old=clipsRef.current;
-    const fromIndex=old.findIndex(c=>c.id===clipId);
-    if(fromIndex<0 || fromIndex===toIndex) return;
+    const plan=planMaterialMove(old,clipId,toIndex);
+    if(!plan) return;
     const before=editSnapshot();
     const current=old.find(c=>timeRef.current>=c.timelineStart && timeRef.current<c.timelineStart+c.duration);
     const local=current ? timeRef.current-current.timelineStart : 0;
-    const arranged=[...old];
-    const [moved]=arranged.splice(fromIndex,1);
-    arranged.splice(Math.max(0,Math.min(toIndex,arranged.length)),0,moved);
-    let removed=0;
-    const safe=arranged.map((clip,i)=>{
-      if(!clip._transitionToNext || clip._transitionToNext.type==='none') return clip;
-      const oldIndex=old.findIndex(c=>c.id===clip.id);
-      if(old[oldIndex+1]?.id===arranged[i+1]?.id) return clip;
-      removed++;
-      const {_transitionToNext,...rest}=clip;
-      return rest;
-    });
     handleStop();
-    const next=recomputeStarts(safe);
+    const next=recomputeStarts(plan.items);
     clipsRef.current=next; setClips(next);
     const end=Math.max(...next.map(c=>c.timelineStart+c.duration));
     durationRef.current=end; setDuration(end);
@@ -8271,7 +9066,7 @@ const recomputeStarts=(arr)=>{
     setCurrentTime(timeRef.current);
     setSelectedTimelineItem({type:'clip',id:clipId});
     recordEdit(before);
-    if(removed){
+    if(plan.removed){
       setEditNotice('隣り合う素材が変わったつなぎ目を解除しました。履歴から戻せます。');
       setTimeout(()=>setEditNotice(''),4500);
     }
@@ -9219,12 +10014,12 @@ const recomputeStarts=(arr)=>{
       setAnalyzeText(`解析中 ${orig.name.slice(0,10)}... ${processed+1}/${targetClips.length}`);
       try{
         const windows = await analyzeClipForFiveSmart(v, orig);
-        // 古いvideo削除
-        const oldV = videoRefs.current.get(orig.id);
-        if(oldV){ try{ oldV.pause(); }catch{} try{ URL.revokeObjectURL(orig.url); }catch{} try{ oldV.src=''; oldV.load(); }catch{} videoRefs.current.delete(orig.id); }
         if(windows.length===0){
           newList.push(orig);
         } else {
+          // 派生素材ができたときだけ元の表示要素を外す。共有URLは維持する。
+          const oldV=videoRefs.current.get(orig.id);
+          if(oldV){try{oldV.pause();oldV.src='';oldV.load();}catch{}videoRefs.current.delete(orig.id);}
           for(let i=0;i<windows.length;i++){
             const w = windows[i];
             const id=Math.random().toString(36).slice(2);
@@ -9239,6 +10034,8 @@ const recomputeStarts=(arr)=>{
             videoRefs.current.set(id, nv);
             newList.push({
               id,
+              assetId:orig.assetId||orig.id,
+              type:'video',
               url:orig.url,
               duration:2,
               timelineStart:0,
@@ -9379,6 +10176,7 @@ const recomputeStarts=(arr)=>{
         }
         newList.push({
           id,
+          assetId:orig.assetId||orig.id,
           type:isPhoto ? 'photo' : 'video',
           url:orig.url,
           duration:storyDuration,
@@ -9868,55 +10666,6 @@ const recomputeStarts=(arr)=>{
 
 
 
-  // 素材カードの持ち手だけで並び替え。確認・選択・長さ調整とジェスチャーを分離する。
-  const handleClipPointerDown = useCallback((e, clipId)=>{
-    e.preventDefault(); e.stopPropagation();
-    const pending={id:clipId,startX:e.clientX,startY:e.clientY,toIndex:null,active:false,timer:null};
-    materialDragRef.current=pending;
-    try{ e.currentTarget.setPointerCapture(e.pointerId); }catch{}
-    pending.timer=setTimeout(()=>{
-      if(materialDragRef.current!==pending) return;
-      pending.active=true;
-      setDraggingClipId(clipId);
-      setGhost({id:clipId});
-    },260);
-  },[]);
-  const handleClipPointerMove = useCallback((e)=>{
-    const pending=materialDragRef.current;
-    if(!pending) return;
-    if(!pending.active){
-      if(Math.hypot(e.clientX-pending.startX,e.clientY-pending.startY)>10){
-        clearTimeout(pending.timer);
-        materialDragRef.current=null;
-      }
-      return;
-    }
-    const container = materialListRef.current;
-    if(!container) return;
-    const filtered=Array.from(container.querySelectorAll('.material-order-row'))
-      .filter(el=>el.getAttribute('data-clip-id')!==pending.id);
-    let overIndex=filtered.length;
-    for(let i=0;i<filtered.length;i++){
-      const cr = filtered[i].getBoundingClientRect();
-      if(e.clientY < cr.top+cr.height/2){ overIndex=i; break; }
-    }
-    pending.toIndex=overIndex;
-    setDropIndicator(overIndex);
-    if(e.clientY>window.innerHeight-72) window.scrollBy(0,20);
-    else if(e.clientY<72) window.scrollBy(0,-20);
-  },[]);
-  const handleClipPointerUp = useCallback((e)=>{
-    const pending=materialDragRef.current;
-    if(!pending) return;
-    clearTimeout(pending.timer);
-    materialDragRef.current=null;
-    try{ e.currentTarget.releasePointerCapture(e.pointerId); }catch{}
-    if(pending.active && pending.toIndex!=null) reorderMaterial(pending.id,pending.toIndex);
-    setDraggingClipId(null);
-    setGhost(null);
-    setDropIndicator(null);
-  },[]);
-
   // TEXT横バー編集
   const handleTextPointerDown = useCallback((e, txtId, type)=>{
     e.preventDefault();
@@ -10327,7 +11076,103 @@ const recomputeStarts=(arr)=>{
         onClick:()=> handleOmakaseEdit && handleOmakaseEdit(),
         className:'px-3 h-8 rounded-full bg-white/10 text-[11px] leading-[11px] active:bg-violet-600/50'
       }, '✨ おまか', React.createElement('br'), 'せ編集'),
-      React.createElement('button', {onClick:startExport, disabled:exportStatus==='preparing'||exportStatus==='recording', className:'px-4 h-8 rounded-full bg-white text-black text-[12px] font-bold leading-[12px]', 'aria-label':'動画を書き出す'}, '書き', React.createElement('br'), '出し')
+      React.createElement('button', {onClick:()=>{
+        setExportChoiceScope(clipsRef.current.some(c=>selectedClipIds.includes(c.id))?'selected':'all');
+        setExportChoiceOpen(true);
+      }, disabled:exportStatus==='preparing'||exportStatus==='recording', className:'px-4 h-8 rounded-full bg-white text-black text-[12px] font-bold leading-[12px]', 'aria-label':'動画を書き出す'}, '書き', React.createElement('br'), '出し')
+    ),
+    React.createElement('div',{className:'h-9 px-3 bg-[#151518] border-b border-white/10 flex items-center gap-2 text-[10px] shrink-0'},
+      React.createElement('button',{onClick:()=>{handleStop();refreshProjectList().catch(error=>setProjectError(error?.message||'作業一覧を開けません。'));setProjectGate(true);},
+        className:'truncate max-w-[38%] text-left font-bold text-violet-200'},projectName||'作業を保存'),
+      React.createElement('span',{className:`truncate flex-1 ${['保存失敗','保存不可','素材読み込み失敗'].includes(projectStatus)?'text-amber-300':'text-white/60'}`,role:'status'},
+        `${projectStatus}${projectStatus==='保存済み'&&projectLastSaved?' '+new Date(projectLastSaved).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'}):''}`),
+      React.createElement('button',{onClick:()=>projectSaveNowRef.current?.(),disabled:!projectIdRef.current||projectBusy,
+        className:'shrink-0 rounded-full bg-white/10 px-2 py-1.5 disabled:opacity-40'},'今すぐ保存'),
+      React.createElement('button',{onClick:()=>{handleStop();refreshProjectList().catch(error=>setProjectError(error?.message||'作業一覧を開けません。'));setProjectGate(true);},
+        className:'shrink-0 rounded-full bg-violet-500/30 px-2 py-1.5'},'作業一覧')
+    ),
+    ['保存失敗','保存不可','素材読み込み失敗'].includes(projectStatus) && !projectGate && React.createElement('div',{
+      className:'px-3 py-2 bg-amber-500/15 border-b border-amber-400/25 text-[10px] text-amber-100 flex items-center gap-2',role:'alert'},
+      React.createElement('span',{className:'flex-1'},projectError||'作業を端末内に保存できません。'),
+      projectIdRef.current && projectStatus!=='素材読み込み失敗' && React.createElement('button',{onClick:()=>projectFailedAssetsRef.current.size?retryProjectAssets():projectSaveNowRef.current?.(),
+        disabled:projectBusy,className:'rounded-full border border-amber-300/40 px-2 py-1 shrink-0 disabled:opacity-40'},'再試行'),
+      projectUnreadableId && projectStatus==='素材読み込み失敗' && React.createElement('button',{onClick:async()=>{
+        try{
+          const record=await readVlogProject(projectIdRef.current);
+          const meta=projectAssetMetaRef.current.get(projectUnreadableId);
+          if(!record||!meta) throw new Error('素材の情報を読み込めません。');
+          setProjectPending(record);setProjectMissing([meta]);setProjectRelinkFiles([]);setProjectRelinkChoice({});setProjectGate(true);
+        }catch(error){setProjectError(error?.message||'素材の情報を読み込めません。');}
+      },className:'rounded-full border border-amber-300/40 px-2 py-1 shrink-0'},'選び直す')
+    ),
+    projectGate && React.createElement('div',{className:'fixed inset-0 z-[1600] bg-[#0a0a0b] text-white flex flex-col',role:'dialog','aria-modal':true,'aria-label':'保存した作業を選ぶ'},
+      React.createElement('div',{className:'px-4 py-4 border-b border-white/15 flex items-center justify-between shrink-0'},
+        React.createElement('div',{className:'font-bold text-base'},projectMissing.length?'素材を選び直す':'作業を続ける'),
+        projectIdRef.current && React.createElement('button',{onClick:()=>{setProjectPending(null);setProjectMissing([]);setProjectGate(false);},className:'text-xs rounded-full bg-white/10 px-3 py-2'},'編集中の画面へ')),
+      React.createElement('div',{className:'flex-1 overflow-y-auto px-4 py-4'},
+        projectError && React.createElement('div',{className:'rounded-xl border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-100 mb-4',role:'alert'},projectError),
+        projectMissing.length ? React.createElement(React.Fragment,null,
+          React.createElement('div',{className:'text-xs text-white/70 mb-3'},'編集情報に元素材は含まれません。写真・動画・追加BGMをまとめて選び、対応を確認してください。'),
+          React.createElement('label',{className:'block rounded-xl border border-violet-400/40 bg-violet-500/15 px-4 py-3 mb-3 text-sm text-center'},
+            `元素材をまとめて選ぶ（${projectRelinkFiles.length}件選択中）`,
+            React.createElement('input',{type:'file',multiple:true,accept:'video/*,image/*,audio/*',className:'hidden',onChange:e=>{selectVlogRelinkFiles(e.target.files);e.target.value='';}})),
+          projectMissing.map(asset=>React.createElement('label',{key:asset.id,className:'block rounded-xl bg-white/5 p-3 mb-2 text-xs'},
+            React.createElement('div',{className:'truncate mb-2'},`${asset.name} · ${Math.round((asset.size||0)/1048576)}MB`),
+            React.createElement('select',{value:projectRelinkChoice[asset.id]??'',onChange:e=>setProjectRelinkChoice(prev=>({...prev,[asset.id]:e.target.value===''?undefined:Number(e.target.value)})),className:'w-full bg-[#242428] text-white p-2 rounded-lg'},
+              React.createElement('option',{value:''},'対応するファイルを選ぶ'),
+              projectRelinkFiles.map((file,i)=>React.createElement('option',{key:i,value:i},`${file.name} · ${Math.round(file.size/1048576)}MB`))))),
+          React.createElement('button',{onClick:applyVlogRelink,disabled:projectBusy||!projectMissing.every(a=>projectRelinkFiles[projectRelinkChoice[a.id]]),
+            className:'w-full h-11 rounded-full bg-white text-black font-bold disabled:opacity-35 mt-3'},projectBusy?'読み込み中…':'素材を確認して再開'),
+          React.createElement('button',{onClick:()=>{setProjectPending(null);setProjectMissing([]);setProjectRelinkFiles([]);setProjectError('');},
+            className:'w-full mt-3 text-xs text-white/60 py-2'},'作業一覧へ戻る')
+        ) : React.createElement(React.Fragment,null,
+          React.createElement('div',{className:'text-xs text-white/60 mb-3'},'同じ端末・同じサイトに保存した作業です。'),
+          projectStorage && React.createElement('div',{className:'text-[10px] text-white/45 mb-3'},
+            `端末内の使用量（推定）：${(projectStorage.usage/1073741824).toFixed(1)}GB / 上限目安 ${(projectStorage.quota/1073741824).toFixed(1)}GB`),
+          projectList.map(record=>React.createElement('div',{key:record.id,className:'rounded-xl border border-white/15 bg-[#17171a] p-3 mb-2'},
+            React.createElement('button',{onClick:()=>activateVlogProject(record),disabled:projectBusy,className:'text-left w-full disabled:opacity-40'},
+              React.createElement('div',{className:'font-bold text-sm truncate'},`${record.id===projectIdRef.current?'編集中 · ':''}${record.name}`),
+              React.createElement('div',{className:'text-xs text-white/50 mt-1'},`${new Date(record.updatedAt).toLocaleString('ja-JP')} · ${record.snapshot?.clips?.length||0}件の素材`)),
+            record.id!==projectIdRef.current && React.createElement('button',{onClick:()=>removeSavedVlogProject(record.id),disabled:projectBusy,
+              className:'text-[10px] text-red-300 mt-2 underline'},'この作業の編集情報を削除'))),
+          React.createElement('button',{onClick:()=>createNewVlogProject(),disabled:projectBusy,
+            className:'w-full h-11 mt-3 rounded-full bg-white text-black font-bold disabled:opacity-40'},'新しく作る'),
+          projectIdRef.current && React.createElement('div',{className:'rounded-xl border border-white/15 p-3 mt-5'},
+            React.createElement('div',{className:'text-xs font-bold mb-2'},'バックアップ'),
+            React.createElement('div',{className:'text-[10px] text-white/55 mb-3'},'編集情報だけのファイルです。元の動画・写真・追加BGMは含みません。'),
+            React.createElement('button',{onClick:exportVlogBackup,disabled:projectBusy,className:'w-full rounded-full bg-white/10 py-2.5 mb-2 text-xs disabled:opacity-40'},'編集情報をファイルに保存')),
+          React.createElement('label',{className:'block text-center rounded-full border border-white/20 py-2.5 mt-3 text-xs'},
+            '編集情報ファイルから復元',
+            React.createElement('input',{type:'file',accept:'.json,application/json',className:'hidden',onChange:e=>{importVlogBackup(e.target.files?.[0]);e.target.value='';}}))
+        )
+      )
+    ),
+    reorderOpen && React.createElement(ReorderMaterials,{
+      clips,initialSourceId:reorderInitialId,
+      onClose:()=>{setReorderOpen(false);setReorderInitialId(null);},
+      onCommit:reorderMaterial
+    }),
+    exportChoiceOpen && React.createElement('div', {className:'fixed inset-0 z-[1000] bg-black/75 flex items-center justify-center p-5', role:'dialog', 'aria-modal':'true', 'aria-label':'書き出す素材の選択'},
+      React.createElement('div', {className:'w-full max-w-sm rounded-2xl bg-[#17171a] border border-white/20 p-5 shadow-2xl'},
+        React.createElement('div', {className:'text-base font-bold mb-2'}, '書き出す素材を選ぶ'),
+        React.createElement('div', {className:'text-xs text-white/60 mb-4'}, '丸で選んだ素材だけを書き出すこともできます。'),
+        [['all',`全素材（${clips.length}件）`],['selected',`丸で選択した素材（${clips.filter(c=>selectedClipIds.includes(c.id)).length}件）`]].map(([scope,label])=>
+          React.createElement('button', {key:scope, type:'button', disabled:scope==='selected' && !clips.some(c=>selectedClipIds.includes(c.id)),
+            onClick:()=>setExportChoiceScope(scope),
+            className:`w-full text-left px-4 py-3 mb-2 rounded-xl border text-sm ${exportChoiceScope===scope?'border-violet-400 bg-violet-500/20':'border-white/20 bg-white/5'} disabled:opacity-40`,
+            'aria-pressed':exportChoiceScope===scope}, `${exportChoiceScope===scope?'●':'○'} ${label}`)),
+        React.createElement('div', {className:'text-xs text-white/60 mt-3 mb-2'}, '書き出し対象（上から順に再生）'),
+        React.createElement('div', {className:'max-h-32 overflow-y-auto rounded-lg bg-black/30 p-3 text-xs text-white/80 mb-4', 'aria-live':'polite'},
+          (exportChoiceScope==='selected'?clips.filter(c=>selectedClipIds.includes(c.id)):clips).length
+            ? (exportChoiceScope==='selected'?clips.filter(c=>selectedClipIds.includes(c.id)):clips).map((c,i)=>
+                React.createElement('div', {key:c.id, className:'py-0.5'}, `${i+1}. ${c.name}`))
+            : '素材がありません'),
+        React.createElement('button', {onClick:()=>startExport(exportChoiceScope), disabled:!clips.length || exportChoiceScope==='selected' && !clips.some(c=>selectedClipIds.includes(c.id)),
+          className:'w-full h-11 rounded-full bg-white text-black font-bold disabled:opacity-40 mb-3'}, 'この範囲を書き出す'),
+        React.createElement('div', {className:'flex gap-2'},
+          React.createElement('button', {onClick:()=>{setExportChoiceOpen(false); materialListRef.current?.scrollIntoView({behavior:'smooth',block:'start'});}, className:'flex-1 h-10 rounded-full bg-white/10 text-xs'}, '素材を選び直す'),
+          React.createElement('button', {onClick:()=>setExportChoiceOpen(false), className:'flex-1 h-10 rounded-full bg-white/10 text-xs'}, '閉じる'))
+      )
     ),
     exportStatus!=='idle' && React.createElement('div', {className:'fixed inset-0 z-[1000] bg-black/75 flex items-center justify-center p-5', role:'dialog', 'aria-modal':'true', 'aria-label':'動画の書き出し'},
       React.createElement('div', {className:'w-full max-w-sm rounded-2xl bg-[#17171a] border border-white/20 p-5 shadow-2xl'},
@@ -11079,10 +11924,15 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
             className:'absolute left-0 right-0 top-full pt-1 text-center text-[8px] leading-none text-white/35 pointer-events-none whitespace-nowrap'
           }, '※追加メニューの「ビデオを撮る」は写真アプリに保存されません')
         ),
-            React.createElement('div', {className:'mx-3 my-2 h-10 min-h-[44px] rounded-[18px] bg-[#111113] border border-white/10 flex items-center px-3 gap-2 shrink-0'},
+    React.createElement('div', {className:'mx-3 my-2 h-10 min-h-[44px] rounded-[18px] bg-[#111113] border border-white/10 flex items-center px-3 gap-2 shrink-0'},
       React.createElement('span', {className:'text-[16px]'}, '⏱'),
       React.createElement('span', {className:'text-[13px] font-bold', style:{fontFamily:'Zen Maru Gothic, sans-serif'}}, 'タイムライン'),
-      React.createElement('span', {className:'text-[10px] text-white/50 ml-1'}, '下で時間を調整'),
+      React.createElement('button', {
+        onClick:()=>{handleStop();setReorderInitialId(null);setReorderOpen(true);},
+        disabled:clips.length<2,
+        className:'ml-1 rounded-full bg-violet-500/25 border border-violet-400/40 px-2 py-1 text-[10px] text-violet-100 disabled:opacity-35',
+        'aria-label':'素材の順番を変える'
+      }, '順番を変える'),
       React.createElement('span', {className:'ml-auto text-[11px] bg-black/50 px-2 py-1 rounded-full font-mono'}, `${currentTime.toFixed(1)}/${duration.toFixed(1)}`),
       React.createElement('button', {
         onClick:(e)=>{
@@ -11503,12 +12353,8 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
             const isPhoto = c.type==='photo';
             const trans = c._transitionToNext;
             const hasTrans = trans && trans.type!=='none';
-            const others=draggingClipId ? clips.filter(item=>item.id!==draggingClipId) : [];
-            const markerBefore=draggingClipId && dropIndicator!=null && others[dropIndicator]?.id===c.id;
-            const markerAfter=draggingClipId && dropIndicator===others.length && others[others.length-1]?.id===c.id;
             return React.createElement('div', {key:c.id, 'data-clip-id':c.id, className:'material-order-row flex flex-col gap-1'},
-              markerBefore && React.createElement('div', {className:'h-1 rounded-full bg-violet-400 mx-2 pointer-events-none'}),
-              React.createElement('div', {className:`h-[72px] shrink-0 rounded-xl border flex items-center px-2 gap-2 relative timeline-clip ${isSelected?'bg-violet-600/20 border-violet-500/50 ring-1 ring-violet-500/30 active' : isPhoto ? 'bg-[#1a102a] border-violet-500/30' : 'bg-[#111113] border-white/10'} ${selectedTimelineItem?.type==='clip'&&selectedTimelineItem.id===c.id?'ring-1 ring-violet-300/40':''} ${isLastViewed?'material-current-clip':''} ${ghost && ghost.id===c.id ? 'dragging' : ''}`, onMouseEnter:e=>{ e.currentTarget.style.willChange='transform'; }, onMouseLeave:e=>{ e.currentTarget.style.willChange='auto'; }},
+              React.createElement('div', {className:`h-[72px] shrink-0 rounded-xl border flex items-center px-2 gap-2 relative timeline-clip ${isSelected?'bg-violet-600/20 border-violet-500/50 ring-1 ring-violet-500/30 active' : isPhoto ? 'bg-[#1a102a] border-violet-500/30' : 'bg-[#111113] border-white/10'} ${selectedTimelineItem?.type==='clip'&&selectedTimelineItem.id===c.id?'ring-1 ring-violet-300/40':''} ${isLastViewed?'material-current-clip':''}`, onMouseEnter:e=>{ e.currentTarget.style.willChange='transform'; }, onMouseLeave:e=>{ e.currentTarget.style.willChange='auto'; }},
                 React.createElement('button', {
                   onClick:()=>{
                     setSelectedClipIds(prev=> prev.includes(c.id) ? prev.filter(id=>id!==c.id) : [...prev, c.id]);
@@ -11517,15 +12363,11 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 }, isSelected?'✓':''),
                 React.createElement('button', {
                   type:'button',
-                  'aria-label':`${c.name}を長押しして並び替え`,
-                  title:'長押しして順序変更',
-                  onPointerDown:e=>handleClipPointerDown(e,c.id),
-                  onPointerMove:handleClipPointerMove,
-                  onPointerUp:handleClipPointerUp,
-                  onPointerCancel:handleClipPointerUp,
-                  onClick:e=>{e.stopPropagation();setSelectedTimelineItem({type:'clip',id:c.id});},
-                  className:`w-10 h-10 rounded-lg flex flex-col items-center justify-center text-[13px] leading-none shrink-0 ${isPhoto?'bg-violet-600/30':'bg-black'}`,
-                  style:{touchAction:'none'}
+                  'aria-label':`${c.name}の順番を変える`,
+                  title:'順番を変える',
+                  disabled:clips.length<2,
+                  onClick:e=>{e.stopPropagation();handleStop();setReorderInitialId(c.id);setReorderOpen(true);},
+                  className:`w-10 h-10 rounded-lg flex flex-col items-center justify-center text-[13px] leading-none shrink-0 disabled:opacity-40 ${isPhoto?'bg-violet-600/30':'bg-black'}`,
                 },React.createElement('span',null,isPhoto?'🖼️':'📼'),React.createElement('span',{className:'text-[9px] text-white/60 mt-0.5','aria-hidden':true},'≡')),
                 React.createElement('div', {
                   className:'flex-1 min-w-0 cursor-pointer',
@@ -11678,6 +12520,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   }, hasTrans ? (trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→':'◎') : '+'),
                   React.createElement('button', {
                     onClick:()=>{
+                      projectFailedAssetsRef.current.delete(c.assetId||c.id);
                       const urlIsShared=clipsRef.current.some(item=>item.id!==c.id && item.url===c.url);
                       const v=videoRefs.current.get(c.id);
                       if(v){ try{ v.pause(); }catch{} if(!urlIsShared){ try{ URL.revokeObjectURL(c.url); }catch{} } try{ v.src=''; v.load(); }catch{} videoRefs.current.delete(c.id); }
@@ -11791,7 +12634,6 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   title:'前のラストと次の冒頭を見比べる'
                 }, 'つながりを見る')
               ),
-              markerAfter && React.createElement('div', {className:'h-1 rounded-full bg-violet-400 mx-2 pointer-events-none'})
             );
           }),
           clips.length>0 && React.createElement('div', {className:'flex gap-2 mt-3'},
@@ -11799,6 +12641,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
             React.createElement('button', {
               onClick:()=>{
                 if(!confirm(`全ての素材(${clips.length}件)を削除しますか？\n動画・写真・5ショット全て削除されます`)) return;
+                clipsRef.current.forEach(cl=>projectFailedAssetsRef.current.delete(cl.assetId||cl.id));
                 clipsRef.current.forEach(cl=>{ try{ URL.revokeObjectURL(cl.url); }catch{} });
                 videoRefs.current.forEach(v=>{ try{ v.pause(); v.src=''; v.load(); }catch{} });
                 videoRefs.current.clear();
@@ -11907,22 +12750,33 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
               accept:'audio/*',
               multiple:true,
               className:'hidden',
-              onChange:e=>{
+              onChange:async e=>{
                 const files = e.target.files;
                 if(!files || files.length===0) return;
+                projectImportBusyRef.current=true;
+                try{
                 const newBgms=[];
                 for(let i=0;i<files.length;i++){
                   const file = files[i];
                   const id = 'custom_' + Math.random().toString(36).slice(2);
+                  if(projectIdRef.current){
+                    setProjectStatus(`BGMを保存中 ${i+1}/${files.length}`);
+                    try{await storeProjectAsset(id,file);projectFailedAssetsRef.current.delete(id);}
+                    catch(error){
+                      projectFailedAssetsRef.current.set(id,file);
+                      setProjectStatus('保存失敗');
+                      setProjectError(`BGM「${file.name}」を保存できませんでした。${vlogStorageMessage(error)}`);
+                    }
+                  }
                   const url = URL.createObjectURL(file);
-                  newBgms.push({id, name: file.name.replace(/\.[^/.]+$/, ''), url, fileName: file.name, file});
+                  newBgms.push({id, assetId:id, name: file.name.replace(/\.[^/.]+$/, ''), url, fileName: file.name, file});
                 }
                 setCustomBgms(prev=> [...prev, ...newBgms]);
                 // 最初に追加したものを自動選択
                 if(newBgms.length>0){
                   setBgmTrack(newBgms[0].id);
                 }
-                e.target.value='';
+                }finally{projectImportBusyRef.current=false;e.target.value='';}
               }
             })
           )
@@ -11992,6 +12846,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 onClick:e=>{
                   e.stopPropagation();
                   if(!confirm(`「${b.name}」を削除しますか？`)) return;
+                  projectFailedAssetsRef.current.delete(b.assetId||b.id);
                   setCustomBgms(prev=> prev.filter(c=> c.id!==b.id));
                   if(bgmTrack===b.id){
                     setBgmTrack('none');
@@ -12008,7 +12863,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
           )
         ),
         customBgms.length>0 && React.createElement('div', {className:'mb-3 p-2 rounded-xl bg-violet-500/10 border border-violet-500/20 text-[10px] text-violet-200'},
-          `MY BGM ${customBgms.length}件: 自分で追加したBGMはこのブラウザに保存されます。書き出し時に音声は含まれます（ブラウザ版ではミックス、アプリ版ではファイルとして）`
+          `MY BGM ${customBgms.length}件: 保存状態は画面上部で確認できます。書き出し時に音声を含めます。`
         ),
         bgmTrack!=='none' && React.createElement('div', {className:'mb-3 p-3 rounded-xl bg-violet-600/10 border border-violet-500/20'},
           React.createElement('div', {className:'flex items-center justify-between mb-2'},
@@ -12635,7 +13490,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           ),
           React.createElement('button', {onClick:()=>{selectTextForEditing(selectedTimelineText);setInlineTimelineExpanded(false);},className:'rounded-full border border-white/20 px-3 py-2 self-start'},'文字・位置を編集')
         ),
-        React.createElement('div', {className:'text-[10px] text-white/40 mt-3'},'素材の順番は上のカードの ≡ を長押しして変更')
+        React.createElement('button', {onClick:()=>{handleStop();setReorderInitialId(selectedTimelineClip?.id||null);setReorderOpen(true);},disabled:clips.length<2,className:'text-[11px] rounded-full bg-violet-500/20 border border-violet-400/30 px-3 py-2 mt-3 disabled:opacity-35'},'素材の順番を変える')
       )
     ),
     showReturnToEdit && React.createElement('button', {
