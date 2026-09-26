@@ -6283,6 +6283,12 @@ function App(){
   const cameraWarnedReachedRef = useRef(false);
   const cameraOpenSeqRef = useRef(0);
   const cameraCaptureUrlRef = useRef(null);
+  const [exportStatus, setExportStatus] = useState('idle');
+  const [exportProgress, setExportProgress] = useState(0);
+  const [exportMessage, setExportMessage] = useState('');
+  const [exportFile, setExportFile] = useState(null);
+  const exportJobRef = useRef(null);
+  const exportAudioRef = useRef({context:null, sources:new WeakMap()});
   const [photoDuration, setPhotoDuration] = useState(2.5);
   const [bulkPhotoDuration, setBulkPhotoDuration] = useState(2.5);
   const [selectedTransition, setSelectedTransition] = useState(null);
@@ -7097,6 +7103,210 @@ function App(){
     setCurrentTime(timeRef.current);
     drawFrameRef.current(timeRef.current);
   },[]);
+
+  // 書き出しはプレビューと同じcanvasを描画し、そのフレームと素材の音声を録画する。
+  const cancelExport=()=>{
+    if(exportJobRef.current) exportJobRef.current.cancelled=true;
+  };
+  const saveExport=()=>{
+    if(!exportFile?.url) return;
+    const link=document.createElement('a');
+    link.href=exportFile.url;
+    link.download=exportFile.name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  };
+  const closeExport=()=>{
+    if(exportStatus==='recording' || exportStatus==='preparing') return;
+    if(exportFile?.url) URL.revokeObjectURL(exportFile.url);
+    setExportFile(null);
+    setExportStatus('idle');
+    setExportMessage('');
+  };
+  const startExport=async()=>{
+    if(exportJobRef.current) return;
+    if(exportFile?.url){ URL.revokeObjectURL(exportFile.url); setExportFile(null); }
+    const items=clipsRef.current.slice();
+    const canvas=canvasRef.current;
+    if(!items.length || !canvas){ setExportMessage('素材を追加してから書き出してください。'); setExportStatus('error'); return; }
+    if(typeof MediaRecorder==='undefined' || !canvas.captureStream){
+      setExportMessage('このブラウザは動画の書き出しに対応していません。'); setExportStatus('error'); return;
+    }
+    const mime=['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4','video/webm;codecs=vp8,opus','video/webm;codecs=vp8','video/webm']
+      .find(type=>MediaRecorder.isTypeSupported?.(type));
+    if(!mime){ setExportMessage('このブラウザで使える動画形式が見つかりません。'); setExportStatus('error'); return; }
+    const total=Math.max(...items.map(c=>c.timelineStart+c.duration));
+    if(!Number.isFinite(total) || total<=0){ setExportMessage('素材の長さを確認してください。'); setExportStatus('error'); return; }
+    const job={cancelled:false, frame:0, recorder:null, stream:null, gains:[], originalTime:timeRef.current,
+      canvasWidth:canvas.width, canvasHeight:canvas.height, videos:new Map()};
+    exportJobRef.current=job;
+    setExportProgress(0);
+    setExportMessage('');
+    setExportStatus('preparing');
+    let bgmVolumeBefore=null;
+    try{
+      handleStop();
+      const soundItems=items.filter(c=>c.type!=='photo');
+      const bgm=bgmTrackRef.current!=='none' ? bgmAudioRef.current : null;
+      if(bgmTrackRef.current!=='none' && !bgm) throw new Error('BGMを読み込めません。BGMを確認してから再度お試しください。');
+      // iOSではユーザーのタップ中に再生を開始しておく必要がある。
+      if(bgm?.readyState>=2){ try{ bgm.play()?.catch?.(()=>{}); }catch{} }
+      const hasSound=soundItems.length>0 || !!bgm;
+      let destination=null;
+      let audioContext=null;
+      if(hasSound){
+        const Context=window.AudioContext || window.webkitAudioContext;
+        if(!Context) throw new Error('このブラウザでは素材の音声を動画に含められません。');
+        const audio=exportAudioRef.current;
+        if(!audio.context || audio.context.state==='closed'){
+          audio.context=new Context();
+          audio.sources=new WeakMap();
+        }
+        audioContext=audio.context;
+        const resume=audioContext.resume();
+        if(resume?.then) await resume;
+        destination=audioContext.createMediaStreamDestination();
+        const connect=(element, volume, monitor=false)=>{
+          let source=audio.sources.get(element);
+          if(!source){
+            source=audioContext.createMediaElementSource(element);
+            audio.sources.set(element,source);
+            if(monitor) source.connect(audioContext.destination);
+          }
+          const gain=audioContext.createGain();
+          gain.gain.value=volume;
+          source.connect(gain);
+          gain.connect(destination);
+          job.gains.push({source,gain});
+          return gain;
+        };
+        for(const clip of soundItems){
+          const video=videoRefs.current.get(clip.id);
+          if(!video) throw new Error(`素材「${clip.name}」の動画を読み込めません。`);
+          job.videos.set(clip.id,{video,muted:video.muted});
+          video.muted=false;
+          connect(video,1);
+        }
+        if(bgm){
+          if(bgm.readyState<2 || !bgm.currentSrc) throw new Error('BGMを読み込めません。BGMを確認してから再度お試しください。');
+          bgmVolumeBefore=bgm.volume;
+          bgm.volume=1;
+          job.bgmGain=connect(bgm,0,true);
+        }
+      }
+      for(const clip of items){
+        if(job.cancelled) throw new Error('書き出しを中止しました。');
+        if(clip.type==='photo'){
+          const image=photoRefs.current.get(clip.id);
+          if(!image?.complete || !image.naturalWidth) throw new Error(`素材「${clip.name}」の写真を読み込めません。`);
+        }else{
+          const video=videoRefs.current.get(clip.id);
+          if(video.readyState<1) throw new Error(`素材「${clip.name}」の動画を読み込めません。`);
+          const target=clip.trimStart||0;
+          if(Math.abs(video.currentTime-target)>0.05 || video.readyState<2){
+            await new Promise((resolve,reject)=>{
+              let timer;
+              const done=(error)=>{ clearTimeout(timer); video.removeEventListener('seeked',ready); video.removeEventListener('loadeddata',ready); error?reject(error):resolve(); };
+              const ready=()=>{ if(video.readyState>=2) done(); };
+              video.addEventListener('seeked',ready);
+              video.addEventListener('loadeddata',ready);
+              timer=setTimeout(()=>done(new Error(`素材「${clip.name}」の映像を読み込めません。`)),5000);
+              try{ video.currentTime=target; ready(); }catch{ done(new Error(`素材「${clip.name}」を再生できません。`)); }
+            });
+          }
+          video.pause();
+        }
+      }
+      if(job.cancelled) throw new Error('書き出しを中止しました。');
+      canvas.width=aspectModeRef.current==='16:9'?1280:720;
+      canvas.height=aspectModeRef.current==='16:9'?720:1280;
+      timeRef.current=0;
+      drawFrameRef.current(0);
+      const canvasStream=canvas.captureStream(30);
+      job.stream=new MediaStream([...canvasStream.getVideoTracks(),...(destination?.stream.getAudioTracks()||[])]);
+      const recorder=new MediaRecorder(job.stream,{mimeType:mime});
+      job.recorder=recorder;
+      const chunks=[];
+      const stopped=new Promise(resolve=>{
+        recorder.ondataavailable=e=>{ if(e.data?.size) chunks.push(e.data); };
+        recorder.onerror=e=>{ job.failure=e.error?.message || '動画の録画に失敗しました。'; job.cancelled=true; };
+        recorder.onstop=()=>resolve();
+      });
+      recorder.start(250);
+      setExportStatus('recording');
+      if(bgm){
+        try{ bgm.currentTime=Math.max(0,bgmOffsetRef.current); }catch{}
+        await bgm.play();
+      }
+      let last=performance.now();
+      let elapsed=0;
+      let lastProgress=-1;
+      const render=()=>{
+        if(job.cancelled || elapsed>=total) return;
+        const now=performance.now();
+        elapsed+=Math.min(0.1,Math.max(0,(now-last)/1000));
+        last=now;
+        const t=Math.min(total-0.001,elapsed);
+        timeRef.current=t;
+        const active=items.find(c=>t>=c.timelineStart && t<c.timelineStart+c.duration) || items[items.length-1];
+        for(const clip of soundItems){
+          const video=videoRefs.current.get(clip.id);
+          if(clip.id===active.id){
+            const target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart);
+            if(Math.abs(video.currentTime-target)>0.25){ try{ video.currentTime=target; }catch{} }
+            if(video.paused){ const result=video.play(); result?.catch?.(()=>{ job.failure=`素材「${clip.name}」を再生できません。`; job.cancelled=true; }); }
+          }else if(!video.paused) video.pause();
+        }
+        if(bgm && job.bgmGain){
+          const start=bgmTimelineStartRef.current;
+          const end=start+bgmTimelineDurationRef.current;
+          const fadeIn=Math.max(0,bgmFadeInRef.current), fadeOut=Math.max(0,bgmFadeOutRef.current);
+          const factor=t<start || t>=end ? 0 : Math.min(1,fadeIn? (t-start)/fadeIn : 1,fadeOut? (end-t)/fadeOut : 1);
+          job.bgmGain.gain.value=bgmVolume*Math.max(0,factor);
+        }
+        drawFrameRef.current(t);
+        if(now-lastProgress>150){ lastProgress=now; setExportProgress(Math.min(100,Math.round(t/total*100))); }
+        job.frame=requestAnimationFrame(render);
+      };
+      job.frame=requestAnimationFrame(render);
+      await new Promise(resolve=>{
+        const check=()=>{ if(job.cancelled || elapsed>=total) resolve(); else job.check=setTimeout(check,80); };
+        check();
+      });
+      cancelAnimationFrame(job.frame);
+      if(recorder.state!=='inactive') recorder.stop();
+      await stopped;
+      if(job.cancelled) throw new Error(job.failure || '書き出しを中止しました。');
+      const type=recorder.mimeType || mime;
+      const blob=new Blob(chunks,{type});
+      if(!blob.size) throw new Error('動画データを作成できませんでした。');
+      const extension=type.includes('webm')?'webm':'mp4';
+      const name=`Vlog-Studio-${new Date().toISOString().replace(/[:.]/g,'-')}.${extension}`;
+      setExportFile({url:URL.createObjectURL(blob),name});
+      setExportProgress(100);
+      setExportStatus('done');
+    }catch(error){
+      setExportMessage(error?.message || '書き出しに失敗しました。');
+      setExportStatus('error');
+    }finally{
+      clearTimeout(job.check);
+      cancelAnimationFrame(job.frame);
+      if(job.recorder?.state==='recording') try{ job.recorder.stop(); }catch{}
+      job.stream?.getTracks().forEach(track=>track.stop());
+      for(const {source,gain} of job.gains){ try{ source.disconnect(gain); gain.disconnect(); }catch{} }
+      for(const {video,muted} of job.videos.values()){ try{ video.pause(); video.muted=muted; }catch{} }
+      if(bgmAudioRef.current){
+        try{ bgmAudioRef.current.pause(); if(bgmVolumeBefore!==null) bgmAudioRef.current.volume=bgmVolumeBefore; }catch{}
+      }
+      canvas.width=job.canvasWidth;
+      canvas.height=job.canvasHeight;
+      timeRef.current=job.originalTime;
+      setCurrentTime(job.originalTime);
+      drawFrameRef.current(job.originalTime);
+      exportJobRef.current=null;
+    }
+  };
 
   const prevFitModeRef = useRef('cover');
   
@@ -9760,7 +9970,26 @@ const recomputeStarts=(arr)=>{
         onClick:()=> handleOmakaseEdit && handleOmakaseEdit(),
         className:'px-3 h-8 rounded-full bg-white/10 text-[11px] leading-[11px] active:bg-violet-600/50'
       }, '✨ おまか', React.createElement('br'), 'せ編集'),
-      React.createElement('button', {className:'px-4 h-8 rounded-full bg-white text-black text-[12px] font-bold leading-[12px]'}, '書き', React.createElement('br'), '出し')
+      React.createElement('button', {onClick:startExport, disabled:exportStatus==='preparing'||exportStatus==='recording', className:'px-4 h-8 rounded-full bg-white text-black text-[12px] font-bold leading-[12px]', 'aria-label':'動画を書き出す'}, '書き', React.createElement('br'), '出し')
+    ),
+    exportStatus!=='idle' && React.createElement('div', {className:'fixed inset-0 z-[1000] bg-black/75 flex items-center justify-center p-5', role:'dialog', 'aria-modal':'true', 'aria-label':'動画の書き出し'},
+      React.createElement('div', {className:'w-full max-w-sm rounded-2xl bg-[#17171a] border border-white/20 p-5 shadow-2xl'},
+        React.createElement('div', {className:'text-base font-bold mb-3'}, '動画の書き出し'),
+        (exportStatus==='preparing'||exportStatus==='recording') && React.createElement(React.Fragment,null,
+          React.createElement('div', {className:'text-sm text-white/70 mb-3'}, exportStatus==='preparing'?'素材を準備しています':`書き出し中 ${exportProgress}%`),
+          React.createElement('progress', {value:exportProgress, max:100, className:'w-full h-2 mb-5', 'aria-label':'書き出しの進行状況'}),
+          React.createElement('button', {onClick:cancelExport, className:'w-full h-10 rounded-full bg-white/10'}, '中止')
+        ),
+        exportStatus==='done' && React.createElement(React.Fragment,null,
+          React.createElement('div', {className:'text-sm text-white/70 mb-4'}, `${exportFile?.name || '動画'} を作成しました。`),
+          React.createElement('button', {onClick:saveExport, className:'w-full h-11 rounded-full bg-white text-black font-bold mb-3'}, '端末に保存'),
+          React.createElement('button', {onClick:closeExport, className:'w-full h-10 rounded-full bg-white/10'}, '閉じる')
+        ),
+        exportStatus==='error' && React.createElement(React.Fragment,null,
+          React.createElement('div', {className:'text-sm text-white/70 mb-4'}, exportMessage),
+          React.createElement('button', {onClick:closeExport, className:'w-full h-10 rounded-full bg-white/10'}, '閉じる')
+        )
+      )
     ),
     React.createElement('div', {className:'h-10 bg-[#0a0a0b] border-b border-white/10 flex items-center px-2 gap-2 shrink-0 overflow-x-auto'},
       React.createElement('button', {onClick:()=>{ const nm = aspectMode==='9:16'?'16:9':'9:16'; setAspectMode(nm); aspectRef.current = nm==='9:16'?9/16:16/9; setTimeout(()=> syncCanvasSize(true),30); }, className:'px-3 h-7 rounded-lg bg-white/10 text-[12px] shrink-0'}, aspectMode),
