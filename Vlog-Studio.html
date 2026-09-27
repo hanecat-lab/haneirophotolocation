@@ -7163,6 +7163,8 @@ function App(){
   const [exportProgress, setExportProgress] = useState(0);
   const [exportMessage, setExportMessage] = useState('');
   const [exportFile, setExportFile] = useState(null);
+  const [exportDiagnosticText, setExportDiagnosticText] = useState('');
+  const [exportDiagnosticVisible, setExportDiagnosticVisible] = useState(false);
   const exportJobRef = useRef(null);
   const exportAudioRef = useRef({context:null, sources:new WeakMap()});
   const [photoDuration, setPhotoDuration] = useState(2.5);
@@ -7884,7 +7886,8 @@ function App(){
     const video=document.createElement('video');
     video.muted=true;video.playsInline=true;video.preload=preload;
     video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');
-    video.src=clip.url;
+    // 書き出し用の待機要素はURLをまだ渡さない。preload=noneだけでは読込抑制を保証できない。
+    if(phase!=='export-pool') video.src=clip.url;
     videoRefs.current.set(clip.id,video);
     if(preload==='auto') video.load();
     const redraw=()=>{
@@ -7893,7 +7896,7 @@ function App(){
     };
     video.addEventListener('loadeddata',redraw,{once:true});
     video.addEventListener('seeked',redraw);
-    if(phase!=='end-of-preview' && phase!=='export-pool') recordPreviewDiagnostic('media-refresh',{clip:clip.name,phase,
+    if(!['end-of-preview','export-pool','export-restore'].includes(phase)) recordPreviewDiagnostic('media-refresh',{clip:clip.name,phase,
       previousError,timelineTime:Number(timeRef.current.toFixed(3))});
     return video;
   };
@@ -8420,6 +8423,8 @@ function App(){
     setExportFile(null);
     setExportStatus('idle');
     setExportMessage('');
+    setExportDiagnosticText('');
+    setExportDiagnosticVisible(false);
   };
   const buildExportSelection=(scope)=>{
     const source=clipsRef.current.slice();
@@ -8457,6 +8462,8 @@ function App(){
   const startExport=async(scope='all')=>{
     if(exportJobRef.current) return;
     setExportChoiceOpen(false);
+    setExportDiagnosticText('');
+    setExportDiagnosticVisible(false);
     if(exportFile?.url){ URL.revokeObjectURL(exportFile.url); setExportFile(null); }
     const {items,texts:exportTexts}=buildExportSelection(scope);
     const canvas=canvasRef.current;
@@ -8479,12 +8486,42 @@ function App(){
       bgmOffset:bgmOffsetRef.current, bgmDriftSince:0, bgmPlayPending:false,
       canvasWidth:canvas.width, canvasHeight:canvas.height, videos:new Map(), videoPlayPending:new WeakSet(),
       preparedIds:new Set(),preparePromises:new Map(),releasedIds:new Set(),startedIds:new Set(),
-      driftSince:new Map(),lastSeekAt:new Map(),prepareCursor:0,releaseCursor:0,soundCursor:0,
-      liveSoundIds:new Set(),notReadySince:0,lastDrawAt:-Infinity,
-      stats:{frames:0,slowFrames:0,gaps:0,corrections:0,notReadyFrames:0,maxDrawMs:0}};
+      driftSince:new Map(),lastSeekAt:new Map(),prepareCursor:0,prepareInFlight:0,
+      releaseCursor:0,soundCursor:0,liveSoundIds:new Set(),waitingByClip:new Map(),
+      frameProgress:new Map(),frameCallbacks:new Map(),events:[],lastDrawAt:-Infinity,
+      stats:{frames:0,slowFrames:0,gaps:0,corrections:0,notReadyFrames:0,
+        waitingFrames:0,maxDrawMs:0}};
+    const exportVideoState=clip=>{
+      if(!clip) return null;
+      const video=job.videos.get(clip.id)?.video;
+      const frame=job.frameProgress.get(clip.id);
+      return {id:clip.id,name:clip.name,timelineStart:clip.timelineStart,duration:clip.duration,
+        trimStart:clip.trimStart||0,prepared:job.preparedIds.has(clip.id),
+        playPending:!!video && job.videoPlayPending.has(video),
+        readyState:video?.readyState??null,networkState:video?.networkState??null,
+        seeking:video?.seeking??null,paused:video?.paused??null,
+        currentTime:video ? Number(video.currentTime.toFixed(3)) : null,
+        videoWidth:video?.videoWidth??null,mediaError:video?.error?.code??null,
+        presentedMediaTime:frame?.mediaTime??null,presentedFrames:frame?.presentedFrames??null};
+    };
+    const recordExportEvent=(type,clip,detail={})=>{
+      job.events.push({at:new Date().toISOString(),type,clip:clip?.name||null,
+        timelineTime:Number(timeRef.current.toFixed(3)),...detail});
+      if(job.events.length>60) job.events.shift();
+    };
+    job.exportSnapshot=(reason,focus)=>JSON.stringify({report:'Vlog Studio 書き出し診断',
+      capturedAt:new Date().toISOString(),browser:navigator.userAgent,reason,
+      timelineTime:Number(timeRef.current.toFixed(3)),totalTime:total,
+      focus:exportVideoState(focus||job.lastIssue?.clip),
+      nearby:items.filter(clip=>clip.type==='video' &&
+        clip.timelineStart<=timeRef.current+2 && clip.timelineStart+clip.duration>=timeRef.current-2)
+        .map(exportVideoState),
+      prepareInFlight:job.prepareInFlight,stats:job.stats,recentEvents:job.events},null,2);
     exportJobRef.current=job;
     setExportProgress(0);
     setExportMessage('');
+    setExportDiagnosticText('');
+    setExportDiagnosticVisible(false);
     setExportStatus('preparing');
     let bgmVolumeBefore=null;
     try{
@@ -8568,7 +8605,19 @@ function App(){
         const task=(async()=>{
           const video=job.videos.get(clip.id)?.video;
           if(!video) throw new Error(`素材「${clip.name}」の動画を読み込めません。`);
+          if(typeof video.requestVideoFrameCallback==='function' && !job.frameCallbacks.has(clip.id)){
+            const observe=(_now,metadata)=>{
+              job.frameProgress.set(clip.id,{...job.frameProgress.get(clip.id),
+                mediaTime:Number.isFinite(metadata.mediaTime)?Number(metadata.mediaTime.toFixed(3)):null,
+                presentedFrames:metadata.presentedFrames,presentedAt:performance.now()});
+              if(exportJobRef.current===job && !job.cancelled && !job.releasedIds.has(clip.id)){
+                try{job.frameCallbacks.set(clip.id,video.requestVideoFrameCallback(observe));}catch{}
+              }
+            };
+            try{job.frameCallbacks.set(clip.id,video.requestVideoFrameCallback(observe));}catch{}
+          }
           video.preload='auto';
+          if(!video.getAttribute('src')) video.src=clip.url;
           if(video.readyState<1){
             const loading=waitForExportVideo(video,()=>video.readyState>=1,
               `素材「${clip.name}」の動画を読み込めません。`);
@@ -8585,6 +8634,7 @@ function App(){
           if(video.error) throw new Error(`素材「${clip.name}」を再生できません。`);
           video.pause();
           job.preparedIds.add(clip.id);
+          recordExportEvent('prepared',clip);
         })();
         job.preparePromises.set(clip.id,task);
         task.then(()=>job.preparePromises.delete(clip.id),()=>job.preparePromises.delete(clip.id));
@@ -8600,6 +8650,23 @@ function App(){
       // 冒頭の3動画だけ先にフレームまで準備し、以降は数秒前に順次準備する。
       for(const clip of exportVideoItems.slice(0,3)) await prepareExportVideo(clip);
       job.prepareCursor=Math.min(3,exportVideoItems.length);
+      const pumpExportPrepare=t=>{
+        let first=0;
+        while(first<exportVideoItems.length &&
+          exportVideoItems[first].timelineStart+exportVideoItems[first].duration<=t) first++;
+        // 現在の素材と直後の3素材まで。短いクリップを大量に同時読込しない。
+        const limit=Math.min(exportVideoItems.length,first+4);
+        while(job.prepareCursor<limit && job.prepareInFlight<2 &&
+          exportVideoItems[job.prepareCursor].timelineStart<=t+4){
+          const ahead=exportVideoItems[job.prepareCursor++];
+          job.prepareInFlight++;
+          prepareExportVideo(ahead).catch(error=>{
+            if(!job.cancelled){job.failure=error?.message||`素材「${ahead.name}」を準備できません。`;job.cancelled=true;
+              job.lastIssue={clip:ahead,reason:'prepare-error'};
+              recordExportEvent('prepare-error',ahead,{message:job.failure});}
+          }).finally(()=>{job.prepareInFlight--;});
+        }
+      };
       if(job.cancelled) throw new Error('書き出しを中止しました。');
       await ensureVlogTextFonts(exportTexts);
       if(job.cancelled) throw new Error('書き出しを中止しました。');
@@ -8648,20 +8715,20 @@ function App(){
         last=now;
         const t=Math.min(total-0.001,elapsed);
         timeRef.current=t;
-        while(job.prepareCursor<exportVideoItems.length &&
-              exportVideoItems[job.prepareCursor].timelineStart<=t+4){
-          const ahead=exportVideoItems[job.prepareCursor++];
-          prepareExportVideo(ahead).catch(error=>{
-            if(!job.cancelled){job.failure=error?.message||`素材「${ahead.name}」を準備できません。`;job.cancelled=true;}
-          });
-        }
+        pumpExportPrepare(t);
         while(job.releaseCursor<exportVideoItems.length &&
-              exportVideoItems[job.releaseCursor].timelineStart+exportVideoItems[job.releaseCursor].duration<t-0.5){
+              exportVideoItems[job.releaseCursor].timelineStart+exportVideoItems[job.releaseCursor].duration<t-0.02){
           const old=exportVideoItems[job.releaseCursor++];
           const video=job.videos.get(old.id)?.video;
           if(video && !job.releasedIds.has(old.id)){
-            try{video.pause();video.removeAttribute('src');video.load();video.preload='none';video.src=old.url;}catch{}
+            const frameCallback=job.frameCallbacks.get(old.id);
+            if(frameCallback!=null) try{video.cancelVideoFrameCallback?.(frameCallback);}catch{}
+            job.frameCallbacks.delete(old.id);
+            try{video.pause();video.preload='none';video.removeAttribute('src');video.load();}catch{}
             job.releasedIds.add(old.id);
+            job.preparedIds.delete(old.id);
+            job.waitingByClip.delete(old.id);
+            recordExportEvent('released',old);
           }
         }
         while(job.soundCursor<items.length &&
@@ -8677,6 +8744,13 @@ function App(){
           const active=t>=clip.timelineStart && t<clip.timelineStart+clip.duration;
           if(active){
             liveSoundIds.add(clip.id);
+            const progress=job.frameProgress.get(clip.id)||{currentTime:video.currentTime,advancedAt:now};
+            if(!Number.isFinite(progress.currentTime) || !Number.isFinite(progress.advancedAt) ||
+               Math.abs(video.currentTime-progress.currentTime)>0.035){
+              progress.currentTime=video.currentTime;
+              progress.advancedAt=now;
+            }
+            job.frameProgress.set(clip.id,progress);
             const target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart);
             if(job.preparedIds.has(clip.id) && !job.startedIds.has(clip.id)){
               // クリップへの入場時だけ位置合わせする。再生中は短い遅れでシークしない。
@@ -8684,6 +8758,7 @@ function App(){
                 try{video.currentTime=target;}catch{}
               }
               job.startedIds.add(clip.id);
+              recordExportEvent('entered',clip);
             }else if(job.startedIds.has(clip.id) && !video.seeking && !video.paused){
               const drift=Math.abs(video.currentTime-target);
               if(drift>0.35){
@@ -8698,10 +8773,12 @@ function App(){
                !job.videoPlayPending.has(video)){
               try{
                 job.videoPlayPending.add(video);
-                Promise.resolve(video.play()).catch(error=>{
+                Promise.resolve(video.play()).then(()=>recordExportEvent('playing',clip)).catch(error=>{
                   if(error?.name==='AbortError' &&
                      (job.cancelled || timeRef.current>=clip.timelineStart+clip.duration)) return;
                   job.failure=`素材「${clip.name}」を再生できません。`;job.cancelled=true;
+                  job.lastIssue={clip,reason:'play-error'};
+                  recordExportEvent('play-error',clip,{error:error?.name||'unknown'});
                 }).finally(()=>job.videoPlayPending.delete(video));
               }catch{job.videoPlayPending.delete(video);job.failure=`素材「${clip.name}」を再生できません。`;job.cancelled=true;}
             }
@@ -8763,29 +8840,65 @@ function App(){
         }
         const visibleVideos=items.filter(clip=>clip.type==='video' &&
           t>=clip.timelineStart && t<clip.timelineStart+clip.duration);
-        const unready=visibleVideos.find(clip=>{
+        const issueForClip=clip=>{
           const video=job.videos.get(clip.id)?.video;
-          return !job.preparedIds.has(clip.id) || !video || video.readyState<2 ||
-            video.seeking || !video.videoWidth || video.paused;
-        });
-        if(unready){
-          job.stats.notReadyFrames++;
-          if(!job.notReadySince) job.notReadySince=now;
-          if(now-job.notReadySince>800){
-            job.failure=`素材「${unready.name}」の映像準備が追いつきません。もう一度書き出してください。`;
+          if(!video) return 'missing-element';
+          if(video.error) return 'media-error';
+          if(!job.preparedIds.has(clip.id)) return 'preparing';
+          if(video.seeking) return 'seeking';
+          if(video.readyState<2 || !video.videoWidth) return 'frame-unavailable';
+          if(video.paused) return job.videoPlayPending.has(video)?'play-pending':'paused';
+          const progress=job.frameProgress.get(clip.id);
+          if(progress && t>clip.timelineStart+0.25 &&
+             now-progress.advancedAt>750 &&
+             video.currentTime<(clip.trimStart||0)+clip.duration-0.12)
+            return 'time-stalled';
+          return null;
+        };
+        const issueLabels={'missing-element':'動画を見つけられなかった',
+          'media-error':'映像の読み込みに失敗した','preparing':'先読みが終わらなかった',
+          'seeking':'使用位置への移動が終わらなかった','frame-unavailable':'映像フレームを読み込めなかった',
+          'play-pending':'再生開始を待ち続けた','paused':'停止したままだった',
+          'time-stalled':'再生時刻が進まなかった'};
+        let blocked=false;
+        let waiting=false;
+        for(const clip of visibleVideos){
+          const reason=issueForClip(clip);
+          if(!reason){
+            if(job.waitingByClip.has(clip.id)) recordExportEvent('ready',clip);
+            job.waitingByClip.delete(clip.id);
+            continue;
+          }
+          waiting=true;
+          if(['missing-element','media-error','preparing','seeking','frame-unavailable'].includes(reason))
+            blocked=true;
+          const previousWait=job.waitingByClip.get(clip.id);
+          const wait=previousWait||{since:now,reason};
+          if(wait.reason!==reason || !previousWait){
+            wait.reason=reason;
+            recordExportEvent('waiting',clip,{reason,media:exportVideoState(clip)});
+          }
+          job.waitingByClip.set(clip.id,wait);
+          const waitLimit=Math.min(1200,Math.max(250,clip.duration*650));
+          if(reason==='media-error' || now-wait.since>waitLimit){
+            job.failure=`素材「${clip.name}」は${issueLabels[reason]}ため、書き出しを停止しました。`;
+            job.lastIssue={clip,reason};
+            recordExportEvent('failed',clip,{reason,waitMs:Math.round(now-wait.since),waitLimit,
+              media:exportVideoState(clip)});
             job.cancelled=true;
+            break;
           }
-        }else{
-          job.notReadySince=0;
-          if(now-job.lastDrawAt>=30){
-            const drawStart=performance.now();
-            drawFrameRef.current(t,items,exportTexts);
-            const drawMs=performance.now()-drawStart;
-            job.lastDrawAt=now;
-            job.stats.frames++;
-            job.stats.maxDrawMs=Math.max(job.stats.maxDrawMs,drawMs);
-            if(drawMs>33) job.stats.slowFrames++;
-          }
+        }
+        if(waiting) job.stats.waitingFrames++;
+        if(blocked) job.stats.notReadyFrames++;
+        if(!job.cancelled && !blocked && now-job.lastDrawAt>=30){
+          const drawStart=performance.now();
+          drawFrameRef.current(t,items,exportTexts);
+          const drawMs=performance.now()-drawStart;
+          job.lastDrawAt=now;
+          job.stats.frames++;
+          job.stats.maxDrawMs=Math.max(job.stats.maxDrawMs,drawMs);
+          if(drawMs>33) job.stats.slowFrames++;
         }
         if(now-lastProgress>500){ lastProgress=now; setExportProgress(Math.min(100,Math.round(t/total*100))); }
         job.frame=requestAnimationFrame(render);
@@ -8815,16 +8928,27 @@ function App(){
       setExportStatus('done');
     }catch(error){
       setExportMessage(error?.message || '書き出しに失敗しました。');
+      if(!job.cancelled || job.failure) setExportDiagnosticText(job.exportSnapshot?.(
+        error?.message||job.failure||'書き出しに失敗しました。')||'');
       setExportStatus('error');
     }finally{
+      job.cancelled=true;
       clearTimeout(job.check);
       cancelAnimationFrame(job.frame);
       if(job.recorder?.state==='recording') try{ job.recorder.stop(); }catch{}
       job.stream?.getTracks().forEach(track=>track.stop());
       for(const {source,gain} of job.gains){ try{ source.disconnect(gain); gain.disconnect(); }catch{} }
       for(const {video,muted} of job.videos.values()){ try{ video.pause(); video.muted=muted; }catch{} }
+      for(const [id,callback] of job.frameCallbacks){
+        try{job.videos.get(id)?.video.cancelVideoFrameCallback?.(callback);}catch{}
+      }
       if(bgmAudioRef.current){
         try{ bgmAudioRef.current.pause(); if(bgmVolumeBefore!==null) bgmAudioRef.current.volume=bgmVolumeBefore; }catch{}
+      }
+      for(const clip of clipsRef.current){
+        if(clip.type==='video')
+          refreshPreviewVideo(clip,'export-restore',
+            clip.timelineStart<=job.originalTime && job.originalTime<clip.timelineStart+clip.duration?'auto':'none');
       }
       canvas.width=job.canvasWidth;
       canvas.height=job.canvasHeight;
@@ -12727,6 +12851,17 @@ const recomputeStarts=(arr)=>{
         ),
         exportStatus==='error' && React.createElement(React.Fragment,null,
           React.createElement('div', {className:'text-sm text-white/70 mb-4'}, exportMessage),
+          exportDiagnosticText && React.createElement('div',{className:'mb-4'},
+            React.createElement('button',{type:'button',onClick:()=>setExportDiagnosticVisible(v=>!v),
+              className:'text-xs text-violet-200 underline mb-2'},
+              exportDiagnosticVisible?'診断を閉じる':'失敗時の状態を確認'),
+            exportDiagnosticVisible && React.createElement(React.Fragment,null,
+              React.createElement('textarea',{readOnly:true,value:exportDiagnosticText,
+                className:'w-full h-28 rounded-lg bg-black/50 p-2 text-[10px] text-white/70',
+                'aria-label':'書き出し診断'}),
+              React.createElement('button',{type:'button',onClick:()=>{
+                navigator.clipboard?.writeText?.(exportDiagnosticText)?.catch?.(()=>{});
+              },className:'mt-2 rounded-full bg-white/10 px-4 py-2 text-xs'},'診断をコピー'))),
           React.createElement('button', {onClick:closeExport, className:'w-full h-10 rounded-full bg-white/10'}, '閉じる')
         )
       )
