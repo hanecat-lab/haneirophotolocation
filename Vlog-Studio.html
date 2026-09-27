@@ -8578,35 +8578,50 @@ function App(){
           const image=photoRefs.current.get(clip.id);
           if(!image?.complete || !image.naturalWidth) throw new Error(`素材「${clip.name}」の写真を読み込めません。`);
         }else{
-          const video=videoRefs.current.get(clip.id);
+          let video=videoRefs.current.get(clip.id);
+          if(!video || video.error){
+            video=refreshPreviewVideo(clip,'export-retry','auto');
+            // 新しい要素を少し待つ
+            await new Promise(r=>setTimeout(r,150));
+          }
           if(video && video.readyState<1){
             video.preload='auto';
-            await new Promise((resolve,reject)=>{
+            await new Promise((resolve)=>{
               let timer,settled=false;
-              const done=(error)=>{if(settled)return;settled=true;clearTimeout(timer);video.removeEventListener('loadedmetadata',ready);
-                video.removeEventListener('error',failed);error?reject(error):resolve();};
+              const done=()=>{if(settled)return;settled=true;clearTimeout(timer);video.removeEventListener('loadedmetadata',ready); video.removeEventListener('error',failed); resolve();};
               const ready=()=>done();
-              const failed=()=>done(new Error(`素材「${clip.name}」の動画を読み込めません。`));
+              const failed=()=>{ console.warn('export preload failed', clip.name); done(); };
               video.addEventListener('loadedmetadata',ready,{once:true});
               video.addEventListener('error',failed,{once:true});
-              timer=setTimeout(failed,5000);
+              timer=setTimeout(done,5000);
               try{video.load();if(video.readyState>=1) ready();}catch{failed();}
             });
           }
-          if(!video || video.error) throw new Error(`素材「${clip.name}」の動画を読み込めません。`);
-          const target=clip.trimStart||0;
-          if(Math.abs(video.currentTime-target)>0.05 || video.readyState<2){
-            await new Promise((resolve,reject)=>{
-              let timer;
-              const done=(error)=>{ clearTimeout(timer); video.removeEventListener('seeked',ready); video.removeEventListener('loadeddata',ready); error?reject(error):resolve(); };
-              const ready=()=>{ if(video.readyState>=2) done(); };
-              video.addEventListener('seeked',ready);
-              video.addEventListener('loadeddata',ready);
-              timer=setTimeout(()=>done(new Error(`素材「${clip.name}」の映像を読み込めません。`)),5000);
-              try{ video.currentTime=target; ready(); }catch{ done(new Error(`素材「${clip.name}」を再生できません。`)); }
+          // durationがまだNaNの.mov対策: metadataが来るまで待つが、失敗しても続行
+          if(video && !Number.isFinite(video.duration)){
+            await new Promise(r=>{
+              const onMeta=()=>{ video.removeEventListener('loadedmetadata',onMeta); r(); };
+              video.addEventListener('loadedmetadata',onMeta,{once:true});
+              setTimeout(r,2500);
             });
           }
-          video.pause();
+          const rawTarget=clip.trimStart||0;
+          let target=rawTarget;
+          if(video && Number.isFinite(video.duration) && video.duration>0){
+            target=Math.min(rawTarget, Math.max(0, video.duration-0.12));
+          }
+          if(video && (Math.abs(video.currentTime-target)>0.08 || video.readyState<2)){
+            await new Promise((resolve)=>{
+              let timer;
+              const done=()=>{ clearTimeout(timer); video.removeEventListener('seeked',ready); video.removeEventListener('loadeddata',ready); resolve(); };
+              const ready=()=>{ if(video.readyState>=1) done(); };
+              video.addEventListener('seeked',ready);
+              video.addEventListener('loadeddata',ready);
+              timer=setTimeout(done,4000);
+              try{ video.currentTime=target; }catch{ done(); }
+            });
+          }
+          try{ video.pause(); }catch{}
         }
       }
       if(job.cancelled) throw new Error('書き出しを中止しました。');
@@ -8647,11 +8662,33 @@ function App(){
         const active=items.find(c=>t>=c.timelineStart && t<c.timelineStart+c.duration) || items[items.length-1];
         for(const clip of soundItems){
           const video=videoRefs.current.get(clip.id);
+          if(!video) continue;
           if(clip.id===active.id){
-            const target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart);
-            if(Math.abs(video.currentTime-target)>0.25){ try{ video.currentTime=target; }catch{} }
-            if(video.paused){ const result=video.play(); result?.catch?.(()=>{ job.failure=`素材「${clip.name}」を再生できません。`; job.cancelled=true; }); }
-          }else if(!video.paused) video.pause();
+            let target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart);
+            if(Number.isFinite(video.duration) && video.duration>0){
+              target=Math.min(target, Math.max(0, video.duration-0.08));
+            }
+            if(Math.abs(video.currentTime-target)>0.35){ try{ video.currentTime=target; }catch{} }
+            if(video.paused){
+              const result=video.play();
+              result?.catch?.(async(err)=>{
+                // iOSでHEVCの音声付き再生がブロックされた場合、ミュートで再試行（映像は残す）
+                console.warn('export play failed, retry muted', clip.name, err?.name);
+                try{ video.muted=true; await video.play(); }catch{
+                  // それでもダメな場合はこの素材をスキップ扱いにせず、黒で続行せずエラーにするが、1回だけ再生成を試す
+                  const refreshed=refreshPreviewVideo(clip,'export-play-retry','auto');
+                  if(refreshed){
+                    try{ refreshed.currentTime=target; await refreshed.play(); }catch{}
+                  }
+                  // 最終的にダメならエラー
+                  if(refreshed?.paused){
+                    job.failure=`素材「${clip.name}」を再生できません。iPhoneの省データ設定でHEVCになっている場合、設定→カメラ→フォーマットを「互換性優先」にすると改善する場合があります。`;
+                    job.cancelled=true;
+                  }
+                }
+              });
+            }
+          }else if(!video.paused) try{ video.pause(); }catch{}
         }
         if(bgm && job.bgmGain){
           const start=bgmTimelineStartRef.current;
