@@ -6324,6 +6324,10 @@ function App(){
   const playingRef = useRef(false);
   const livePreviewIdsRef = useRef(new Set());
   const previewPlaybackRef = useRef({activeId:null, preparedId:null, incomingId:null, bgmDriftSince:0, lastRenderAt:0});
+  const previewDiagnosticRef = useRef({events:[],lastTime:null,lastClipId:null,lastProgressAt:0,
+    stallReported:false,waitReason:'',lastErrorKey:'',lastErrorAt:0,mediaEventAt:{}});
+  const previewDiagnosticWatchedRef = useRef(new WeakSet());
+  const previewDiagnosticTextRef = useRef(null);
   const timeRef = useRef(0);
   const aspectRef = useRef(16/9);
   const aspectModeRef = useRef('9:16');
@@ -6423,6 +6427,9 @@ function App(){
     return Number.isFinite(start) && Number.isFinite(length) && length>0 && currentTime>=start && currentTime<start+length;
   });
   const [isPlaying, setIsPlaying] = useState(false);
+  const [previewDiagnosticCount,setPreviewDiagnosticCount] = useState(0);
+  const [previewDiagnosticText,setPreviewDiagnosticText] = useState('');
+  const [previewDiagnosticNotice,setPreviewDiagnosticNotice] = useState('');
   const [activeTab, setActiveTab] = useState('material');
   const [mode, setMode] = useState('normal');
   // Level 1-3 Polaroid tokens
@@ -7807,6 +7814,126 @@ function App(){
     };
   },[mode,aspectMode,syncCanvasSize]);
 
+  // プレビューの待機状態を採取する。映像やURLは記録せず、素材名と再生状態だけ残す。
+  const previewMediaState=(clip)=>{
+    if(!clip) return null;
+    const base={id:clip.id,name:clip.name,type:clip.type,
+      timelineStart:clip.timelineStart,duration:clip.duration,trimStart:clip.trimStart||0};
+    if(clip.type==='photo') return base;
+    const video=videoRefs.current.get(clip.id);
+    if(!video) return {...base,missing:true};
+    let bufferedEnd=null;
+    try{ if(video.buffered.length) bufferedEnd=video.buffered.end(video.buffered.length-1); }catch{}
+    return {...base,currentTime:Number(video.currentTime.toFixed(3)),
+      readyState:video.readyState,networkState:video.networkState,
+      seeking:video.seeking,paused:video.paused,ended:video.ended,
+      videoWidth:video.videoWidth,videoHeight:video.videoHeight,
+      bufferedEnd,mediaError:video.error?.code||null};
+  };
+  const previewDiagnosticSnapshot=(reason)=>{
+    const t=timeRef.current;
+    const list=clipsRef.current;
+    const index=list.findIndex(c=>t>=c.timelineStart && t<c.timelineStart+c.duration);
+    const active=list[index]||null;
+    const next=list[index+1]||null;
+    return {reason,timelineTime:Number(t.toFixed(3)),totalTime:Number(durationRef.current.toFixed(3)),
+      mode:modeRef.current,playing:playingRef.current,playbackRate,
+      waitReason:previewDiagnosticRef.current.waitReason||null,
+      active:previewMediaState(active),incoming:previewMediaState(next),
+      previous:previewMediaState(list[index-1]),videoElements:videoRefs.current.size,
+      bgm:bgmAudioRef.current ? {paused:bgmAudioRef.current.paused,
+        readyState:bgmAudioRef.current.readyState,currentTime:Number(bgmAudioRef.current.currentTime.toFixed(3))} : null};
+  };
+  const recordPreviewDiagnostic=(type,detail={})=>{
+    const diag=previewDiagnosticRef.current;
+    diag.events.push({at:new Date().toISOString(),type,...detail});
+    if(diag.events.length>80) diag.events.splice(0,diag.events.length-80);
+    if(type==='stall' || type==='play-error' || type==='media-error')
+      setPreviewDiagnosticCount(count=>count+1);
+  };
+  const watchPreviewMedia=()=>{
+    clipsRef.current.forEach(clip=>{
+      if(clip.type!=='video') return;
+      const video=videoRefs.current.get(clip.id);
+      if(!video || previewDiagnosticWatchedRef.current.has(video)) return;
+      previewDiagnosticWatchedRef.current.add(video);
+      ['waiting','stalled','playing','error'].forEach(eventName=>{
+        video.addEventListener(eventName,()=>{
+          if(!playingRef.current || !livePreviewIdsRef.current.has(clip.id)) return;
+          const diag=previewDiagnosticRef.current;
+          const key=`${clip.id}|${eventName}`;
+          const now=performance.now();
+          if(now-(diag.mediaEventAt[key]||0)<1000) return;
+          diag.mediaEventAt[key]=now;
+          recordPreviewDiagnostic(eventName==='error'?'media-error':`media-${eventName}`,
+            {clip:clip.name,media:previewMediaState(clip),
+              timelineTime:Number(timeRef.current.toFixed(3))});
+        });
+      });
+    });
+  };
+  const requestPreviewPlay=(video,clip,phase)=>{
+    try{
+      const result=video.play();
+      result?.catch?.(error=>{
+        const name=error?.name||'UnknownError';
+        const diag=previewDiagnosticRef.current;
+        const key=`${clip?.id||'bgm'}|${phase}|${name}`;
+        const now=performance.now();
+        if(diag.lastErrorKey===key && now-diag.lastErrorAt<1500) return;
+        diag.lastErrorKey=key;diag.lastErrorAt=now;
+        recordPreviewDiagnostic(name==='AbortError'?'play-aborted':'play-error',
+          {clip:clip?.name||'BGM',phase,error:name,message:String(error?.message||'').slice(0,160),
+            state:previewDiagnosticSnapshot('再生要求の失敗')});
+      });
+    }catch(error){
+      recordPreviewDiagnostic('play-error',{clip:clip?.name||'BGM',phase,
+        error:error?.name||'UnknownError',message:String(error?.message||'').slice(0,160),
+        state:previewDiagnosticSnapshot('再生要求の例外')});
+    }
+  };
+  const trackPreviewProgress=(now,t,active,waitReason)=>{
+    const diag=previewDiagnosticRef.current;
+    diag.waitReason=waitReason||'';
+    if(diag.lastTime===null || Math.abs(t-diag.lastTime)>0.03 || diag.lastClipId!==active?.id){
+      if(diag.stallReported) recordPreviewDiagnostic('resumed',
+        {state:previewDiagnosticSnapshot('再生が進んだ')});
+      diag.lastTime=t;diag.lastClipId=active?.id||null;
+      diag.lastProgressAt=now;diag.stallReported=false;
+    }else if(!diag.stallReported && now-diag.lastProgressAt>=1500){
+      diag.stallReported=true;
+      recordPreviewDiagnostic('stall',{elapsedMs:Math.round(now-diag.lastProgressAt),
+        state:previewDiagnosticSnapshot('再生時刻が1.5秒以上進まない')});
+    }
+  };
+  const formatPreviewDiagnostic=()=>{
+    const diag=previewDiagnosticRef.current;
+    return JSON.stringify({report:'Vlog Studio 再生診断',capturedAt:new Date().toISOString(),
+      browser:navigator.userAgent,now:previewDiagnosticSnapshot('手動で状態を記録'),
+      recentEvents:diag.events.slice(-40)},null,2);
+  };
+  const capturePreviewDiagnostic=()=>{
+    recordPreviewDiagnostic('manual',{state:previewDiagnosticSnapshot('手動で状態を記録')});
+    setPreviewDiagnosticText(formatPreviewDiagnostic());
+    setPreviewDiagnosticNotice('今の状態を記録しました。');
+  };
+  const copyPreviewDiagnostic=async()=>{
+    const report=formatPreviewDiagnostic();
+    setPreviewDiagnosticText(report);
+    try{
+      await navigator.clipboard.writeText(report);
+      setPreviewDiagnosticNotice('診断結果をコピーしました。');
+    }catch{
+      try{
+        const field=previewDiagnosticTextRef.current;
+        if(!field) throw new Error('copy unavailable');
+        field.value=report;field.focus();field.select();
+        if(!document.execCommand('copy')) throw new Error('copy unavailable');
+        setPreviewDiagnosticNotice('診断結果をコピーしました。');
+      }catch{ setPreviewDiagnosticNotice('下の診断結果を長押ししてコピーしてください。'); }
+    }
+  };
+
   const tick = useCallback(()=>{
     if(!playingRef.current) return;
     const now=performance.now();
@@ -7820,7 +7947,9 @@ function App(){
     let active=clipsNow[index];
     const clockClipId=active?.id;
     let waiting=false;
+    const waitReasons=[];
     let activeVideo=active?.type==='video' ? videoRefs.current.get(active.id) : null;
+    if(active?.type==='video' && !activeVideo) waitReasons.push('active-video-missing');
     if(activeVideo){
       if(state.activeId!==active.id){
         const target=(active.trimStart||0)+t-active.timelineStart;
@@ -7835,12 +7964,14 @@ function App(){
       if(activeVideo.ended){
         // 終了済み動画への play() は冒頭から再開し得るため、次の素材へ進む。
         t=active.timelineStart+active.duration;
-      }else if(activeVideo.readyState<2 || activeVideo.seeking) waiting=true;
+      }else if(activeVideo.readyState<2 || activeVideo.seeking){
+        waiting=true;waitReasons.push(activeVideo.seeking?'active-seeking':'active-not-ready');
+      }
       else{
         if(activeVideo.paused){
-          try{ activeVideo.play()?.catch?.(()=>{}); }catch{}
+          requestPreviewPlay(activeVideo,active,'active-tick');
         }
-        if(activeVideo.paused) waiting=true;
+        if(activeVideo.paused){ waiting=true;waitReasons.push('active-paused'); }
         else{
           const mediaTime=Math.max(active.timelineStart,Math.min(active.timelineStart+active.duration,
             active.timelineStart+activeVideo.currentTime-(active.trimStart||0)));
@@ -7848,6 +7979,7 @@ function App(){
             // 再生時刻が予期せず戻った時だけ回復し、毎フレームの補正には戻さない。
             try{ activeVideo.currentTime=(active.trimStart||0)+t-active.timelineStart; }catch{}
             waiting=true;
+            waitReasons.push('active-clock-behind');
           }else{
             // 前後の動画の時計差でタイムラインが巻き戻るのを防ぐ。
             t=Math.max(t,mediaTime);
@@ -7869,6 +8001,7 @@ function App(){
       timeRef.current=t;
       state.activeId=null;
       waiting=true;
+      waitReasons.push('clip-switch');
     }
     const trans=active?._transitionToNext;
     const transDur=trans?.type && trans.type!=='none' && index<clipsNow.length-1 ? trans.duration||0.5 : 0;
@@ -7893,16 +8026,19 @@ function App(){
         }
       }
       incoming.playbackRate=playbackRate;
-      if(incoming.readyState<2 || incoming.seeking) waiting=true;
+      if(incoming.readyState<2 || incoming.seeking){
+        waiting=true;waitReasons.push(incoming.seeking?'incoming-seeking':'incoming-not-ready');
+      }
       else{
-        if(incoming.paused){ try{ incoming.play()?.catch?.(()=>{}); }catch{} }
-        if(incoming.paused) waiting=true;
+        if(incoming.paused) requestPreviewPlay(incoming,next,'incoming-tick');
+        if(incoming.paused){ waiting=true;waitReasons.push('incoming-paused'); }
       }
     }
     const liveIds=new Set();
     if(active?.type==='video') liveIds.add(active.id);
     if(inOverlap && incoming) liveIds.add(next.id);
     livePreviewIdsRef.current=liveIds;
+    trackPreviewProgress(now,t,active,waitReasons.join(','));
     // 読み込み待ちでは音・タイムラインも待ち、黒画面や文字だけの先行を防ぐ。
     if(waiting){
       if(activeVideo && !activeVideo.paused) try{ activeVideo.pause(); }catch{}
@@ -7932,7 +8068,7 @@ function App(){
       const bgm=bgmAudioRef.current;
       bgm.playbackRate=playbackRate;
       const bgmTarget=t+bgmOffsetRef.current;
-      if(bgm.paused) try{ bgm.play()?.catch?.(()=>{}); }catch{}
+      if(bgm.paused) requestPreviewPlay(bgm,null,'bgm-tick');
       if(Math.abs(bgm.currentTime-bgmTarget)>0.35){
         if(!state.bgmDriftSince) state.bgmDriftSince=now;
         if(now-state.bgmDriftSince>400){
@@ -7987,6 +8123,10 @@ function App(){
     playingRef.current=true;
     setIsPlaying(true);
     tick._last=performance.now();
+    watchPreviewMedia();
+    Object.assign(previewDiagnosticRef.current,{lastTime:timeRef.current,lastClipId:null,
+      lastProgressAt:tick._last,stallReported:false,waitReason:''});
+    recordPreviewDiagnostic('play',{state:previewDiagnosticSnapshot('再生開始')});
     // 解析後の再生停止バグ修正: 再生前に全videoのreadyStateを確認して必要なら少し待つ
     let needsWait=false;
     clipsRef.current.forEach(clip=>{
@@ -8012,7 +8152,7 @@ function App(){
       firstVideo.playbackRate=playbackRate;
       previewPlaybackRef.current.activeId=activeAtStart.id;
       livePreviewIdsRef.current=new Set([activeAtStart.id]);
-      try{ const p=firstVideo.play(); if(p?.catch) p.catch(()=>{}); }catch{}
+      requestPreviewPlay(firstVideo,activeAtStart,'tap-start');
     }
     if(bgmAudioRef.current && bgmTrack!=='none'){
       bgmAudioRef.current.playbackRate=playbackRate;
@@ -8020,7 +8160,7 @@ function App(){
         const target=Math.max(0,timeRef.current+bgmOffsetRef.current);
         if(Math.abs(bgmAudioRef.current.currentTime-target)>0.05) bgmAudioRef.current.currentTime=target;
       }catch{}
-      try{ bgmAudioRef.current.play().catch(()=>{}); }catch{}
+      requestPreviewPlay(bgmAudioRef.current,null,'bgm-start');
     }
     // 少し待ってからtick開始（seek完了待ち）
     const startDelay = needsWait ? 120 : 30;
@@ -8038,10 +8178,7 @@ function App(){
         if(active){
           const v=videoRefs.current.get(active.id);
           if(v){
-            try{
-              const p=v.play();
-              if(p&&p.then) p.catch(()=>{});
-            }catch{}
+            requestPreviewPlay(v,active,'delayed-start');
           }
         }
         rafTickRef.current=requestAnimationFrame(tick);
@@ -8050,6 +8187,8 @@ function App(){
   },[tick, bgmTrack, playbackRate]);
 
   const handleStop = useCallback((redraw=true)=>{
+    if(playingRef.current) recordPreviewDiagnostic('stop',
+      {state:previewDiagnosticSnapshot('再生停止ボタンまたは処理による停止')});
     ++previewSessionRef.current;
     clearTimeout(previewStartTimerRef.current);
     previewStartTimerRef.current=0;
@@ -8058,13 +8197,15 @@ function App(){
     previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0};
     setIsPlaying(false);
     tick._last=0;
+    previewDiagnosticRef.current.lastTime=null;
+    previewDiagnosticRef.current.stallReported=false;
     cancelAnimationFrame(rafTickRef.current);
     videoRefs.current.forEach(v=>{ try{ v.pause(); v.playbackRate=1; }catch{} });
     if(bgmAudioRef.current){ try{ bgmAudioRef.current.pause(); bgmAudioRef.current.playbackRate=1; }catch{} }
     lastDisplayedTimeRef.current = timeRef.current;
     setCurrentTime(timeRef.current);
     if(redraw!==false) drawFrameRef.current(timeRef.current);
-  },[]);
+  },[playbackRate]);
   const handleRestartPreview=useCallback((e)=>{
     if(!clipsRef.current.length || analysisBusyRef.current) return;
     handleStop(false);
@@ -12797,6 +12938,38 @@ const recomputeStarts=(arr)=>{
           React.createElement('div', {className:'nami-bar'}),
           React.createElement('div', {className:'nami-bar'}),
           React.createElement('div', {className:'nami-bar'})
+        )
+      ),
+      React.createElement('details', {
+        className:'w-full max-w-md rounded-xl border border-white/10 bg-white/[0.03] text-[11px] text-white/70',
+        onToggle:e=>{if(e.currentTarget.open) setPreviewDiagnosticText(formatPreviewDiagnostic());}
+      },
+        React.createElement('summary', {className:'cursor-pointer px-3 py-2.5 font-bold'},
+          previewDiagnosticCount>0 ? `再生診断 · 異常 ${previewDiagnosticCount}件` : '再生診断'),
+        React.createElement('div', {className:'px-3 pb-3 border-t border-white/10'},
+          React.createElement('div', {className:'text-white/55 py-2'},
+            '再生が止まったら「今の状態を記録」を押してください。再生を押し直した後も記録は残ります。'),
+          React.createElement('div', {className:'flex flex-wrap gap-2'},
+            React.createElement('button', {type:'button',onClick:capturePreviewDiagnostic,
+              className:'min-h-10 rounded-full bg-white/15 px-3'}, '今の状態を記録'),
+            React.createElement('button', {type:'button',onClick:copyPreviewDiagnostic,
+              className:'min-h-10 rounded-full bg-violet-600 px-3 text-white'}, '診断結果をコピー'),
+            React.createElement('button', {type:'button',onClick:()=>{
+              previewDiagnosticRef.current.events=[];
+              previewDiagnosticRef.current.lastErrorKey='';
+              previewDiagnosticRef.current.mediaEventAt={};
+              previewDiagnosticRef.current.stallReported=false;
+              previewDiagnosticRef.current.lastProgressAt=performance.now();
+              previewDiagnosticRef.current.lastTime=timeRef.current;
+              setPreviewDiagnosticCount(0);setPreviewDiagnosticText('');
+              setPreviewDiagnosticNotice('記録を消しました。');
+            },className:'min-h-10 rounded-full border border-white/20 px-3'}, '記録を消す')
+          ),
+          previewDiagnosticNotice && React.createElement('div', {role:'status',className:'mt-2 text-violet-200'},previewDiagnosticNotice),
+          React.createElement('textarea', {ref:previewDiagnosticTextRef,readOnly:true,
+            value:previewDiagnosticText,'aria-label':'再生診断の記録',
+            className:'mt-2 w-full h-32 rounded-lg bg-black/50 p-2 font-mono text-[10px] text-white/70 select-text',
+            onFocus:e=>e.currentTarget.select()})
         )
       )
     ),
