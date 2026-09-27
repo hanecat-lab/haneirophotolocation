@@ -7460,9 +7460,11 @@ function App(){
     }catch{}
     
     // デコード待ちの間は前の完成フレームを残し、背景色だけの瞬間を出さない。
-    if(playingRef.current && !exportClips && [activeClip,nextClip].some(clip=>
-      clip?.type==='video' && livePreviewIdsRef.current.has(clip.id) &&
-      (videoRefs.current.get(clip.id)?.readyState||0)<2)) return;
+    if(playingRef.current && !exportClips && [activeClip,nextClip].some(clip=>{
+      if(clip?.type!=='video' || !livePreviewIdsRef.current.has(clip.id)) return false;
+      const video=videoRefs.current.get(clip.id);
+      return !video || video.readyState<2 || video.seeking || !video.videoWidth;
+    })) return;
     ctx.fillStyle=paperColor;
     ctx.fillRect(0,0,cw,ch);
     const css=getClipPreviewFilter(activeClip,activeFilterRef.current,filterIntensityRef.current);
@@ -7690,8 +7692,23 @@ function App(){
         drawFrameRef.current(timeRef.current);
         return;
       }
-      c.width=Math.max(10,targetW*dpr);
-      c.height=Math.max(10,targetH*dpr);
+      const nextWidth=Math.max(10,Math.round(targetW*dpr));
+      const nextHeight=Math.max(10,Math.round(targetH*dpr));
+      if(c.width!==nextWidth || c.height!==nextHeight){
+        let previousFrame=null;
+        if(playingRef.current && c.width>0 && c.height>0){
+          try{
+            previousFrame=document.createElement('canvas');
+            previousFrame.width=c.width;previousFrame.height=c.height;
+            previousFrame.getContext('2d').drawImage(c,0,0);
+          }catch{previousFrame=null;}
+        }
+        c.width=nextWidth;
+        c.height=nextHeight;
+        if(previousFrame){
+          try{c.getContext('2d',{alpha:false}).drawImage(previousFrame,0,0,nextWidth,nextHeight);}catch{}
+        }
+      }
       if(isFs){
         // ファインダーとシアターはpreview-wrapに100%で収まる
         if(modeRef.current==='finder' || modeRef.current==='hikariyomi'){
@@ -7762,21 +7779,35 @@ function App(){
     if(activeVideo){
       if(state.activeId!==active.id){
         const target=(active.trimStart||0)+t-active.timelineStart;
-        // 素材への入場時だけシーク。重なりから引き継いだ動画はそのまま進める。
-        if(state.incomingId!==active.id && Math.abs(activeVideo.currentTime-target)>0.035){
+        // 重なりから引き継ぐ際も大きな遅れだけは一度合わせる。
+        const tolerance=state.incomingId===active.id ? 0.08 : 0.035;
+        if(Math.abs(activeVideo.currentTime-target)>tolerance){
           try{ activeVideo.currentTime=target; }catch{}
         }
         state.activeId=active.id;
       }
       activeVideo.playbackRate=playbackRate;
-      if(activeVideo.readyState<2 || activeVideo.seeking) waiting=true;
+      if(activeVideo.ended){
+        // 終了済み動画への play() は冒頭から再開し得るため、次の素材へ進む。
+        t=active.timelineStart+active.duration;
+      }else if(activeVideo.readyState<2 || activeVideo.seeking) waiting=true;
       else{
         if(activeVideo.paused){
           try{ activeVideo.play()?.catch?.(()=>{}); }catch{}
         }
         if(activeVideo.paused) waiting=true;
-        else t=Math.max(active.timelineStart,Math.min(active.timelineStart+active.duration,
-          active.timelineStart+activeVideo.currentTime-(active.trimStart||0)));
+        else{
+          const mediaTime=Math.max(active.timelineStart,Math.min(active.timelineStart+active.duration,
+            active.timelineStart+activeVideo.currentTime-(active.trimStart||0)));
+          if(mediaTime<t-0.12){
+            // 再生時刻が予期せず戻った時だけ回復し、毎フレームの補正には戻さない。
+            try{ activeVideo.currentTime=(active.trimStart||0)+t-active.timelineStart; }catch{}
+            waiting=true;
+          }else{
+            // 前後の動画の時計差でタイムラインが巻き戻るのを防ぐ。
+            t=Math.max(t,mediaTime);
+          }
+        }
       }
     }else if(active?.type==='photo'){
       state.activeId=null;
