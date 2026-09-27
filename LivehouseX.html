@@ -655,6 +655,10 @@
           <div class="hint">キューを呼んだとき、いまの明かりからそのキューへ何秒かけて移るか。0 はカット（瞬時）。この時間はキューを保存すると一緒に保存され、そのキューを呼ぶときに使われます ― 「サビはカット、落ちサビは5秒」がキュー側に付いてきます。モードの切り替え・再生中のフラグ・灯体の並びは即座に変わり、時間をかけるのは明るさ・色・ON/OFF だけです。</div>
           <div class="status-note" id="cueStatus"></div>
         </details></section>
+        <section class="section"><details class="sec" data-sec="sub"><summary class="label"><span>サブマスター</span><small>SUBMASTER</small></summary>
+          <div id="subList" style="display:flex;flex-direction:column;gap:12px"></div>
+          <div class="hint">記録した見た目を、レバーの位置ぶんだけ足します（明るさだけ／HTP＝すでに明るい灯体は下がりません）。キューを呼んでもレバーは残るので、キューを作り直さずに一箇所だけ持ち上げられます。バンプは押しているあいだ全開。暗転は従来どおり全部落とします。</div>
+        </details></section>
         <section class="section"><details class="sec" data-sec="sec23"><summary class="label"><span>設定データ</span><small>JSON / BACKUP</small></summary>
           <div class="io-actions"><button id="exportSettings" type="button">設定をエクスポート</button><button id="importSettings" type="button">設定をインポート</button></div>
           <input id="importFile" type="file" accept="application/json,.json" hidden />
@@ -3346,6 +3350,22 @@
     }
     /* 保存済みの状態を id で引いて復元する。restoreSettings（module末尾で同期実行）
        から呼ばれる。id で引くので、配列の並びや本数が変わっても壊れない。 */
+    /* サブマスター。id で引くので、本数や並びが変わっても壊れない。
+       割り当て先は「いま存在するもの」だけ受ける ― 消えたキュー名は残しておき、
+       卓に「割り当てたキューがありません」と出す（黙って別のものに化けない）。 */
+    function sanitizeSubmasters(list){
+      if(!Array.isArray(list))return;
+      list.forEach(item=>{
+        if(!item||typeof item.id!=='string')return;
+        const s=submastersData.find(d=>d.id===item.id); if(!s)return;
+        s.mode=['none','group','cue'].includes(item.mode)?item.mode:'none';
+        const t=typeof item.target==='string'?item.target:'';
+        s.target=s.mode==='group'?(SUB_GROUPS.some(g=>g.id===t)?t:''):(s.mode==='cue'?t:'');
+        const p=Number(item.pos);
+        s.pos=Number.isFinite(p)?THREE.MathUtils.clamp(p,0,100):0;
+        s.bump=false;
+      });
+    }
     function sanitizeGlowFans(list){
       if(!Array.isArray(list))return;
       const cl=(v,lo,hi,dflt)=>{const n=Number(v);return Number.isFinite(n)?THREE.MathUtils.clamp(n,lo,hi):dflt};
@@ -6553,6 +6573,45 @@
       const value=chosen?chosen[key]:fallback;
       return value&&typeof value.clone==='function'?value.clone():value;
     }
+    /* ===== サブマスター =====
+       本物の卓と同じく「記録した見た目 × レバー」を HTP で足す。掛ける位置は
+       グランドマスター（board.bright）の直前 ― 暗転は従来どおり全部を落とす。
+       状態は board の外に置く。applyBoard はキュー呼び出しのたびに board を
+       名指しで上書きし、cueFadeTick は毎フレーム board へ破壊的に書き込み、
+       saveCue は board を丸ごと写すので、board に置くと「キューを呼んでも
+       レバーは残る」というサブマスターの要件そのものが成り立たない。 */
+    const SUB_COUNT=5;
+    /* 灯体のグループ。foh だけは type ではなく role（前明かりの1列）。 */
+    const SUB_GROUPS=[{id:'par',label:'PAR'},{id:'moving',label:'ムービング'},
+      {id:'side',label:'サイド'},{id:'uplight',label:'アップライト'},{id:'foh',label:'前明かり'}];
+    const subGroupHas=(id,f)=>id==='foh'?f.role==='foh':f.type===id;
+    const submastersData=[...Array(SUB_COUNT)].map((_,i)=>
+      ({id:'sub'+(i+1), label:'サブ'+(i+1), mode:'none', target:'', pos:0, bump:false}));
+    /* キューは localStorage なので毎フレーム読まない。書いたら捨てる。 */
+    let _subCueCache=null;
+    const subCues=()=>_subCueCache||(_subCueCache=readCues());
+    const subCuesInvalidate=()=>{_subCueCache=null};
+    /* 記録した明るさ 0..1。グループはレバーの位置まで持ち上げる（記録は一律1）。 */
+    function subRecordOf(s,i){
+      if(s.mode==='group')return subGroupHas(s.target,RIG[i])?1:0;
+      if(s.mode==='cue'){
+        const c=subCues()[s.target];
+        const f=c&&Array.isArray(c.fixtures)?c.fixtures[i]:null;
+        if(!f||!f.on)return 0;
+        return THREE.MathUtils.clamp(Number(f.level)||0,0,100)/100;
+      }
+      return 0;
+    }
+    const subPosOf=s=>(s.bump?100:THREE.MathUtils.clamp(Number(s.pos)||0,0,100))/100;
+    function submasterLevel(i){
+      let v=0;
+      for(const s of submastersData){
+        const p=subPosOf(s); if(p<=0||s.mode==='none')continue;
+        const r=subRecordOf(s,i)*p; if(r>v)v=r;
+      }
+      return v;
+    }
+    const submasterActive=()=>submastersData.some(s=>s.mode!=='none'&&subPosOf(s)>0);
     function composeLightingFrame(t){
       const master=THREE.MathUtils.clamp(board.bright/100,0,1),blackout=!!board.blackout;
       const showSlots=activeShowSlots(t);
@@ -6562,10 +6621,16 @@
         const requests=[base,movement,...accents].filter(Boolean),levelRequests=activeLevelRequests(requests);
         const offMask=levelRequests.some(r=>r.forceOff),manualOff=!base.enabled;
         const preMaster=offMask?0:htpLevel(levelRequests);
-        const level=manualOff||blackout?0:THREE.MathUtils.clamp(preMaster*master,0,1);
+        /* サブマスターは優先度の奪い合い（activeLevelRequests の replacesLevel）を
+           通さず、ここで HTP する。通すと base を奪うか、チェイス中に自分が消える。
+           卓で消してある灯体（manualOff）もサブでは上がる ― 記録した見た目を
+           足すのがサブマスターなので、これが正しい。暗転だけは必ず落とす。 */
+        const sub=submasterLevel(i), own=manualOff?0:preMaster, out=Math.max(own,sub);
+        const level=blackout?0:THREE.MathUtils.clamp(out*master,0,1);
         const source=levelRequests.reduce((best,r)=>!best||r.level>=best.level?r:best,null);
         return{id:f.id,level,preMaster,color:ltpValue(requests,'color',base.color),
-          aim:beamOrbitAim(f,ltpValue(requests,'aim',base.aim),t,orbitGain),forceOff:offMask||manualOff||blackout,
+          aim:beamOrbitAim(f,ltpValue(requests,'aim',base.aim),t,orbitGain),
+          forceOff:blackout||(out<=0&&(offMask||manualOff)),
           sourceLayer:source?.layer||'base',sourceSlot:source?.slot||null};
       });
       const requestedPolicy=['maintain','follow','off'].includes(board.subjectSpot.policy)?board.subjectSpot.policy:'follow';
@@ -9068,6 +9133,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         smallModel:{version:2,activeSlot:activeSmallModelSlot,slots:{a:{...smallModelSlots.a},b:{...smallModelSlots.b}}},
         micStands:micStandsData.map(d=>({id:d.id,on:!!d.on})),
         glowFans:glowFansData.map(d=>({id:d.id,on:!!d.on,x:d.x,z:d.z,rot:d.rot,pose:d.pose,color:d.color})),
+        /* サブマスターは board の外。bump は押しているあいだだけなので保存しない。 */
+        submasters:submastersData.map(s=>({id:s.id,mode:s.mode,target:s.target,pos:s.pos})),
         glowStance:{abd:Math.round(glowAbd*180/Math.PI)},   // 股の角は30人共通
         mannequinColor:document.querySelector('#mannequinColor').value,
         costumeColor:document.querySelector('#costumeColor').value,
@@ -9103,7 +9170,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     addEventListener('pagehide',flushSettings);
     document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')flushSettings()});
     function readCues(){try{return JSON.parse(localStorage.getItem(CUE_STORAGE_KEY)||'{}')}catch(e){console.warn('キューの読み込みに失敗しました',e);return{}}}
-    function writeCues(c){try{localStorage.setItem(CUE_STORAGE_KEY,JSON.stringify(c))}catch(e){console.warn('キューの保存に失敗しました',e)}}
+    function writeCues(c){subCuesInvalidate();   // サブマスターが読む控えを捨てる
+      try{localStorage.setItem(CUE_STORAGE_KEY,JSON.stringify(c))}catch(e){console.warn('キューの保存に失敗しました',e)}}
     function cueStatus(text){const el=document.querySelector('#cueStatus');if(el)el.textContent=text}
     function renderCueOptions(){
       const select=document.querySelector('#cueSelect');if(!select)return;
@@ -9113,6 +9181,59 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         const o=document.createElement('option');o.value=name;o.textContent=name;select.append(o);
       });
       if(readCues()[current])select.value=current;
+      renderSubUI();   // キューが増減したら、サブマスターの割り当て先も組み直す
+    }
+    /* サブマスターの卓。5本ぶんの行を作り直す（キュー名の増減に追従する）。 */
+    function renderSubUI(){
+      const list=document.querySelector('#subList'); if(!list)return;
+      const names=Object.keys(subCues()).sort((a,b)=>a.localeCompare(b,'ja'));
+      list.innerHTML='';
+      submastersData.forEach((s,i)=>{
+        const lost=s.mode==='cue'&&s.target&&!names.includes(s.target);
+        const row=document.createElement('div');
+        row.className='fan-row';
+        row.innerHTML=`
+          <div class="fan-head"><strong>${s.label}</strong>
+            <button class="mode${subPosOf(s)>0?' active':''}" data-sub-bump="${i}" type="button">バンプ</button>
+          </div>
+          <div class="fan-pose"><span>割り当て</span><select data-sub-mode="${i}">
+            <option value="none"${s.mode==='none'?' selected':''}>なし</option>
+            <option value="group"${s.mode==='group'?' selected':''}>灯体グループ</option>
+            <option value="cue"${s.mode==='cue'?' selected':''}>キュー</option>
+          </select></div>
+          ${s.mode==='none'?'':`<div class="fan-pose"><span>${s.mode==='cue'?'キュー':'グループ'}</span><select data-sub-target="${i}">
+            <option value=""${s.target?'':' selected'}>選択</option>
+            ${(s.mode==='cue'?names.map(n=>[n,n]):SUB_GROUPS.map(g=>[g.id,g.label]))
+              .map(([v,l])=>`<option value="${v}"${v===s.target?' selected':''}>${l}</option>`).join('')}
+          </select></div>`}
+          <div class="slider" style="margin:4px 0"><div><span>レバー</span><strong id="v-sub${i}">${Math.round(s.pos)}%</strong></div><input type="range" data-sub-pos="${i}" min="0" max="100" step="1" value="${Math.round(s.pos)}"></div>
+          ${lost?'<div class="hint">割り当てたキューがありません。</div>':''}
+        `;
+        list.appendChild(row);
+      });
+      list.querySelectorAll('[data-sub-mode]').forEach(sel=>sel.addEventListener('change',e=>{
+        const i=+e.currentTarget.getAttribute('data-sub-mode');
+        submastersData[i].mode=e.currentTarget.value; submastersData[i].target='';
+        renderSubUI(); saveSettings(); refresh();
+      }));
+      list.querySelectorAll('[data-sub-target]').forEach(sel=>sel.addEventListener('change',e=>{
+        const i=+e.currentTarget.getAttribute('data-sub-target');
+        submastersData[i].target=e.currentTarget.value; saveSettings(); refresh();
+      }));
+      list.querySelectorAll('[data-sub-pos]').forEach(inp=>inp.addEventListener('input',e=>{
+        const i=+e.currentTarget.getAttribute('data-sub-pos');
+        submastersData[i].pos=+e.currentTarget.value;
+        document.getElementById('v-sub'+i).textContent=Math.round(submastersData[i].pos)+'%';
+        saveSettings(); refresh();
+      }));
+      /* バンプは押しているあいだだけ全開。pointer は離す・外す・取り消しの
+         3つとも拾わないと、指を滑らせたときに上がったままになる。 */
+      list.querySelectorAll('[data-sub-bump]').forEach(btn=>{
+        const i=+btn.getAttribute('data-sub-bump');
+        const set=v=>{submastersData[i].bump=v; btn.classList.toggle('active',v||subPosOf(submastersData[i])>0); refresh()};
+        btn.addEventListener('pointerdown',e=>{e.preventDefault(); set(true)});
+        ['pointerup','pointercancel','pointerleave'].forEach(k=>btn.addEventListener(k,()=>set(false)));
+      });
     }
     function saveCue(){
       const name=document.querySelector('#cueName').value.trim();
@@ -9371,6 +9492,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       if(s.glowStance&&Number.isFinite(Number(s.glowStance.abd)))setGlowAbd(s.glowStance.abd);
       // 復元したら連結ポーズの起点も取り直す（前の起点は無意味なため）
       sanitizeGlowFans(s.glowFans);glowFanRestart();glowFansData.forEach((_,i)=>updateGlowFan(i));renderGlowFanUI();
+      sanitizeSubmasters(s.submasters);renderSubUI();
       if(POSES[s.pose])pose=s.pose;
       showGlasses=!!s.showGlasses;showSunglasses=!!s.showSunglasses;showCatEars=!!s.showCatEars;
       highlightZebraEnabled=!!s.highlightZebraEnabled;syncHighlightZebraUI();
@@ -9663,6 +9785,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       sec11:()=>board.backlight.on,
       sec12:()=>board.laserSheet.on,
       fan  :()=>glowFansData.some(d=>d.on)||board.penTrail.on,
+      sub  :()=>submasterActive(),
       sec26:()=>board.humanContour.on,
       sec27:()=>board.photonRain.on,
       sec25:()=>board.redMesh.on,
