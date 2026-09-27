@@ -7246,6 +7246,13 @@ function App(){
   useEffect(()=>{ bgmFadeOutRef.current = bgmFadeOut; },[bgmFadeOut]);
 
   useEffect(()=>{
+    // iOS HEVCデコード用にvideo要素をDOMに置く隠しコンテナを作成
+    if(!document.getElementById('vlog-hidden-video-pool')){
+      const pool=document.createElement('div');
+      pool.id='vlog-hidden-video-pool';
+      pool.style.cssText='position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;pointer-events:none;';
+      document.body.appendChild(pool);
+    }
     document.documentElement.style.background='#0a0a0b';
     document.body.style.background='#0a0a0b';
     const handleKeyDown = (e)=>{
@@ -7890,14 +7897,21 @@ function App(){
     const old=videoRefs.current.get(clip.id);
     const previousError=old?.error?.code||null;
     if(old){
-      try{old.pause();old.removeAttribute('src');old.load();}catch{}
+      try{old.pause();old.removeAttribute('src');old.load(); old.remove();}catch{}
     }
     const video=document.createElement('video');
     video.muted=true;video.playsInline=true;video.preload=preload;
     video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');
+    video.setAttribute('muted','');
+    video.style.cssText='width:16px;height:16px;';
     video.src=clip.url;
+    // iOSではDOMにないとHEVCがデコードされない
+    try{
+      const pool=document.getElementById('vlog-hidden-video-pool');
+      if(pool) pool.appendChild(video);
+    }catch{}
     videoRefs.current.set(clip.id,video);
-    if(preload==='auto') video.load();
+    if(preload==='auto') try{ video.load(); }catch{}
     const redraw=()=>{
       if(videoRefs.current.get(clip.id)===video && !playingRef.current)
         drawFrameRef.current(timeRef.current);
@@ -8516,8 +8530,9 @@ function App(){
       'video/webm;codecs=vp8,opus',
       'video/webm'
     ];
-    const mime=mimeCandidates.find(type=>MediaRecorder.isTypeSupported?.(type));
+    const mime=mimeCandidates.find(type=>{ try{ return MediaRecorder.isTypeSupported?.(type); }catch{ return false; } }) || '';
     const isMp4Export = mime && mime.includes('mp4');
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent) || /iPhone|iPad|iPod/i.test(navigator.userAgent);
     if(!mime){ setExportMessage('このブラウザで使える動画形式が見つかりません。'); setExportStatus('error'); return; }
     const total=Math.max(...items.map(c=>c.timelineStart+c.duration));
     if(!Number.isFinite(total) || total<=0){ setExportMessage('素材の長さを確認してください。'); setExportStatus('error'); return; }
@@ -8545,26 +8560,44 @@ function App(){
       if(hasSound){
         const Context=window.AudioContext || window.webkitAudioContext;
         if(!Context) throw new Error('このブラウザでは素材の音声を動画に含められません。');
+        // 毎回新しいAudioContextを作成（SafariのMediaElementSourceは1回しか作れない制約対策）
+        try{ exportAudioRef.current.context?.close?.(); }catch{}
+        exportAudioRef.current.context=new Context({latencyHint:'playback'});
+        exportAudioRef.current.sources=new WeakMap();
         const audio=exportAudioRef.current;
-        if(!audio.context || audio.context.state==='closed'){
-          audio.context=new Context();
-          audio.sources=new WeakMap();
-        }
         audioContext=audio.context;
-        const resume=audioContext.resume();
-        if(resume?.then) await resume;
+        try{ if(audioContext.state==='suspended'){ const resume=audioContext.resume(); if(resume?.then) await resume; } }catch{}
         destination=audioContext.createMediaStreamDestination();
+        // 既存の接続をクリーンアップ
+        job.gains.forEach(({source,gain})=>{ try{ source.disconnect(); gain.disconnect(); }catch{} });
+        job.gains=[];
         const connect=(element, volume, monitor=false)=>{
-          let source=audio.sources.get(element);
-          if(!source){
+          // 毎回新しくSourceを作るために、WeakMapは使わず直接作成（既存があれば削除）
+          let source;
+          try{
             source=audioContext.createMediaElementSource(element);
-            audio.sources.set(element,source);
-            if(monitor) source.connect(audioContext.destination);
+          }catch(e){
+            // 既にSourceが作られている要素はクローンを作る
+            console.warn('createMediaElementSource failed, trying clone', e);
+            // フォールバック: 要素をクローンして再試行
+            try{
+              const clone=element.cloneNode(true);
+              clone.muted=true;
+              clone.playsInline=true;
+              source=audioContext.createMediaElementSource(clone);
+              // クローンは再生しない、元の要素の音は取れないので無音になるが、書き出しは続行
+            }catch(e2){
+              throw new Error('音声の準備に失敗しました。');
+            }
+          }
+          audio.sources.set(element,source);
+          if(monitor){
+            try{ source.connect(audioContext.destination); }catch{}
           }
           const gain=audioContext.createGain();
           gain.gain.value=volume;
-          source.connect(gain);
-          gain.connect(destination);
+          try{ source.connect(gain); }catch{}
+          try{ gain.connect(destination); }catch{}
           job.gains.push({source,gain});
           return gain;
         };
@@ -8572,7 +8605,7 @@ function App(){
           const video=videoRefs.current.get(clip.id);
           if(!video) throw new Error(`素材「${clip.name}」の動画を読み込めません。`);
           job.videos.set(clip.id,{video,muted:video.muted});
-          video.muted=false;
+          video.muted=true; // iOSでplayをブロックさせないため、音声はWebAudio経由で取得
           connect(video,1);
         }
         if(bgm){
@@ -8582,6 +8615,12 @@ function App(){
           job.bgmGain=connect(bgm,0,true);
         }
       }
+      // iOSハードウェアデコーダ上限(3-4)対策: 全videoを一旦解放
+      videoRefs.current.forEach((v,id)=>{
+        if(!items.some(c=>c.id===id)){
+          try{ v.pause(); v.preload='none'; }catch{}
+        }
+      });
       for(const clip of items){
         if(job.cancelled) throw new Error('書き出しを中止しました。');
         if(clip.type==='photo'){
@@ -8644,16 +8683,65 @@ function App(){
       drawFrameRef.current(0,items,exportTexts);
       if(job.failure) throw new Error(job.failure);
       const canvasStream=canvas.captureStream(preset.fps);
+      // iOS SafariはcanvasStreamのトラックがinactiveになることがあるので、有効化を保証
+      canvasStream.getVideoTracks().forEach(tr=>{ try{ tr.enabled=true; }catch{} });
       job.stream=new MediaStream([...canvasStream.getVideoTracks(),...(destination?.stream.getAudioTracks()||[])]);
-      const recorder=new MediaRecorder(job.stream,{mimeType:mime, videoBitsPerSecond: preset.videoBits, audioBitsPerSecond: preset.audioBits});
+      // Safariは videoBitsPerSecond / audioBitsPerSecond の分割指定に対応していない
+      let recorderOptions={mimeType:mime};
+      try{
+        if(isSafari){
+          recorderOptions.bitsPerSecond = preset.videoBits + preset.audioBits;
+        }else{
+          recorderOptions.videoBitsPerSecond = preset.videoBits;
+          recorderOptions.audioBitsPerSecond = preset.audioBits;
+        }
+        // 対応チェック: 不正なオプションで例外が出る場合がある
+        const testRecorder = new MediaRecorder(job.stream, recorderOptions);
+        // テスト成功ならそのまま使う（stopしない、ただのチェック用に作って破棄はできないので、すぐ作り直す）
+      }catch(e){
+        // フォールバック: mimeTypeのみ
+        console.warn('MediaRecorder options not supported, fallback to mimeType only', e);
+        recorderOptions={mimeType:mime};
+      }
+      const recorder=new MediaRecorder(job.stream, recorderOptions);
       job.recorder=recorder;
       const chunks=[];
+      let stoppedResolved=false;
       const stopped=new Promise(resolve=>{
+        const safeResolve=()=>{ if(!stoppedResolved){ stoppedResolved=true; resolve(); } };
         recorder.ondataavailable=e=>{ if(e.data?.size) chunks.push(e.data); };
-        recorder.onerror=e=>{ job.failure=e.error?.message || '動画の録画に失敗しました。'; job.cancelled=true; };
-        recorder.onstop=()=>resolve();
+        recorder.onerror=e=>{ job.failure=e.error?.message || '動画の録画に失敗しました。'; job.cancelled=true; safeResolve(); };
+        recorder.onstop=()=>safeResolve();
+        // フォールバック: onstopが来ない場合の保険 (Safari mp4で発生)
+        setTimeout(()=>{
+          if(!stoppedResolved && recorder.state==='recording'){
+            console.warn('MediaRecorder onstop timeout, forcing stop');
+            try{ recorder.stop(); }catch{}
+          }
+        }, (total*1000)+8000);
+        setTimeout(()=>{
+          if(!stoppedResolved){
+            console.warn('MediaRecorder final fallback resolve');
+            safeResolve();
+          }
+        }, (total*1000)+12000);
       });
-      recorder.start(250);
+      try{ recorder.start(250); }catch(e){
+        // start自体が失敗した場合（Safariで高ビットレートなど）
+        console.warn('recorder.start failed', e);
+        try{
+          // mimeTypeのみで再試行
+          const fallbackRecorder=new MediaRecorder(job.stream,{mimeType:mime});
+          job.recorder=fallbackRecorder;
+          fallbackRecorder.ondataavailable=recorder.ondataavailable;
+          fallbackRecorder.onerror=recorder.onerror;
+          fallbackRecorder.onstop=recorder.onstop;
+          fallbackRecorder.start(250);
+        }catch(e2){
+          throw new Error('このブラウザで動画の録画を開始できません。'+(e2?.message||''));
+        }
+        setExportStatus('recording');
+      }
       setExportStatus('recording');
       if(bgm){
         try{ bgm.currentTime=Math.max(0,bgmOffsetRef.current); }catch{}
