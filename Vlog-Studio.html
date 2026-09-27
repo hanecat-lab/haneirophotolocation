@@ -6327,6 +6327,7 @@ function App(){
   const previewDiagnosticRef = useRef({events:[],lastTime:null,lastClipId:null,lastProgressAt:0,
     stallReported:false,waitReason:'',lastErrorKey:'',lastErrorAt:0,mediaEventAt:{}});
   const previewDiagnosticWatchedRef = useRef(new WeakSet());
+  const previewPlayPendingRef = useRef(new WeakMap());
   const previewDiagnosticTextRef = useRef(null);
   const timeRef = useRef(0);
   const aspectRef = useRef(16/9);
@@ -7865,17 +7866,20 @@ function App(){
           const now=performance.now();
           if(now-(diag.mediaEventAt[key]||0)<1000) return;
           diag.mediaEventAt[key]=now;
+          const currentClip=clipsRef.current.find(item=>item.id===clip.id)||clip;
           recordPreviewDiagnostic(eventName==='error'?'media-error':`media-${eventName}`,
-            {clip:clip.name,media:previewMediaState(clip),
+            {clip:currentClip.name,media:previewMediaState(currentClip),
               timelineTime:Number(timeRef.current.toFixed(3))});
         });
       });
     });
   };
   const requestPreviewPlay=(video,clip,phase)=>{
+    if(previewPlayPendingRef.current.has(video)) return;
     try{
       const result=video.play();
-      result?.catch?.(error=>{
+      if(!result?.then) return;
+      const pending=Promise.resolve(result).catch(error=>{
         const name=error?.name||'UnknownError';
         const diag=previewDiagnosticRef.current;
         const key=`${clip?.id||'bgm'}|${phase}|${name}`;
@@ -7885,7 +7889,11 @@ function App(){
         recordPreviewDiagnostic(name==='AbortError'?'play-aborted':'play-error',
           {clip:clip?.name||'BGM',phase,error:name,message:String(error?.message||'').slice(0,160),
             state:previewDiagnosticSnapshot('再生要求の失敗')});
+      }).finally(()=>{
+        if(previewPlayPendingRef.current.get(video)===pending)
+          previewPlayPendingRef.current.delete(video);
       });
+      previewPlayPendingRef.current.set(video,pending);
     }catch(error){
       recordPreviewDiagnostic('play-error',{clip:clip?.name||'BGM',phase,
         error:error?.name||'UnknownError',message:String(error?.message||'').slice(0,160),
@@ -7949,6 +7957,14 @@ function App(){
     let waiting=false;
     const waitReasons=[];
     let activeVideo=active?.type==='video' ? videoRefs.current.get(active.id) : null;
+    const activeTransition=active?._transitionToNext;
+    const activeOverlap=activeTransition?.type && activeTransition.type!=='none' && index<clipsNow.length-1
+      ? activeTransition.duration||0.5 : 0;
+    const nextAtOverlap=activeOverlap ? clipsNow[index+1] : null;
+    const nextAtOverlapVideo=nextAtOverlap?.type==='video' ? videoRefs.current.get(nextAtOverlap.id) : null;
+    const incomingPreparing=!!nextAtOverlapVideo &&
+      t>=active.timelineStart+active.duration-activeOverlap &&
+      (nextAtOverlapVideo.readyState<2 || nextAtOverlapVideo.seeking);
     if(active?.type==='video' && !activeVideo) waitReasons.push('active-video-missing');
     if(activeVideo){
       if(state.activeId!==active.id){
@@ -7968,10 +7984,12 @@ function App(){
         waiting=true;waitReasons.push(activeVideo.seeking?'active-seeking':'active-not-ready');
       }
       else{
-        if(activeVideo.paused){
+        if(activeVideo.paused && !incomingPreparing){
           requestPreviewPlay(activeVideo,active,'active-tick');
         }
-        if(activeVideo.paused){ waiting=true;waitReasons.push('active-paused'); }
+        if(activeVideo.paused){
+          waiting=true;waitReasons.push(incomingPreparing?'incoming-preparing':'active-paused');
+        }
         else{
           const mediaTime=Math.max(active.timelineStart,Math.min(active.timelineStart+active.duration,
             active.timelineStart+activeVideo.currentTime-(active.trimStart||0)));
@@ -8030,7 +8048,9 @@ function App(){
         waiting=true;waitReasons.push(incoming.seeking?'incoming-seeking':'incoming-not-ready');
       }
       else{
-        if(incoming.paused) requestPreviewPlay(incoming,next,'incoming-tick');
+        const activeBlocked=waitReasons.some(reason=>
+          ['active-seeking','active-not-ready','active-clock-behind','clip-switch'].includes(reason));
+        if(incoming.paused && !activeBlocked) requestPreviewPlay(incoming,next,'incoming-tick');
         if(incoming.paused){ waiting=true;waitReasons.push('incoming-paused'); }
       }
     }
@@ -8041,8 +8061,14 @@ function App(){
     trackPreviewProgress(now,t,active,waitReasons.join(','));
     // 読み込み待ちでは音・タイムラインも待ち、黒画面や文字だけの先行を防ぐ。
     if(waiting){
-      if(activeVideo && !activeVideo.paused) try{ activeVideo.pause(); }catch{}
-      if(incoming && !incoming.paused) try{ incoming.pause(); }catch{}
+      const mustHold=waitReasons.some(reason=>
+        ['active-seeking','active-not-ready','active-clock-behind','incoming-seeking',
+          'incoming-not-ready','incoming-preparing','clip-switch'].includes(reason));
+      // play()の完了待ちだけなら停止しない。毎フレーム pause/play すると再生が進めない。
+      if(mustHold){
+        if(activeVideo && !activeVideo.paused) try{ activeVideo.pause(); }catch{}
+        if(incoming && !incoming.paused) try{ incoming.pause(); }catch{}
+      }
       if(bgmAudioRef.current && !bgmAudioRef.current.paused) try{ bgmAudioRef.current.pause(); }catch{}
       rafTickRef.current=requestAnimationFrame(tick);
       return;
