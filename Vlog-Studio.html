@@ -5853,7 +5853,7 @@ function changedMaterialSeams(before,after,movedId){
 }
 
 // サムネイルは表示に必要な境目だけを順番に取り出す。元の再生用videoはシークしない。
-async function captureMaterialEdge(clip,edge,signal){
+async function captureMaterialEdge(clip,edge,signal,localTime=null,filter='none'){
   if(clip.type==='photo') return clip.url;
   if(signal?.aborted) throw new Error('capture-cancelled');
   const video=document.createElement('video');
@@ -5877,7 +5877,9 @@ async function captureMaterialEdge(clip,edge,signal){
     if(loaded) await loaded;
     if(signal?.aborted) throw new Error('capture-cancelled');
     if(video.readyState<2 || !video.videoWidth) throw new Error('frame-unavailable');
-    const raw=(clip.trimStart||0)+(edge==='last'?Math.max(0,clip.duration-0.08):Math.min(0.08,clip.duration/2));
+    const raw=(clip.trimStart||0)+(Number.isFinite(localTime)
+      ? Math.max(0,Math.min(clip.duration-0.04,localTime))
+      : edge==='last'?Math.max(0,clip.duration-0.08):Math.min(0.08,clip.duration/2));
     const target=Math.max(0,Math.min(raw,Number.isFinite(video.duration)?Math.max(0,video.duration-0.04):raw));
     if(Math.abs(video.currentTime-target)>0.04){
       const seeked=wait(['seeked'],2500);
@@ -5891,6 +5893,7 @@ async function captureMaterialEdge(clip,edge,signal){
     const context=canvas.getContext('2d');
     if(!context) throw new Error('frame-unavailable');
     context.fillStyle='#09090b';context.fillRect(0,0,168,100);
+    context.filter=filter;
     const ratio=Math.min(168/video.videoWidth,100/video.videoHeight);
     const width=video.videoWidth*ratio,height=video.videoHeight*ratio;
     context.drawImage(video,(168-width)/2,(100-height)/2,width,height);
@@ -6862,10 +6865,32 @@ function App(){
   const [draggingClipBar, setDraggingClipBar] = useState(null);
   const [selectedTextId, setSelectedTextId] = useState(null);
   const [textMoveTarget, setTextMoveTarget] = useState(null); // {textId, start}: preview seeking must not change the destination
+  const textMoveTargetRef = useRef(null);
+  const [textMoveZoom, setTextMoveZoom] = useState(null); // fixed six-second window while fine-tuning
+  const [textMoveReview, setTextMoveReview] = useState(null);
+  const textMoveReviewSequenceRef = useRef(0);
+  const reviewTextMove=(textId,start)=>setTextMoveReview({textId,start,nonce:++textMoveReviewSequenceRef.current});
+  const [textMoveFrames, setTextMoveFrames] = useState(null);
+  const [textMoveGhostFrame, setTextMoveGhostFrame] = useState(null);
+  const textMoveGhostCacheRef = useRef(new Map());
+  const [textMoveUndo, setTextMoveUndo] = useState(null);
+  const textMoveDragOriginRef = useRef(null);
+  const setMoveTarget=(textId,start)=>{
+    const next={textId,start:Math.max(0,Math.min(durationRef.current,Number.isFinite(start)?start:0))};
+    textMoveTargetRef.current=next;
+    setTextMoveTarget(next);
+    setTextMoveReview(null);
+    setTextPlacementPrompt(null);
+    setTextTimingNotice('');
+  };
   const [textPlacementPrompt, setTextPlacementPrompt] = useState(null);
+  const textPlacementPromptRef = useRef(null);
   const [textTimingNotice, setTextTimingNotice] = useState('');
   const textInputRef = useRef(null);
   const textTrialTokenRef = useRef(0);
+  useEffect(()=>{
+    if(textPlacementPrompt) requestAnimationFrame(()=>textPlacementPromptRef.current?.scrollIntoView({behavior:'smooth',block:'nearest'}));
+  },[textPlacementPrompt]);
   const [selectedTimelineItem, setSelectedTimelineItem] = useState(null);
   const [inlineTimelineExpanded, setInlineTimelineExpanded] = useState(false);
   const [showReturnToEdit, setShowReturnToEdit] = useState(false);
@@ -8206,7 +8231,7 @@ function App(){
       const t3 = { id: makeId('feel'), text: 'また来たい', start: Math.max(0, total-1.2), end: total, x:pos3.x, y:pos3.y, fontSize:0.062, color:'#ffe4b5', bgColor:'transparent', fontFamily:'hand', bold:false, outline:true, strokeColor:'rgba(0,0,0,0.5)', align:'center', anim:'bounce' };
       setTexts(prev=> [...prev, t1, t2, t3]);
       setSelectedTextId(t1.id);
-      setTextMoveTarget({textId:t1.id,start:Math.round(timeRef.current*10)/10});
+      setMoveTarget(t1.id,Math.round(timeRef.current*10)/10);
       setActiveTab('text');
       setTimeout(()=>{ try{ drawFrameRef.current(timeRef.current); }catch{} },30);
     }catch(e){ console.error(e); }
@@ -8231,7 +8256,7 @@ function App(){
     });
     setTexts(prev=> [...prev, newItem]);
     setSelectedTextId(id);
-    setTextMoveTarget({textId:id,start:Math.round(t*10)/10});
+    setMoveTarget(id,Math.round(t*10)/10);
     setActiveTab('text');
     modeRef.current='textEdit';
     setMode('textEdit');
@@ -10948,7 +10973,7 @@ const recomputeStarts=(arr)=>{
     const txt = textsRef.current.find(t=> t.id===txtId);
     if(!txt) return;
     setSelectedTextId(txtId);
-    setTextMoveTarget({textId:txtId,start:Math.round(timeRef.current*10)/10});
+    setMoveTarget(txtId,type==='move' ? txt.start : Math.round(timeRef.current*10)/10);
     setDraggingText({
       id: txtId,
       type,
@@ -10973,14 +10998,8 @@ const recomputeStarts=(arr)=>{
       const newEnd = Math.max(draggingText.origStart + 0.2, Math.min(draggingText.origEnd + deltaTime, durationRef.current));
       updated=textsRef.current.map(t=> t.id===draggingText.id ? withTextTiming(t,t.start,newEnd,draggingText.wasAttached) : t);
     } else if(draggingText.type==='move'){
-      const dur = draggingText.origEnd - draggingText.origStart;
-      let newStart = draggingText.origStart + deltaTime;
-      const owner=draggingText.wasAttached && clipsRef.current.find(c=>c.id===textsRef.current.find(t=>t.id===draggingText.id)?._clipId);
-      const min=owner ? owner.timelineStart : 0;
-      const max=owner ? owner.timelineStart+owner.duration-dur : durationRef.current-dur;
-      newStart = Math.max(min, Math.min(newStart, max));
-      const newEnd = newStart + dur;
-      updated=textsRef.current.map(t=> t.id===draggingText.id ? withTextTiming(t,newStart,newEnd,draggingText.wasAttached) : t);
+      const newStart=Math.max(0,Math.min(durationRef.current,draggingText.origStart+deltaTime));
+      setMoveTarget(draggingText.id,Number(newStart.toFixed(1)));
     }
     if(updated){ textsRef.current=updated; setTexts(updated); }
     setTimeout(()=> drawFrameRef.current(timeRef.current), 0);
@@ -10988,7 +11007,11 @@ const recomputeStarts=(arr)=>{
   const handleTextPointerUp = useCallback((e)=>{
     if(!draggingText) return;
     try{ e.currentTarget.releasePointerCapture(e.pointerId); }catch{}
-    recordEdit(draggingText.before);
+    if(draggingText.type==='move'){
+      const source=textsRef.current.find(t=>t.id===draggingText.id);
+      if(e.type==='pointercancel') setMoveTarget(draggingText.id,draggingText.origStart);
+      else if(source) finishTextMove(source);
+    }else recordEdit(draggingText.before);
     setDraggingText(null);
   },[draggingText]);
 
@@ -11045,7 +11068,7 @@ const recomputeStarts=(arr)=>{
     setTextPlacementPrompt(null);
     setTextTimingNotice('');
     // Keep the position the user was viewing before the selection seeks to the caption.
-    setTextMoveTarget({textId:txt.id,start:Math.round(timeRef.current*10)/10});
+    setMoveTarget(txt.id,Math.round(timeRef.current*10)/10);
     if(playingRef.current) handleStop();
     setSelectedTextId(txt.id);
     setActiveTab('text');
@@ -11069,8 +11092,22 @@ const recomputeStarts=(arr)=>{
   const textPlacementOverlaps=(placement)=>{
     const source=textsRef.current.find(t=>t.id===placement.sourceId);
     if(!source) return [];
-    return textsRef.current.filter(t=>t.id!==source.id &&
-      placement.start<t.end-0.0001 && placement.end>t.start+0.0001);
+    const canvas=canvasRef.current;
+    const sourceBounds=getTextCanvasBounds(source,canvas);
+    const occupiesSameArea=other=>{
+      const otherBounds=getTextCanvasBounds(other,canvas);
+      if(!sourceBounds || !otherBounds) return Math.abs((source.x??50)-(other.x??50))<18 && Math.abs((source.y??50)-(other.y??50))<9;
+      const x=Math.max(0,Math.min(sourceBounds.left+sourceBounds.width,otherBounds.left+otherBounds.width)-Math.max(sourceBounds.left,otherBounds.left));
+      const y=Math.max(0,Math.min(sourceBounds.top+sourceBounds.height,otherBounds.top+otherBounds.height)-Math.max(sourceBounds.top,otherBounds.top));
+      return x*y/Math.max(1,Math.min(sourceBounds.width*sourceBounds.height,otherBounds.width*otherBounds.height))>=0.12;
+    };
+    return textsRef.current.filter(t=>{
+      if(t.id===source.id || !occupiesSameArea(t)) return false;
+      const overlap=Math.min(placement.end,t.end)-Math.max(placement.start,t.start);
+      if(overlap<=0.12) return false;
+      const existed=Math.min(source.end,t.end)-Math.max(source.start,t.start)>0.12;
+      return placement.kind==='next' || !existed;
+    });
   };
   const commitTextPlacement=(placement,allowOverlap=false)=>{
     const source=textsRef.current.find(t=>t.id===placement.sourceId);
@@ -11079,6 +11116,9 @@ const recomputeStarts=(arr)=>{
     if(!valid){ setTextPlacementPrompt(null); setTextTimingNotice('この長さのまま置ける時間がありません。'); return; }
     const overlaps=textPlacementOverlaps(valid);
     if(overlaps.length && !allowOverlap){
+      setSelectedTextId(source.id);
+      setActiveTab('text');
+      setInlineTimelineExpanded(false);
       setTextPlacementPrompt({kind:'overlap',placement:valid,names:overlaps.map(t=>t.text||'テキスト')});
       return;
     }
@@ -11090,11 +11130,14 @@ const recomputeStarts=(arr)=>{
       const next=[...textsRef.current,newText];
       textsRef.current=next; setTexts(next);
       setSelectedTextId(newText.id);
-      setTextMoveTarget({textId:newText.id,start:Math.round(valid.start*10)/10});
+      setMoveTarget(newText.id,Math.round(valid.start*10)/10);
       seekEditorTime(Math.min(valid.end-0.01,valid.start+0.02));
       setTimeout(()=>{ textInputRef.current?.focus(); textInputRef.current?.select(); },40);
       setTextTimingNotice('同じ長さで追加しました。文字を入力してください。');
     }else{
+      setTextMoveUndo({textId:source.id,
+        before:{start:source.start,end:source.end,_clipId:source._clipId||null,_clipStart:source._clipStart??null,_clipEnd:source._clipEnd??null},
+        after:{start:valid.start,end:valid.end,_clipId:attachFields._clipId}});
       const next=textsRef.current.map(t=>t.id===source.id ? {...t,...attachFields,start:valid.start,end:valid.end} : t);
       textsRef.current=next; setTexts(next);
       seekEditorTime(Math.min(valid.end-0.01,valid.start+0.02));
@@ -11103,10 +11146,41 @@ const recomputeStarts=(arr)=>{
     setTextPlacementPrompt(null);
     requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
-  const requestTextMove=(source,start,clipId=source._clipId||null)=>{
-    const placement=textPlacement(source,start,clipId,'move');
-    if(!placement){ setTextTimingNotice('この素材には同じ長さのまま置けません。全体の時間か次の素材を選んでください。'); return; }
-    commitTextPlacement(placement);
+  const finishTextMove=(source,start=textMoveTargetRef.current?.start)=>{
+    if(!Number.isFinite(start) || textMoveTargetRef.current?.textId!==source.id) return;
+    reviewTextMove(source.id,start);
+    if(start<0 || start+(source.end-source.start)>durationRef.current+0.0001){
+      setSelectedTextId(source.id);
+      setActiveTab('text');
+      setInlineTimelineExpanded(false);
+      setTextPlacementPrompt({kind:'limit',sourceId:source.id,lastStart:Math.max(0,durationRef.current-(source.end-source.start))});
+      return;
+    }
+    if(Math.abs(start-source.start)<0.0001){setTextTimingNotice('この位置に表示中です。');return;}
+    const current=textPlacement(source,start,source._clipId||null,'move');
+    if(current){commitTextPlacement(current);return;}
+    const alternatives=clipsRef.current.filter(c=>c.id!==source._clipId)
+      .map(c=>({clip:c,placement:textPlacement(source,start,c.id,'move')})).filter(item=>item.placement);
+    const across=textPlacement(source,start,null,'move');
+    setSelectedTextId(source.id);
+    setActiveTab('text');
+    setInlineTimelineExpanded(false);
+    setTextPlacementPrompt({kind:'move-boundary',sourceId:source.id,alternatives,across});
+  };
+  const undoTextPlacement=()=>{
+    const undo=textMoveUndo;
+    if(!undo) return;
+    const current=textsRef.current.find(t=>t.id===undo.textId);
+    if(!current || Math.abs(current.start-undo.after.start)>0.0001 ||
+       Math.abs(current.end-undo.after.end)>0.0001 || (current._clipId||null)!==undo.after._clipId){
+      setTextMoveUndo(null);return;
+    }
+    const next=textsRef.current.map(t=>t.id===undo.textId ? {...t,...undo.before} : t);
+    textsRef.current=next;setTexts(next);
+    setMoveTarget(undo.textId,Number(undo.before.start.toFixed(1)));
+    seekEditorTime(Math.min(undo.before.end-0.01,undo.before.start+0.02));
+    setTextMoveUndo(null);
+    setTextTimingNotice('元の位置に戻しました。');
   };
   const requestNextWord=(source)=>{
     const start=source.end;
@@ -11135,6 +11209,63 @@ const recomputeStarts=(arr)=>{
     };
     requestAnimationFrame(watch);
   };
+
+  // Still frames are sampled only after the user releases the slider or asks to review.
+  // Dedicated muted video elements leave the playback videos and playhead untouched.
+  useEffect(()=>{
+    if(!textMoveReview || activeTab!=='text'){setTextMoveFrames(null);return;}
+    const source=textsRef.current.find(t=>t.id===textMoveReview.textId);
+    if(!source) return;
+    const controller=new AbortController();
+    const start=textMoveReview.start;
+    const span=source.end-source.start;
+    const end=durationRef.current;
+    const samples=[
+      {label:'直前',time:Math.max(0,start-0.15),withText:false},
+      {label:'開始',time:Math.min(end-0.01,start+0.08),withText:true},
+      {label:'終了後',time:Math.min(end-0.01,start+span+0.08),withText:false}
+    ];
+    setTextMoveFrames({textId:source.id,start,status:'loading',frames:[]});
+    (async()=>{
+      const frames=[];
+      for(const sample of samples){
+        if(controller.signal.aborted) return;
+        const clip=clips.find(c=>sample.time>=c.timelineStart && sample.time<c.timelineStart+c.duration);
+        let url=null;
+        if(clip){
+          try{
+            url=await captureMaterialEdge(clip,'first',controller.signal,
+              sample.time-clip.timelineStart,
+              getClipPreviewFilter(clip,activeFilter,filterIntensity));
+          }catch{if(controller.signal.aborted)return;}
+        }
+        frames.push({...sample,url,clipName:clip?.name||'映像なし',photo:clip?.type==='photo',
+          filter:clip?.type==='photo' ? getClipPreviewFilter(clip,activeFilter,filterIntensity) : 'none'});
+        if(!controller.signal.aborted) setTextMoveFrames({textId:source.id,start,status:'loading',frames:[...frames]});
+      }
+      if(!controller.signal.aborted) setTextMoveFrames({textId:source.id,start,status:'ready',frames});
+    })();
+    return()=>controller.abort();
+  },[textMoveReview?.textId,textMoveReview?.start,textMoveReview?.nonce,clips,activeTab,activeFilter,filterIntensity]);
+  const ghostClip=activeTab==='text' && textMoveTarget?.textId===selectedTextId
+    ? clips.find(c=>textMoveTarget.start>=c.timelineStart && textMoveTarget.start<c.timelineStart+c.duration)
+    : null;
+  const ghostFilter=ghostClip ? getClipPreviewFilter(ghostClip,activeFilter,filterIntensity) : 'none';
+  useEffect(()=>{
+    if(!ghostClip){setTextMoveGhostFrame(null);return;}
+    const key=`${ghostClip.id}|${ghostClip.url}|${ghostClip.trimStart||0}|${ghostFilter}`;
+    const cached=textMoveGhostCacheRef.current.get(key);
+    if(cached!==undefined){setTextMoveGhostFrame({key,url:cached,status:'ready'});return;}
+    const controller=new AbortController();
+    setTextMoveGhostFrame({key,url:null,status:'loading'});
+    captureMaterialEdge(ghostClip,'first',controller.signal,null,ghostFilter).then(url=>{
+      if(controller.signal.aborted)return;
+      textMoveGhostCacheRef.current.set(key,url);
+      if(textMoveGhostCacheRef.current.size>12) textMoveGhostCacheRef.current.delete(textMoveGhostCacheRef.current.keys().next().value);
+      setTextMoveGhostFrame({key,url,status:'ready'});
+    }).catch(()=>{if(!controller.signal.aborted)setTextMoveGhostFrame({key,url:null,status:'error'});});
+    return()=>controller.abort();
+  },[ghostClip?.id,ghostClip?.url,ghostClip?.trimStart,ghostFilter]);
 
   const onPointerDown=useCallback((e)=>{
     if(modeRef.current==='finder' || modeRef.current==='hikariyomi' || modeRef.current==='fullscreen') return;
@@ -13330,7 +13461,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 const newItem=textForActiveClip({ id, text:p.text, start:Math.max(0,t), end:Math.max(0.2,t+2), x:50, y:50, anim:'fade', ...p.style, strokeColor:'rgba(0,0,0,0.8)', align:'center' });
                 setTexts(prev=> [...prev, newItem]);
                 setSelectedTextId(id);
-                setTextMoveTarget({textId:id,start:Math.round(t*10)/10});
+                setMoveTarget(id,Math.round(t*10)/10);
                 setTimeout(()=> drawFrameRef.current(timeRef.current),20);
               },
               className:'shrink-0 h-14 px-4 rounded-xl bg-[#111113] border border-white/10 text-[11px] font-bold flex flex-col items-center justify-center gap-0.5'
@@ -13585,14 +13716,25 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             if(!cur) return null;
             const span=cur.end-cur.start;
             const owner=clips.find(c=>c.id===cur._clipId);
-            const min=owner ? owner.timelineStart : 0;
-            const max=Math.max(min,(owner ? owner.timelineStart+owner.duration : duration)-span);
             const previous=texts.filter(t=>t.id!==cur.id && t.end<=cur.start+0.0001).sort((a,b)=>b.end-a.end)[0];
             const nextClip=owner && clips[clips.findIndex(c=>c.id===owner.id)+1];
             const target=textMoveTarget?.textId===cur.id ? textMoveTarget.start : null;
             const targetFits=target!==null && !!textPlacement(cur,target,cur._clipId||null,'move');
             const targetGlobalFits=target!==null && !!textPlacement(cur,target,null,'move');
             const targetClip=owner && clips.find(c=>c.id!==owner.id && target!==null && !!textPlacement(cur,target,c.id,'move'));
+            const zoom=textMoveZoom?.textId===cur.id ? textMoveZoom : null;
+            const min=zoom ? Math.max(0,zoom.center-3) : 0;
+            const max=zoom ? Math.min(duration,zoom.center+3) : duration;
+            const visibleTarget=target===null ? cur.start : target;
+            const markerPercent=time=>`${Math.max(0,Math.min(100,(time-min)/Math.max(0.1,max-min)*100))}%`;
+            const snapChoices=target===null ? [] : [
+              ...clips.flatMap(c=>[{time:c.timelineStart,label:'素材の先頭'},{time:c.timelineStart+c.duration,label:'素材の終わり'}]),
+              ...texts.filter(t=>t.id!==cur.id).map(t=>({time:t.end,label:'前の文字の後'}))
+            ].filter(item=>Math.abs(item.time-target)<=0.16 && Math.abs(item.time-target)>0.001)
+              .sort((a,b)=>Math.abs(a.time-target)-Math.abs(b.time-target)).slice(0,1);
+            const review=textMoveFrames?.textId===cur.id && Math.abs(textMoveFrames.start-visibleTarget)<0.0001 ? textMoveFrames : null;
+            const canUndo=textMoveUndo?.textId===cur.id && Math.abs(cur.start-textMoveUndo.after.start)<0.0001 &&
+              Math.abs(cur.end-textMoveUndo.after.end)<0.0001 && (cur._clipId||null)===textMoveUndo.after._clipId;
             return React.createElement('div',{className:'rounded-xl border border-violet-400/30 bg-violet-500/10 p-3 mb-3'},
               React.createElement('div',{className:'flex items-center justify-between gap-2 text-[12px] font-bold mb-1'},
                 React.createElement('span',null,'位置だけ動かす'),
@@ -13612,50 +13754,125 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                 ),
                 React.createElement('button',{
                   onClick:()=>{
-                    setTextMoveTarget({textId:cur.id,start:Number(currentTime.toFixed(1))});
+                    setMoveTarget(cur.id,Number(currentTime.toFixed(1)));
                     setTextTimingNotice('現在の再生位置を移動先として記録しました。');
                   },
                   className:'mt-2 rounded-full border border-violet-400/40 px-3 py-2 text-[11px]'
                 },`今の再生位置 ${currentTime.toFixed(1)}秒を移動先に記録`),
                 React.createElement('div',{className:'text-[10px] text-white/45 mt-1'},'文字を選ぶ前の再生位置を保持します。プレビューが動いても移動先は変わりません。'),
-                target!==null && !targetFits && React.createElement('div',{className:'text-[10px] text-amber-200 mt-1'},
-                  targetGlobalFits ? 'この素材の範囲外です。配置先を選ぶと、この時刻に開始を合わせます。'
-                    : '動画の終わりを越えるため、同じ長さでは置けません。'),
-                target!==null && !targetFits && targetGlobalFits && React.createElement('div',{className:'flex flex-wrap gap-2 mt-2'},
-                  targetClip && React.createElement('button',{
-                    onClick:()=>requestTextMove(cur,target,targetClip.id),
-                    className:'rounded-full border border-violet-400/40 px-3 py-2 text-[11px]'
-                  },`${targetClip.name||'移動先の素材'}に付ける`),
-                  React.createElement('button',{
-                    onClick:()=>requestTextMove(cur,target,null),
-                    className:'rounded-full border border-violet-400/40 px-3 py-2 text-[11px]'
-                  },'動画全体の時間に置く')
+                target!==null && React.createElement('div',{className:`text-[10px] mt-1 ${targetGlobalFits?'text-violet-200':'text-amber-200'}`},
+                  !targetGlobalFits ? '動画末尾を越えます。指を離した後に置ける位置を選べます。'
+                    : targetFits ? owner ? `仮置き：${owner.name||'現在の素材'}に付く` : '仮置き：動画全体の時間'
+                    : targetClip ? `仮置き：${targetClip.name||'次の素材'}または動画全体` : '仮置き：カットをまたぐ（動画全体の時間）')
+              ),
+              React.createElement('div',{className:'flex flex-wrap gap-2 mb-2'},
+                React.createElement('button',{onClick:()=>setTextMoveZoom(null),className:`rounded-full px-3 py-1.5 text-[11px] ${!zoom?'bg-violet-500 text-white':'bg-white/10'}`},'全体'),
+                React.createElement('button',{onClick:()=>setTextMoveZoom({textId:cur.id,center:visibleTarget}),className:`rounded-full px-3 py-1.5 text-[11px] ${zoom?'bg-violet-500 text-white':'bg-white/10'}`},'前後3秒を拡大'),
+                zoom && React.createElement('button',{onClick:()=>setTextMoveZoom({textId:cur.id,center:visibleTarget}),className:'rounded-full bg-white/10 px-2 py-1.5 text-[10px]'},'ここを中心に')
+              ),
+              React.createElement('div',{className:'relative mb-1 pt-2'},
+                cur.start>=min && cur.start<=max && React.createElement('div',{className:'absolute top-0 bottom-0 w-[2px] bg-white/70 pointer-events-none',style:{left:markerPercent(cur.start)}}),
+                React.createElement('input',{type:'range',min,max,step:0.1,
+                  value:Math.max(min,Math.min(max,visibleTarget)),
+                  onPointerDown:()=>{textMoveDragOriginRef.current=textMoveTargetRef.current;},
+                  onChange:e=>setMoveTarget(cur.id,Number(e.target.value)),
+                  onPointerUp:()=>finishTextMove(cur),
+                  onPointerCancel:()=>{
+                    const origin=textMoveDragOriginRef.current;
+                    if(origin?.textId===cur.id) setMoveTarget(cur.id,origin.start);
+                  },
+                  className:'w-full accent-violet-400',
+                  'aria-label':'移動先の開始位置。指を離すと確定'}),
+                React.createElement('div',{className:'flex justify-between text-[9px] text-white/45'},
+                  React.createElement('span',null,`${min.toFixed(1)}秒`),
+                  React.createElement('span',null,`${max.toFixed(1)}秒`))
+              ),
+              React.createElement('div',{className:'text-[10px] text-white/50 mb-2'},'白線＝現在の開始　紫のつまみ＝移動先。ドラッグ中は元の文字を保ちます。'),
+              target!==null && ghostClip && React.createElement('div',{className:'flex items-center gap-2 rounded-lg bg-black/30 p-2 mb-2'},
+                React.createElement('div',{className:'relative w-20 h-16 shrink-0 rounded bg-black overflow-hidden flex items-center justify-center'},
+                  textMoveGhostFrame?.key===`${ghostClip.id}|${ghostClip.url}|${ghostClip.trimStart||0}|${ghostFilter}` && textMoveGhostFrame.url
+                    ? React.createElement('img',{src:textMoveGhostFrame.url,alt:'移動先の素材の参考画像',
+                        style:{filter:ghostClip.type==='photo'?ghostFilter:'none'},
+                        className:'w-full h-full object-contain'})
+                    : React.createElement('span',{className:'text-[9px] text-white/40'},textMoveGhostFrame?.status==='error'?'画像を取得できません':'画像を準備中'),
+                  React.createElement('span',{className:'absolute max-w-[90%] truncate rounded bg-black/70 px-1 text-white',
+                    style:{left:`${cur.x??50}%`,top:`${cur.y??50}%`,transform:'translate(-50%,-50%)',fontSize:'9px'}},cur.text)
+                ),
+                React.createElement('div',{className:'min-w-0 text-[10px] text-white/65'},
+                  React.createElement('div',{className:'truncate'},ghostClip.name||'素材'),
+                  React.createElement('div',null,`仮置き ${target.toFixed(1)}〜${(target+span).toFixed(1)}秒`),
+                  React.createElement('div',{className:'text-white/40'},'ドラッグ中は素材の参考画像')
                 )
               ),
-              React.createElement('input',{type:'range',min,max,step:0.1,value:Math.max(min,Math.min(max,cur.start)),
-                onChange:e=>requestTextMove(cur,Number(e.target.value)),className:'w-full mb-2',
-                'aria-label':'長さを保って文字を移動'}),
+              snapChoices.map(choice=>React.createElement('button',{key:`${choice.label}-${choice.time}`,
+                onClick:()=>setMoveTarget(cur.id,Number(choice.time.toFixed(1))),
+                className:'rounded-full border border-violet-400/30 px-3 py-1.5 mb-2 text-[10px]'},
+                `${choice.label} ${choice.time.toFixed(1)}秒に合わせる`)),
               React.createElement('div',{className:'flex flex-wrap gap-2 mb-2'},
-                React.createElement('button',{onClick:()=>requestTextMove(cur,cur.start-0.1),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'−0.1秒'),
-                React.createElement('button',{onClick:()=>requestTextMove(cur,cur.start+0.1),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'＋0.1秒'),
+                React.createElement('button',{onClick:()=>setMoveTarget(cur.id,Number((visibleTarget-0.1).toFixed(1))),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'−0.1秒'),
+                React.createElement('button',{onClick:()=>setMoveTarget(cur.id,Number((visibleTarget+0.1).toFixed(1))),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'＋0.1秒'),
                 React.createElement('button',{
-                  onClick:()=>{if(target!==null) requestTextMove(cur,target);},
-                  disabled:target===null || !targetFits,
+                  onClick:()=>{if(target!==null) finishTextMove(cur,target);},
+                  disabled:target===null,
                   className:'rounded-full bg-violet-500/30 border border-violet-400/40 px-3 py-2 text-[11px] disabled:opacity-40'
-                },target===null ? '移動先を記録してください' : `開始を ${target.toFixed(1)}秒へ移動`),
-                previous && React.createElement('button',{onClick:()=>requestTextMove(cur,previous.end),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'前の文字の後へ'),
-                owner && React.createElement('button',{onClick:()=>requestTextMove(cur,owner.timelineStart),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'素材の先頭へ')
+                },target===null ? '移動先を記録してください' : `開始を ${target.toFixed(1)}秒に置く`),
+                previous && React.createElement('button',{onClick:()=>setMoveTarget(cur.id,Number(previous.end.toFixed(1))),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'前の文字の後へ'),
+                owner && React.createElement('button',{onClick:()=>setMoveTarget(cur.id,Number(owner.timelineStart.toFixed(1))),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'素材の先頭へ')
               ),
               owner && React.createElement('div',{className:'flex flex-wrap gap-2 mb-2'},
-                React.createElement('button',{onClick:()=>requestTextMove(cur,cur.start,null),className:'rounded-full border border-violet-400/40 px-3 py-2 text-[11px]'},'動画全体の時間へ'),
-                nextClip && React.createElement('button',{onClick:()=>requestTextMove(cur,Math.max(cur.end,nextClip.timelineStart),nextClip.id),className:'rounded-full border border-violet-400/40 px-3 py-2 text-[11px]'},'次の素材へ')
+                nextClip && React.createElement('button',{onClick:()=>setMoveTarget(cur.id,Number(nextClip.timelineStart.toFixed(1))),className:'rounded-full border border-violet-400/40 px-3 py-2 text-[11px]'},'次の素材の先頭を仮置き')
               ),
               React.createElement('div',{className:'flex gap-2'},
                 React.createElement('button',{onClick:()=>requestNextWord(cur),className:'flex-1 rounded-full bg-violet-500 text-white px-3 py-2.5 text-[12px] font-bold'},'＋ 次の言葉を作る'),
-                React.createElement('button',{onClick:()=>previewTextBoundary(cur),className:'rounded-full border border-white/25 px-3 py-2.5 text-[11px]'},'短く試写')
+                React.createElement('button',{onClick:()=>previewTextBoundary(cur),className:'rounded-full border border-white/25 px-3 py-2.5 text-[11px]'},'確定後を短く試写')
+              ),
+              React.createElement('div',{className:'mt-3 rounded-lg border border-white/10 bg-black/30 p-2'},
+                React.createElement('div',{className:'flex items-center justify-between gap-2 mb-2'},
+                  React.createElement('span',{className:'text-[11px] text-white/75'},'移動先の直前・開始・終了後'),
+                  React.createElement('button',{onClick:()=>target!==null && reviewTextMove(cur.id,target),
+                    disabled:target===null,className:'rounded-full border border-white/20 px-2 py-1 text-[10px] disabled:opacity-40'},'画像で確認')
+                ),
+                review && React.createElement('div',{className:'grid grid-cols-3 gap-1.5'},
+                  ...[0,1,2].map(index=>{
+                    const frame=review.frames[index];
+                    return React.createElement('div',{key:index,className:'min-w-0'},
+                      React.createElement('div',{className:'relative aspect-[9/10] bg-black rounded border border-white/10 overflow-hidden flex items-center justify-center'},
+                        frame?.url ? React.createElement('img',{src:frame.url,alt:`${frame.label}の参考画像`,
+                          style:{filter:frame.photo?frame.filter:'none'},className:'w-full h-full object-contain'})
+                          : React.createElement('span',{className:'text-[9px] text-white/40'},review.status==='loading'?'読み込み中':'画像なし'),
+                        frame?.withText && React.createElement('span',{className:'absolute max-w-[90%] truncate rounded bg-black/65 px-1 text-center text-white shadow',
+                          style:{left:`${cur.x??50}%`,top:`${cur.y??50}%`,transform:'translate(-50%,-50%)',fontSize:'9px'}},cur.text)
+                      ),
+                      React.createElement('div',{className:'text-[9px] text-white/60 truncate'},frame?.label||['直前','開始','終了後'][index]),
+                      React.createElement('div',{className:'text-[9px] text-white/35 truncate'},frame?.clipName||'')
+                    );
+                  })
+                ),
+                React.createElement('div',{className:'text-[9px] text-white/40 mt-1'},'静止画は位置確認用です。文字の見え方は確定後の短い試写で確認できます。')
               ),
               textTimingNotice && React.createElement('div',{role:'status',className:'text-[11px] text-amber-200 mt-2'},textTimingNotice),
-              textPlacementPrompt?.kind==='boundary' && textPlacementPrompt.sourceId===cur.id && React.createElement('div',{className:'rounded-lg bg-black/70 border border-violet-400/40 p-3 mt-3 text-[11px]'},
+              canUndo && React.createElement('button',{onClick:undoTextPlacement,
+                className:'rounded-full border border-white/25 px-3 py-2 text-[11px] mt-2'},'直前の文字移動を元に戻す'),
+              textPlacementPrompt?.kind==='limit' && textPlacementPrompt.sourceId===cur.id && React.createElement('div',{ref:textPlacementPromptRef,className:'rounded-lg bg-black/70 border border-amber-400/50 p-3 mt-3 text-[11px]'},
+                React.createElement('div',{className:'font-bold mb-1'},'動画の終わりに収まりません'),
+                React.createElement('div',{className:'text-white/60 mb-2'},`${span.toFixed(1)}秒の長さを保つには、開始は${textPlacementPrompt.lastStart.toFixed(2)}秒までです。`),
+                React.createElement('div',{className:'flex flex-wrap gap-2'},
+                  React.createElement('button',{onClick:()=>{const start=textPlacementPrompt.lastStart;setMoveTarget(cur.id,start);finishTextMove(cur,start);},className:'rounded-full bg-violet-600 px-3 py-2'},'置ける最後の位置へ'),
+                  React.createElement('button',{onClick:()=>{setMoveTarget(cur.id,cur.start);},className:'rounded-full border border-white/20 px-3 py-2'},'元の位置へ戻す')
+                )
+              ),
+              textPlacementPrompt?.kind==='move-boundary' && textPlacementPrompt.sourceId===cur.id && React.createElement('div',{ref:textPlacementPromptRef,className:'rounded-lg bg-black/70 border border-violet-400/40 p-3 mt-3 text-[11px]'},
+                React.createElement('div',{className:'font-bold mb-1'},'素材の境目を越えました'),
+                React.createElement('div',{className:'text-white/60 mb-2'},`${target?.toFixed(1)}〜${(target+span).toFixed(1)}秒。長さを変えずに配置先を選んでください。`),
+                React.createElement('div',{className:'flex flex-wrap gap-2'},
+                  ...textPlacementPrompt.alternatives.map(({clip,placement})=>React.createElement('button',{key:clip.id,
+                    onClick:()=>commitTextPlacement(placement),className:'rounded-full bg-violet-600 px-3 py-2'},`${clip.name||'素材'}に付ける`)),
+                  textPlacementPrompt.across && React.createElement('button',{onClick:()=>commitTextPlacement(textPlacementPrompt.across),
+                    className:'rounded-full bg-white/20 px-3 py-2'},'動画全体の時間に置く'),
+                  React.createElement('button',{onClick:()=>setTextPlacementPrompt(null),className:'rounded-full border border-white/20 px-3 py-2'},'戻る')
+                )
+              ),
+              textPlacementPrompt?.kind==='boundary' && textPlacementPrompt.sourceId===cur.id && React.createElement('div',{ref:textPlacementPromptRef,className:'rounded-lg bg-black/70 border border-violet-400/40 p-3 mt-3 text-[11px]'},
                 React.createElement('div',{className:'font-bold mb-1'},'この素材の終わりを越えます。置き方を選んでください'),
                 React.createElement('div',{className:'text-white/60 mb-2'},'長さは変えません。次の素材はその先頭以降に置き、境目をまたぐ場合は動画全体の時間に置きます。'),
                 React.createElement('div',{className:'flex flex-wrap gap-2'},
@@ -13664,8 +13881,8 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   React.createElement('button',{onClick:()=>setTextPlacementPrompt(null),className:'rounded-full border border-white/20 px-3 py-2'},'戻る')
                 )
               ),
-              textPlacementPrompt?.kind==='overlap' && textPlacementPrompt.placement.sourceId===cur.id && React.createElement('div',{className:'rounded-lg bg-black/70 border border-amber-400/50 p-3 mt-3 text-[11px]'},
-                React.createElement('div',{className:'font-bold mb-1'},'ほかの文字と表示時間が重なります'),
+              textPlacementPrompt?.kind==='overlap' && textPlacementPrompt.placement.sourceId===cur.id && React.createElement('div',{ref:textPlacementPromptRef,className:'rounded-lg bg-black/70 border border-amber-400/50 p-3 mt-3 text-[11px]'},
+                React.createElement('div',{className:'font-bold mb-1'},'画面上でほかの文字と重なります'),
                 React.createElement('div',{className:'text-white/60 mb-2'},textPlacementPrompt.names.slice(0,3).join('、')),
                 React.createElement('div',{className:'flex gap-2'},
                   React.createElement('button',{onClick:()=>commitTextPlacement(textPlacementPrompt.placement,true),className:'rounded-full bg-amber-600 px-3 py-2'},'重ねて置く'),
@@ -13867,7 +14084,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                       e.stopPropagation();
                       setSelectedTimelineItem({type:'text',id:t.id});
                       setSelectedTextId(t.id);
-                      setTextMoveTarget({textId:t.id,start:Math.round(timeRef.current*10)/10});
+                      setMoveTarget(t.id,Math.round(timeRef.current*10)/10);
                       seekEditorTime(t.start+Math.min(t.end-t.start-0.01,Math.max(0,(e.clientX-e.currentTarget.getBoundingClientRect().left)/e.currentTarget.getBoundingClientRect().width)*(t.end-t.start)));
                     }
                   },
@@ -13886,6 +14103,11 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                     }, '›')
                   );
                 }),
+                draggingText?.type==='move' && textMoveTarget?.textId===draggingText.id && React.createElement('div',{
+                  className:'absolute top-1 bottom-1 rounded border-2 border-dashed border-violet-300 bg-violet-500/30 pointer-events-none z-10 flex items-center px-1 text-[9px] text-white truncate',
+                  style:{left:`${textMoveTarget.start*timelineZoom}px`,width:`${Math.max(8,(draggingText.origEnd-draggingText.origStart)*timelineZoom)}px`},
+                  'aria-hidden':true
+                },'仮置き'),
                 React.createElement('div', {className:'absolute top-0 bottom-0 w-[2px] bg-white/80 pointer-events-none z-20', style:{left:`${currentTime*timelineZoom}px`}})
               )
             )
@@ -13938,24 +14160,27 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         selectedTimelineText && React.createElement('div', {className:'flex flex-col gap-3'},
           React.createElement('div', {className:'text-white/50'},selectedTimelineText._clipId?'この素材に連動':'全体の時間に配置'),
           React.createElement('label', {className:'flex items-center gap-3'},
-            React.createElement('span', {className:'w-16 shrink-0'},`位置 ${selectedTimelineText.start.toFixed(1)}s`),
+            React.createElement('span', {className:'w-16 shrink-0'},`移動先 ${(textMoveTarget?.textId===selectedTimelineText.id?textMoveTarget.start:selectedTimelineText.start).toFixed(1)}s`),
             React.createElement('input', {
-              type:'range',
-              min:clips.find(c=>c.id===selectedTimelineText._clipId)?.timelineStart||0,
-              max:(()=>{const owner=clips.find(c=>c.id===selectedTimelineText._clipId);return Math.max(owner?.timelineStart||0,(owner ? owner.timelineStart+owner.duration : duration)-(selectedTimelineText.end-selectedTimelineText.start));})(),
+              type:'range', min:0,max:duration,
               step:0.1,
-              value:selectedTimelineText.start,
-              onPointerDown:beginRangeEdit,onPointerUp:finishRangeEdit,onPointerCancel:finishRangeEdit,
-              onFocus:beginRangeEdit,onBlur:finishRangeEdit,
-              onChange:e=>{
-                beginRangeEdit();
-                const start=Number(e.target.value);
-                const span=selectedTimelineText.end-selectedTimelineText.start;
-                const wasAttached=!!rangeEditRef.current?.texts.find(t=>t.id===selectedTimelineText.id)?._clipId;
-                applyTextTiming(selectedTimelineText.id,start,start+span,wasAttached);
-              },className:'flex-1 accent-yellow-500'
+              value:Math.max(0,Math.min(duration,textMoveTarget?.textId===selectedTimelineText.id?textMoveTarget.start:selectedTimelineText.start)),
+              onPointerDown:()=>{textMoveDragOriginRef.current=textMoveTargetRef.current;},
+              onPointerUp:()=>finishTextMove(selectedTimelineText),
+              onPointerCancel:()=>{
+                const origin=textMoveDragOriginRef.current;
+                if(origin?.textId===selectedTimelineText.id) setMoveTarget(selectedTimelineText.id,origin.start);
+              },
+              onChange:e=>setMoveTarget(selectedTimelineText.id,Number(e.target.value)),
+              className:'flex-1 accent-yellow-500', 'aria-label':'文字の移動先。指を離して確定'
             })
           ),
+          React.createElement('div', {className:'text-white/50'},'長さを保って仮置きします。素材の境目は文字編集で配置先を選びます。'),
+          React.createElement('button', {
+            onClick:()=>finishTextMove(selectedTimelineText,
+              textMoveTarget?.textId===selectedTimelineText.id?textMoveTarget.start:selectedTimelineText.start),
+            className:'rounded-full border border-yellow-500/40 px-3 py-2 self-start'
+          },'この移動先に置く'),
           React.createElement('label', {className:'flex items-center gap-3'},
             React.createElement('span', {className:'w-16 shrink-0'},`終了 ${selectedTimelineText.end.toFixed(1)}s`),
             React.createElement('input', {
