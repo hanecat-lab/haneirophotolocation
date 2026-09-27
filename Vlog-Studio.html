@@ -7439,7 +7439,14 @@ function App(){
           return finishClip();
         } else {
           const v=videoRefs.current.get(clip.id);
-          if(!v || v.readyState<1){ try{ outputCtx.fillStyle=paperColor; outputCtx.fillRect(0,0,cw,ch); }catch{} return true; }
+          if(!v || v.readyState<1){
+            if(v && !v.error && v.preload!=='auto'){
+              v.preload='auto';
+              try{v.load();}catch{}
+            }
+            try{ outputCtx.fillStyle=paperColor; outputCtx.fillRect(0,0,cw,ch); }catch{}
+            return true;
+          }
           try{
             const trimStart = clip.trimStart || 0;
             const targetTime = trimStart + lTime;
@@ -7866,10 +7873,12 @@ function App(){
     video.src=clip.url;
     videoRefs.current.set(clip.id,video);
     if(preload==='auto') video.load();
-    video.addEventListener('loadeddata',()=>{
+    const redraw=()=>{
       if(videoRefs.current.get(clip.id)===video && !playingRef.current)
         drawFrameRef.current(timeRef.current);
-    },{once:true});
+    };
+    video.addEventListener('loadeddata',redraw,{once:true});
+    video.addEventListener('seeked',redraw);
     if(phase!=='end-of-preview') recordPreviewDiagnostic('media-refresh',{clip:clip.name,phase,
       previousError,timelineTime:Number(timeRef.current.toFixed(3))});
     return video;
@@ -7881,7 +7890,7 @@ function App(){
       const video=videoRefs.current.get(clip.id);
       if(!video || previewDiagnosticWatchedRef.current.has(video)) return;
       previewDiagnosticWatchedRef.current.add(video);
-      ['waiting','stalled','playing','error'].forEach(eventName=>{
+      ['waiting','stalled','playing','error','emptied','loadstart'].forEach(eventName=>{
         video.addEventListener(eventName,()=>{
           if(videoRefs.current.get(clip.id)!==video) return;
           if(eventName!=='error' && (!playingRef.current || !livePreviewIdsRef.current.has(clip.id))) return;
@@ -7937,6 +7946,7 @@ function App(){
       recordPreviewDiagnostic('stall',{elapsedMs:Math.round(now-diag.lastProgressAt),
         state:previewDiagnosticSnapshot('再生時刻が1.5秒以上進まない')});
     }
+    return now-diag.lastProgressAt;
   };
   const formatPreviewDiagnostic=()=>{
     const diag=previewDiagnosticRef.current;
@@ -8116,7 +8126,38 @@ function App(){
     if(active?.type==='video') liveIds.add(active.id);
     if(inOverlap && incoming) liveIds.add(next.id);
     livePreviewIdsRef.current=liveIds;
-    trackPreviewProgress(now,t,active,waitReasons.join(','));
+    const stalledMs=trackPreviewProgress(now,t,active,waitReasons.join(','));
+    if(stalledMs>=15000 && active?.type==='video' &&
+       (previewRecoveryRef.current.get(active.id)||0)>0){
+      recordPreviewDiagnostic('media-recovery-failed',{clip:active.name,
+        state:previewDiagnosticSnapshot('再読み込み後も15秒間再生が進まない')});
+      setPreviewDiagnosticNotice(`「${active.name}」の再生が進みません。診断結果を記録してください。`);
+      handleStop(false);
+      return;
+    }
+    if(stalledMs>=10000 && waiting && activeVideo && activeVideo.readyState<2 &&
+       !activeVideo.seeking && !(previewRecoveryRef.current.get(active.id)||0)){
+      previewRecoveryRef.current.set(active.id,1);
+      recordPreviewDiagnostic('media-wait-recovery',{clip:active.name,
+        state:previewDiagnosticSnapshot('映像の読み込み待ちが10秒続いたため再読み込み')});
+      refreshPreviewVideo(active,'long-wait');
+      state.activeId=null;
+      watchPreviewMedia();
+      rafTickRef.current=requestAnimationFrame(tick);
+      return;
+    }
+    if(stalledMs>=3000 && !waiting && active?.id===clockClipId && activeVideo &&
+       activeVideo.readyState>=2 && !activeVideo.paused && !activeVideo.seeking &&
+       !(previewRecoveryRef.current.get(active.id)||0)){
+      previewRecoveryRef.current.set(active.id,1);
+      recordPreviewDiagnostic('media-clock-recovery',{clip:active.name,
+        state:previewDiagnosticSnapshot('動画の再生時刻が3秒進まないため再読み込み')});
+      refreshPreviewVideo(active,'clock-stall');
+      state.activeId=null;
+      watchPreviewMedia();
+      rafTickRef.current=requestAnimationFrame(tick);
+      return;
+    }
     // 読み込み待ちでは音・タイムラインも待ち、黒画面や文字だけの先行を防ぐ。
     if(waiting){
       const mustHold=waitReasons.some(reason=>
@@ -8154,6 +8195,19 @@ function App(){
     videoRefs.current.forEach((video,id)=>{
       if(!liveIds.has(id) && !video.paused) try{ video.pause(); }catch{}
     });
+    // 再生済みの動画を保持し続けると、二周目の終盤で多数のデコーダが残る。
+    // 直前の素材だけ残し、戻った時は同じURLから読み込み直す。
+    const retireUntil=Math.max(-1,index-2);
+    let retired=false;
+    for(let i=(state.releasedThrough??-1)+1;i<=retireUntil;i++){
+      const passed=clipsNow[i];
+      if(passed?.type==='video' && !liveIds.has(passed.id)){
+        refreshPreviewVideo(passed,'played-clip','none');
+        retired=true;
+      }
+      state.releasedThrough=i;
+    }
+    if(retired) watchPreviewMedia();
     if(bgmAudioRef.current && bgmTrack!=='none'){
       const bgm=bgmAudioRef.current;
       bgm.playbackRate=playbackRate;
