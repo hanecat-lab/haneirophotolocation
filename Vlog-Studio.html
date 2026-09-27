@@ -8485,10 +8485,10 @@ function App(){
     const job={cancelled:false, frame:0, recorder:null, stream:null, gains:[], originalTime:timeRef.current,
       bgmOffset:bgmOffsetRef.current, bgmDriftSince:0, bgmPlayPending:false,
       canvasWidth:canvas.width, canvasHeight:canvas.height, videos:new Map(), videoPlayPending:new WeakSet(),
-      preparedIds:new Set(),preparePromises:new Map(),releasedIds:new Set(),startedIds:new Set(),
+      preparedIds:new Set(),preparePromises:new Map(),releasedIds:new Set(),startedIds:new Set(),warmStartedIds:new Set(),
       driftSince:new Map(),lastSeekAt:new Map(),prepareCursor:0,prepareInFlight:0,
-      releaseCursor:0,soundCursor:0,liveSoundIds:new Set(),waitingByClip:new Map(),
-      frameProgress:new Map(),frameCallbacks:new Map(),events:[],lastDrawAt:-Infinity,
+      releaseCursor:0,soundCursor:0,liveSoundIds:new Set(),waitingByClip:new Map(),waitSummary:new Map(),gapSummary:new Map(),
+      frameProgress:new Map(),frameCallbacks:new Map(),events:[],lastDrawAt:-Infinity,drawTick:-1,
       stats:{frames:0,slowFrames:0,gaps:0,corrections:0,notReadyFrames:0,
         waitingFrames:0,maxDrawMs:0}};
     const exportVideoState=clip=>{
@@ -8516,7 +8516,10 @@ function App(){
       nearby:items.filter(clip=>clip.type==='video' &&
         clip.timelineStart<=timeRef.current+2 && clip.timelineStart+clip.duration>=timeRef.current-2)
         .map(exportVideoState),
-      prepareInFlight:job.prepareInFlight,stats:job.stats,recentEvents:job.events},null,2);
+      prepareInFlight:job.prepareInFlight,stats:job.stats,
+      waits:[...job.waitSummary.values()].sort((a,b)=>b.frames-a.frames).slice(0,12),
+      gaps:[...job.gapSummary.values()].sort((a,b)=>b.count-a.count).slice(0,12),
+      recentEvents:job.events},null,2);
     exportJobRef.current=job;
     setExportProgress(0);
     setExportMessage('');
@@ -8581,6 +8584,7 @@ function App(){
         }
       }
       const exportVideoItems=items.filter(clip=>clip.type==='video');
+      const exportWarmLead=0.09;
       const waitForExportVideo=(video,ready,message)=>new Promise((resolve,reject)=>{
         if(ready()) {resolve();return;}
         let settled=false;
@@ -8625,7 +8629,9 @@ function App(){
             await loading;
           }
           if(job.cancelled) return;
-          const target=clip.trimStart||0;
+          // 先行再生できる素材は開始位置の少し手前を準備して、切り替え時刻と合わせる。
+          const target=Math.max(0,(clip.trimStart||0)-
+            (clip.timelineStart>0?Math.min(exportWarmLead,clip.trimStart||0):0));
           if(Math.abs(video.currentTime-target)>0.05 || video.readyState<2){
             try{video.currentTime=target;}catch{throw new Error(`素材「${clip.name}」を再生できません。`);}
             await waitForExportVideo(video,()=>video.readyState>=2 && !video.seeking && !!video.videoWidth &&
@@ -8654,10 +8660,10 @@ function App(){
         let first=0;
         while(first<exportVideoItems.length &&
           exportVideoItems[first].timelineStart+exportVideoItems[first].duration<=t) first++;
-        // 現在の素材と直後の3素材まで。短いクリップを大量に同時読込しない。
+        // 切り替え前に読み込みとシークを終える。読み込み数の上限も維持する。
         const limit=Math.min(exportVideoItems.length,first+4);
         while(job.prepareCursor<limit && job.prepareInFlight<2 &&
-          exportVideoItems[job.prepareCursor].timelineStart<=t+4){
+          exportVideoItems[job.prepareCursor].timelineStart<=t+6){
           const ahead=exportVideoItems[job.prepareCursor++];
           job.prepareInFlight++;
           prepareExportVideo(ahead).catch(error=>{
@@ -8675,7 +8681,9 @@ function App(){
       timeRef.current=0;
       drawFrameRef.current(0,items,exportTexts);
       if(job.failure) throw new Error(job.failure);
-      const canvasStream=canvas.captureStream(30);
+      const exportFps=/iPhone|iPad|iPod/.test(navigator.userAgent)?24:30;
+      job.stats.exportFps=exportFps;
+      const canvasStream=canvas.captureStream(exportFps);
       job.stream=new MediaStream([...canvasStream.getVideoTracks(),...(destination?.stream.getAudioTracks()||[])]);
       const targetBitrate=exportSizeMode==='compact'?3500000:5000000;
       let bitrateFallback=false;
@@ -8700,9 +8708,11 @@ function App(){
         if(job.bgmOffset>=0) await bgm.play();
         else bgm.pause();
       }
-      recorder.start(250);
+      // 数百ミリ秒ごとの MP4 チャンク生成は録画中のメインスレッドを使う。
+      recorder.start();
       setExportStatus('recording');
       let last=performance.now();
+      const recordingStartedAt=last;
       let elapsed=0;
       let lastProgress=-1;
       const render=()=>{
@@ -8710,14 +8720,21 @@ function App(){
         const now=performance.now();
         // 録画と音声は実時間で進む。描画遅延時も映像の時計だけを遅くしない。
         const frameGap=now-last;
-        if(frameGap>50) job.stats.gaps++;
         elapsed+=Math.max(0,frameGap/1000);
         last=now;
         const t=Math.min(total-0.001,elapsed);
         timeRef.current=t;
+        if(frameGap>50){
+          job.stats.gaps++;
+          const clip=items.find(item=>item.timelineStart<=t && t<item.timelineStart+item.duration);
+          const key=clip?.id||'none';
+          const gap=job.gapSummary.get(key)||{name:clip?.name||'素材の切り替え',count:0,maxMs:0};
+          gap.count++;gap.maxMs=Math.max(gap.maxMs,Math.round(frameGap));
+          job.gapSummary.set(key,gap);
+        }
         pumpExportPrepare(t);
         while(job.releaseCursor<exportVideoItems.length &&
-              exportVideoItems[job.releaseCursor].timelineStart+exportVideoItems[job.releaseCursor].duration<t-0.02){
+              exportVideoItems[job.releaseCursor].timelineStart+exportVideoItems[job.releaseCursor].duration<t-0.65){
           const old=exportVideoItems[job.releaseCursor++];
           const video=job.videos.get(old.id)?.video;
           if(video && !job.releasedIds.has(old.id)){
@@ -8735,6 +8752,26 @@ function App(){
               t>=items[job.soundCursor].timelineStart+items[job.soundCursor].duration)
           job.soundCursor++;
         const liveSoundIds=new Set();
+        // paused のまま切り替え点で play() するより、音量 0 で少し早くデコードを始める。
+        // 素材の音声は実際の開始時刻になるまで録画へ流さない。
+        for(const clip of exportVideoItems){
+          if(clip.timelineStart<=0 || clip.timelineStart-t>exportWarmLead || t>=clip.timelineStart) continue;
+          const entry=job.videos.get(clip.id), video=entry?.video;
+          if(!video || !job.preparedIds.has(clip.id) || job.warmStartedIds.has(clip.id) ||
+             video.seeking || job.videoPlayPending.has(video)) continue;
+          job.warmStartedIds.add(clip.id);
+          entry.gain.gain.value=0;
+          try{
+            job.videoPlayPending.add(video);
+            Promise.resolve(video.play()).then(()=>recordExportEvent('warm-playing',clip)).catch(error=>{
+              job.warmStartedIds.delete(clip.id);
+              recordExportEvent('warm-play-wait',clip,{error:error?.name||'unknown'});
+            }).finally(()=>job.videoPlayPending.delete(video));
+          }catch(error){
+            job.videoPlayPending.delete(video);
+            job.warmStartedIds.delete(clip.id);
+          }
+        }
         for(let i=job.soundCursor;i<items.length && items[i].timelineStart<=t;i++){
           const clip=items[i];
           if(clip.type==='photo') continue;
@@ -8754,7 +8791,8 @@ function App(){
             const target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart);
             if(job.preparedIds.has(clip.id) && !job.startedIds.has(clip.id)){
               // クリップへの入場時だけ位置合わせする。再生中は短い遅れでシークしない。
-              if(!video.seeking && Math.abs(video.currentTime-target)>0.12){
+              if(!video.seeking && Math.abs(video.currentTime-target)>
+                 (job.warmStartedIds.has(clip.id)?0.28:0.06)){
                 try{video.currentTime=target;}catch{}
               }
               job.startedIds.add(clip.id);
@@ -8874,6 +8912,11 @@ function App(){
             blocked=true;
           const previousWait=job.waitingByClip.get(clip.id);
           const wait=previousWait||{since:now,reason};
+          const summary=job.waitSummary.get(clip.id)||{name:clip.name,frames:0,reasons:{},maxWaitMs:0};
+          summary.frames++;
+          summary.reasons[reason]=(summary.reasons[reason]||0)+1;
+          summary.maxWaitMs=Math.max(summary.maxWaitMs,Math.round(now-wait.since));
+          job.waitSummary.set(clip.id,summary);
           if(wait.reason!==reason || !previousWait){
             wait.reason=reason;
             recordExportEvent('waiting',clip,{reason,media:exportVideoState(clip)});
@@ -8891,11 +8934,13 @@ function App(){
         }
         if(waiting) job.stats.waitingFrames++;
         if(blocked) job.stats.notReadyFrames++;
-        if(!job.cancelled && !blocked && now-job.lastDrawAt>=30){
+        const drawTick=Math.floor((now-recordingStartedAt)*exportFps/1000);
+        if(!job.cancelled && !blocked && drawTick>job.drawTick){
           const drawStart=performance.now();
           drawFrameRef.current(t,items,exportTexts);
           const drawMs=performance.now()-drawStart;
           job.lastDrawAt=now;
+          job.drawTick=drawTick;
           job.stats.frames++;
           job.stats.maxDrawMs=Math.max(job.stats.maxDrawMs,drawMs);
           if(drawMs>33) job.stats.slowFrames++;
@@ -8924,6 +8969,8 @@ function App(){
         job.stats.notReadyFrames>6
         ? `書き出し中に描画の遅れを検出しました（間隔の遅れ ${job.stats.gaps}回、描画負荷 ${job.stats.slowFrames}回、素材待ち ${job.stats.notReadyFrames}回）。保存後に動きを確認してください。`
         : '');
+      if(job.stats.notReadyFrames>6 || job.stats.gaps>Math.max(3,job.stats.frames*0.05))
+        setExportDiagnosticText(job.exportSnapshot('完成動画の動きに遅れがありました。'));
       setExportProgress(100);
       setExportStatus('done');
     }catch(error){
@@ -12811,7 +12858,8 @@ const recomputeStarts=(arr)=>{
             onClick:()=>setExportChoiceScope(scope),
             className:`w-full text-left px-4 py-3 mb-2 rounded-xl border text-sm ${exportChoiceScope===scope?'border-violet-400 bg-violet-500/20':'border-white/20 bg-white/5'} disabled:opacity-40`,
             'aria-pressed':exportChoiceScope===scope}, `${exportChoiceScope===scope?'●':'○'} ${label}`)),
-        React.createElement('div',{className:'text-xs text-white/60 mt-2 mb-2'},'画質と容量（720p・最大30fps）'),
+        React.createElement('div',{className:'text-xs text-white/60 mt-2 mb-2'},
+          /iPhone|iPad|iPod/.test(navigator.userAgent)?'画質と容量（720p・24fps）':'画質と容量（720p・最大30fps）'),
         React.createElement('div',{className:'grid grid-cols-2 gap-2 mb-2'},
           [['compact','容量を抑える','約3.5Mbps'],['quality','画質優先','約5Mbps']].map(([mode,label,rate])=>
             React.createElement('button',{key:mode,type:'button',onClick:()=>setExportSizeMode(mode),
@@ -12846,6 +12894,17 @@ const recomputeStarts=(arr)=>{
           React.createElement('div', {className:'text-xs text-white/55 mb-4'},
             `${exportFile?.size ? (exportFile.size/1048576).toFixed(1)+' MB' : ''}${exportFile?.bitrateFallback?' · 端末の録画方式により容量設定の指定値から変わる場合があります。':''}`),
           exportMessage && React.createElement('div',{className:'text-xs text-amber-200 mb-4'},exportMessage),
+          exportDiagnosticText && React.createElement('div',{className:'mb-3'},
+            React.createElement('button',{type:'button',onClick:()=>setExportDiagnosticVisible(v=>!v),
+              className:'text-xs text-violet-200 underline mb-2'},
+              exportDiagnosticVisible?'診断を閉じる':'書き出し診断を確認'),
+            exportDiagnosticVisible && React.createElement(React.Fragment,null,
+              React.createElement('textarea',{readOnly:true,value:exportDiagnosticText,
+                className:'w-full h-28 rounded-lg bg-black/50 p-2 text-[10px] text-white/70',
+                'aria-label':'書き出し診断'}),
+              React.createElement('button',{type:'button',onClick:()=>{
+                navigator.clipboard?.writeText?.(exportDiagnosticText)?.catch?.(()=>{});
+              },className:'mt-2 rounded-full bg-white/10 px-4 py-2 text-xs'},'診断をコピー'))),
           React.createElement('button', {onClick:saveExport, className:'w-full h-11 rounded-full bg-white text-black font-bold mb-3'}, '端末に保存'),
           React.createElement('button', {onClick:closeExport, className:'w-full h-10 rounded-full bg-white/10'}, '閉じる')
         ),
