@@ -6290,6 +6290,8 @@ function App(){
   const photoRefs = useRef(new Map());
   const bgmAudioRef = useRef(null);
   const rafTickRef = useRef(0);
+  const previewStartTimerRef = useRef(0);
+  const previewSessionRef = useRef(0);
   const playingRef = useRef(false);
   const livePreviewIdsRef = useRef(new Set());
   const previewPlaybackRef = useRef({activeId:null, preparedId:null, incomingId:null, bgmDriftSince:0, lastRenderAt:0});
@@ -7005,6 +7007,15 @@ function App(){
   const [draggingText, setDraggingText] = useState(null);
   const [draggingClipBar, setDraggingClipBar] = useState(null);
   const [selectedTextId, setSelectedTextId] = useState(null);
+  const [textListFrozenIds, setTextListFrozenIds] = useState(null);
+  const textListPositionRef = useRef(null);
+  const beginTextListTimingEdit=()=>{
+    setTextListFrozenIds(previous=>previous || textsRef.current
+      .map((text,index)=>({text,index}))
+      .sort((a,b)=>a.text.start-b.text.start || a.index-b.index)
+      .map(({text})=>text.id));
+  };
+  const endTextListTimingEdit=()=>setTextListFrozenIds(null);
   const [textFontPickerOpen,setTextFontPickerOpen] = useState(false);
   const [textPreviewBackdrop,setTextPreviewBackdrop] = useState('black');
   useEffect(()=>setTextFontPickerOpen(false),[selectedTextId]);
@@ -7190,6 +7201,8 @@ function App(){
     window.addEventListener('keydown', handleKeyDown);
     return ()=>{ 
       cancelAnimationFrame(rafTickRef.current); 
+      clearTimeout(previewStartTimerRef.current);
+      previewSessionRef.current++;
       playingRef.current=false; 
       window.removeEventListener('keydown', handleKeyDown);
     };
@@ -7928,6 +7941,8 @@ function App(){
     setTimeout(()=> setShowFlash(false), 200);
     
     if(playingRef.current) return;
+    clearTimeout(previewStartTimerRef.current);
+    const previewSession=++previewSessionRef.current;
     if(timeRef.current>=durationRef.current-0.05){
       timeRef.current=0;
       setCurrentTime(0);
@@ -7977,8 +7992,9 @@ function App(){
     }
     // 少し待ってからtick開始（seek完了待ち）
     const startDelay = needsWait ? 120 : 30;
-    setTimeout(()=>{
-      if(playingRef.current){
+    previewStartTimerRef.current=setTimeout(()=>{
+      previewStartTimerRef.current=0;
+      if(playingRef.current && previewSessionRef.current===previewSession){
         // 再生直前にアクティブクリップのvideoを確実にplay。ここでの再シークは不要。
         const clipsNow = clipsRef.current;
         let active=null, local=0;
@@ -8001,7 +8017,10 @@ function App(){
     }, startDelay);
   },[tick, bgmTrack, playbackRate]);
 
-  const handleStop = useCallback(()=>{
+  const handleStop = useCallback((redraw=true)=>{
+    ++previewSessionRef.current;
+    clearTimeout(previewStartTimerRef.current);
+    previewStartTimerRef.current=0;
     playingRef.current=false;
     livePreviewIdsRef.current=new Set();
     previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0};
@@ -8012,8 +8031,16 @@ function App(){
     if(bgmAudioRef.current){ try{ bgmAudioRef.current.pause(); bgmAudioRef.current.playbackRate=1; }catch{} }
     lastDisplayedTimeRef.current = timeRef.current;
     setCurrentTime(timeRef.current);
-    drawFrameRef.current(timeRef.current);
+    if(redraw!==false) drawFrameRef.current(timeRef.current);
   },[]);
+  const handleRestartPreview=useCallback((e)=>{
+    if(!clipsRef.current.length || analysisBusyRef.current) return;
+    handleStop(false);
+    timeRef.current=0;
+    lastDisplayedTimeRef.current=0;
+    setCurrentTime(0);
+    handlePlay(e);
+  },[handleStop,handlePlay]);
 
   // 書き出しはプレビューと同じcanvasを描画し、そのフレームと素材の音声を録画する。
   const cancelExport=()=>{
@@ -11212,6 +11239,7 @@ const recomputeStarts=(arr)=>{
     if(!container) return;
     const txt = textsRef.current.find(t=> t.id===txtId);
     if(!txt) return;
+    beginTextListTimingEdit();
     setSelectedTextId(txtId);
     setMoveTarget(txtId,type==='move' ? txt.start : Math.round(timeRef.current*10)/10);
     setDraggingText({
@@ -11253,6 +11281,7 @@ const recomputeStarts=(arr)=>{
       else if(source) finishTextMove(source);
     }else recordEdit(draggingText.before);
     setDraggingText(null);
+    endTextListTimingEdit();
   },[draggingText]);
 
   // CLIPS横バー編集（v11新規）
@@ -11821,6 +11850,34 @@ const recomputeStarts=(arr)=>{
       React.createElement('circle', {cx:24, cy:24, r:21.5, fill:'none', stroke:'rgba(255,255,255,0.65)', strokeWidth:1})
     )
   );
+
+  // The list follows time; the source array keeps its original drawing/layer order.
+  const frozenTextPositions=textListFrozenIds && new Map(textListFrozenIds.map((id,index)=>[id,index]));
+  const textListRows=texts.map((text,index)=>({text,index})).sort((a,b)=>{
+    if(frozenTextPositions){
+      const first=frozenTextPositions.get(a.text.id) ?? Infinity;
+      const second=frozenTextPositions.get(b.text.id) ?? Infinity;
+      if(first!==second) return first-second;
+    }
+    return a.text.start-b.text.start || a.index-b.index;
+  }).map(({text})=>text);
+  const selectedTextListPosition=textListRows.findIndex(text=>text.id===selectedTextId);
+  useEffect(()=>{
+    if(textListFrozenIds) return;
+    const previous=textListPositionRef.current;
+    textListPositionRef.current={id:selectedTextId,position:selectedTextListPosition};
+    if(!previous || previous.id!==selectedTextId || previous.position===selectedTextListPosition ||
+       selectedTextListPosition<0 || activeTab!=='text') return;
+    const frame=requestAnimationFrame(()=>{
+      const row=Array.from(document.querySelectorAll('[data-text-list-id]'))
+        .find(element=>element.getAttribute('data-text-list-id')===selectedTextId);
+      if(!row) return;
+      const bounds=row.getBoundingClientRect();
+      if(bounds.bottom<40 || bounds.top>window.innerHeight-40)
+        row.scrollIntoView({block:'nearest',behavior:'smooth'});
+    });
+    return ()=>cancelAnimationFrame(frame);
+  },[selectedTextId,selectedTextListPosition,textListFrozenIds,activeTab]);
 
   return React.createElement('div', {className:'soft-editorial-ui min-h-[100vh] bg-[#0a0a0b] text-white flex flex-col select-none', style:{fontFamily:'-apple-system,BlinkMacSystemFont,sans-serif'}},
     React.createElement('header', {className:'h-16 bg-[#0a0a0b] border-b border-white/10 flex items-center px-3 gap-2 shrink-0'},
@@ -12596,7 +12653,10 @@ const recomputeStarts=(arr)=>{
         )
       ),
       React.createElement('div', {className:'flex items-center gap-2 w-full justify-center mt-1'},
-        React.createElement('button', {onClick:handleStop, className:'h-8 px-4 rounded-full bg-white/5 text-[11px] text-white/50 active:bg-white/10'}, '停止 ■'),
+        React.createElement('button', {type:'button',onClick:handleRestartPreview,disabled:clips.length===0,
+          className:'min-h-11 px-5 rounded-full border border-white/25 bg-white/10 text-[11px] text-white font-bold active:bg-white/20 disabled:opacity-30',
+          'aria-label':'最初から再生'}, '↺ 最初から再生'),
+        React.createElement('button', {type:'button',onClick:handleStop, className:'min-h-11 px-4 rounded-full bg-white/5 text-[11px] text-white/50 active:bg-white/10'}, '停止 ■'),
         isPlaying && React.createElement('div', {className:'flex items-center gap-1'},
           React.createElement('div', {className:'nami-bar'}),
           React.createElement('div', {className:'nami-bar'}),
@@ -13772,10 +13832,11 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         ),
         React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'テキスト一覧 / タップで編集'),
         React.createElement('div', {className:'flex flex-col gap-2 mb-4'},
-          texts.map(t=>{
+          textListRows.map(t=>{
             const isSel = selectedTextId===t.id;
             return React.createElement('div', {
               key:t.id,
+              'data-text-list-id':t.id,
               className:`min-h-[56px] rounded-xl border flex items-center px-2 py-2 ${isSel ? 'bg-yellow-500/20 border-yellow-500 ring-1 ring-yellow-500/50' : 'bg-[#111113] border-white/10'}`
             },
               React.createElement('button', {
@@ -14113,6 +14174,10 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               React.createElement('input', {
                 type:'range', min:0, max:Math.max(0.5, duration-0.2), step:0.1,
                 value: texts.find(t=>t.id===selectedTextId)?.start || 0,
+                onPointerDown:beginTextListTimingEdit,
+                onPointerUp:endTextListTimingEdit,
+                onPointerCancel:endTextListTimingEdit,
+                onBlur:endTextListTimingEdit,
                 onChange:e=>{
                   const v=parseFloat(e.target.value);
                   const cur=texts.find(t=>t.id===selectedTextId);
@@ -14129,6 +14194,10 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               React.createElement('input', {
                 type:'range', min:0.2, max:duration, step:0.1,
                 value: texts.find(t=>t.id===selectedTextId)?.end || 2,
+                onPointerDown:beginTextListTimingEdit,
+                onPointerUp:endTextListTimingEdit,
+                onPointerCancel:endTextListTimingEdit,
+                onBlur:endTextListTimingEdit,
                 onChange:e=>{
                   const v=parseFloat(e.target.value);
                   const cur=texts.find(t=>t.id===selectedTextId);
