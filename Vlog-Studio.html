@@ -5454,6 +5454,39 @@ const applyVlogCanvasFilter=(canvas,css)=>{
   ctx.putImageData(image,0,0);
 };
 
+// 録画が音声だけ続いた MP4 を完成扱いにしないため、映像トラックの実サンプル数を読む。
+const countMp4VideoSamples=async blob=>{
+  try{
+    const view=new DataView(await blob.slice(0,Math.min(blob.size,2*1024*1024)).arrayBuffer());
+    const typeAt=at=>String.fromCharCode(view.getUint8(at),view.getUint8(at+1),
+      view.getUint8(at+2),view.getUint8(at+3));
+    const boxes=(from,to)=>{
+      const found=[];
+      for(let at=from;at+8<=to;){
+        let size=view.getUint32(at),header=8;
+        if(size===1){
+          if(at+16>to) break;
+          size=Number(view.getBigUint64(at+8));header=16;
+        }else if(size===0) size=to-at;
+        if(!Number.isSafeInteger(size) || size<header || at+size>to) break;
+        found.push({type:typeAt(at+4),start:at+header,end:at+size});
+        at+=size;
+      }
+      return found;
+    };
+    const child=(box,type)=>box && boxes(box.start,box.end).find(part=>part.type===type);
+    const moov=boxes(0,view.byteLength).find(box=>box.type==='moov');
+    if(!moov) return null;
+    for(const trak of boxes(moov.start,moov.end).filter(box=>box.type==='trak')){
+      const mdia=child(trak,'mdia'),hdlr=child(mdia,'hdlr');
+      if(!hdlr || hdlr.start+12>hdlr.end || typeAt(hdlr.start+8)!=='vide') continue;
+      const stsz=child(child(child(mdia,'minf'),'stbl'),'stsz');
+      if(stsz && stsz.start+12<=stsz.end) return view.getUint32(stsz.start+8);
+    }
+  }catch{}
+  return null;
+};
+
 const STORY_TEMPLATES = [
   {
     id:'night_walk',
@@ -8488,9 +8521,9 @@ function App(){
       preparedIds:new Set(),preparePromises:new Map(),releasedIds:new Set(),startedIds:new Set(),warmStartedIds:new Set(),
       driftSince:new Map(),lastSeekAt:new Map(),prepareCursor:0,prepareInFlight:0,
       releaseCursor:0,soundCursor:0,liveSoundIds:new Set(),waitingByClip:new Map(),waitSummary:new Map(),gapSummary:new Map(),
-      frameProgress:new Map(),frameCallbacks:new Map(),events:[],lastDrawAt:-Infinity,drawTick:-1,
+      frameProgress:new Map(),frameCallbacks:new Map(),events:[],recorderChunks:[],lastDrawAt:-Infinity,drawTick:-1,
       stats:{frames:0,slowFrames:0,gaps:0,corrections:0,playRequests:0,notReadyFrames:0,
-        waitingFrames:0,maxDrawMs:0}};
+        waitingFrames:0,maxDrawMs:0,recordedChunks:0,recordedBytes:0}};
     const exportVideoState=clip=>{
       if(!clip) return null;
       const video=job.videos.get(clip.id)?.video;
@@ -8521,7 +8554,7 @@ function App(){
       prepareInFlight:job.prepareInFlight,stats:job.stats,
       waits:[...job.waitSummary.values()].sort((a,b)=>b.frames-a.frames).slice(0,12),
       gaps:[...job.gapSummary.values()].sort((a,b)=>b.count-a.count).slice(0,12),
-      recentEvents:job.events},null,2);
+      recorderChunks:job.recorderChunks,recentEvents:job.events},null,2);
     exportJobRef.current=job;
     setExportProgress(0);
     setExportMessage('');
@@ -8722,7 +8755,13 @@ function App(){
       job.recorder=recorder;
       const chunks=[];
       const stopped=new Promise(resolve=>{
-        recorder.ondataavailable=e=>{ if(e.data?.size) chunks.push(e.data); };
+        recorder.ondataavailable=e=>{
+          if(!e.data?.size) return;
+          chunks.push(e.data);
+          job.stats.recordedChunks++;
+          job.stats.recordedBytes+=e.data.size;
+          job.recorderChunks.push({timelineTime:Number(timeRef.current.toFixed(3)),bytes:e.data.size});
+        };
         recorder.onerror=e=>{ job.failure=e.error?.message || '動画の録画に失敗しました。'; job.cancelled=true; };
         recorder.onstop=()=>resolve();
       });
@@ -8731,8 +8770,9 @@ function App(){
         if(job.bgmOffset>=0) await bgm.play();
         else bgm.pause();
       }
-      // 数百ミリ秒ごとの MP4 チャンク生成は録画中のメインスレッドを使う。
-      recorder.start();
+      // iPhoneでは録画データを最後まで保持すると、Canvasの映像トラックだけが
+      // 約12秒で途切れても音声だけが録り続けられる場合がある。定期的に取り出す。
+      recorder.start(2000);
       setExportStatus('recording');
       let last=performance.now();
       const recordingStartedAt=last;
@@ -9009,6 +9049,15 @@ function App(){
       const type=recorder.mimeType || mime;
       const blob=new Blob(chunks,{type});
       if(!blob.size) throw new Error('動画データを作成できませんでした。');
+      if(type.includes('mp4') && isIOSExport){
+        const videoSamples=await countMp4VideoSamples(blob);
+        job.stats.recordedVideoSamples=videoSamples;
+        if(videoSamples!==null && videoSamples<total*exportFps*0.5){
+          job.failure=`録画された映像が途中で止まりました（${videoSamples}フレーム）。音声だけの動画を保存せず、もう一度書き出してください。`;
+          recordExportEvent('recorded-video-short',null,{videoSamples,expectedFrames:Math.round(total*exportFps)});
+          throw new Error(job.failure);
+        }
+      }
       const extension=type.includes('webm')?'webm':'mp4';
       const name=`Vlog-Studio-${new Date().toISOString().replace(/[:.]/g,'-')}.${extension}`;
       setExportFile({url:URL.createObjectURL(blob),name,size:blob.size,
