@@ -651,6 +651,8 @@
             <span></span>
             <button id="deleteCue" type="button">削除</button>
           </div>
+          <div class="slider" style="margin-top:8px"><div><span>フェード時間</span><strong id="v-cueFade">カット</strong></div><input type="range" id="cueFadeR" min="0" max="10" step="0.1" value="0" /></div>
+          <div class="hint">キューを呼んだとき、いまの明かりからそのキューへ何秒かけて移るか。0 はカット（瞬時）。この時間はキューを保存すると一緒に保存され、そのキューを呼ぶときに使われます ― 「サビはカット、落ちサビは5秒」がキュー側に付いてきます。モードの切り替え・再生中のフラグ・灯体の並びは即座に変わり、時間をかけるのは明るさ・色・ON/OFF だけです。</div>
           <div class="status-note" id="cueStatus"></div>
         </details></section>
         <section class="section"><details class="sec" data-sec="sec23"><summary class="label"><span>設定データ</span><small>JSON / BACKUP</small></summary>
@@ -6053,6 +6055,9 @@
       backlight:{on:false,level:70},
       beamZoom:{mode:'fixed',width:100,depth:60},
       outputGain:0,
+      /* キューを呼んだときのフェード時間[秒]。キューごとに保存されるので、
+         「サビはカット、落ちサビは5秒」がキュー側に付いてくる。 */
+      cueFade:0,
       show:{mode:'blinder',speed:1,level:80,fade:.55,spread:70,loop:true,keepSpot:true,playing:false},
       overlay:{enabled:false,mode:'fan',speed:1,level:65},
       timeline:{bpm:120,beats:4,loop:true,playing:false,index:0,steps:[]},
@@ -8700,6 +8705,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     }
 
     function updateScene(t){
+      cueFadeTick(t);                  // 読む側より先に board を書き換える
       const frame=composeLightingFrame(t);
       _activeFrame=frame;
       // WB_GAIN を使う処理より前に、この瞬間の光色から段を選び直す。
@@ -9015,7 +9021,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     function loadCue(){
       const name=document.querySelector('#cueSelect').value,cue=readCues()[name];
       if(!name||!cue){cueStatus('呼び出すキューを選択してください。');return}
-      applyBoard(cue);cueStatus('キュー「'+name+'」を呼び出しました。');
+      const sec=applyBoardFaded(cue,clock);
+      cueStatus('キュー「'+name+'」を'+(sec>0?sec.toFixed(1)+'秒かけて呼び出しています。':'呼び出しました。'));
       document.querySelector('#cueName').value=name;
     }
     function deleteCue(){
@@ -9024,6 +9031,78 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       if(!confirm('キュー「'+name+'」を削除しますか？'))return;
       const cues=readCues();delete cues[name];writeCues(cues);renderCueOptions();
       cueStatus('キュー「'+name+'」を削除しました。');
+    }
+    /* ===== キューのフェード =====
+       キューを呼ぶと、いまの明かりから呼んだ明かりへ時間をかけて移る。
+       読む側（composeLightingFrame ほか）は一切変えない ― 毎フレーム
+       board そのものへ補間した値を書き、いつもどおり読ませる。
+       構造（モード・並び・再生中フラグ・セクション）は applyBoard が
+       最初に確定させる。時間をかけるのは下に並べた数値だけ。
+       実機の卓と同じく曲線は掛けない（等速）。 */
+    const CUE_FADE_NUM=['bright','tilt','soft','frontFill','outputGain'];
+    const CUE_FADE_COL=['color'];
+    /* on と level を持つ演出は「on なら level、off なら 0」を送る。
+       キューのあいだで消える／点くところにも幅が出る。 */
+    const CUE_FADE_FX=[['subjectSpot','level'],['faceFill','level'],['laserSheet','level'],
+      ['backlight','level'],['humanContour','level'],['photonRain','level'],['redMesh','glow']];
+    const CUE_FADE_FXCOL=[['laserSheet','color'],['humanContour','color'],
+      ['photonRain','color'],['redMesh','color']];
+    const _cueHex=h=>{const v=parseInt(String(h||'#000000').slice(1),16)||0;
+      return [(v>>16)&255,(v>>8)&255,v&255]};
+    const _cueStr=r=>'#'+r.map(v=>Math.max(0,Math.min(255,Math.round(v))).toString(16).padStart(2,'0')).join('');
+    /* フェードで動く値だけを1本の配列へ。取り出しと書き戻しで順番を揃える。 */
+    function cueFadeGrab(b){
+      const v=[];
+      CUE_FADE_NUM.forEach(k=>v.push(Number(b[k])||0));
+      CUE_FADE_COL.forEach(k=>v.push(..._cueHex(b[k])));
+      CUE_FADE_FX.forEach(([g,k])=>v.push(b[g].on?(Number(b[g][k])||0):0));
+      CUE_FADE_FXCOL.forEach(([g,k])=>v.push(..._cueHex(b[g][k])));
+      b.fixtures.forEach(f=>{v.push(f.on?(Number(f.level)||0):0); v.push(..._cueHex(f.color))});
+      return v;
+    }
+    function cueFadePut(b,v){
+      let i=0;
+      CUE_FADE_NUM.forEach(k=>{b[k]=v[i++]});
+      CUE_FADE_COL.forEach(k=>{b[k]=_cueStr([v[i++],v[i++],v[i++]])});
+      /* 0 まで送ったら消えている扱いにする。終わりは厳密な値で上書きするので、
+         この目安が残るのはフェードの途中だけ。 */
+      CUE_FADE_FX.forEach(([g,k])=>{const x=v[i++]; b[g][k]=x; b[g].on=x>.05});
+      CUE_FADE_FXCOL.forEach(([g,k])=>{b[g][k]=_cueStr([v[i++],v[i++],v[i++]])});
+      b.fixtures.forEach(f=>{const x=v[i++]; f.level=x; f.on=x>.05; f.color=_cueStr([v[i++],v[i++],v[i++]])});
+    }
+    /* 着地。途中の目安ではなく、キューが持っていた値をそのまま入れ直す。 */
+    function cueFadeExact(b,to){
+      CUE_FADE_NUM.forEach(k=>{b[k]=to[k]});
+      CUE_FADE_COL.forEach(k=>{b[k]=to[k]});
+      CUE_FADE_FX.forEach(([g,k])=>{b[g][k]=to[g][k]; b[g].on=to[g].on});
+      CUE_FADE_FXCOL.forEach(([g,k])=>{b[g][k]=to[g][k]});
+      b.fixtures.forEach((f,i)=>{const t=to.fixtures[i]; if(!t)return; f.level=t.level; f.on=t.on; f.color=t.color});
+    }
+    let cueFade=null;                 // {t0,sec,from,to,toBoard}
+    const cueFadeActive=()=>!!cueFade;
+    /* updateScene の先頭で呼ぶ。読む側より先に board を書き換える。 */
+    function cueFadeTick(t){
+      if(!cueFade)return;
+      const u=cueFade.sec>0?(t-cueFade.t0)/cueFade.sec:1;
+      if(!(u<1)){
+        cueFadeExact(board,cueFade.toBoard); cueFade=null;
+        syncBoardUI(); saveSettings(); return;
+      }
+      const a=cueFade.from,b2=cueFade.to,n=a.length,v=new Array(n);
+      for(let i=0;i<n;i++)v[i]=a[i]+(b2[i]-a[i])*u;
+      cueFadePut(board,v);
+    }
+    /* キューを呼ぶ。構造は applyBoard が即座に確定させ、数値だけ追いつかせる。
+       フェード中にもう一度呼ぶと、その瞬間の値が新しい出発点になる。 */
+    function applyBoardFaded(src,clockNow){
+      const from=cueFadeGrab(board);
+      applyBoard(src);
+      const sec=Math.max(0,Number(board.cueFade)||0);
+      if(sec<=0){cueFade=null; return 0}
+      const toBoard=JSON.parse(JSON.stringify(board));
+      cueFade={t0:clockNow,sec,from,to:cueFadeGrab(board),toBoard};
+      cueFadePut(board,from);          // 出発点へ戻してから、毎フレーム寄せていく
+      return sec;
     }
     function applyBoard(src){
       const prevGlbTexture=board.glbTexture;
@@ -9077,6 +9156,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       // depth は 0 が有効値なので || で既定へ倒せない。?? は NaN を拾わないため isFinite で判定する。
       const zoomDepth=Number(board.beamZoom.depth);
       board.beamZoom.depth=THREE.MathUtils.clamp(Math.round(Number.isFinite(zoomDepth)?zoomDepth:60),0,100);
+      const cf=Number(src.cueFade);
+      board.cueFade=THREE.MathUtils.clamp(Number.isFinite(cf)?cf:0,0,10);
       Object.assign(board.penTrail,src.penTrail||{});
       board.penTrail.on=!!board.penTrail.on;
       Object.assign(board.humanContour,src.humanContour||{});
@@ -9547,6 +9628,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       q('#movingRigAzR').value=board.movingRig.azimuth;
       q('#movingRigSpreadR').value=board.movingRig.spread; syncMovingRig();
       q('#brightR').value=board.bright; q('#v-bright').textContent=board.bright;
+      q('#cueFadeR').value=board.cueFade;
+      q('#v-cueFade').textContent=board.cueFade>0?board.cueFade.toFixed(1)+'秒':'カット';
       q('#outputGainR').value=board.outputGain;
       q('#v-outputGain').textContent=board.outputGain.toFixed(1)+'段';
       q('#outputGainHint').textContent=board.outputGain>0
@@ -9730,6 +9813,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     })();
 
     document.querySelectorAll('[data-shadow-mode]').forEach(b=>b.onclick=()=>{board.shadow.mode=b.dataset.shadowMode;syncBoardUI();saveSettings();refresh()});
+    /* フェード時間は明かりを変えないので refresh は要らない。 */
+    q('#cueFadeR').oninput=e=>{board.cueFade=+e.target.value;syncBoardUI();saveSettings()};
     q('#outputGainR').oninput=e=>{board.outputGain=+e.target.value;syncBoardUI();saveSettings();refresh()};
     q('#colorPick').oninput=e=>{board.color=e.target.value;q('#v-color').textContent=board.color;applyColorToSelection()};
     q('#smokeToggle').onclick=()=>{board.smoke=!board.smoke;console.log('[SMOKE] toggle smoke', board.smoke);setToggle('smokeToggle',board.smoke,'スモーク');smoke.visible=board.smoke&&!board.blackout;if(board.smoke&&typeof reseedSmokeToAudience==='function'){reseedSmokeToAudience(board.smokeAudience!=null?board.smokeAudience:true);}saveSettings();refresh()};
@@ -11060,7 +11145,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       requestAnimationFrame(loop);
       const dt=Math.min((now-last)/1000,0.05); last=now;
       const abActive=diagPerf?diagPerf.step():false;
-      const animating=abActive||board.chase.playing||board.blink.playing||board.show.playing||board.rainbow||board.smoke||(board.humanContour.on&&board.humanContour.speed>0)||board.photonRain.on||glowFansData.some(d=>d.on)||(board.laserSheet.on&&board.laserSheet.mode!=='fixed'&&board.laserSheet.speed>0)||beamOrbitActive(clock)||beamZoomActive(clock)||(board.redMesh.on&&(board.redMesh.moveSpeed>0||!board.redMesh.independent));
+      const animating=abActive||cueFadeActive()||board.chase.playing||board.blink.playing||board.show.playing||board.rainbow||board.smoke||(board.humanContour.on&&board.humanContour.speed>0)||board.photonRain.on||glowFansData.some(d=>d.on)||(board.laserSheet.on&&board.laserSheet.mode!=='fixed'&&board.laserSheet.speed>0)||beamOrbitActive(clock)||beamZoomActive(clock)||(board.redMesh.on&&(board.redMesh.moveSpeed>0||!board.redMesh.independent));
       if(animating){
         clock+=dt;
         advanceTimeline(clock);
