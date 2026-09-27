@@ -2919,8 +2919,9 @@
     const GLOW_BLUR_STEPS=4;           // 露光を何分割して軌跡を測るか
     const GLOW_BLUR_OK=2;              // これ以下なら止まって見える[px]。判定の基準
     const GLOW_BLUR_EVERY=6;           // 何フレームに1回測るか（毎フレームだと姿勢の評価が5倍になる）
-    let glowBlur={px:0,label:'',n:0};  // 直近の測定結果
-    let glowBlurFrame=0, _gbAcc={px:0,label:'',n:0};
+    /* 直近の測定結果。診断（?diag=blur）が読むので、捨てた理由も数える。 */
+    let glowBlur={px:0,label:'',n:0,on:0,out:0,hid:0,sh:0,meas:0};
+    let glowBlurFrame=0, _gbAcc={px:0,label:'',n:0,on:0,out:0,hid:0,sh:0,meas:0};
     const _gbV=new THREE.Vector3(), _gbW=new THREE.Vector3(), _gbP=[];
     /* 世界座標をカメラへ投影して画素へ直す。画角の外は null（最大値を汚さない）。 */
     function glowBlurPx(v){
@@ -2942,9 +2943,10 @@
       for(let k=0;k<=GLOW_BLUR_STEPS;k++){
         poseGlowFan(g,P,tt+k*dt,i);
         for(let m=0;m<2;m++){
-          if(!ok[m]||!st[m]||!st[m].visible){ok[m]=false;continue}
+          if(!ok[m])continue;
+          if(!st[m]||!st[m].visible){ok[m]=false;_gbAcc.hid++;continue}
           const q=glowBlurPx(g.localToWorld(_gbW.copy(st[m].position)));
-          if(!q){ok[m]=false;continue}
+          if(!q){ok[m]=false;_gbAcc.out++;continue}
           if(k>0)len[m]+=Math.hypot(q.x-_gbP[m].x,q.y-_gbP[m].y);
           _gbP[m]=q;
         }
@@ -2959,12 +2961,12 @@
       glowClockNow=t;
       /* 俯瞰は写真ではないので測らない。画素の意味が変わる。 */
       const meas=(cameraMode!=='map')&&(++glowBlurFrame%GLOW_BLUR_EVERY===0);
-      if(meas)_gbAcc={px:0,label:'',n:0};
+      if(meas)_gbAcc={px:0,label:'',n:0,on:0,out:0,hid:0,sh:expo.shutter,meas:glowBlur.meas+1};
       glowFansData.forEach((d,i)=>{
         if(!d.on)return;
         const g=glowFanMeshes[i]; if(!g)return;
         const P=glowPoseOf(d);
-        if(meas)glowBlurSample(g,P,d,t-glowChainStart,i);
+        if(meas){_gbAcc.on++; glowBlurSample(g,P,d,t-glowChainStart,i)}
         poseGlowFan(g,P,t-glowChainStart,i);
       });
       if(meas)glowBlur=_gbAcc;
@@ -10175,6 +10177,33 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       }};
     })();
 
+    /* ?diag=blur — 観客のブレの計算が実際に走っているかを実機から読み出す。
+       読み出しの行が出ないとき、原因は「測っていない」「測れているが捨てている」
+       「測れているが書いていない」のどれか。推し量らずに全部出す。 */
+    const diagBlur=(()=>{
+      if(!diagHas('blur'))return null;
+      const el=document.createElement('div');el.id='diagBlur';
+      el.style.cssText='position:fixed;left:8px;bottom:8px;z-index:9999;max-width:94vw;padding:8px 10px;'
+        +'background:rgba(0,0,0,.85);color:#ffd784;font:10px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;'
+        +'white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid rgba(224,168,58,.5);border-radius:6px;'
+        +'-webkit-user-select:text;user-select:text';
+      document.body.append(el);
+      return {tick(){
+        const c=renderer.domElement, b=glowBlur;
+        const note=glowBlurNote();
+        const ro=document.querySelector('#expoReadout');
+        const shown=ro?(ro.textContent||'').includes('観客のブレ'):null;
+        el.textContent='ブレ診断  '+glowFansData.filter(d=>d.on).length+'人 ON / 全'+glowFansData.length+'人\n'
+          +'  測定 '+b.meas+'回目（'+GLOW_BLUR_EVERY+'フレームに1回・'+GLOW_BLUR_STEPS+'分割）'
+          +'  カメラ '+cameraMode+'  画面 '+c.width+'x'+c.height+'\n'
+          +'  測った人 '+b.on+'人  シャッター 1/'+(b.sh?Math.round(1/b.sh):'--')+'\n'
+          +'  最大 '+b.px.toFixed(2)+'px'+(b.label?'（'+b.label+'）':'')
+          +'  '+GLOW_BLUR_OK+'px超 '+b.n+'本  画角の外 '+b.out+'本  非表示 '+b.hid+'本\n'
+          +'  読み出しの文 '+(note?'「'+note+'」':'（空）')+'\n'
+          +'  露出パネルに出ているか: '+(shown===null?'パネルが無い':(shown?'はい':'いいえ'));
+      }};
+    })();
+
     /* ?diag=fan — ロマンスの左右を実機から読み出す。
        これまで左右を3度取り違えたのは、すべて「図形ローカルの x」を
        「画面の左右」と読んだため。ここでは推論を一切挟まず、
@@ -11013,6 +11042,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       if(diagPerf)diagPerf.tick(now);
       if(diagRain)diagRain.tick(clock);
       if(diagFan)diagFan.tick(clock);
+      if(diagBlur)diagBlur.tick();
     }
     requestAnimationFrame(loop);
 
