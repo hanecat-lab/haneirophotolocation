@@ -5786,15 +5786,79 @@ const cleanupVlogAssetIds=ids=>{
   });
 };
 
+const VLOG_TEXT_FONTS=[
+  {key:'sans',label:'ゴシック',family:'"Noto Sans JP", sans-serif'},
+  {key:'serif',label:'明朝',family:'"Noto Serif JP", serif'},
+  {key:'rounded',label:'丸ゴ',family:'"Zen Maru Gothic", sans-serif'},
+  {key:'pop',label:'ポップ',family:'"M PLUS Rounded 1c", sans-serif'},
+  {key:'hand',label:'手書き',family:'"Kosugi Maru", sans-serif'},
+  {key:'yuji',label:'筆文字',family:'"Yuji Syuku", serif'},
+  {key:'shippori',label:'しっぽり',family:'"Shippori Mincho", serif'},
+  {key:'reggae',label:'レゲエ',family:'"Reggae One", sans-serif'},
+  {key:'dela',label:'デラゴ',family:'"Dela Gothic One", sans-serif'},
+  {key:'rock',label:'ロック',family:'"RocknRoll One", sans-serif'},
+  {key:'kiwi',label:'キウイ',family:'"Kiwi Maru", sans-serif'},
+  {key:'hachi',label:'ハチ丸',family:'"Hachi Maru Pop", sans-serif'},
+  {key:'stick',label:'スティック',family:'"Stick", sans-serif'}
+];
+const vlogTextFont=key=>VLOG_TEXT_FONTS.find(font=>font.key===key)?.family ||
+  (key && key!=='sans' ? key : VLOG_TEXT_FONTS[0].family);
+const vlogTextFontSpec=(txt,size)=>`${txt.bold?'700':'400'} ${size}px ${vlogTextFont(txt.fontFamily)}`;
+
+function drawVlogCaption(ctx,txt,width,height,options={}){
+  const content=options.sampleText??txt.text??'';
+  const x=options.x??(txt.x??50)/100*width;
+  const y=options.y??(txt.y??50)/100*height;
+  const fontSize=options.fontSizePx??(txt.fontSize||0.06)*height;
+  ctx.save();
+  ctx.font=vlogTextFontSpec(txt,fontSize);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  const measured=ctx.measureText(content).width;
+  if(txt.bgColor && txt.bgColor!=='transparent'){
+    const pad=Math.max(4,fontSize*0.22);
+    ctx.fillStyle=txt.bgColor;
+    ctx.fillRect(x-measured/2-pad,y-fontSize/2-pad,measured+pad*2,fontSize+pad*2);
+  }
+  ctx.lineJoin='round';
+  ctx.shadowColor='rgba(0,0,0,0.8)';ctx.shadowBlur=Math.max(2,fontSize*0.1);
+  if(txt.outline){
+    ctx.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
+    ctx.lineWidth=Math.max(2,fontSize*0.12);
+    ctx.strokeText(content,x,y);
+  }
+  ctx.fillStyle=txt.color||'#fff';
+  ctx.fillText(content,x,y);
+  ctx.restore();
+  return measured;
+}
+
+async function ensureVlogTextFonts(texts){
+  if(!texts.length || !document.fonts?.load) return;
+  const used=[...new Set(texts.filter(t=>VLOG_TEXT_FONTS.some(f=>f.key===(t.fontFamily||'sans')))
+    .map(t=>`${t.fontFamily||'sans'}|${t.bold?'700':'400'}`))];
+  if(!used.length)return;
+  let timer;
+  try{
+    const loaded=await Promise.race([
+      Promise.all(used.map(key=>{
+        const [family,weight]=key.split('|');
+        return document.fonts.load(`${weight} 32px ${vlogTextFont(family)}`,'あア Aa 123');
+      })),
+      new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('書体の読み込みが終わりません。通信を確認して再試行してください。')),5000);})
+    ]);
+    if(loaded.some(faces=>!faces.length)) throw new Error('書体を読み込めません。通信を確認して再試行してください。');
+  }finally{clearTimeout(timer);}
+}
+
 function getTextCanvasBounds(txt, canvas){
   const ctx=canvas?.getContext('2d');
   if(!ctx || !canvas.width || !canvas.height) return null;
   const fontSize=(txt.fontSize||0.06)*canvas.height;
   ctx.save();
-  ctx.font=`${txt.bold?'bold ':''}${fontSize}px ${txt.fontFamily||'sans-serif'}`;
+  ctx.font=vlogTextFontSpec(txt,fontSize);
   const width=ctx.measureText(txt.text||'').width;
   ctx.restore();
-  const pad=8;
+  const pad=Math.max(8,txt.outline?fontSize*0.12:0);
   const x=(txt.x ?? 50)/100*canvas.width;
   const y=(txt.y ?? 50)/100*canvas.height;
   return {left:x-width/2-pad, top:y-fontSize/2-pad, width:width+pad*2, height:fontSize+pad*2};
@@ -5932,21 +5996,50 @@ async function captureTextPlacementFrame(clip,time,caption,texts,filter,signal){
   ctx.drawImage(img,(width-w)/2,(height-h)/2,w,h);
   ctx.restore();
   for(const txt of [...texts, ...(caption?[caption]:[])]){
-    ctx.save();
-    const x=(txt.x??50)/100*width,y=(txt.y??50)/100*height;
-    const size=(txt.fontSize||0.06)*height;
-    ctx.font=`${txt.bold?'bold ':''}${size}px ${txt.fontFamily||'sans-serif'}`;
-    ctx.textAlign='center';ctx.textBaseline='middle';
-    if(txt.bgColor && txt.bgColor!=='transparent'){
-      const metrics=ctx.measureText(txt.text);const pad=4;
-      ctx.fillStyle=txt.bgColor;
-      ctx.fillRect(x-metrics.width/2-pad,y-size/2-pad,metrics.width+pad*2,size+pad*2);
-    }
-    ctx.fillStyle=txt.color||'#fff';ctx.shadowColor='rgba(0,0,0,0.8)';ctx.shadowBlur=3;
-    ctx.fillText(txt.text,x,y);
-    ctx.restore();
+    drawVlogCaption(ctx,txt,width,height);
   }
   return canvas.toDataURL('image/jpeg',0.82);
+}
+
+function TextStylePreview({item,backdrop,onFontReady}){
+  const canvasRef=useRef(null);
+  const fontSpecRef=useRef('');
+  const [fontStatus,setFontStatus]=useState('loading');
+  const [overflows,setOverflows]=useState(false);
+  useEffect(()=>{
+    let active=true;
+    const sample=item.text||'あア Aa 123';
+    const spec=vlogTextFontSpec(item,36);
+    if(fontSpecRef.current!==spec){fontSpecRef.current=spec;setFontStatus('loading');}
+    if(!document.fonts?.load){setFontStatus('fallback');return()=>{active=false;};}
+    const timeout=setTimeout(()=>{if(active)setFontStatus('fallback');},5000);
+    document.fonts.load(spec,sample).then(faces=>{
+      if(!active)return;
+      clearTimeout(timeout);
+      setFontStatus(faces.length?'ready':'fallback');
+      onFontReady?.();
+    }).catch(()=>{if(active){clearTimeout(timeout);setFontStatus('fallback');}});
+    return()=>{active=false;clearTimeout(timeout);};
+  },[item.id,item.fontFamily,item.bold,item.text]);
+  useEffect(()=>{
+    const canvas=canvasRef.current,ctx=canvas?.getContext('2d');
+    if(!ctx)return;
+    const width=canvas.width,height=canvas.height;
+    ctx.fillStyle=backdrop==='white'?'#fff':'#000';
+    ctx.fillRect(0,0,width,height);
+    const size=Math.max(30,Math.min(56,(item.fontSize||0.06)*600));
+    const measured=drawVlogCaption(ctx,item,width,height,{x:width/2,y:height/2,
+      fontSizePx:size,sampleText:item.text||'あア Aa 123'});
+    setOverflows(measured>width-36);
+  },[item,backdrop,fontStatus]);
+  return React.createElement('div',null,
+    React.createElement('canvas',{ref:canvasRef,width:600,height:180,
+      className:'block w-full h-auto rounded-xl border border-white/25',
+      role:'img','aria-label':`文字だけの見本。${backdrop==='white'?'白':'黒'}背景`}),
+    (fontStatus!=='ready'||overflows) && React.createElement('div',{className:'text-[10px] text-amber-200 mt-1',role:'status'},
+      [fontStatus==='loading'?'書体を読み込み中':fontStatus==='fallback'?'書体を読み込めません。代替書体を表示中':null,
+        overflows?'文字が表示幅を越えています':null].filter(Boolean).join(' · '))
+  );
 }
 
 function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
@@ -6910,12 +7003,17 @@ function App(){
   const [draggingText, setDraggingText] = useState(null);
   const [draggingClipBar, setDraggingClipBar] = useState(null);
   const [selectedTextId, setSelectedTextId] = useState(null);
+  const [textFontPickerOpen,setTextFontPickerOpen] = useState(false);
+  const [textPreviewBackdrop,setTextPreviewBackdrop] = useState('black');
+  useEffect(()=>setTextFontPickerOpen(false),[selectedTextId]);
   const [textMoveTarget, setTextMoveTarget] = useState(null); // {textId, start}: preview seeking must not change the destination
   const textMoveTargetRef = useRef(null);
   const [textMoveZoom, setTextMoveZoom] = useState(null); // fixed six-second window while fine-tuning
   const [textMoveReview, setTextMoveReview] = useState(null);
   const textMoveReviewSequenceRef = useRef(0);
-  const reviewTextMove=(textId,start)=>setTextMoveReview({textId,start,nonce:++textMoveReviewSequenceRef.current});
+  const reviewTextMove=(textId,start,force=false)=>setTextMoveReview(previous=>
+    !force && previous?.textId===textId && Math.abs(previous.start-start)<0.0001
+      ? previous : {textId,start,nonce:++textMoveReviewSequenceRef.current});
   const [textMoveFrames, setTextMoveFrames] = useState(null);
   const [textMoveDragging, setTextMoveDragging] = useState(false);
   const [textMoveGhostFrame, setTextMoveGhostFrame] = useState(null);
@@ -6924,6 +7022,8 @@ function App(){
   const textMoveDragOriginRef = useRef(null);
   const setMoveTarget=(textId,start)=>{
     const next={textId,start:Math.max(0,Math.min(durationRef.current,Number.isFinite(start)?start:0))};
+    if(textMoveTargetRef.current?.textId===next.textId &&
+       Math.abs(textMoveTargetRef.current.start-next.start)<0.0001) return;
     textMoveTargetRef.current=next;
     setTextMoveTarget(next);
     setTextMoveReview(null);
@@ -7443,27 +7543,7 @@ function App(){
 
     // テキスト描画
     const activeTexts = textsNow.filter(tx=> t>=tx.start && t<tx.end);
-    activeTexts.forEach(txt=>{
-      ctx.save();
-      const x = (txt.x ?? 50)/100 * cw;
-      const y = (txt.y ?? 50)/100 * ch;
-      const fontSize = (txt.fontSize||0.06) * ch;
-      ctx.font=`${txt.bold?'bold ':''}${fontSize}px ${txt.fontFamily||'sans-serif'}`;
-      ctx.fillStyle=txt.color||'#fff';
-      ctx.textAlign='center';
-      ctx.textBaseline='middle';
-      if(txt.bgColor && txt.bgColor!=='transparent'){
-        const metrics = ctx.measureText(txt.text);
-        const pad=8;
-        ctx.fillStyle=txt.bgColor;
-        ctx.fillRect(x-metrics.width/2-pad, y-fontSize/2-pad, metrics.width+pad*2, fontSize+pad*2);
-        ctx.fillStyle=txt.color||'#fff';
-      }
-      ctx.shadowColor='rgba(0,0,0,0.8)';
-      ctx.shadowBlur=4;
-      ctx.fillText(txt.text, x, y);
-      ctx.restore();
-    });
+    activeTexts.forEach(txt=>drawVlogCaption(ctx,txt,cw,ch));
   },[fitMode, filterIntensity, aspectMode, verticalPriority, autoVerticalDetect]);
 
   useEffect(()=>{ drawFrameRef.current = drawFrame; },[drawFrame]);
@@ -7980,6 +8060,8 @@ function App(){
           video.pause();
         }
       }
+      if(job.cancelled) throw new Error('書き出しを中止しました。');
+      await ensureVlogTextFonts(exportTexts);
       if(job.cancelled) throw new Error('書き出しを中止しました。');
       canvas.width=aspectModeRef.current==='16:9'?1280:720;
       canvas.height=aspectModeRef.current==='16:9'?720:1280;
@@ -11262,6 +11344,11 @@ const recomputeStarts=(arr)=>{
     requestAnimationFrame(watch);
   };
 
+  // A move changes only the source caption's timing. Its composed draft at the
+  // same target is already correct, so do not discard all three decoded frames.
+  const textMoveVisualKey=JSON.stringify(texts.map(t=>t.id===textMoveReview?.textId
+    ? [t.id,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor]
+    : [t.id,t.start,t.end,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor]));
   // Compose a draft only after the slider settles; keep the playback videos untouched.
   useEffect(()=>{
     if(!textMoveReview || activeTab!=='text'){setTextMoveFrames(null);return;}
@@ -11297,7 +11384,7 @@ const recomputeStarts=(arr)=>{
       if(!controller.signal.aborted) setTextMoveFrames({textId:source.id,start,status:'ready',frames});
     })();
     return()=>controller.abort();
-  },[textMoveReview?.textId,textMoveReview?.start,textMoveReview?.nonce,clips,texts,activeTab,activeFilter,filterIntensity]);
+  },[textMoveReview?.textId,textMoveReview?.start,textMoveReview?.nonce,clips,textMoveVisualKey,activeTab,activeFilter,filterIntensity]);
   const ghostClip=activeTab==='text' && textMoveTarget?.textId===selectedTextId
     ? clips.find(c=>textMoveTarget.start>=c.timelineStart && textMoveTarget.start<c.timelineStart+c.duration)
     : null;
@@ -13645,6 +13732,22 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             React.createElement('div', {className:'text-[12px] font-bold'}, 'テキスト編集'),
             React.createElement('button', {onClick:()=> setSelectedTextId(null), className:'w-7 h-7 rounded-full bg-white/10 flex items-center justify-center text-[12px]'}, '×')
           ),
+          React.createElement('div',{className:'mb-3'},
+            React.createElement('div',{className:'flex items-center justify-between gap-2 mb-2'},
+              React.createElement('span',{className:'text-[11px] font-bold'},'文字だけの見本'),
+              React.createElement('div',{className:'flex gap-1','aria-label':'見本の背景色'},
+                [{key:'white',label:'白'},{key:'black',label:'黒'}].map(option=>
+                  React.createElement('button',{key:option.key,type:'button',
+                    onClick:()=>setTextPreviewBackdrop(option.key),
+                    'aria-pressed':textPreviewBackdrop===option.key,
+                    className:`min-w-10 min-h-9 rounded-full border px-2 text-[11px] ${textPreviewBackdrop===option.key?'bg-white text-black border-white font-bold':'border-white/25 text-white/70'}`},option.label))
+              )
+            ),
+            React.createElement(TextStylePreview,{item:texts.find(t=>t.id===selectedTextId),
+              backdrop:textPreviewBackdrop,
+              onFontReady:()=>requestAnimationFrame(()=>drawFrameRef.current(timeRef.current))}),
+            React.createElement('div',{className:'text-[9px] text-white/40 mt-1'},'白・黒は見本の背景です。動画内の背景は下の「文字の帯背景」で設定します。')
+          ),
           React.createElement('div', {className:'mb-3'},
             React.createElement('div', {className:'text-[10px] text-white/50 mb-1'}, '内容'),
             React.createElement('input', {
@@ -13660,36 +13763,24 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             })
           ),
           React.createElement('div', {className:'mb-3'},
-            React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, 'フォント書体 (13種類) - 以前より大幅追加'),
-            React.createElement('div', {className:'grid grid-cols-4 gap-2'},
-              [
-                {k:'sans',l:'ゴシック',s:'"Noto Sans JP"'},
-                {k:'serif',l:'明朝',s:'"Noto Serif JP"'},
-                {k:'rounded',l:'丸ゴ',s:'"Zen Maru Gothic"'},
-                {k:'pop',l:'ポップ',s:'"M PLUS Rounded 1c"'},
-                {k:'hand',l:'手書き',s:'Kosugi Maru'},
-                {k:'yuji',l:'筆文字',s:'Yuji Syuku'},
-                {k:'shippori',l:'しっぽり',s:'Shippori Mincho'},
-                {k:'reggae',l:'レゲエ',s:'Reggae One'},
-                {k:'dela',l:'デラゴ',s:'Dela Gothic One'},
-                {k:'rock',l:'ロック',s:'RocknRoll One'},
-                {k:'kiwi',l:'キウイ',s:'Kiwi Maru'},
-                {k:'hachi',l:'ハチ丸',s:'Hachi Maru Pop'},
-                {k:'stick',l:'スティック',s:'Stick'}
-              ].map(f=>
-                React.createElement('button', {
-                  key:f.k,
-                  onClick:()=>{
-                    setTexts(prev=> prev.map(t=> t.id===selectedTextId ? {...t, fontFamily:f.k} : t));
-                    setTimeout(()=> drawFrameRef.current(timeRef.current),10);
-                  },
-                  style:{fontFamily:f.s},
-                  className:`h-12 rounded-lg border text-[11px] flex flex-col items-center justify-center ${texts.find(t=>t.id===selectedTextId)?.fontFamily===f.k ? 'bg-white text-black border-white font-bold' : 'bg-white/10 border-white/10'}`
-                }, 
-                  React.createElement('div', null, f.l),
-                  React.createElement('div', {className:'text-[8px] opacity-60'}, 'あア')
-                )
-              )
+            React.createElement('div',{className:'text-[10px] text-white/50 mb-1'},'書体'),
+            React.createElement('button',{type:'button',
+              onClick:()=>setTextFontPickerOpen(open=>!open),
+              'aria-expanded':textFontPickerOpen,
+              className:'w-full min-h-11 rounded-xl bg-black border border-white/20 px-3 flex items-center justify-between text-[12px]'},
+              React.createElement('span',null,VLOG_TEXT_FONTS.find(f=>f.key===(texts.find(t=>t.id===selectedTextId)?.fontFamily||'sans'))?.label||'現在の書体'),
+              React.createElement('span',{className:'text-white/60'},textFontPickerOpen?'閉じる ▲':'選ぶ ▼')
+            ),
+            textFontPickerOpen && React.createElement('div',{className:'mt-2 max-h-56 overflow-y-auto rounded-xl border border-white/20 bg-[#101013] p-1 grid grid-cols-2 gap-1','data-scrollable':true},
+              ...VLOG_TEXT_FONTS.map(font=>React.createElement('button',{key:font.key,type:'button',
+                onClick:()=>{
+                  setTexts(prev=>prev.map(t=>t.id===selectedTextId?{...t,fontFamily:font.key}:t));
+                  setTextFontPickerOpen(false);
+                },
+                style:{fontFamily:font.family},
+                className:`min-h-12 rounded-lg border px-2 text-left text-[11px] ${(texts.find(t=>t.id===selectedTextId)?.fontFamily||'sans')===font.key?'bg-white text-black border-white':'bg-white/5 border-white/10 text-white'}`},
+                React.createElement('span',{className:'block font-bold'},font.label),
+                React.createElement('span',{className:'block text-[10px] opacity-65'},'あア Aa')))
             )
           ),
           React.createElement('div', {className:'mb-3'},
@@ -13706,7 +13797,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             )
           ),
           React.createElement('div', {className:'mb-3'},
-            React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '背景'),
+            React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '文字の帯背景'),
             React.createElement('div', {className:'grid grid-cols-5 gap-2'},
               [
                 {c:'transparent', l:'なし'},
@@ -13813,6 +13904,9 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   );
                 })
               ),
+              review?.status==='ready' && review.frames.some(frame=>!frame.url) &&
+                React.createElement('button',{onClick:()=>reviewTextMove(cur.id,visibleTarget,true),
+                  className:'w-full rounded-full border border-white/25 px-3 py-1.5 text-[11px] mb-2'},'画像を再取得'),
               React.createElement('div',{className:'rounded-lg bg-black/30 px-2 py-1.5 mb-2 text-[11px] flex flex-wrap justify-center gap-x-2'},
                 React.createElement('span',null,`現在 ${cur.start.toFixed(1)}秒 → 移動先 ${visibleTarget.toFixed(1)}秒`),
                 React.createElement('span',{className:'text-violet-200'},`長さ ${span.toFixed(1)}秒`),
@@ -13840,7 +13934,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               React.createElement('div',{className:'flex items-center gap-2 mb-2'},
                 React.createElement('button',{onClick:()=>setMoveTarget(cur.id,Number((visibleTarget-0.1).toFixed(1))),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]','aria-label':'移動先を0.1秒前へ'},'−0.1秒'),
                 React.createElement('button',{onClick:()=>setMoveTarget(cur.id,Number((visibleTarget+0.1).toFixed(1))),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]','aria-label':'移動先を0.1秒後へ'},'＋0.1秒'),
-                React.createElement('button',{onClick:()=>setMoveTarget(cur.id,Number(currentTime.toFixed(1))),className:'rounded-full border border-white/20 px-3 py-2 text-[11px] ml-auto'},'再生位置へ')
+                React.createElement('button',{onClick:()=>setMoveTarget(cur.id,Number(timeRef.current.toFixed(1))),className:'rounded-full border border-white/20 px-3 py-2 text-[11px] ml-auto'},'再生位置へ')
               ),
               React.createElement('button',{
                 onClick:()=>{if(target!==null) finishTextMove(cur,target);},
