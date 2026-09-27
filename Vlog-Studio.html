@@ -6291,6 +6291,8 @@ function App(){
   const bgmAudioRef = useRef(null);
   const rafTickRef = useRef(0);
   const playingRef = useRef(false);
+  const livePreviewIdsRef = useRef(new Set());
+  const previewPlaybackRef = useRef({activeId:null, preparedId:null, incomingId:null, bgmDriftSince:0, lastRenderAt:0});
   const timeRef = useRef(0);
   const aspectRef = useRef(16/9);
   const aspectModeRef = useRef('9:16');
@@ -7218,9 +7220,9 @@ function App(){
     if(canvasRef.current) canvasRef.current.style.filter='none';
     const paperColor=getMoodPaperColor();
     ctx.fillStyle = paperColor;
-    ctx.fillRect(0,0,cw,ch);
     
     if(clipsNow.length===0){
+      ctx.fillRect(0,0,cw,ch);
       const emptyTitleSize=Math.max(15,Math.min(23,Math.round(ch*0.034)));
       const emptyHelpSize=Math.max(11,Math.min(14,Math.round(ch*0.022)));
       ctx.fillStyle='rgba(20,20,22,0.78)';
@@ -7388,7 +7390,9 @@ function App(){
           try{
             const trimStart = clip.trimStart || 0;
             const targetTime = trimStart + lTime;
-            if(Math.abs(v.currentTime - targetTime) > 0.3){
+            // 再生中の動画は自身の時計で進める。停止中の確認と書き出しだけ位置を合わせる。
+            if((exportClips || !playingRef.current || !livePreviewIdsRef.current.has(clip.id)) &&
+               Math.abs(v.currentTime - targetTime) > 0.3){
               v.currentTime = Math.max(0, Math.min(targetTime, (v.duration||999)-0.1));
             }
           }catch{}
@@ -7455,6 +7459,12 @@ function App(){
       if(canvasRef.current) canvasRef.current.style.filter='none';
     }catch{}
     
+    // デコード待ちの間は前の完成フレームを残し、背景色だけの瞬間を出さない。
+    if(playingRef.current && !exportClips && [activeClip,nextClip].some(clip=>
+      clip?.type==='video' && livePreviewIdsRef.current.has(clip.id) &&
+      (videoRefs.current.get(clip.id)?.readyState||0)<2)) return;
+    ctx.fillStyle=paperColor;
+    ctx.fillRect(0,0,cw,ch);
     const css=getClipPreviewFilter(activeClip,activeFilterRef.current,filterIntensityRef.current);
     ctx.filter='none';
     
@@ -7557,7 +7567,8 @@ function App(){
       if(!c||!wrap) return;
       const currentAspectMode = aspectModeRef.current || aspectMode;
       const isFs = modeRef.current==='fullscreen' || modeRef.current==='finder' || modeRef.current==='hikariyomi' || wrap.classList.contains('fullscreen') || wrap.classList.contains('finder-mode');
-      const dpr=window.devicePixelRatio||1;
+      // 書き出し時は別途 720x1280 / 1280x720 に設定する。表示用だけ画素数を抑える。
+      const dpr=Math.min(window.devicePixelRatio||1,1.5);
       let targetW, targetH;
       if(isFs){ 
         const isTheater = modeRef.current==='fullscreen';
@@ -7738,12 +7749,94 @@ function App(){
     if(!playingRef.current) return;
     const now=performance.now();
     const last=tick._last||now;
-    let delta=(now-last)/1000*playbackRate;
-    if(delta>0.15) delta=0.08;
-    if(delta<0) delta=0;
+    const delta=Math.max(0,Math.min(0.1,(now-last)/1000*playbackRate));
     tick._last=now;
-    timeRef.current+=delta;
-    if(timeRef.current>=durationRef.current-0.02){
+    const clipsNow=clipsRef.current;
+    const state=previewPlaybackRef.current;
+    let t=timeRef.current;
+    let index=clipsNow.findIndex(clip=>t>=clip.timelineStart && t<clip.timelineStart+clip.duration);
+    let active=clipsNow[index];
+    const clockClipId=active?.id;
+    let waiting=false;
+    let activeVideo=active?.type==='video' ? videoRefs.current.get(active.id) : null;
+    if(activeVideo){
+      if(state.activeId!==active.id){
+        const target=(active.trimStart||0)+t-active.timelineStart;
+        // 素材への入場時だけシーク。重なりから引き継いだ動画はそのまま進める。
+        if(state.incomingId!==active.id && Math.abs(activeVideo.currentTime-target)>0.035){
+          try{ activeVideo.currentTime=target; }catch{}
+        }
+        state.activeId=active.id;
+      }
+      activeVideo.playbackRate=playbackRate;
+      if(activeVideo.readyState<2 || activeVideo.seeking) waiting=true;
+      else{
+        if(activeVideo.paused){
+          try{ activeVideo.play()?.catch?.(()=>{}); }catch{}
+        }
+        if(activeVideo.paused) waiting=true;
+        else t=Math.max(active.timelineStart,Math.min(active.timelineStart+active.duration,
+          active.timelineStart+activeVideo.currentTime-(active.trimStart||0)));
+      }
+    }else if(active?.type==='photo'){
+      state.activeId=null;
+      t+=delta;
+    }
+    // 写真から動画に入ったフレームでも、その動画を先に準備する。
+    if(!waiting && active?.type==='photo' && t>=active.timelineStart+active.duration){
+      t=active.timelineStart+active.duration;
+    }
+    index=clipsNow.findIndex(clip=>t>=clip.timelineStart && t<clip.timelineStart+clip.duration);
+    active=clipsNow[index] || active;
+    if(!waiting && active?.type==='video' && active.id!==clockClipId){
+      // 新素材を次の tick で一度だけ位置合わせしてから表示する。
+      timeRef.current=t;
+      state.activeId=null;
+      waiting=true;
+    }
+    const trans=active?._transitionToNext;
+    const transDur=trans?.type && trans.type!=='none' && index<clipsNow.length-1 ? trans.duration||0.5 : 0;
+    const overlapStart=active ? active.timelineStart+active.duration-transDur : Infinity;
+    const next=transDur ? clipsNow[index+1] : null;
+    const incoming=next?.type==='video' ? videoRefs.current.get(next.id) : null;
+    if(incoming && t>=overlapStart-0.5 && state.preparedId!==next.id){
+      state.preparedId=next.id;
+      incoming.preload='auto';
+      try{
+        if(incoming.readyState<1) incoming.load();
+        if(Math.abs(incoming.currentTime-(next.trimStart||0))>0.08) incoming.currentTime=next.trimStart||0;
+      }catch{}
+    }
+    const inOverlap=!!next && t>=overlapStart;
+    if(inOverlap && incoming){
+      if(state.incomingId!==next.id){
+        state.incomingId=next.id;
+        const target=(next.trimStart||0)+Math.max(0,t-overlapStart);
+        if(Math.abs(incoming.currentTime-target)>0.035){
+          try{ incoming.currentTime=target; }catch{}
+        }
+      }
+      incoming.playbackRate=playbackRate;
+      if(incoming.readyState<2 || incoming.seeking) waiting=true;
+      else{
+        if(incoming.paused){ try{ incoming.play()?.catch?.(()=>{}); }catch{} }
+        if(incoming.paused) waiting=true;
+      }
+    }
+    const liveIds=new Set();
+    if(active?.type==='video') liveIds.add(active.id);
+    if(inOverlap && incoming) liveIds.add(next.id);
+    livePreviewIdsRef.current=liveIds;
+    // 読み込み待ちでは音・タイムラインも待ち、黒画面や文字だけの先行を防ぐ。
+    if(waiting){
+      if(activeVideo && !activeVideo.paused) try{ activeVideo.pause(); }catch{}
+      if(incoming && !incoming.paused) try{ incoming.pause(); }catch{}
+      if(bgmAudioRef.current && !bgmAudioRef.current.paused) try{ bgmAudioRef.current.pause(); }catch{}
+      rafTickRef.current=requestAnimationFrame(tick);
+      return;
+    }
+    timeRef.current=t;
+    if(t>=durationRef.current-0.02){
       timeRef.current=0;
       if(bgmAudioRef.current){
         try{ bgmAudioRef.current.currentTime = bgmOffsetRef.current; }catch{}
@@ -7752,48 +7845,33 @@ function App(){
       handleStop();
       return;
     }
-    if(Math.abs(timeRef.current - lastDisplayedTimeRef.current) >= 0.08){
-      lastDisplayedTimeRef.current = timeRef.current;
-      setCurrentTime(timeRef.current);
+    if(Math.abs(t-lastDisplayedTimeRef.current)>=0.08){
+      lastDisplayedTimeRef.current=t;
+      setCurrentTime(t);
     }
-    const clipsNow = clipsRef.current;
-    let active=null;
-    let local=0;
-    for(const clip of clipsNow){
-      if(timeRef.current>=clip.timelineStart && timeRef.current<clip.timelineStart+clip.duration){
-        active=clip;
-        local=timeRef.current-clip.timelineStart;
-        break;
-      }
-    }
-    if(active){
-      const v=videoRefs.current.get(active.id);
-      if(v){
-        const target = (active.trimStart||0)+local;
-        if(Math.abs(v.currentTime-target)>0.14){
-          try{ v.currentTime=target; }catch{}
-        }
-        if(v.paused){
-          try{ const p=v.play(); if(p&&p.catch) p.catch(()=>{}); }catch{}
-        }
-      }
-      clipsNow.forEach(c=>{
-        if(c.id!==active.id){
-          const ov=videoRefs.current.get(c.id);
-          const av=videoRefs.current.get(active.id);
-          if(ov && ov!==av && !ov.paused){
-            try{ ov.pause(); }catch{}
-          }
-        }
-      });
-    }
+    videoRefs.current.forEach((video,id)=>{
+      if(!liveIds.has(id) && !video.paused) try{ video.pause(); }catch{}
+    });
     if(bgmAudioRef.current && bgmTrack!=='none'){
-      const bgmTarget = timeRef.current + bgmOffsetRef.current;
-      if(Math.abs(bgmAudioRef.current.currentTime - bgmTarget) > 0.3){
-        try{ bgmAudioRef.current.currentTime = Math.max(0, bgmTarget); }catch{}
+      const bgm=bgmAudioRef.current;
+      bgm.playbackRate=playbackRate;
+      const bgmTarget=t+bgmOffsetRef.current;
+      if(bgm.paused) try{ bgm.play()?.catch?.(()=>{}); }catch{}
+      if(Math.abs(bgm.currentTime-bgmTarget)>0.35){
+        if(!state.bgmDriftSince) state.bgmDriftSince=now;
+        if(now-state.bgmDriftSince>400){
+          try{ bgm.currentTime=Math.max(0,bgmTarget); }catch{}
+          state.bgmDriftSince=0;
+        }
+      }else{
+        state.bgmDriftSince=0;
       }
     }
-    drawFrameRef.current(timeRef.current);
+    // 動画素材の書き出しと同じ約30fpsで描画し、60Hz画面での重複処理を避ける。
+    if(now-state.lastRenderAt>=30){
+      drawFrameRef.current(t);
+      state.lastRenderAt=now;
+    }
     rafTickRef.current=requestAnimationFrame(tick);
   },[playbackRate, bgmTrack]);
 
@@ -7822,17 +7900,12 @@ function App(){
     if(timeRef.current>=durationRef.current-0.05){
       timeRef.current=0;
       setCurrentTime(0);
-      clipsRef.current.forEach(clip=>{
-        const v=videoRefs.current.get(clip.id);
-        if(v){
-          try{ v.currentTime = clip.trimStart||0; }catch{}
-        }
-      });
       if(bgmAudioRef.current){
         try{ bgmAudioRef.current.currentTime = bgmOffsetRef.current; }catch{}
       }
     }
     cancelAnimationFrame(rafTickRef.current);
+    previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0};
     playingRef.current=true;
     setIsPlaying(true);
     tick._last=performance.now();
@@ -7845,18 +7918,12 @@ function App(){
         if(local>=0 && local<clip.duration){
           const target=(clip.trimStart||0)+local;
           try{ 
-            if(Math.abs(v.currentTime-target)>0.25){
+            if(v.ended || Math.abs(v.currentTime-target)>0.04){
               v.currentTime=target;
               needsWait=true;
             }
           }catch{}
         }
-        // iOSでvideoがended状態だとplayできないことがあるのでloadし直さずcurrentTimeをリセット
-        try{
-          if(v.ended){
-            v.currentTime = clip.trimStart||0;
-          }
-        }catch{}
       }
     });
     // タップ操作の中で先に再生を要求する。タイマー内だけの play() は iOS で拒否されうる。
@@ -7864,16 +7931,24 @@ function App(){
       timeRef.current>=clip.timelineStart && timeRef.current<clip.timelineStart+clip.duration);
     const firstVideo=activeAtStart && videoRefs.current.get(activeAtStart.id);
     if(firstVideo){
+      firstVideo.playbackRate=playbackRate;
+      previewPlaybackRef.current.activeId=activeAtStart.id;
+      livePreviewIdsRef.current=new Set([activeAtStart.id]);
       try{ const p=firstVideo.play(); if(p?.catch) p.catch(()=>{}); }catch{}
     }
     if(bgmAudioRef.current && bgmTrack!=='none'){
+      bgmAudioRef.current.playbackRate=playbackRate;
+      try{
+        const target=Math.max(0,timeRef.current+bgmOffsetRef.current);
+        if(Math.abs(bgmAudioRef.current.currentTime-target)>0.05) bgmAudioRef.current.currentTime=target;
+      }catch{}
       try{ bgmAudioRef.current.play().catch(()=>{}); }catch{}
     }
     // 少し待ってからtick開始（seek完了待ち）
     const startDelay = needsWait ? 120 : 30;
     setTimeout(()=>{
       if(playingRef.current){
-        // 再生直前にアクティブクリップのvideoを確実にplay
+        // 再生直前にアクティブクリップのvideoを確実にplay。ここでの再シークは不要。
         const clipsNow = clipsRef.current;
         let active=null, local=0;
         for(const clip of clipsNow){
@@ -7885,8 +7960,6 @@ function App(){
           const v=videoRefs.current.get(active.id);
           if(v){
             try{
-              const target=(active.trimStart||0)+local;
-              v.currentTime=target;
               const p=v.play();
               if(p&&p.then) p.catch(()=>{});
             }catch{}
@@ -7895,15 +7968,17 @@ function App(){
         rafTickRef.current=requestAnimationFrame(tick);
       }
     }, startDelay);
-  },[tick, bgmTrack]);
+  },[tick, bgmTrack, playbackRate]);
 
   const handleStop = useCallback(()=>{
     playingRef.current=false;
+    livePreviewIdsRef.current=new Set();
+    previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0};
     setIsPlaying(false);
     tick._last=0;
     cancelAnimationFrame(rafTickRef.current);
-    videoRefs.current.forEach(v=>{ try{ v.pause(); }catch{} });
-    if(bgmAudioRef.current){ try{ bgmAudioRef.current.pause(); }catch{} }
+    videoRefs.current.forEach(v=>{ try{ v.pause(); v.playbackRate=1; }catch{} });
+    if(bgmAudioRef.current){ try{ bgmAudioRef.current.pause(); bgmAudioRef.current.playbackRate=1; }catch{} }
     lastDisplayedTimeRef.current = timeRef.current;
     setCurrentTime(timeRef.current);
     drawFrameRef.current(timeRef.current);
