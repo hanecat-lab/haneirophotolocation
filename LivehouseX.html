@@ -429,6 +429,8 @@
         </details></section>
         <section class="section"><details class="sec" data-sec="fan"><summary class="label"><span>客席の観客</span><small>GLOW FAN</small></summary>
           <div id="glowFanList" style="display:flex;flex-direction:column;gap:12px"></div>
+          <button class="mode" id="penTrailToggle" type="button" style="width:100%;margin-top:6px">○ サイリウムの軌跡（被写体ブレ）</button>
+          <div class="hint">サイリウムの軌跡は、露光のあいだに動いた道のりをそのまま描きます。伸びたぶんだけ薄くなる（光の総量は変わらない）ので、シャッターを速くすると短く濃く、遅くすると長く淡くなります。露出パネルの「観客のブレ ○○px」と同じ折れ線を描いているので、数字と絵が必ず一致します。ON のあいだは毎フレーム計算します。</div>
           <div class="hint">客席の床に立つサイリウムの観客。左右 ±3.6m、前後 1.6〜10.0m。サイリウムは自光だけなので、照明や露出計には影響しない。「足の開き」と「全員のポーズ」は30人まとめて、ON/OFF と配置は10人ごとの組に掛かる。「ばらけて配置」はその組を、他の組を避けながら足が重ならないように置き直し、向きも少しずつ振る。演者が隠れないよう、客席カメラの正面だけは空ける。</div>
         </details></section>
         <section class="section"><details class="sec" data-sec="sec4"><summary class="label"><span>アクセサリー</span><small>ACCESSORY</small></summary>
@@ -2909,6 +2911,47 @@
     /* 連結（chain）の起点。全員で1つを共有するので、3人とも同じ小節を踊る。
        人ごとに持つと ON にした時刻の差だけ振り付けがずれる。 */
     function glowFanRestart(){glowChainStart=glowClockNow}
+    const GLOW_BLUR_STEPS=4;           // 露光を何分割して軌跡を測る／描くか
+    const GLOW_BLUR_OK=2;              // これ以下なら止まって見える[px]。判定の基準
+    /* 軌跡を描いていないときは毎フレーム測らない（姿勢の評価が5倍になる）。
+       描いているときは絵と数字を合わせるため毎フレーム測る。 */
+    const GLOW_BLUR_EVERY=6;
+    /* ===== サイリウムの軌跡（被写体ブレの描画） =====
+       光の雨と同じ作り ― 固定容量のバッファを1つ確保し、setDrawRange で
+       本数を絞る。粒を伸ばすのではなく、測定で使っている折れ線をそのまま
+       板で繋ぐので、読み出しの画素数と絵が必ず一致する。
+       伸びたぶんは薄くする（a = 幅/(幅+道のり)）。光の総量が保存されるので、
+       速く動くほど薄く長く尾を引く ― 実際の露光と同じ振る舞い。 */
+    const GLOW_TRAIL_MAX=glowFansData.length*2*GLOW_BLUR_STEPS;   // 板の最大枚数
+    /* ペンの厚み（半径）。薄くする量の基準にだけ使う ―
+       軌跡の幅は動いた道のりで決まり、高さはペンの長さそのもの。 */
+    const GLOW_TRAIL_W=.011;
+    const glowTrailGeo=new THREE.BufferGeometry();
+    glowTrailGeo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(GLOW_TRAIL_MAX*6*3),3));
+    glowTrailGeo.setAttribute('color',new THREE.BufferAttribute(new Float32Array(GLOW_TRAIL_MAX*6*3),3));
+    const glowTrailMat=new THREE.MeshBasicMaterial({vertexColors:true,transparent:true,
+      depthWrite:false,blending:THREE.AdditiveBlending,side:THREE.DoubleSide});
+    const glowTrail=new THREE.Mesh(glowTrailGeo,glowTrailMat);
+    glowTrail.frustumCulled=false; glowTrail.renderOrder=6; glowTrail.visible=false;
+    scene.add(glowTrail);
+    const _gtCol=new THREE.Color('#39ffb0');        // サイリウムの発光色に合わせる
+    let glowTrailN=0;                                // この回に積んだ板の枚数
+    /* 世界座標の2点を、鉛直のリボン1枚として積む。ペンは常に鉛直なので、
+       21cm の棒が横へ動いて掃く面は「ペンの高さ × 動いた道のり」の長方形。
+       カメラへ正対させる必要はない（面そのものが実体）。 */
+    function glowTrailPush(a,b,alpha){
+      if(glowTrailN>=GLOW_TRAIL_MAX)return;
+      const h=GLOW_STICK/2;
+      const pos=glowTrailGeo.attributes.position.array, col=glowTrailGeo.attributes.color.array;
+      let o=glowTrailN*18;
+      const put=(p,sgn)=>{pos[o]=p.x;pos[o+1]=p.y+h*sgn;pos[o+2]=p.z;
+        col[o]=_gtCol.r*alpha;col[o+1]=_gtCol.g*alpha;col[o+2]=_gtCol.b*alpha;o+=3};
+      put(a,-1);put(a,1);put(b,1);put(a,-1);put(b,1);put(b,-1);
+      glowTrailN++;
+    }
+    /* 標本の世界座標を入れる置き場。毎フレーム作ると 50人で 500個になる。 */
+    const _gtPool=[[],[]];
+    for(let m=0;m<2;m++)for(let k=0;k<=GLOW_BLUR_STEPS;k++)_gtPool[m].push(new THREE.Vector3());
     /* ===== 観客の被写体ブレ =====
        露光のあいだにサイリウムが画面上で何画素流れるかを数える。
        ぼかして描くのではなく数える ― このレンダラにポストプロセスが無いので、
@@ -2916,9 +2959,6 @@
        往復する振り付けは始点と終点が近くても軌跡は長いので、直線距離ではなく
        露光を GLOW_BLUR_STEPS に割った折れ線の長さで測る。
        ペンは常に鉛直なので、先端と中心の移動量は同じ ― 中心をそのまま使う。 */
-    const GLOW_BLUR_STEPS=4;           // 露光を何分割して軌跡を測るか
-    const GLOW_BLUR_OK=2;              // これ以下なら止まって見える[px]。判定の基準
-    const GLOW_BLUR_EVERY=6;           // 何フレームに1回測るか（毎フレームだと姿勢の評価が5倍になる）
     /* 直近の測定結果。診断（?diag=blur）が読むので、捨てた理由も数える。 */
     let glowBlur={px:0,label:'',n:0,on:0,out:0,hid:0,sh:0,meas:0};
     let glowBlurFrame=0, _gbAcc={px:0,label:'',n:0,on:0,out:0,hid:0,sh:0,meas:0};
@@ -2932,44 +2972,65 @@
     }
     /* 1人ぶんの軌跡を測る。姿勢を露光の各時刻へ置いて投影するので、
        呼んだあとに必ず本来の時刻で置き直すこと（updateGlowFans がやる）。 */
-    function glowBlurSample(g,P,d,tt,i){
+    /* 1人ぶんの軌跡を測る（描くときは同じ折れ線を板として積む）。
+       姿勢を露光の各時刻へ置くので、呼んだあとに必ず本来の時刻で置き直すこと
+       （updateGlowFans がやる）。 */
+    function glowBlurSample(g,P,d,tt,i,draw){
       const dt=expo.shutter/GLOW_BLUR_STEPS;
       const st=[g.getObjectByName('glowStickR'),g.getObjectByName('glowStickL')];
       /* サイリウムは figure group の直下なので、group の世界行列は露光のあいだ
          変わらない。1人につき1回だけ更新して、あとは localToWorld で済ませる
          （getWorldPosition は毎回 親を遡って行列を作り直す）。 */
       g.updateWorldMatrix(true,false);
-      const len=[0,0]; let ok=[true,true];
+      const len=[0,0], nw=[0,0]; let ok=[true,true];
       for(let k=0;k<=GLOW_BLUR_STEPS;k++){
         poseGlowFan(g,P,tt+k*dt,i);
         for(let m=0;m<2;m++){
           if(!ok[m])continue;
           if(!st[m]||!st[m].visible){ok[m]=false;_gbAcc.hid++;continue}
-          const q=glowBlurPx(g.localToWorld(_gbW.copy(st[m].position)));
+          const w=g.localToWorld(_gtPool[m][k].copy(st[m].position));
+          const q=glowBlurPx(w);
           if(!q){ok[m]=false;_gbAcc.out++;continue}
           if(k>0)len[m]+=Math.hypot(q.x-_gbP[m].x,q.y-_gbP[m].y);
-          _gbP[m]=q;
+          _gbP[m]=q; nw[m]=k+1;
         }
       }
       for(let m=0;m<2;m++){
         if(!ok[m])continue;
         if(len[m]>GLOW_BLUR_OK)_gbAcc.n++;
         if(len[m]>_gbAcc.px){_gbAcc.px=len[m];_gbAcc.label=d.label}
+        if(!draw||nw[m]<2)continue;
+        /* 薄くする量は「ペンの厚み ÷ (厚み＋道のり)」。伸びたぶんだけ薄くなる
+           ので、光の総量が保存される。軌跡もペンも同じ距離にあるので、
+           世界の長さの比がそのまま画面の面積の比になる（距離は打ち消す）。 */
+        let path=0;
+        for(let k=1;k<nw[m];k++)path+=_gtPool[m][k].distanceTo(_gtPool[m][k-1]);
+        const a=2*GLOW_TRAIL_W/(2*GLOW_TRAIL_W+path);
+        for(let k=1;k<nw[m];k++)glowTrailPush(_gtPool[m][k-1],_gtPool[m][k],a);
       }
     }
     function updateGlowFans(t){
       glowClockNow=t;
-      /* 俯瞰は写真ではないので測らない。画素の意味が変わる。 */
-      const meas=(cameraMode!=='map')&&(++glowBlurFrame%GLOW_BLUR_EVERY===0);
-      if(meas)_gbAcc={px:0,label:'',n:0,on:0,out:0,hid:0,sh:expo.shutter,meas:glowBlur.meas+1};
+      glowBlurFrame++;
+      /* 俯瞰は写真ではないので測らない。画素の意味が変わる。
+         軌跡を描いているあいだは、絵と数字を合わせるため毎フレーム測る。 */
+      const draw=!!(board.penTrail&&board.penTrail.on)&&cameraMode!=='map';
+      const meas=cameraMode!=='map'&&(draw||glowBlurFrame%GLOW_BLUR_EVERY===0);
+      if(meas){_gbAcc={px:0,label:'',n:0,on:0,out:0,hid:0,sh:expo.shutter,meas:glowBlur.meas+1}; glowTrailN=0}
       glowFansData.forEach((d,i)=>{
         if(!d.on)return;
         const g=glowFanMeshes[i]; if(!g)return;
         const P=glowPoseOf(d);
-        if(meas){_gbAcc.on++; glowBlurSample(g,P,d,t-glowChainStart,i)}
+        if(meas){_gbAcc.on++; glowBlurSample(g,P,d,t-glowChainStart,i,draw)}
         poseGlowFan(g,P,t-glowChainStart,i);
       });
       if(meas)glowBlur=_gbAcc;
+      if(draw&&meas){
+        glowTrailGeo.setDrawRange(0,glowTrailN*6);
+        glowTrailGeo.attributes.position.needsUpdate=true;
+        glowTrailGeo.attributes.color.needsUpdate=true;
+      }
+      glowTrail.visible=draw&&glowTrailN>0;
     }
     /* 露出の読み出しへ出す1行。ON の観客がいないときは何も出さない。 */
     function glowBlurNote(){
@@ -5983,6 +6044,7 @@
       // いまは等高線だけ。空中の薄板とシャッター連動は後の手順で足す。
       // thickness は「線の間隔に対する割合」。絶対値[m]にすると間隔を詰めたとき
       // 帯どうしがくっつき、間隔2cmではシャッターを上げても solid のままだった。
+      penTrail:{on:false},
       humanContour:{on:false,level:60,gap:.05,span:.50,speed:1.0,thickness:.25,color:'#9ff0c4'},
       // PHOTON RAIN — 落ちる光の粒。筋の長さはシャッター速度で決まる。
       // 粒数は実測で決めるので、まずは少数から。
@@ -9015,6 +9077,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       // depth は 0 が有効値なので || で既定へ倒せない。?? は NaN を拾わないため isFinite で判定する。
       const zoomDepth=Number(board.beamZoom.depth);
       board.beamZoom.depth=THREE.MathUtils.clamp(Math.round(Number.isFinite(zoomDepth)?zoomDepth:60),0,100);
+      Object.assign(board.penTrail,src.penTrail||{});
+      board.penTrail.on=!!board.penTrail.on;
       Object.assign(board.humanContour,src.humanContour||{});
       board.humanContour.on=!!board.humanContour.on;
       const contourLv=Number(board.humanContour.level);
@@ -9414,7 +9478,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       sec10:()=>board.beamZoom.mode!=='fixed',
       sec11:()=>board.backlight.on,
       sec12:()=>board.laserSheet.on,
-      fan  :()=>glowFansData.some(d=>d.on),
+      fan  :()=>glowFansData.some(d=>d.on)||board.penTrail.on,
       sec26:()=>board.humanContour.on,
       sec27:()=>board.photonRain.on,
       sec25:()=>board.redMesh.on,
@@ -9502,6 +9566,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       q('#redMeshPulse').value=board.redMesh.pulse;q('#v-redMeshPulse').textContent=board.redMesh.pulse+'%';
       q('#redMeshGlow').value=board.redMesh.glow;q('#v-redMeshGlow').textContent=board.redMesh.glow+'%';
       q('#redMeshBlanking').value=board.redMesh.blanking;q('#v-redMeshBlanking').textContent=board.redMesh.blanking+'%';       q('#redMeshMoveSpeed').value=board.redMesh.moveSpeed;q('#v-redMeshMoveSpeed').textContent=board.redMesh.moveSpeed+'%';       q('#redMeshFloor').value=board.redMesh.floor;q('#v-redMeshFloor').textContent=board.redMesh.floor+'%';       q('#redMeshWaist').value=board.redMesh.waist;q('#v-redMeshWaist').textContent=board.redMesh.waist+'%';       q('#redMeshHead').value=board.redMesh.head;q('#v-redMeshHead').textContent=board.redMesh.head+'%';       q('#redMeshColor').value=board.redMesh.color;q('#v-redMeshColor').textContent=board.redMesh.color;       setToggle('redMeshIndependentToggle',board.redMesh.independent,'独立動作（BPM非連動）');
+      setToggle('penTrailToggle',board.penTrail.on,'サイリウムの軌跡（被写体ブレ）');
       setToggle('humanContourToggle',board.humanContour.on,'人体等高線スキャン');
       q('#humanContourLevel').value=board.humanContour.level;q('#v-humanContourLevel').textContent=board.humanContour.level+'%';
       q('#humanContourSpeed').value=board.humanContour.speed;q('#v-humanContourSpeed').textContent=board.humanContour.speed.toFixed(1)+' 往復/秒';
@@ -9701,6 +9766,9 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     q('#laserSheetSpeed').oninput=e=>{board.laserSheet.speed=+e.target.value;q('#v-laserSheetSpeed').textContent=board.laserSheet.speed.toFixed(1);saveSettings();refresh()};
     q('#laserSheetColor').oninput=e=>{board.laserSheet.color=e.target.value;q('#v-laserSheetColor').textContent=board.laserSheet.color;saveSettings();refresh()};
     q('#redMeshColor').oninput=e=>{board.redMesh.color=e.target.value;q('#v-redMeshColor').textContent=board.redMesh.color;saveSettings();refresh()};
+    q('#penTrailToggle').onclick=()=>{board.penTrail.on=!board.penTrail.on;
+      setToggle('penTrailToggle',board.penTrail.on,'サイリウムの軌跡（被写体ブレ）');
+      saveSettings();refresh()};
     q('#humanContourToggle').onclick=()=>{board.humanContour.on=!board.humanContour.on;
       setToggle('humanContourToggle',board.humanContour.on,'人体等高線スキャン');
       // OFFにすると renderSubjectContour が走らないので、ここで戻す
