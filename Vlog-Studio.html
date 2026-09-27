@@ -5278,6 +5278,57 @@ body:has(.polaroid-wrapper.hikariyomi-mode) #moodSelector{
 .finder-mark-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .finder-mark-time{flex:none;font-family:monospace;font-size:10px;}
 
+/* 両モードの時間はGRID直下の進行バーと一緒に表示する。 */
+.polaroid-wrapper:is(.finder-mode,.hikariyomi-mode) .mode-dock .mode-time-progress{
+  box-sizing:border-box;
+  width:100%;
+  min-width:0;
+  padding:7px 3px 5px;
+  border-radius:9px;
+  background:rgba(5,13,16,0.76);
+  pointer-events:none;
+}
+.polaroid-wrapper:is(.finder-mode,.hikariyomi-mode) .mode-time-progress .finder-progress{
+  position:relative !important;
+  width:100% !important;
+  height:3px !important;
+  background:rgba(167,243,208,0.20) !important;
+  border-radius:999px;
+}
+.polaroid-wrapper:is(.finder-mode,.hikariyomi-mode) .mode-time-progress .finder-progress-bar{
+  position:absolute !important;
+  left:0 !important;
+  top:0 !important;
+  height:100% !important;
+  border-radius:inherit;
+  background:#A7F3D0 !important;
+  transition:width 0.1s linear !important;
+}
+.polaroid-wrapper:is(.finder-mode,.hikariyomi-mode) .mode-time-progress .finder-progress-dot{
+  position:absolute !important;
+  top:50% !important;
+  width:6px !important;
+  height:6px !important;
+  margin-left:0 !important;
+  transform:translate(-50%,-50%) !important;
+  border-radius:50%;
+  background:#A7F3D0 !important;
+  box-shadow:0 0 8px #A7F3D0;
+  transition:left 0.1s linear !important;
+}
+.polaroid-wrapper:is(.finder-mode,.hikariyomi-mode) .mode-time-numbers{
+  display:flex;
+  justify-content:space-between;
+  gap:1px;
+  margin-top:6px;
+  font:8px/1.1 'JetBrains Mono',monospace;
+  font-variant-numeric:tabular-nums;
+  letter-spacing:-0.06em;
+  white-space:nowrap;
+  color:rgba(255,255,255,0.76);
+}
+.polaroid-wrapper:is(.finder-mode,.hikariyomi-mode) .mode-time-current{color:#A7F3D0;}
+
 </style>
 </head>
 <body class="bg-[#0a0a0b] text-white">
@@ -6810,6 +6861,10 @@ function App(){
   const [draggingText, setDraggingText] = useState(null);
   const [draggingClipBar, setDraggingClipBar] = useState(null);
   const [selectedTextId, setSelectedTextId] = useState(null);
+  const [textPlacementPrompt, setTextPlacementPrompt] = useState(null);
+  const [textTimingNotice, setTextTimingNotice] = useState('');
+  const textInputRef = useRef(null);
+  const textTrialTokenRef = useRef(0);
   const [selectedTimelineItem, setSelectedTimelineItem] = useState(null);
   const [inlineTimelineExpanded, setInlineTimelineExpanded] = useState(false);
   const [showReturnToEdit, setShowReturnToEdit] = useState(false);
@@ -8123,7 +8178,8 @@ function App(){
 
   const withTextTiming=useCallback((item,start,end,allowAttach=!!item._clipId)=>{
     if(!allowAttach) return {...item,start,end};
-    const clip=clipsRef.current.find(c=>start>=c.timelineStart-0.0001 && end<=c.timelineStart+c.duration+0.0001);
+    const fits=c=>start>=c.timelineStart-0.0001 && end<=c.timelineStart+c.duration+0.0001;
+    const clip=clipsRef.current.find(c=>c.id===item._clipId && fits(c)) || clipsRef.current.find(fits);
     if(!clip) return {...item,start,end,_clipId:null,_clipStart:null,_clipEnd:null};
     return {...item,start,end,_clipId:clip.id,_clipStart:start-clip.timelineStart,_clipEnd:end-clip.timelineStart};
   },[]);
@@ -10915,7 +10971,10 @@ const recomputeStarts=(arr)=>{
     } else if(draggingText.type==='move'){
       const dur = draggingText.origEnd - draggingText.origStart;
       let newStart = draggingText.origStart + deltaTime;
-      newStart = Math.max(0, Math.min(newStart, durationRef.current - dur));
+      const owner=draggingText.wasAttached && clipsRef.current.find(c=>c.id===textsRef.current.find(t=>t.id===draggingText.id)?._clipId);
+      const min=owner ? owner.timelineStart : 0;
+      const max=owner ? owner.timelineStart+owner.duration-dur : durationRef.current-dur;
+      newStart = Math.max(min, Math.min(newStart, max));
       const newEnd = newStart + dur;
       updated=textsRef.current.map(t=> t.id===draggingText.id ? withTextTiming(t,newStart,newEnd,draggingText.wasAttached) : t);
     }
@@ -10978,6 +11037,9 @@ const recomputeStarts=(arr)=>{
   },[draggingClipBar]);
 
   const selectTextForEditing=useCallback((txt)=>{
+    textTrialTokenRef.current+=1;
+    setTextPlacementPrompt(null);
+    setTextTimingNotice('');
     if(playingRef.current) handleStop();
     setSelectedTextId(txt.id);
     setActiveTab('text');
@@ -10987,6 +11049,85 @@ const recomputeStarts=(arr)=>{
       requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
     }
   },[handleStop]);
+
+  // A placement is always calculated from the source's full span. Only an explicit
+  // choice can change whether a caption follows a clip or uses the whole timeline.
+  const textPlacement=(source,start,clipId,kind)=>{
+    const span=source.end-source.start;
+    const end=start+span;
+    const owner=clipId ? clipsRef.current.find(c=>c.id===clipId) : null;
+    if(!Number.isFinite(start) || span<=0 || start<0 || end>durationRef.current+0.0001 ||
+       (clipId && (!owner || start<owner.timelineStart-0.0001 || end>owner.timelineStart+owner.duration+0.0001))) return null;
+    return {sourceId:source.id,kind,start,end,clipId:clipId||null};
+  };
+  const textPlacementOverlaps=(placement)=>{
+    const source=textsRef.current.find(t=>t.id===placement.sourceId);
+    if(!source) return [];
+    return textsRef.current.filter(t=>t.id!==source.id &&
+      placement.start<t.end-0.0001 && placement.end>t.start+0.0001);
+  };
+  const commitTextPlacement=(placement,allowOverlap=false)=>{
+    const source=textsRef.current.find(t=>t.id===placement.sourceId);
+    if(!source) { setTextPlacementPrompt(null); return; }
+    const valid=textPlacement(source,placement.start,placement.clipId,placement.kind);
+    if(!valid){ setTextPlacementPrompt(null); setTextTimingNotice('この長さのまま置ける時間がありません。'); return; }
+    const overlaps=textPlacementOverlaps(valid);
+    if(overlaps.length && !allowOverlap){
+      setTextPlacementPrompt({kind:'overlap',placement:valid,names:overlaps.map(t=>t.text||'テキスト')});
+      return;
+    }
+    const attached=valid.clipId && clipsRef.current.find(c=>c.id===valid.clipId);
+    const attachFields=attached ? {_clipId:attached.id,_clipStart:valid.start-attached.timelineStart,_clipEnd:valid.end-attached.timelineStart}
+      : {_clipId:null,_clipStart:null,_clipEnd:null};
+    if(valid.kind==='next'){
+      const newText={...source,...attachFields,id:Math.random().toString(36).slice(2),start:valid.start,end:valid.end};
+      const next=[...textsRef.current,newText];
+      textsRef.current=next; setTexts(next);
+      setSelectedTextId(newText.id);
+      seekEditorTime(Math.min(valid.end-0.01,valid.start+0.02));
+      setTimeout(()=>{ textInputRef.current?.focus(); textInputRef.current?.select(); },40);
+      setTextTimingNotice('同じ長さで追加しました。文字を入力してください。');
+    }else{
+      const next=textsRef.current.map(t=>t.id===source.id ? {...t,...attachFields,start:valid.start,end:valid.end} : t);
+      textsRef.current=next; setTexts(next);
+      seekEditorTime(Math.min(valid.end-0.01,valid.start+0.02));
+      setTextTimingNotice('長さを保って移動しました。');
+    }
+    setTextPlacementPrompt(null);
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
+  const requestTextMove=(source,start,clipId=source._clipId||null)=>{
+    const placement=textPlacement(source,start,clipId,'move');
+    if(!placement){ setTextTimingNotice('この素材には同じ長さのまま置けません。全体の時間か次の素材を選んでください。'); return; }
+    commitTextPlacement(placement);
+  };
+  const requestNextWord=(source)=>{
+    const start=source.end;
+    const same=textPlacement(source,start,source._clipId||null,'next');
+    if(same){ commitTextPlacement(same); return; }
+    if(!source._clipId){ setTextTimingNotice('動画の終わりに同じ長さの文字を追加する余白がありません。'); return; }
+    const ownerIndex=clipsRef.current.findIndex(c=>c.id===source._clipId);
+    const nextClip=clipsRef.current[ownerIndex+1];
+    const nextStart=nextClip ? Math.max(start,nextClip.timelineStart) : start;
+    const nextAttached=nextClip && textPlacement(source,nextStart,nextClip.id,'next');
+    const across=textPlacement(source,start,null,'next');
+    if(!nextAttached && !across){ setTextTimingNotice('次の素材にも動画全体にも、同じ長さで置ける余白がありません。'); return; }
+    setTextTimingNotice('');
+    setTextPlacementPrompt({kind:'boundary',sourceId:source.id,nextAttached,across});
+  };
+  const previewTextBoundary=(source)=>{
+    textTrialTokenRef.current+=1;
+    const token=textTrialTokenRef.current;
+    seekEditorTime(Math.max(0,source.start-0.25));
+    handlePlay();
+    const stopAt=Math.min(durationRef.current-0.01,source.end+0.25);
+    const watch=()=>{
+      if(token!==textTrialTokenRef.current || !playingRef.current) return;
+      if(timeRef.current>=stopAt){ handleStop(); return; }
+      requestAnimationFrame(watch);
+    };
+    requestAnimationFrame(watch);
+  };
 
   const onPointerDown=useCallback((e)=>{
     if(modeRef.current==='finder' || modeRef.current==='hikariyomi' || modeRef.current==='fullscreen') return;
@@ -11255,6 +11396,26 @@ const recomputeStarts=(arr)=>{
     onClick:()=>setModeSafe(mode==='hikariyomi'?'normal':'hikariyomi'),
     className:'haneiro-btn dark text-[11px] px-3 min-h-[32px] rounded-full bg-gradient-to-r from-amber-500/20 to-orange-500/20 border border-amber-500/30'
   }, mode==='hikariyomi'?'縮小':'🔍 ひかりよみ');
+  const modeTimeLabel=(seconds)=>`${String(Math.floor(Math.max(0,seconds)/60)).padStart(2,'0')}:${String(Math.floor(Math.max(0,seconds)%60)).padStart(2,'0')}`;
+  const modeProgressPercent=Math.max(0,Math.min(100, duration>0 ? currentTime/duration*100 : 0));
+  const renderModeTimeProgress=()=>clips.length>0 && React.createElement('div', {
+    className:'mode-time-progress', role:'group',
+    'aria-label':`再生時間 ${modeTimeLabel(currentTime)}、全体 ${modeTimeLabel(duration)}`
+  },
+    React.createElement('div', {className:'finder-progress', role:'progressbar',
+      'aria-label':'再生の進行', 'aria-valuemin':0, 'aria-valuemax':Math.max(0,duration),
+      'aria-valuenow':Math.max(0,Math.min(duration,currentTime))},
+      React.createElement('div', {className:'finder-progress-bar', style:{width:`${modeProgressPercent}%`}}),
+      React.createElement('div', {className:'finder-progress-dot', style:{left:`clamp(3px, ${modeProgressPercent}%, calc(100% - 3px))`}}),
+      ...(mode==='finder' ? finderMarks.filter(({clip,mark})=>markInClip(clip,mark)).map(({clip,mark})=>
+        React.createElement('div', {key:mark.id,className:'finder-progress-mark',
+          style:{left:`${Math.max(0,Math.min(100,markTimelineTime(clip,mark)/Math.max(0.01,duration)*100))}%`},'aria-hidden':true})) : [])
+    ),
+    React.createElement('div', {className:'mode-time-numbers', 'aria-hidden':true},
+      React.createElement('span', {className:'mode-time-current'}, modeTimeLabel(currentTime)),
+      React.createElement('span', {className:'mode-time-total'}, modeTimeLabel(duration))
+    )
+  );
   const renderCurvedIrisAction=(shot, onDone, clipId)=>shot>0 && React.createElement('svg', {
     key:`${clipId}-${shot}`,
     className:'shutter-curved-action',
@@ -11727,7 +11888,7 @@ const recomputeStarts=(arr)=>{
           mode!=='finder' && React.createElement('div', {className:`rec ${cameraMode==='video' && cameraStatus==='recording' ? 'is-recording' : ''}`},
             React.createElement('span', {className:'rec-dot', style:cameraMode==='video' && cameraStatus==='recording' ? undefined : {display:'none'}}),
             React.createElement('span', null, cameraMode==='video' && cameraStatus==='recording' ? 'REC' : clips.length ? (isPlaying ? 'PLAY' : 'PAUSE') : 'NO FILM'),
-            clips.length>0 && React.createElement('span', {className:'rec-time', style:{marginLeft:'8px', opacity:0.9}}, `${String(Math.floor(currentTime/60)).padStart(2,'0')}:${String(Math.floor(currentTime%60)).padStart(2,'0')} / ${String(Math.floor(duration/60)).padStart(2,'0')}:${String(Math.floor(duration%60)).padStart(2,'0')}`)
+            mode!=='hikariyomi' && clips.length>0 && React.createElement('span', {className:'rec-time', style:{marginLeft:'8px', opacity:0.9}}, `${modeTimeLabel(currentTime)} / ${modeTimeLabel(duration)}`)
           ),
           mode!=='finder' && React.createElement('div', {className:'settings'},
             React.createElement('span', {className:'badge'}, aspectMode),
@@ -11805,13 +11966,7 @@ const recomputeStarts=(arr)=>{
               React.createElement('button', {onClick:(e)=>{ e.stopPropagation(); setShowGrid(v=>!v); }, className:`grid-btn ${showGrid ? 'active' : ''}`, title:'グリッド線のON/OFF', 'aria-pressed':showGrid}, 'GRID')
             )
           ),
-          clips.length>0 && React.createElement('div', {className:'finder-progress'},
-            React.createElement('div', {className:'finder-progress-bar', style:{width:`${(duration||1)>0 ? (currentTime/(duration||1))*100 : 0}%`}}),
-            React.createElement('div', {className:'finder-progress-dot', style:{left:`calc(${(duration||1)>0 ? (currentTime/(duration||1))*100 : 0}% - 3px)`}}),
-            ...finderMarks.filter(({clip,mark})=>markInClip(clip,mark)).map(({clip,mark})=>
-              React.createElement('div', {key:mark.id,className:'finder-progress-mark',
-                style:{left:`${Math.max(0,Math.min(100,markTimelineTime(clip,mark)/Math.max(0.01,duration)*100))}%`},'aria-hidden':true}))
-          ),
+          renderModeTimeProgress(),
           React.createElement('div', {className:'finder-bottom-bar mode-primary-row'},
             // ファインダー用再生ボタン（中央）
             React.createElement('button', {
@@ -11881,6 +12036,7 @@ const recomputeStarts=(arr)=>{
               disabled:!hasPreviewMaterial
             }, '光')
           ),
+          renderModeTimeProgress(),
           React.createElement('div', {className:'mode-primary-row'},
             React.createElement('button', {
               onClick:(e)=>{ e.stopPropagation(); isPlaying ? handleStop() : handlePlay(); },
@@ -13183,6 +13339,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
           ),
           React.createElement('div', {className:'flex gap-2 mb-2'},
             React.createElement('input', {
+              ref:textInputRef,
               type:'text',
               value: cafeStoreName,
               onChange: e=> setCafeStoreName(e.target.value),
@@ -13415,6 +13572,62 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               )
             )
           ),
+          (()=>{
+            const cur=texts.find(t=>t.id===selectedTextId);
+            if(!cur) return null;
+            const span=cur.end-cur.start;
+            const owner=clips.find(c=>c.id===cur._clipId);
+            const min=owner ? owner.timelineStart : 0;
+            const max=Math.max(min,(owner ? owner.timelineStart+owner.duration : duration)-span);
+            const previous=texts.filter(t=>t.id!==cur.id && t.end<=cur.start+0.0001).sort((a,b)=>b.end-a.end)[0];
+            const nextClip=owner && clips[clips.findIndex(c=>c.id===owner.id)+1];
+            return React.createElement('div',{className:'rounded-xl border border-violet-400/30 bg-violet-500/10 p-3 mb-3'},
+              React.createElement('div',{className:'flex items-center justify-between gap-2 text-[12px] font-bold mb-1'},
+                React.createElement('span',null,'位置だけ動かす'),
+                React.createElement('span',{className:'text-violet-200'},`${span.toFixed(1)}秒 固定`)
+              ),
+              React.createElement('div',{className:'text-[11px] text-white/65 mb-2'},
+                `${cur.start.toFixed(1)}〜${cur.end.toFixed(1)}秒 · ${owner ? 'この素材に付く' : '動画全体の時間'}`
+              ),
+              React.createElement('input',{type:'range',min,max,step:0.1,value:Math.max(min,Math.min(max,cur.start)),
+                onChange:e=>requestTextMove(cur,Number(e.target.value)),className:'w-full mb-2',
+                'aria-label':'長さを保って文字を移動'}),
+              React.createElement('div',{className:'flex flex-wrap gap-2 mb-2'},
+                React.createElement('button',{onClick:()=>requestTextMove(cur,cur.start-0.1),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'−0.1秒'),
+                React.createElement('button',{onClick:()=>requestTextMove(cur,cur.start+0.1),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'＋0.1秒'),
+                React.createElement('button',{onClick:()=>requestTextMove(cur,timeRef.current),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'再生位置へ'),
+                previous && React.createElement('button',{onClick:()=>requestTextMove(cur,previous.end),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'前の文字の後へ'),
+                owner && React.createElement('button',{onClick:()=>requestTextMove(cur,owner.timelineStart),className:'rounded-full bg-white/10 px-3 py-2 text-[11px]'},'素材の先頭へ')
+              ),
+              owner && React.createElement('div',{className:'flex flex-wrap gap-2 mb-2'},
+                React.createElement('button',{onClick:()=>requestTextMove(cur,cur.start,null),className:'rounded-full border border-violet-400/40 px-3 py-2 text-[11px]'},'動画全体の時間へ'),
+                nextClip && React.createElement('button',{onClick:()=>requestTextMove(cur,Math.max(cur.end,nextClip.timelineStart),nextClip.id),className:'rounded-full border border-violet-400/40 px-3 py-2 text-[11px]'},'次の素材へ')
+              ),
+              React.createElement('div',{className:'flex gap-2'},
+                React.createElement('button',{onClick:()=>requestNextWord(cur),className:'flex-1 rounded-full bg-violet-500 text-white px-3 py-2.5 text-[12px] font-bold'},'＋ 次の言葉を作る'),
+                React.createElement('button',{onClick:()=>previewTextBoundary(cur),className:'rounded-full border border-white/25 px-3 py-2.5 text-[11px]'},'短く試写')
+              ),
+              textTimingNotice && React.createElement('div',{role:'status',className:'text-[11px] text-amber-200 mt-2'},textTimingNotice),
+              textPlacementPrompt?.kind==='boundary' && textPlacementPrompt.sourceId===cur.id && React.createElement('div',{className:'rounded-lg bg-black/70 border border-violet-400/40 p-3 mt-3 text-[11px]'},
+                React.createElement('div',{className:'font-bold mb-1'},'この素材の終わりを越えます。置き方を選んでください'),
+                React.createElement('div',{className:'text-white/60 mb-2'},'長さは変えません。次の素材はその先頭以降に置き、境目をまたぐ場合は動画全体の時間に置きます。'),
+                React.createElement('div',{className:'flex flex-wrap gap-2'},
+                  textPlacementPrompt.nextAttached && React.createElement('button',{onClick:()=>commitTextPlacement(textPlacementPrompt.nextAttached),className:'rounded-full bg-violet-600 px-3 py-2'},'次の素材に付ける'),
+                  textPlacementPrompt.across && React.createElement('button',{onClick:()=>commitTextPlacement(textPlacementPrompt.across),className:'rounded-full bg-white/20 px-3 py-2'},'カットをまたいで表示'),
+                  React.createElement('button',{onClick:()=>setTextPlacementPrompt(null),className:'rounded-full border border-white/20 px-3 py-2'},'戻る')
+                )
+              ),
+              textPlacementPrompt?.kind==='overlap' && textPlacementPrompt.placement.sourceId===cur.id && React.createElement('div',{className:'rounded-lg bg-black/70 border border-amber-400/50 p-3 mt-3 text-[11px]'},
+                React.createElement('div',{className:'font-bold mb-1'},'ほかの文字と表示時間が重なります'),
+                React.createElement('div',{className:'text-white/60 mb-2'},textPlacementPrompt.names.slice(0,3).join('、')),
+                React.createElement('div',{className:'flex gap-2'},
+                  React.createElement('button',{onClick:()=>commitTextPlacement(textPlacementPrompt.placement,true),className:'rounded-full bg-amber-600 px-3 py-2'},'重ねて置く'),
+                  React.createElement('button',{onClick:()=>setTextPlacementPrompt(null),className:'rounded-full border border-white/20 px-3 py-2'},'戻る')
+                )
+              )
+            );
+          })(),
+          React.createElement('div', {className:'text-[10px] text-white/45 mb-2'},'長さを変える場合は開始・終了を調整'),
           React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-3'},
             React.createElement('div', null,
               React.createElement('div', {className:'text-[10px] text-white/50 mb-1'}, `開始 ${texts.find(t=>t.id===selectedTextId)?.start.toFixed(1)}s`),
@@ -13679,7 +13892,10 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           React.createElement('label', {className:'flex items-center gap-3'},
             React.createElement('span', {className:'w-16 shrink-0'},`位置 ${selectedTimelineText.start.toFixed(1)}s`),
             React.createElement('input', {
-              type:'range', min:0,max:Math.max(0,duration-(selectedTimelineText.end-selectedTimelineText.start)),step:0.1,
+              type:'range',
+              min:clips.find(c=>c.id===selectedTimelineText._clipId)?.timelineStart||0,
+              max:(()=>{const owner=clips.find(c=>c.id===selectedTimelineText._clipId);return Math.max(owner?.timelineStart||0,(owner ? owner.timelineStart+owner.duration : duration)-(selectedTimelineText.end-selectedTimelineText.start));})(),
+              step:0.1,
               value:selectedTimelineText.start,
               onPointerDown:beginRangeEdit,onPointerUp:finishRangeEdit,onPointerCancel:finishRangeEdit,
               onFocus:beginRangeEdit,onBlur:finishRangeEdit,
