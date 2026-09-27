@@ -8502,7 +8502,9 @@ function App(){
         seeking:video?.seeking??null,paused:video?.paused??null,
         currentTime:video ? Number(video.currentTime.toFixed(3)) : null,
         videoWidth:video?.videoWidth??null,mediaError:video?.error?.code??null,
-        presentedMediaTime:frame?.mediaTime??null,presentedFrames:frame?.presentedFrames??null};
+        presentedMediaTime:frame?.mediaTime??null,presentedFrames:frame?.presentedFrames??null,
+        presentedAgoMs:Number.isFinite(frame?.presentedAt)
+          ? Math.round(performance.now()-frame.presentedAt):null};
     };
     const recordExportEvent=(type,clip,detail={})=>{
       job.events.push({at:new Date().toISOString(),type,clip:clip?.name||null,
@@ -8662,16 +8664,17 @@ function App(){
           if(!image?.complete || !image.naturalWidth) throw new Error(`素材「${clip.name}」の写真を読み込めません。`);
         }
       }
-      // 冒頭の3動画だけ先にフレームまで準備し、以降は数秒前に順次準備する。
-      for(const clip of exportVideoItems.slice(0,3)) await prepareExportVideo(clip);
-      job.prepareCursor=Math.min(3,exportVideoItems.length);
+      // iPhoneでは同時に保持するデコーダを絞る。次の素材は再生前に準備する。
+      const initialPrepareCount=isIOSExport?2:3;
+      for(const clip of exportVideoItems.slice(0,initialPrepareCount)) await prepareExportVideo(clip);
+      job.prepareCursor=Math.min(initialPrepareCount,exportVideoItems.length);
       const pumpExportPrepare=t=>{
         let first=0;
         while(first<exportVideoItems.length &&
           exportVideoItems[first].timelineStart+exportVideoItems[first].duration<=t) first++;
         // 切り替え前に読み込みとシークを終える。読み込み数の上限も維持する。
-        const limit=Math.min(exportVideoItems.length,first+(isIOSExport?5:4));
-        while(job.prepareCursor<limit && job.prepareInFlight<2 &&
+        const limit=Math.min(exportVideoItems.length,first+(isIOSExport?3:4));
+        while(job.prepareCursor<limit && job.prepareInFlight<(isIOSExport?1:2) &&
           exportVideoItems[job.prepareCursor].timelineStart<=t+6){
           const ahead=exportVideoItems[job.prepareCursor++];
           job.prepareInFlight++;
@@ -8693,6 +8696,17 @@ function App(){
       const exportFps=30;
       job.stats.exportFps=exportFps;
       const canvasStream=canvas.captureStream(exportFps);
+      const canvasVideoTrack=canvasStream.getVideoTracks()[0];
+      if(!canvasVideoTrack) throw new Error('書き出し用の映像トラックを作成できませんでした。');
+      canvasVideoTrack.addEventListener('ended',()=>{
+        if(job.cancelled) return;
+        job.failure='書き出し中に映像トラックが停止しました。';
+        job.lastIssue={reason:'video-track-ended'};
+        recordExportEvent('video-track-ended');
+        job.cancelled=true;
+      });
+      canvasVideoTrack.addEventListener('mute',()=>recordExportEvent('video-track-muted'));
+      canvasVideoTrack.addEventListener('unmute',()=>recordExportEvent('video-track-unmuted'));
       job.stream=new MediaStream([...canvasStream.getVideoTracks(),...(destination?.stream.getAudioTracks()||[])]);
       const targetBitrate=exportSizeMode==='compact'?3500000:5000000;
       let bitrateFallback=false;
@@ -8910,6 +8924,16 @@ function App(){
             return job.videoPlayPending.has(video)?'play-pending':'paused';
           }
           const progress=job.frameProgress.get(clip.id);
+          // readyState と currentTime は音声だけ進む場合にも正常値になる。
+          // 実際に表示された映像フレームが追い付いているかを別に確認する。
+          if(typeof video.requestVideoFrameCallback==='function' &&
+             (!isIOSExport || primaryVideo?.id===clip.id) &&
+             t>clip.timelineStart+(iosEntryDelay.get(clip.id)||0)+0.45){
+            if(!Number.isFinite(progress?.mediaTime) ||
+               (Number.isFinite(progress.presentedAt) &&
+                now-progress.presentedAt>700 && video.currentTime-progress.mediaTime>0.45))
+              return 'video-frame-stalled';
+          }
           if(progress && t>clip.timelineStart+0.25 &&
              now-progress.advancedAt>750 &&
              video.currentTime<(clip.trimStart||0)+clip.duration-0.12)
@@ -8920,7 +8944,8 @@ function App(){
           'media-error':'映像の読み込みに失敗した','preparing':'先読みが終わらなかった',
           'seeking':'使用位置への移動が終わらなかった','frame-unavailable':'映像フレームを読み込めなかった',
           'play-pending':'再生開始を待ち続けた','paused':'停止したままだった',
-          'time-stalled':'再生時刻が進まなかった'};
+          'time-stalled':'再生時刻が進まなかった',
+          'video-frame-stalled':'映像フレームが更新されなかった'};
         let blocked=false;
         let waiting=false;
         for(const clip of visibleVideos){
@@ -8931,7 +8956,8 @@ function App(){
             continue;
           }
           waiting=true;
-          if(['missing-element','media-error','preparing','seeking','frame-unavailable'].includes(reason))
+          if(['missing-element','media-error','preparing','seeking','frame-unavailable',
+              'video-frame-stalled'].includes(reason))
             blocked=true;
           const previousWait=job.waitingByClip.get(clip.id);
           const wait=previousWait||{since:now,reason};
@@ -8992,8 +9018,9 @@ function App(){
         job.stats.notReadyFrames>6
         ? `書き出し中に描画の遅れを検出しました（間隔の遅れ ${job.stats.gaps}回、描画負荷 ${job.stats.slowFrames}回、素材待ち ${job.stats.notReadyFrames}回）。保存後に動きを確認してください。`
         : '');
-      if(job.stats.notReadyFrames>6 || job.stats.gaps>Math.max(3,job.stats.frames*0.05))
-        setExportDiagnosticText(job.exportSnapshot('完成動画の動きに遅れがありました。'));
+      setExportDiagnosticText(job.exportSnapshot(
+        job.stats.notReadyFrames>6 || job.stats.gaps>Math.max(3,job.stats.frames*0.05)
+          ? '完成動画の動きに遅れがありました。' : '書き出し完了時の状態を記録しました。'));
       setExportProgress(100);
       setExportStatus('done');
     }catch(error){
