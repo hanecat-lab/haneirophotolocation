@@ -2061,6 +2061,14 @@ body::before{ content:''; position:fixed; inset:0; background:#0a0a0b; z-index:-
 .timeline-clip.active:not(.dragging)::after{
   opacity:1;
 }
+.material-focus-clip{
+  box-shadow:0 0 0 2px #A7F3D0,0 0 18px rgba(167,243,208,0.16);
+}
+.timeline-focus-clip{
+  outline:2px solid #A7F3D0;
+  outline-offset:1px;
+  z-index:3;
+}
 
 /* フィルム風タイムライン - パーフォレーション */
 .timeline-film{
@@ -6538,6 +6546,8 @@ function App(){
   const rangeEditRef = useRef(null);
   const editHistoryRef = useRef([]);
   const editReturnScrollRef = useRef(0);
+  const editReturnTimelineLeftRef = useRef(0);
+  const previewScrubbingRef = useRef(false);
 
   const clipsRef = useRef([]);
   const textsRef = useRef([]);
@@ -7311,6 +7321,9 @@ function App(){
   const [selectedTimelineItem, setSelectedTimelineItem] = useState(null);
   const [inlineTimelineExpanded, setInlineTimelineExpanded] = useState(false);
   const [showReturnToEdit, setShowReturnToEdit] = useState(false);
+  const [focusedClipId, setFocusedClipId] = useState(null);
+  const [materialThumbnails, setMaterialThumbnails] = useState({});
+  const [previewScrubTime, setPreviewScrubTime] = useState(null);
   const [editHistoryCount, setEditHistoryCount] = useState(0);
   const [editNotice, setEditNotice] = useState('');
   const [dragPreviewText, setDragPreviewText] = useState(null);
@@ -10179,12 +10192,27 @@ const recomputeStarts=(arr)=>{
     setProjectStatus('保存中');
     const job=projectSaveQueueRef.current.catch(()=>{}).then(async()=>{
       if(projectIdRef.current!==id) return false;
-      const found=await checkVlogAssetIds(ids);
-      const missing=ids.filter(assetId=>!found.has(assetId));
-      if(missing.length) throw new Error(`元の素材${missing.length}件が保存されていません。`);
-      const saved=await commitVlogProject(id,snapshot,projectRevisionRef.current);
+      const persistSnapshot=async()=>{
+        const found=await checkVlogAssetIds(ids);
+        const missing=ids.filter(assetId=>!found.has(assetId));
+        if(missing.length) throw new Error(`元の素材${missing.length}件が保存されていません。`);
+        return commitVlogProject(id,snapshot,projectRevisionRef.current);
+      };
+      let saved;
+      try{
+        saved=await persistSnapshot();
+      }catch(error){
+        // iOS では画面の切り替え時に書き込みが中断されることがある。
+        // 同じ版の編集情報を、画面が見えている場合だけ一度再試行する。
+        const interrupted=error?.name==='AbortError' || error?.message==='保存を中断しました。';
+        if(!interrupted || document.visibilityState!=='visible') throw error;
+        await new Promise(resolve=>setTimeout(resolve,250));
+        if(projectIdRef.current!==id) return false;
+        saved=await persistSnapshot();
+      }
       if(projectIdRef.current===id){
         projectRevisionRef.current=saved.revision;
+        projectSavedVersionRef.current=Math.max(projectSavedVersionRef.current,dirtyVersion);
         if(sequence===projectSaveSequenceRef.current && dirtyVersion===projectDirtyVersionRef.current){
           setProjectStatus('保存済み');setProjectLastSaved(saved.updatedAt);setProjectError('');
         }
@@ -10195,11 +10223,14 @@ const recomputeStarts=(arr)=>{
     });
     projectSaveQueueRef.current=job;
     try{return await job;}catch(error){
-      if(projectIdRef.current===id){setProjectStatus('保存失敗');setProjectError(error?.message||'保存できませんでした。');}
+      if(projectIdRef.current===id && sequence===projectSaveSequenceRef.current){
+        setProjectStatus('保存失敗');setProjectError(error?.message||'保存できませんでした。');
+      }
       return false;
     }
   };
   const projectSaveSequenceRef=useRef(0);
+  const projectSavedVersionRef=useRef(0);
   projectSaveNowRef.current=saveCurrentProject;
   const scheduleProjectSave=()=>{
     if(!projectIdRef.current || projectRestoringRef.current) return;
@@ -10216,9 +10247,15 @@ const recomputeStarts=(arr)=>{
     showSafeArea,autoLayoutEnabled,cafeStoreName
   ]);
   useEffect(()=>{
-    const saveOnHide=()=>{if(document.visibilityState==='hidden') projectSaveNowRef.current?.();};
-    document.addEventListener('visibilitychange',saveOnHide);
-    return()=>{document.removeEventListener('visibilitychange',saveOnHide);clearTimeout(projectSaveTimerRef.current);};
+    const saveOnVisibilityChange=()=>{
+      if(projectRestoringRef.current || !projectIdRef.current) return;
+      if(projectDirtyVersionRef.current>projectSavedVersionRef.current){
+        // ダウンロード画面から戻った後にも未保存の編集を再試行する。
+        projectSaveNowRef.current?.();
+      }
+    };
+    document.addEventListener('visibilitychange',saveOnVisibilityChange);
+    return()=>{document.removeEventListener('visibilitychange',saveOnVisibilityChange);clearTimeout(projectSaveTimerRef.current);};
   },[]);
   useEffect(()=>{
     if(!projectGate || !navigator.storage?.estimate)return;
@@ -10257,6 +10294,7 @@ const recomputeStarts=(arr)=>{
     urls.forEach(url=>{if(url?.startsWith('blob:'))try{URL.revokeObjectURL(url);}catch{}});
     clipsRef.current=[];textsRef.current=[];
     setClips([]);setTexts([]);setCustomBgms([]);setSelectedClipIds([]);
+    setFocusedClipId(null);setMaterialThumbnails({});setPreviewScrubTime(null);setShowReturnToEdit(false);
     setBgmTrack('none');setSourceAudioVolume(1);setExportSizeMode('compact');
     setDuration(3);durationRef.current=3;
     timeRef.current=0;setCurrentTime(0);
@@ -10595,6 +10633,47 @@ const recomputeStarts=(arr)=>{
       }else position();
     }
     requestAnimationFrame(()=>drawFrameRef.current(t));
+  };
+  const focusEditorClip=(clip,center=true)=>{
+    if(!clip) return;
+    setFocusedClipId(clip.id);
+    if(center) requestAnimationFrame(()=>{
+      const scroller=bottomTimelineScrollRef.current;
+      if(!scroller) return;
+      const midpoint=72+(clip.timelineStart+clip.duration/2)*timelineZoom;
+      scroller.scrollTo({left:Math.max(0,midpoint-scroller.clientWidth/2),behavior:'smooth'});
+    });
+  };
+  const openTimelineForClip=(clip)=>{
+    closeQuickPeek(false);
+    focusEditorClip(clip);
+    setSelectedTimelineItem({type:'clip',id:clip.id});
+    inlineTimelineRef.current?.scrollIntoView({behavior:'smooth',block:'center'});
+  };
+  const openEditorPreview=(play=false)=>{
+    editReturnScrollRef.current=window.scrollY;
+    editReturnTimelineLeftRef.current=bottomTimelineScrollRef.current?.scrollLeft||0;
+    setShowReturnToEdit(true);
+    if(play){
+      if(playingRef.current) handleStop(false);
+      handlePlay(); // iPhone の再生要求をタップ操作の中で行う。
+    }else{
+      if(playingRef.current) handleStop(false);
+      drawFrameRef.current(timeRef.current);
+    }
+    previewFrameRef.current?.scrollIntoView({behavior:'smooth',block:'center'});
+  };
+  const playClipFromList=(clip)=>{
+    closeQuickPeek(false);
+    focusEditorClip(clip);
+    seekEditorTime(clip.timelineStart);
+    openEditorPreview(true);
+  };
+  const finishPreviewScrub=(value)=>{
+    previewScrubbingRef.current=false;
+    setPreviewScrubTime(null);
+    const target=Number(value);
+    if(Number.isFinite(target)) seekEditorTime(target);
   };
   const markInClip=(clip,mark)=>clip?.type==='photo' ||
     (Number.isFinite(mark?.sourceTime) && mark.sourceTime >= (clip.trimStart||0)-0.001 &&
@@ -12865,8 +12944,9 @@ const recomputeStarts=(arr)=>{
   };
   const makeRecentMaterialThumb=(clip)=>{
     const source=clip?.type==='photo'
-      ? (photoRefs.current.get(clip.id)||canvasRef.current)
-      : (quickPeekVideoRef.current||videoRefs.current.get(clip?.id)||canvasRef.current);
+      ? photoRefs.current.get(clip.id)
+      : (quickPeekId===clip?.id && quickPeekVideoRef.current?.readyState>=2
+          ? quickPeekVideoRef.current : videoRefs.current.get(clip?.id));
     const sourceWidth=source?.videoWidth||source?.naturalWidth||source?.width||0;
     const sourceHeight=source?.videoHeight||source?.naturalHeight||source?.height||0;
     if(!source || !sourceWidth || !sourceHeight) return clip?.type==='photo' ? clip.url : '';
@@ -12916,12 +12996,35 @@ const recomputeStarts=(arr)=>{
   const showQuickPeek=(clipId)=>{
     const clip=clipsRef.current.find(item=>item.id===clipId);
     if(!clip) return;
+    handleStop(false);
     stopQuickPeekVideo();
+    focusEditorClip(clip);
     setQuickPeekId(clip.id);
     timeRef.current=clip.timelineStart;
     setCurrentTime(clip.timelineStart);
     setTimeout(()=>drawFrameRef.current(clip.timelineStart),20);
   };
+  useEffect(()=>{
+    const subscriptions=[];
+    clips.forEach(clip=>{
+      if(clip.type!=='video' || materialThumbnails[clip.id]) return;
+      const video=videoRefs.current.get(clip.id);
+      if(!video) return;
+      const capture=()=>{
+        if(video.readyState<2 || !video.videoWidth) return;
+        const thumb=makeRecentMaterialThumb(clip);
+        if(thumb) setMaterialThumbnails(prev=>prev[clip.id]?prev:{...prev,[clip.id]:thumb});
+      };
+      video.addEventListener('loadeddata',capture);
+      video.addEventListener('seeked',capture);
+      subscriptions.push([video,capture]);
+      capture();
+    });
+    return()=>subscriptions.forEach(([video,capture])=>{
+      video.removeEventListener('loadeddata',capture);
+      video.removeEventListener('seeked',capture);
+    });
+  },[clips,materialThumbnails]);
   const moveQuickPeek=(direction)=>{
     const list=clipsRef.current;
     const index=list.findIndex(item=>item.id===quickPeekId);
@@ -13062,6 +13165,9 @@ const recomputeStarts=(arr)=>{
   } : null;
   const selectedTimelineClip=selectedTimelineItem?.type==='clip' ? clips.find(c=>c.id===selectedTimelineItem.id) : null;
   const selectedTimelineText=selectedTimelineItem?.type==='text' ? texts.find(t=>t.id===selectedTimelineItem.id) : null;
+  const focusedClip=clips.find(c=>c.id===focusedClipId)||null;
+  const timelineContextClip=focusedClip||previewClip;
+  const timelineContextIndex=timelineContextClip ? clips.findIndex(c=>c.id===timelineContextClip.id)+1 : 0;
   const standardIrisMode=mode==='normal' || mode==='finder';
   const standardPlayIcon=React.createElement('span', {key:'icon', className:'standard-play-icon', 'aria-hidden':true}, isPlaying ? 'Ⅱ' : '▶');
   const standardPlayCopy=React.createElement('span', {key:'copy', className:'standard-play-copy'},
@@ -13928,6 +14034,36 @@ const recomputeStarts=(arr)=>{
           React.createElement('button', {onClick:()=>cyclePreviewPlaybackRate([1,1.5,2,3]), className:'h-7 px-2.5 rounded-full bg-white/10 text-[10px] text-white/70'}, `${playbackRate}x`)
         )
       ),
+      mode==='normal' && clips.length>0 && React.createElement('div',{
+        className:'w-full max-w-md px-1',role:'group','aria-label':'プレビューの再生位置'
+      },
+        React.createElement('div',{className:'flex items-center justify-between text-[10px] text-white/55 font-mono mb-1'},
+          React.createElement('span',null,`${(previewScrubTime??currentTime).toFixed(1)}秒`),
+          React.createElement('span',null,`全体 ${duration.toFixed(1)}秒`)
+        ),
+        React.createElement('div',{className:'relative h-9 flex items-center'},
+          React.createElement('div',{className:'absolute inset-x-0 h-1 rounded-full bg-white/15 pointer-events-none'},
+            React.createElement('div',{className:'h-full rounded-full bg-violet-400',
+              style:{width:`${Math.max(0,Math.min(100,(previewScrubTime??currentTime)/Math.max(0.01,duration)*100))}%`}})
+          ),
+          clips.slice(1).map(c=>React.createElement('span',{key:c.id,
+            className:'absolute top-2.5 h-4 w-px bg-white/35 pointer-events-none',
+            style:{left:`${c.timelineStart/Math.max(0.01,duration)*100}%`},'aria-hidden':true})),
+          React.createElement('input',{type:'range',min:0,max:duration,step:0.1,
+            value:previewScrubTime??currentTime,
+            onPointerDown:e=>{previewScrubbingRef.current=true;handleStop(false);setPreviewScrubTime(Number(e.currentTarget.value));},
+            onChange:e=>{
+              const value=Number(e.currentTarget.value);
+              if(previewScrubbingRef.current) setPreviewScrubTime(value);
+              else finishPreviewScrub(value);
+            },
+            onPointerUp:e=>finishPreviewScrub(e.currentTarget.value),
+            onPointerCancel:()=>{previewScrubbingRef.current=false;setPreviewScrubTime(null);},
+            onBlur:e=>{if(previewScrubbingRef.current)finishPreviewScrub(e.currentTarget.value);},
+            className:'relative z-10 w-full h-9 accent-violet-300 bg-transparent',
+            'aria-label':`再生位置を選ぶ。現在 ${(previewScrubTime??currentTime).toFixed(1)}秒`})
+        )
+      ),
       React.createElement('div', {className:'flex items-center gap-2 w-full justify-center mt-1'},
         React.createElement('button', {type:'button',onClick:handleRestartPreview,disabled:clips.length===0,
           className:'min-h-11 px-5 rounded-full border border-white/25 bg-white/10 text-[11px] text-white font-bold active:bg-white/20 disabled:opacity-30',
@@ -14473,16 +14609,18 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
         React.createElement('div', {ref:materialListRef, className:'flex flex-col gap-2 timeline-film'},
           clips.map((c,i)=>{
             const isSelected = selectedClipIds.includes(c.id);
-            const isLastViewed = lastViewedClipId===c.id;
+            const isFocused = focusedClipId===c.id;
             const isPhoto = c.type==='photo';
             const trans = c._transitionToNext;
             const hasTrans = trans && trans.type!=='none';
             return React.createElement('div', {key:c.id, 'data-clip-id':c.id, className:'material-order-row flex flex-col gap-1'},
-              React.createElement('div', {className:`h-[72px] shrink-0 rounded-xl border flex items-center px-2 gap-2 relative timeline-clip ${isSelected?'bg-violet-600/20 border-violet-500/50 ring-1 ring-violet-500/30 active' : isPhoto ? 'bg-[#1a102a] border-violet-500/30' : 'bg-[#111113] border-white/10'} ${selectedTimelineItem?.type==='clip'&&selectedTimelineItem.id===c.id?'ring-1 ring-violet-300/40':''} ${isLastViewed?'material-current-clip':''}`, onMouseEnter:e=>{ e.currentTarget.style.willChange='transform'; }, onMouseLeave:e=>{ e.currentTarget.style.willChange='auto'; }},
+              React.createElement('div', {className:`h-[72px] shrink-0 rounded-xl border flex items-center px-2 gap-2 relative timeline-clip ${isSelected?'bg-violet-600/20 border-violet-500/50 ring-1 ring-violet-500/30 active' : isPhoto ? 'bg-[#1a102a] border-violet-500/30' : 'bg-[#111113] border-white/10'} ${selectedTimelineItem?.type==='clip'&&selectedTimelineItem.id===c.id?'ring-1 ring-violet-300/40':''} ${isFocused?'material-focus-clip':''}`, onMouseEnter:e=>{ e.currentTarget.style.willChange='transform'; }, onMouseLeave:e=>{ e.currentTarget.style.willChange='auto'; }},
                 React.createElement('button', {
                   onClick:()=>{
                     setSelectedClipIds(prev=> prev.includes(c.id) ? prev.filter(id=>id!==c.id) : [...prev, c.id]);
                   },
+                  'aria-label':`${c.name}をまとめて選択`,
+                  'aria-pressed':isSelected,
                   className:`w-8 h-8 rounded-full border flex items-center justify-center text-[12px] shrink-0 ${isSelected?'bg-violet-600 border-violet-500 text-white':'bg-white/10 border-white/20 text-white/60'}`
                 }, isSelected?'✓':''),
                 React.createElement('button', {
@@ -14493,16 +14631,23 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   onClick:e=>{e.stopPropagation();handleStop();setReorderInitialId(c.id);setReorderOpen(true);},
                   className:`w-10 h-10 rounded-lg flex flex-col items-center justify-center text-[13px] leading-none shrink-0 disabled:opacity-40 ${isPhoto?'bg-violet-600/30':'bg-black'}`,
                 },React.createElement('span',null,isPhoto?'🖼️':'📼'),React.createElement('span',{className:'text-[9px] text-white/60 mt-0.5','aria-hidden':true},'≡')),
+                React.createElement('button', {
+                  type:'button',onClick:()=>showQuickPeek(c.id),
+                  className:'w-9 h-11 rounded-md bg-black/70 border border-white/15 overflow-hidden shrink-0 flex items-center justify-center',
+                  'aria-label':`${i+1}番目の素材 ${c.name} を素材だけ確認`
+                }, (isPhoto?c.url:materialThumbnails[c.id])
+                  ? React.createElement('img',{src:isPhoto?c.url:materialThumbnails[c.id],alt:'',loading:'lazy',className:'w-full h-full object-cover'})
+                  : React.createElement('span',{className:'text-white/45 text-base'},'▣')),
                 React.createElement('div', {
                   className:'flex-1 min-w-0 cursor-pointer',
                   onClick:()=>showQuickPeek(c.id),
                   role:'button', tabIndex:0,
                   onKeyDown:e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); showQuickPeek(c.id); } },
-                  'aria-label':`${c.name}をクイック確認`
+                  'aria-label':`${i+1}番目の素材 ${c.name} を素材だけ確認`
                 },
                   React.createElement('div', {className:'text-[12px] truncate flex items-center gap-1 flex-wrap'},
-                    React.createElement('span', {className:'truncate max-w-[90px]'}, c.name),
-                    isLastViewed && React.createElement('span', {className:'text-[8px] px-1.5 py-0.5 rounded-full bg-white text-black font-bold shrink-0'}, '確認中'),
+                    React.createElement('span', {className:'truncate max-w-[90px]'}, `${i+1}. ${c.name}`),
+                    isFocused && React.createElement('span', {className:'text-[8px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-black font-bold shrink-0'}, '確認中'),
                     isPhoto && React.createElement('span', {className:'text-[8px] px-1 py-0.5 rounded bg-violet-600 text-white shrink-0'}, '写真'),
                     c._filterDot && React.createElement('span', {className:'text-[10px]'}, c._filterDot),
                     c._filterName && React.createElement('span', {className:'text-[8px] px-1 py-0.5 rounded bg-white/10 truncate'}, c._filterName),
@@ -14652,6 +14797,8 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       if(img){ if(!urlIsShared){ try{ URL.revokeObjectURL(c.url || img.src); }catch{} } photoRefs.current.delete(c.id); }
                       if(quickPeekId===c.id) closeQuickPeek(false);
                       if(lastViewedClipId===c.id) setLastViewedClipId(null);
+                      if(focusedClipId===c.id) setFocusedClipId(null);
+                      setMaterialThumbnails(prev=>{const next={...prev};delete next[c.id];return next;});
                       window.dispatchEvent(new CustomEvent('haneiro:removerecentmaterial',{detail:{clipId:c.id}}));
                       setSelectedClipIds(prev=> prev.filter(id=>id!==c.id));
                       const filtered=clips.filter(x=> x.id!==c.id);
@@ -14665,6 +14812,16 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     },
                     className:'w-8 h-6 rounded-full bg-red-500/20 border border-red-500/30 flex items-center justify-center text-[10px] text-red-300 active:bg-red-500/40'
                   }, '🗑')
+                )
+              ),
+              isFocused && React.createElement('div',{className:'flex flex-col gap-1.5 px-1 pb-1'},
+                React.createElement('span',{className:'text-[10px] text-emerald-100 break-all'},
+                  `${i+1}/${clips.length} · ${c.name} · ${c.timelineStart.toFixed(1)}秒`),
+                React.createElement('div',{className:'flex items-center gap-2'},
+                  React.createElement('button',{type:'button',onClick:()=>playClipFromList(c),
+                    className:'rounded-full bg-emerald-100 px-3 py-2 text-[10px] font-bold text-black'},'▶ ここから再生'),
+                  React.createElement('button',{type:'button',onClick:()=>openTimelineForClip(c),
+                    className:'rounded-full border border-white/25 px-3 py-2 text-[10px] text-white/85'},'タイムラインへ')
                 )
               ),
               React.createElement('button', {
@@ -15698,6 +15855,26 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           className:'w-28 accent-violet-500'
         })
       ),
+      clips.length>0 && React.createElement('div',{className:'min-h-12 flex items-center gap-2 px-2 py-1 border-b border-white/10'},
+        timelineContextClip && React.createElement('div',{className:'flex items-center gap-1.5 min-w-0 flex-1'},
+          React.createElement('div',{className:'w-7 h-9 rounded-sm bg-white/10 border border-white/20 overflow-hidden shrink-0 flex items-center justify-center'},
+            (timelineContextClip.type==='photo'?timelineContextClip.url:materialThumbnails[timelineContextClip.id])
+              ? React.createElement('img',{src:timelineContextClip.type==='photo'?timelineContextClip.url:materialThumbnails[timelineContextClip.id],alt:'',className:'h-full w-full object-cover'})
+              : React.createElement('span',{className:'text-[11px] text-white/50'},'▣')
+          ),
+          React.createElement('div',{className:'min-w-0 flex-1'},
+            React.createElement('div',{className:'text-[9px] text-emerald-200'},focusedClip?'確認中':'再生位置'),
+            React.createElement('div',{className:'truncate text-[10px] text-white/80',title:timelineContextClip.name},
+              `${timelineContextIndex}/${clips.length} · ${timelineContextClip.name} · ${timelineContextClip.timelineStart.toFixed(1)}秒`)
+          )
+        ),
+        React.createElement('button',{type:'button',onClick:()=>openEditorPreview(false),
+          className:'shrink-0 rounded-full border border-white/25 px-2 py-2 text-[10px] text-white/85',
+          'aria-label':`現在の${currentTime.toFixed(1)}秒を画面で確認`},'↑ 画面で確認'),
+        React.createElement('button',{type:'button',onClick:()=>openEditorPreview(true),
+          className:'shrink-0 rounded-full bg-emerald-100 px-2 py-2 text-[10px] font-bold text-black',
+          'aria-label':`現在の${currentTime.toFixed(1)}秒から再生`},'▶ ここから')
+      ),
       React.createElement('div', {
         ref:bottomTimelineScrollRef,
         className:'flex-1 overflow-x-auto overflow-y-hidden bg-black',
@@ -15730,16 +15907,18 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   const left = c.timelineStart * timelineZoom;
                   const width = Math.max(8,Math.min(c.duration*timelineZoom-2,Math.max(40,c.duration*timelineZoom*0.9)));
                   const selected=selectedTimelineItem?.type==='clip' && selectedTimelineItem.id===c.id;
+                  const focused=focusedClipId===c.id;
                   const showHandles=inlineTimelineExpanded && selected && width>=74;
                   return React.createElement('div', {
                     key:c.id, 
                     'data-timeline-clip-id':c.id,
-                    className:`absolute top-1 bottom-1 rounded border text-[10px] flex items-center gap-0.5 overflow-hidden ${selected?'bg-violet-500 border-white':'bg-violet-600/60 border-violet-400'}`,
+                    className:`absolute top-1 bottom-1 rounded border text-[10px] flex items-center gap-0.5 overflow-hidden ${selected?'bg-violet-500 border-white':'bg-violet-600/60 border-violet-400'} ${focused?'timeline-focus-clip':''}`,
                     style:{left:`${left}px`, width:`${width}px`},
                     title:`${c.name} ${c.timelineStart.toFixed(1)}s-${(c.timelineStart+c.duration).toFixed(1)}s`,
                     onClick:e=>{
                       e.stopPropagation();
                       setSelectedTimelineItem({type:'clip',id:c.id});
+                      setFocusedClipId(c.id);
                       const r=e.currentTarget.getBoundingClientRect();
                       seekEditorTime(c.timelineStart+Math.min(.99,Math.max(0,(e.clientX-r.left)/r.width))*c.duration);
                     }
@@ -15825,13 +16004,9 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           React.createElement('div', {className:'font-bold truncate flex-1'},
             selectedTimelineClip ? `素材：${selectedTimelineClip.name}` : selectedTimelineText ? `テキスト：${selectedTimelineText.text}` : 'バーを選んで時間を調整'),
           React.createElement('button', {
-            onClick:()=>{
-              editReturnScrollRef.current=window.scrollY;
-              setShowReturnToEdit(true);
-              previewFrameRef.current?.scrollIntoView({behavior:'smooth',block:'center'});
-            },
+            onClick:()=>openEditorPreview(false),
             className:'shrink-0 rounded-full border border-white/20 px-3 py-2 text-white/80'
-          },'プレビュー確認')
+          },'画面で確認')
         ),
         selectedTimelineClip && React.createElement('div', {className:'flex flex-col gap-3'},
           selectedTimelineClip.type!=='photo' && React.createElement('label', {className:'flex items-center gap-3'},
@@ -15907,7 +16082,12 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       )
     ),
     showReturnToEdit && React.createElement('button', {
-      onClick:()=>{window.scrollTo({top:editReturnScrollRef.current,behavior:'smooth'});setShowReturnToEdit(false);},
+      onClick:()=>{
+        handleStop();
+        window.scrollTo({top:editReturnScrollRef.current,behavior:'smooth'});
+        if(bottomTimelineScrollRef.current) bottomTimelineScrollRef.current.scrollLeft=editReturnTimelineLeftRef.current;
+        setShowReturnToEdit(false);
+      },
       className:'fixed bottom-20 right-3 z-[45] px-3 py-2 rounded-full bg-[#111113] border border-white/25 shadow-lg text-[11px]'
     },'編集へ戻る'),
     showTemplateModal && React.createElement('div', {className:'fixed inset-0 z-[90] bg-[#0a0a0b] flex flex-col'},
@@ -16106,6 +16286,10 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               className:'w-full h-full object-contain',
               style:{filter:quickPeekFilter},
               onLoadedMetadata:e=>beginQuickPeekSample(e.currentTarget,clip),
+              onSeeked:()=>{
+                const thumb=makeRecentMaterialThumb(clip);
+                if(thumb) setMaterialThumbnails(prev=>prev[clip.id]?prev:{...prev,[clip.id]:thumb});
+              },
               onPlay:()=>setQuickPeekPlaying(true),
               onPause:()=>setQuickPeekPlaying(false),
               onEnded:()=>setQuickPeekPlaying(false),
@@ -16137,7 +16321,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               'aria-label':'クイック確認を閉じる'
             }, '×')
           ),
-          React.createElement('div', {className:'text-[9px] text-black/40 text-center mt-2'}, isPhoto?'左右スワイプで前後・下へスワイプで閉じる':'タップで再生／停止・左右スワイプで前後')
+          React.createElement('div', {className:'text-[9px] text-black/40 text-center mt-2'}, isPhoto?'素材だけ見る · 左右スワイプで前後':'素材だけ見る · タップで再生／停止・左右スワイプで前後')
         )
       );
     })(),
