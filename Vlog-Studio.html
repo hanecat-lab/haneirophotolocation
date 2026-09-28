@@ -7018,6 +7018,24 @@ function App(){
 
   const polaroidRef = useRef(null);
   const [playbackRate, setPlaybackRate] = useState(1);
+  // 実行中の requestAnimationFrame は開始時の関数を使い続けるため、速度は ref から読む。
+  const playbackRateRef = useRef(playbackRate);
+  playbackRateRef.current = playbackRate;
+  const cyclePreviewPlaybackRate = rates => {
+    const current=playbackRateRef.current;
+    const next=rates[(rates.indexOf(current)+1)%rates.length];
+    playbackRateRef.current=next;
+    setPlaybackRate(next);
+    videoRefs.current.forEach(video=>{
+      if(!video.paused) try{video.playbackRate=next;}catch{}
+    });
+    if(bgmAudioRef.current && !bgmAudioRef.current.paused)
+      try{bgmAudioRef.current.playbackRate=next;}catch{}
+    recordPreviewDiagnostic('speed-change',{
+      from:current,to:next,mode:modeRef.current,
+      activePlaybackRate:[...videoRefs.current.values()].find(video=>!video.paused)?.playbackRate??null
+    });
+  };
   const [showGrid, setShowGrid] = useState(true);
   const [finderShutterShot, setFinderShutterShot] = useState(0);
   const [standardIrisShot, setStandardIrisShot] = useState(0);
@@ -8022,6 +8040,7 @@ function App(){
     let bufferedEnd=null;
     try{ if(video.buffered.length) bufferedEnd=video.buffered.end(video.buffered.length-1); }catch{}
     return {...base,currentTime:Number(video.currentTime.toFixed(3)),
+      playbackRate:video.playbackRate,
       readyState:video.readyState,networkState:video.networkState,
       seeking:video.seeking,paused:video.paused,ended:video.ended,
       videoWidth:video.videoWidth,videoHeight:video.videoHeight,
@@ -8035,7 +8054,7 @@ function App(){
     const active=list[index]||null;
     const next=list[index+1]||null;
     return {reason,timelineTime:Number(t.toFixed(3)),totalTime:Number(durationRef.current.toFixed(3)),
-      mode:modeRef.current,playing:playingRef.current,playbackRate,
+      mode:modeRef.current,playing:playingRef.current,playbackRate:playbackRateRef.current,
       waitReason:previewDiagnosticRef.current.waitReason||null,
       active:previewMediaState(active),incoming:previewMediaState(next),
       previous:previewMediaState(list[index-1]),videoElements:videoRefs.current.size,
@@ -8182,7 +8201,9 @@ function App(){
     if(!playingRef.current) return;
     const now=performance.now();
     const last=tick._last||now;
-    const delta=Math.max(0,Math.min(0.1,(now-last)/1000*playbackRate));
+    const rate=playbackRateRef.current;
+    // 停止復帰時の経過時間だけを制限し、選んだ倍率そのものは制限しない。
+    const delta=Math.max(0,Math.min(0.1,(now-last)/1000))*rate;
     tick._last=now;
     const clipsNow=clipsRef.current;
     const state=previewPlaybackRef.current;
@@ -8235,7 +8256,7 @@ function App(){
            positionPreviewVideo(activeVideo,active,target,'active-entry',0.08))
           state.activeId=active.id;
       }
-      activeVideo.playbackRate=playbackRate;
+      activeVideo.playbackRate=rate;
       if(activeVideo.ended){
         // 終了済み動画への play() は冒頭から再開し得るため、次の素材へ進む。
         t=active.timelineStart+active.duration;
@@ -8308,7 +8329,7 @@ function App(){
         if(positionPreviewVideo(incoming,next,target,'incoming-entry'))
           state.incomingId=next.id;
       }
-      incoming.playbackRate=playbackRate;
+      incoming.playbackRate=rate;
       if(incoming.readyState<2 || incoming.seeking){
         waiting=true;waitReasons.push(incoming.seeking?'incoming-seeking':'incoming-not-ready');
       }
@@ -8424,7 +8445,7 @@ function App(){
     if(retired) watchPreviewMedia();
     if(bgmAudioRef.current && bgmTrack!=='none'){
       const bgm=bgmAudioRef.current;
-      bgm.playbackRate=playbackRate;
+      bgm.playbackRate=rate;
       const bgmTarget=t+bgmOffsetRef.current;
       if(bgm.paused) requestPreviewPlay(bgm,null,'bgm-tick');
       if(Math.abs(bgm.currentTime-bgmTarget)>0.35){
@@ -8512,12 +8533,12 @@ function App(){
       timeRef.current>=clip.timelineStart && timeRef.current<clip.timelineStart+clip.duration);
     const firstVideo=activeAtStart && videoRefs.current.get(activeAtStart.id);
     if(firstVideo){
-      firstVideo.playbackRate=playbackRate;
+      firstVideo.playbackRate=playbackRateRef.current;
       livePreviewIdsRef.current=new Set([activeAtStart.id]);
       requestPreviewPlay(firstVideo,activeAtStart,'tap-start');
     }
     if(bgmAudioRef.current && bgmTrack!=='none'){
-      bgmAudioRef.current.playbackRate=playbackRate;
+      bgmAudioRef.current.playbackRate=playbackRateRef.current;
       try{
         const target=Math.max(0,timeRef.current+bgmOffsetRef.current);
         if(Math.abs(bgmAudioRef.current.currentTime-target)>0.05) bgmAudioRef.current.currentTime=target;
@@ -13619,9 +13640,7 @@ const recomputeStarts=(arr)=>{
               React.createElement('button', {
                 onClick:(e)=>{
                   e.stopPropagation();
-                  const rates = [0.5, 1, 1.5, 2];
-                  const idx = rates.indexOf(playbackRate);
-                  setPlaybackRate(rates[(idx+1)%rates.length]);
+                  cyclePreviewPlaybackRate([0.5, 1, 1.5, 2]);
                 },
                 className:'zoom',
                 title:'タップで再生速度切替',
@@ -13877,7 +13896,7 @@ const recomputeStarts=(arr)=>{
             }, '◧ ファインダー'),
             hikariyomiSwitch
           ) : hikariyomiSwitch,
-          React.createElement('button', {onClick:()=> setPlaybackRate(r=> r===1?1.5:r===1.5?2:r===2?3:1), className:'h-7 px-2.5 rounded-full bg-white/10 text-[10px] text-white/70'}, `${playbackRate}x`)
+          React.createElement('button', {onClick:()=>cyclePreviewPlaybackRate([1,1.5,2,3]), className:'h-7 px-2.5 rounded-full bg-white/10 text-[10px] text-white/70'}, `${playbackRate}x`)
         )
       ),
       React.createElement('div', {className:'flex items-center gap-2 w-full justify-center mt-1'},
