@@ -23,23 +23,40 @@
       }catch{}
       return _origWarn.apply(console, args);
     };
-    // location ハイジャック試行を無力化（エラーを出さない）
-    const _origDefineProperty = Object.defineProperty;
-    Object.defineProperty = function(obj, prop, desc){
-      try{
-        if(obj===window && prop==='location'){
-          // 外部スクリプトの location 再定義をブロック
-          return obj;
-        }
-      }catch{}
-      try{
-        return _origDefineProperty.call(Object, obj, prop, desc);
-      }catch(e){
-        // location の再定義失敗は無視（外部スクリプトのエラー）
-        if(prop==='location') return obj;
-        throw e;
+    // location ハイジャック試行を無力化（エラーを出さない） - バグ修正: 安全なガードに改善
+    try{
+      if(!Object.defineProperty._haneiroPatched){
+        const _origDefineProperty = Object.defineProperty;
+        const _patched = function(obj, prop, desc){
+          try{
+            if(obj===window && prop==='location' && desc){
+              const hasHijack = (()=> {
+                try{
+                  const v = desc.value;
+                  const g = desc.get ? desc.get.toString() : '';
+                  const s = desc.set ? desc.set.toString() : '';
+                  const combined = (typeof v==='string'?v:'') + g + s;
+                  return /cently|rd:site|affiliate|redirect/i.test(combined);
+                }catch{ return false; }
+              })();
+              // 明らかなハイジャック試行のみブロック、それ以外は本来の挙動を維持
+              if(hasHijack){
+                return obj;
+              }
+            }
+          }catch{}
+          try{
+            return _origDefineProperty.call(Object, obj, prop, desc);
+          }catch(e){
+            // location の再定義失敗は無視（外部スクリプトのエラー）
+            if(prop==='location' && obj===window) return obj;
+            throw e;
+          }
+        };
+        _patched._haneiroPatched = true;
+        Object.defineProperty = _patched;
       }
-    };
+    }catch{}
   }catch{}
 })();
 </script>
@@ -47,6 +64,9 @@
 <link href="https://fonts.googleapis.com/css2?family=Kosugi+Maru&family=M+PLUS+Rounded+1c:wght@400;700&family=Noto+Sans+JP:wght@400;700&family=Noto+Serif+JP:wght@400;700&family=Shippori+Mincho:wght@400;700&family=Yuji+Syuku&family=Zen+Maru+Gothic:wght@400;700&family=Reggae+One&family=Dela+Gothic+One&family=RocknRoll+One&family=Kiwi+Maru:wght@400;500&family=Hachi+Maru+Pop&family=Stick&display=swap" rel="stylesheet">
 <script>tailwind.config = { darkMode: 'class' }</script>
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;500;700&family=Caveat:wght@500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
+
 
 /* Haneiro Viewfinder - ポラロイドファインダー */
 :root{
@@ -357,7 +377,6 @@ body::before{ content:''; position:fixed; inset:0; background:#0a0a0b; z-index:-
 
 
 /* #3 Polaroid Theater Mode - Mock-03完全再現版 v2 - アニメーション & 白枠修正 */
-@import url('https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;500;700&family=Caveat:wght@500;600&display=swap');
 .handwritten { font-family: "Caveat", cursive; }
 @keyframes polaroidIn{
   0%{ transform: translateY(calc(28px + var(--drag-y, 0px))) scale(0.9) rotate(-1deg); opacity: 0; }
@@ -843,7 +862,6 @@ body::before{ content:''; position:fixed; inset:0; background:#0a0a0b; z-index:-
 /* #5 ファインダーモード - シアターとの切替対応 - 黒全画面、ポラロイドなし */
 
 /* #5 Finder Mode - Mock-05完全再現版 */
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
 .mono { font-family: "JetBrains Mono", monospace !important; }
 
 .polaroid-wrapper.finder-mode{
@@ -5918,35 +5936,182 @@ function drawVlogCaption(ctx,txt,width,height,options={}){
   const bandHeight=Math.min(height,Math.max(fontSize+pad*2,fontSize*1.6));
   const textY=fullBand?Math.max(bandHeight/2,Math.min(height-bandHeight/2,y)):y;
   const textX=fullBand?width/2:x;
+
+  // --- アニメーション計算 ---
+  const hasTiming = Number.isFinite(options.elapsed) && Number.isFinite(options.remaining);
+  const elapsed = hasTiming ? options.elapsed : 0.5;
+  const remaining = hasTiming ? options.remaining : 999;
+  const anim = txt.anim || 'none';
+
+  let alpha = 1, scale = 1, offX = 0, offY = 0;
+
+  if(!hasTiming){
+    alpha = 1; scale = 1; offX = 0; offY = 0;
+  } else if(anim==='fade'){
+    if(elapsed < 0.35) alpha = Math.max(0.08, Math.min(1, 0.08 + (elapsed/0.35)*0.92));
+    if(remaining < 0.3) alpha = Math.min(alpha, Math.max(0, remaining/0.3));
+  } else if(anim==='bounce'){
+    if(elapsed < 0.6){
+      const p = elapsed/0.6;
+      const elastic = 1 - Math.pow(1-p, 3);
+      const bounce = Math.sin(p * Math.PI * 2.5) * 0.18 * (1-p);
+      scale = 0.35 + 0.65*elastic + bounce;
+      alpha = Math.min(1, 0.15 + p*1.5);
+    }
+    if(remaining < 0.3) alpha = Math.min(alpha, Math.max(0, remaining/0.3));
+  } else if(anim==='slide'){
+    if(elapsed < 0.45){
+      const p = elapsed/0.45;
+      if(txt.vertical){
+        offY = (1-p) * -90 * (height/1280);
+      } else {
+        offX = (1-p) * -90 * (width/720);
+        offY = (1-p) * 8 * (height/1280);
+      }
+      alpha = Math.min(1, 0.12 + p*1.2);
+    }
+    if(remaining < 0.35){
+      const p = remaining/0.35;
+      if(txt.vertical){
+        offY += (1-p) * 50 * (height/1280);
+      } else {
+        offX += (1-p) * 50 * (width/720);
+      }
+      alpha = Math.min(alpha, Math.max(0, p));
+    }
+  } else {
+    if(remaining < 0.18) alpha = Math.max(0, remaining/0.18);
+  }
+
+  const isVertical = !!txt.vertical;
+  const vSpacing = Number.isFinite(txt.verticalSpacing) ? txt.verticalSpacing : 0.15;
+  const chars = isVertical ? Array.from(content) : null;
+  const rotateSet = new Set(['ー','-','–','—','~','～','…','‥','ｰ','-','ｰ','ー','—']);
+
+  // 縦書きの全体サイズ計算（帯用）
+  let totalVHeight = 0;
+  let bandW = 0, bandH = 0;
+  if(isVertical && chars){
+    const charStep = fontSize * (1 + vSpacing);
+    totalVHeight = chars.length * fontSize + Math.max(0, chars.length-1) * fontSize * vSpacing;
+    bandW = fontSize * 1.8 + pad*2; // 程よい帯幅
+    bandH = totalVHeight + pad*2;
+    // 横帯の時より狭く、縦に程よい幅
+  }
+
   ctx.save();
+  ctx.globalAlpha *= alpha;
+  ctx.translate(textX+offX, textY+offY);
+  ctx.scale(scale, scale);
+  ctx.translate(-textX, -textY);
+
   ctx.font=vlogTextFontSpec(txt,fontSize);
   ctx.textAlign='center';ctx.textBaseline='middle';
-  const measured=ctx.measureText(content).width;
-  if(fullBand){
-    const opacity=Number.isFinite(Number(txt.bandOpacity)) ?
-      Math.max(0.15,Math.min(0.95,Number(txt.bandOpacity))) : 0.72;
-    ctx.globalAlpha=opacity;
-    ctx.fillStyle=txt.bandColor||'#f5efe4';
-    ctx.fillRect(0,textY-bandHeight/2,width,bandHeight);
-    ctx.globalAlpha=1;
-  }else if(txt.bgColor && txt.bgColor!=='transparent'){
-    ctx.fillStyle=txt.bgColor;
-    ctx.fillRect(x-measured/2-pad,y-fontSize/2-pad,measured+pad*2,fontSize+pad*2);
+
+  if(isVertical){
+    // --- 縦書き描画 ---
+    const charStep = fontSize * (1 + vSpacing);
+    const startY = textY - totalVHeight/2 + fontSize/2;
+
+    // 背景
+    if(fullBand){
+      const opacity=Number.isFinite(Number(txt.bandOpacity)) ?
+        Math.max(0.15,Math.min(0.95,Number(txt.bandOpacity))) : 0.72;
+      const prevAlpha = ctx.globalAlpha;
+      ctx.globalAlpha = prevAlpha * opacity;
+      ctx.fillStyle=txt.bandColor||'#f5efe4';
+      // 程よい縦帯：テキスト中心に縦長の帯
+      ctx.fillRect(textX-bandW/2, textY-bandH/2, bandW, bandH);
+      ctx.globalAlpha = prevAlpha;
+    }else if(txt.bgColor && txt.bgColor!=='transparent'){
+      ctx.fillStyle=txt.bgColor;
+      ctx.fillRect(textX-bandW/2, textY-bandH/2, bandW, bandH);
+    }
+
+    // 文字1文字ずつ
+    ctx.lineJoin='round';
+    ctx.shadowColor='rgba(0,0,0,0.8)';ctx.shadowBlur=Math.max(2,fontSize*0.1);
+    for(let i=0;i<chars.length;i++){
+      const ch = chars[i];
+      const cy = startY + i*charStep;
+      const needRotate = rotateSet.has(ch);
+      ctx.save();
+      ctx.translate(textX, cy);
+      if(needRotate) ctx.rotate(Math.PI/2);
+      if(txt.outline){
+        ctx.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
+        ctx.lineWidth=Math.max(2,fontSize*0.12);
+        ctx.strokeText(ch, 0, 0);
+      }
+      ctx.fillStyle=txt.color||'#fff';
+      ctx.fillText(ch, 0, 0);
+      ctx.restore();
+    }
+    ctx.restore();
+    // 測定値は縦の高さを返す
+    return bandW;
+  } else {
+    // --- 横書き（字間対応・修正版） ---
+    const hSpacing = Number.isFinite(txt.letterSpacing) ? txt.letterSpacing : 0;
+    const charsH = Array.from(content);
+    let measured = 0;
+    if(hSpacing>0){
+      for(let i=0;i<charsH.length;i++){
+        measured += ctx.measureText(charsH[i]).width;
+        if(i>0) measured += fontSize * hSpacing;
+      }
+    } else {
+      measured = ctx.measureText(content).width;
+    }
+
+    if(fullBand){
+      const opacity=Number.isFinite(Number(txt.bandOpacity)) ?
+        Math.max(0.15,Math.min(0.95,Number(txt.bandOpacity))) : 0.72;
+      const prevAlpha = ctx.globalAlpha;
+      ctx.globalAlpha = prevAlpha * opacity;
+      ctx.fillStyle=txt.bandColor||'#f5efe4';
+      ctx.fillRect(0,textY-bandHeight/2,width,bandHeight);
+      ctx.globalAlpha = prevAlpha;
+    }else if(txt.bgColor && txt.bgColor!=='transparent'){
+      ctx.fillStyle=txt.bgColor;
+      ctx.fillRect(x-measured/2-pad,y-fontSize/2-pad,measured+pad*2,fontSize+pad*2);
+    }
+    ctx.lineJoin='round';
+    ctx.shadowColor='rgba(0,0,0,0.8)';ctx.shadowBlur=Math.max(2,fontSize*0.1);
+
+    if(hSpacing>0){
+      let curX = x - measured/2;
+      for(let i=0;i<charsH.length;i++){
+        const ch = charsH[i];
+        const cw = ctx.measureText(ch).width;
+        const drawX = curX + cw/2;
+        if(txt.outline){
+          ctx.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
+          ctx.lineWidth=Math.max(2,fontSize*0.12);
+          if(fullBand) ctx.strokeText(ch, drawX, textY, width*0.84);
+          else ctx.strokeText(ch, drawX, y);
+        }
+        ctx.fillStyle=txt.color||'#fff';
+        if(fullBand) ctx.fillText(ch, drawX, textY, width*0.84);
+        else ctx.fillText(ch, drawX, y);
+        curX += cw + (i < charsH.length-1 ? fontSize*hSpacing : 0);
+      }
+    } else {
+      if(txt.outline){
+        ctx.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
+        ctx.lineWidth=Math.max(2,fontSize*0.12);
+        if(fullBand) ctx.strokeText(content,textX,textY,width*0.84);
+        else ctx.strokeText(content,x,y);
+      }
+      ctx.fillStyle=txt.color||'#fff';
+      if(fullBand) ctx.fillText(content,textX,textY,width*0.84);
+      else ctx.fillText(content,x,y);
+    }
+    ctx.restore();
+    return measured;
   }
-  ctx.lineJoin='round';
-  ctx.shadowColor='rgba(0,0,0,0.8)';ctx.shadowBlur=Math.max(2,fontSize*0.1);
-  if(txt.outline){
-    ctx.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
-    ctx.lineWidth=Math.max(2,fontSize*0.12);
-    if(fullBand) ctx.strokeText(content,textX,textY,width*0.84);
-    else ctx.strokeText(content,x,y);
-  }
-  ctx.fillStyle=txt.color||'#fff';
-  if(fullBand) ctx.fillText(content,textX,textY,width*0.84);
-  else ctx.fillText(content,x,y);
-  ctx.restore();
-  return measured;
 }
+
 
 async function ensureVlogTextFonts(texts){
   if(!texts.length || !document.fonts?.load) return;
@@ -5970,20 +6135,59 @@ function getTextCanvasBounds(txt, canvas){
   const ctx=canvas?.getContext('2d');
   if(!ctx || !canvas.width || !canvas.height) return null;
   const fontSize=(txt.fontSize||0.06)*canvas.height;
+  const isVertical=!!txt.vertical;
+  const vSpacing=Number.isFinite(txt.verticalSpacing)?txt.verticalSpacing:0.15;
+  const hSpacing=Number.isFinite(txt.letterSpacing)?txt.letterSpacing:0;
+  const padBand=Math.max(4,fontSize*0.22);
   if(txt.backgroundMode==='band'){
-    const pad=Math.max(4,fontSize*0.22);
-    const bandHeight=Math.min(canvas.height,Math.max(fontSize+pad*2,fontSize*1.6));
-    const y=Math.max(bandHeight/2,Math.min(canvas.height-bandHeight/2,(txt.y??50)/100*canvas.height));
-    return {left:0,top:y-bandHeight/2,width:canvas.width,height:bandHeight};
+    if(isVertical){
+      const chars=Array.from(txt.text||'');
+      const totalVHeight=chars.length*fontSize + Math.max(0,chars.length-1)*fontSize*vSpacing;
+      const bandW=fontSize*1.8 + padBand*2;
+      const bandH=totalVHeight + padBand*2;
+      const x=(txt.x??50)/100*canvas.width;
+      const y=(txt.y??50)/100*canvas.height;
+      const bandHeightFull=Math.min(canvas.height,Math.max(fontSize+padBand*2,fontSize*1.6));
+      const textY=Math.max(bandHeightFull/2,Math.min(canvas.height-bandHeightFull/2,y));
+      return {left:x-bandW/2, top:textY-bandH/2, width:bandW, height:bandH};
+    } else {
+      const bandHeight=Math.min(canvas.height,Math.max(fontSize+padBand*2,fontSize*1.6));
+      const y=Math.max(bandHeight/2,Math.min(canvas.height-bandHeight/2,(txt.y??50)/100*canvas.height));
+      return {left:0,top:y-bandHeight/2,width:canvas.width,height:bandHeight};
+    }
   }
   ctx.save();
   ctx.font=vlogTextFontSpec(txt,fontSize);
-  const width=ctx.measureText(txt.text||'').width;
-  ctx.restore();
+  let width, height;
   const pad=Math.max(8,txt.outline?fontSize*0.12:0);
   const x=(txt.x ?? 50)/100*canvas.width;
   const y=(txt.y ?? 50)/100*canvas.height;
-  return {left:x-width/2-pad, top:y-fontSize/2-pad, width:width+pad*2, height:fontSize+pad*2};
+  if(isVertical){
+    const chars=Array.from(txt.text||'');
+    const totalVHeight=chars.length*fontSize + Math.max(0,chars.length-1)*fontSize*vSpacing;
+    width=fontSize + pad*2;
+    height=totalVHeight + pad*2;
+  } else {
+    const content=txt.text||'';
+    if(hSpacing>0){
+      const chars=Array.from(content);
+      let totalW=0;
+      for(let i=0;i<chars.length;i++){
+        totalW+=ctx.measureText(chars[i]).width;
+        if(i>0) totalW+=fontSize*hSpacing;
+      }
+      width=totalW;
+    } else {
+      width=ctx.measureText(content).width;
+    }
+    height=fontSize;
+  }
+  ctx.restore();
+  if(isVertical){
+    return {left:x-width/2, top:y-height/2, width:width, height:height};
+  } else {
+    return {left:x-width/2-pad, top:y-height/2-pad, width:width+pad*2, height:height+pad*2};
+  }
 }
 
 // 並び替えの仮配置と確定は同じ計算を使う。効果は元の隣接関係が残るときだけ保持する。
@@ -7882,9 +8086,13 @@ function App(){
       window._lastActiveClipId = activeClip.id;
     }
 
-    // テキスト描画
+    // テキスト描画（アニメーション対応）
     const activeTexts = textsNow.filter(tx=> t>=tx.start && t<tx.end);
-    activeTexts.forEach(txt=>drawVlogCaption(ctx,txt,cw,ch));
+    activeTexts.forEach(txt=>{
+      const elapsed = t - txt.start;
+      const remaining = txt.end - t;
+      drawVlogCaption(ctx,txt,cw,ch,{elapsed, remaining, totalDuration: txt.end - txt.start});
+    });
   },[fitMode, filterIntensity, aspectMode, verticalPriority, autoVerticalDetect]);
 
   useEffect(()=>{ drawFrameRef.current = drawFrame; },[drawFrame]);
@@ -8680,7 +8888,7 @@ function App(){
   };
   const closeExport=()=>{
     if(exportStatus==='recording' || exportStatus==='preparing' || exportStatus==='verifying') return;
-    if(exportFile?.url) URL.revokeObjectURL(exportFile.url);
+    if(exportFile?.url){ try{ URL.revokeObjectURL(exportFile.url); }catch{} }
     setExportFile(null);
     setExportStatus('idle');
     setExportMessage('');
@@ -8725,7 +8933,7 @@ function App(){
     setExportChoiceOpen(false);
     setExportDiagnosticText('');
     setExportDiagnosticVisible(false);
-    if(exportFile?.url){ URL.revokeObjectURL(exportFile.url); setExportFile(null); }
+    if(exportFile?.url){ try{ URL.revokeObjectURL(exportFile.url); }catch{} setExportFile(null); }
     const {items,texts:exportTexts}=buildExportSelection(scope);
     const canvas=canvasRef.current;
     if(!items.length || !canvas){
@@ -9028,7 +9236,7 @@ function App(){
       });
       if(bgm){
         try{ bgm.currentTime=Math.max(0,job.bgmOffset); }catch{}
-        if(job.bgmOffset>=0) await bgm.play();
+        if(job.bgmOffset>=0){ try{ const p=bgm.play(); if(p?.then) await p; }catch{} }
         else bgm.pause();
       }
       // iPhoneでは録画データを最後まで保持すると、Canvasの映像トラックだけが
@@ -9404,6 +9612,8 @@ function App(){
       if(job.recorder?.state==='recording') try{ job.recorder.stop(); }catch{}
       job.stream?.getTracks().forEach(track=>track.stop());
       for(const {source,gain} of job.gains){ try{ source.disconnect(gain); gain.disconnect(); }catch{} }
+      // バグ修正: エクスポート後のAudioContextをサスペンドしてバッテリー消費とリークを防ぐ
+      try{ if(audioContext && audioContext.state==='running'){ const susp=audioContext.suspend(); if(susp?.catch) susp.catch(()=>{});} }catch{}
       for(const {video,muted} of job.videos.values()){ try{ video.pause(); video.muted=muted; }catch{} }
       for(const [id,callback] of job.frameCallbacks){
         try{job.videos.get(id)?.video.cancelVideoFrameCallback?.(callback);}catch{}
@@ -9643,9 +9853,9 @@ function App(){
       const pos1 = findSafePosition(18, 50);
       const pos2 = findSafePosition(78, 50);
       const pos3 = findSafePosition(88, 50);
-      const t1 = { id: makeId('store'), text: storeName, start: 0, end: Math.min(1.5, total*0.5), x:pos1.x, y:pos1.y, fontSize:0.092, color:'#ffffff', bgColor:'transparent', fontFamily:'sans', bold:true, outline:true, strokeColor:'rgba(0,0,0,0.85)', align:'center', anim:'fade' };
-      const t2 = { id: makeId('menu'), text: 'カフェラテとチーズケーキ', start: Math.max(0.2, total*0.35), end: Math.min(total, total*0.35+2.2), x:pos2.x, y:pos2.y, fontSize:0.048, color:'#fff8e1', bgColor:'rgba(0,0,0,0.55)', fontFamily:'rounded', bold:false, outline:false, strokeColor:'rgba(0,0,0,0.6)', align:'center', anim:'fade' };
-      const t3 = { id: makeId('feel'), text: 'また来たい', start: Math.max(0, total-1.2), end: total, x:pos3.x, y:pos3.y, fontSize:0.062, color:'#ffe4b5', bgColor:'transparent', fontFamily:'hand', bold:false, outline:true, strokeColor:'rgba(0,0,0,0.5)', align:'center', anim:'bounce' };
+      const t1 = { id: makeId('store'), text: storeName, start: 0, end: Math.min(1.5, total*0.5), x:pos1.x, y:pos1.y, fontSize:0.092, color:'#ffffff', bgColor:'transparent', fontFamily:'sans', bold:true, outline:true, strokeColor:'rgba(0,0,0,0.85)', align:'center', anim:'fade', vertical:false, verticalSpacing:0.15 };
+      const t2 = { id: makeId('menu'), text: 'カフェラテとチーズケーキ', start: Math.max(0.2, total*0.35), end: Math.min(total, total*0.35+2.2), x:pos2.x, y:pos2.y, fontSize:0.048, color:'#fff8e1', bgColor:'rgba(0,0,0,0.55)', fontFamily:'rounded', bold:false, outline:false, strokeColor:'rgba(0,0,0,0.6)', align:'center', anim:'fade', vertical:false, verticalSpacing:0.15 };
+      const t3 = { id: makeId('feel'), text: 'また来たい', start: Math.max(0, total-1.2), end: total, x:pos3.x, y:pos3.y, fontSize:0.062, color:'#ffe4b5', bgColor:'transparent', fontFamily:'hand', bold:false, outline:true, strokeColor:'rgba(0,0,0,0.5)', align:'center', anim:'bounce', vertical:false, verticalSpacing:0.15 };
       setTexts(prev=> [...prev, t1, t2, t3]);
       textEditOriginalRef.current={id:t1.id,text:null};
       setSelectedTextId(t1.id);
@@ -9657,7 +9867,7 @@ function App(){
 
 
   const addText = useCallback(()=>{
-    const id=Math.random().toString(36).slice(2);
+    const id=`${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
     const t = timeRef.current;
     const existingCount = textsRef.current.filter(tx=> Math.abs(tx.start - t) < 0.1).length;
     const offset = existingCount * 0.2;
@@ -9670,16 +9880,20 @@ function App(){
       x:safePos.x, y:safePos.y, 
       font:0, anim:'fade',
       fontSize:0.06, color:'#ffffff', bgColor:'transparent', 
-      fontFamily:'sans', bold:false, outline:true, strokeColor:'rgba(0,0,0,0.8)', align:'center'
+      fontFamily:'sans', bold:false, outline:true, strokeColor:'rgba(0,0,0,0.8)', align:'center',
+      vertical:false, verticalSpacing:0.15, letterSpacing:0
     });
     setTexts(prev=> [...prev, newItem]);
     textEditOriginalRef.current={id,text:null};
     setSelectedTextId(id);
     setMoveTarget(id,Math.round(t*10)/10);
     setActiveTab('text');
+    setTextEditorSection('style');
+    requestedTextEditorSectionRef.current='style';
     modeRef.current='textEdit';
     setMode('textEdit');
     setTimeout(()=>{ drawFrameRef.current(timeRef.current); }, 16);
+    setTimeout(()=>{ textEditorRef.current?.scrollIntoView({behavior:'smooth',block:'start'}); }, 80);
   },[autoLayoutEnabled, findSafePosition, textForActiveClip]);
 
   useEffect(()=>{
@@ -9760,10 +9974,18 @@ function App(){
     const newClips=[];
     for(let fileIndex=0;fileIndex<arr.length;fileIndex++){
       const file=arr[fileIndex];
-      const isImage = file.type.startsWith('image/');
-      const isVideo = file.type.startsWith('video/');
+      const lowerName = (file.name||'').toLowerCase();
+      const ext = lowerName.split('.').pop()||'';
+      const imageExts = ['jpg','jpeg','png','gif','webp','heic','heif','bmp','tiff'];
+      const videoExts = ['mp4','mov','m4v','webm','avi','mkv','3gp','mts','m2ts','hevc','qt'];
+      const typeIsImage = file.type.startsWith('image/');
+      const typeIsVideo = file.type.startsWith('video/');
+      const extIsImage = imageExts.includes(ext);
+      const extIsVideo = videoExts.includes(ext);
+      const isImage = typeIsImage || (!typeIsVideo && extIsImage);
+      const isVideo = typeIsVideo || (!typeIsImage && extIsVideo) || (!file.type && !extIsImage);
       if(!isImage && !isVideo) continue;
-      const id=Math.random().toString(36).slice(2);
+      const id=`${Date.now()}-${Math.random().toString(36).slice(2,9)}-${Math.random().toString(36).slice(2,6)}`;
       if(projectIdRef.current){
         setProjectStatus(`素材を保存中 ${fileIndex+1}/${arr.length}`);
         try{await storeProjectAsset(id,file);projectFailedAssetsRef.current.delete(id);}
@@ -9782,13 +10004,15 @@ function App(){
           img.onload=fin; img.onerror=fin; setTimeout(fin,2000);
         });
         photoRefs.current.set(id, img);
+        // バグ修正: 複数枚同時追加時はbulkPhotoDurationを使用
+        const photoDur = arr.length>1 ? (typeof bulkPhotoDurationRef!=='undefined'?bulkPhotoDurationRef.current:photoDurationRef.current) : photoDurationRef.current;
         newClips.push({
           id,
           assetId:id,
           type:'photo',
           url,
           name:file.name,
-          duration: photoDurationRef.current,
+          duration: photoDur,
           timelineStart:0,
           _photoZoom: 1.0,
           _photoPan: 'center'
@@ -10086,7 +10310,8 @@ function App(){
       try{
         const canvas=cameraRecordingCanvasRef.current || document.createElement('canvas');
         canvas.width=720; canvas.height=1280;
-        const ctx=canvas.getContext('2d');
+        const ctx=canvas.getContext('2d', {willReadFrequently:true});
+        if(!ctx){ stopCameraRecordingOutput(); throw new Error('canvas context failed'); }
         const draw=()=>{
           const video=cameraPreviewRef.current;
           if(video && video.videoWidth>1 && video.videoHeight>1){
@@ -10154,7 +10379,7 @@ function App(){
       const a=document.createElement('a');
       a.href=url; a.download=file.name;
       document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(()=>URL.revokeObjectURL(url),60000);
+      setTimeout(()=>{try{URL.revokeObjectURL(url);}catch{}},2000);
     }catch(e){
       if(e?.name!=='AbortError') setCameraError('端末への書き出しに失敗しました。もう一度お試しください。');
     }
@@ -10179,7 +10404,8 @@ function App(){
 const recomputeStarts=(arr)=>{ 
   let cur=0; 
   return arr.map((c,i)=>{
-    const safeDur = Math.max(0.3, c.duration||0.3);
+    const rawDur = Number(c.duration);
+    const safeDur = Math.max(0.3, Number.isFinite(rawDur) && rawDur>0 ? rawDur : 0.3);
     const n={...c,duration:safeDur,timelineStart:cur}; 
     const transDur = (c._transitionToNext && c._transitionToNext.type!=='none') ? (c._transitionToNext.duration||0.5) : 0;
     if(i < arr.length-1 && transDur>0){
@@ -10481,7 +10707,7 @@ const recomputeStarts=(arr)=>{
         const url=URL.createObjectURL(file);
         const link=document.createElement('a');link.href=url;link.download=file.name;
         document.body.appendChild(link);link.click();link.remove();
-        setTimeout(()=>URL.revokeObjectURL(url),60000);
+        setTimeout(()=>{try{URL.revokeObjectURL(url);}catch{}},2000);
       }
     }catch(error){if(error?.name!=='AbortError')setProjectError(error?.message||'バックアップを作れませんでした。');}
     finally{setProjectBusy(false);}
@@ -11875,7 +12101,7 @@ const recomputeStarts=(arr)=>{
           if(oldV){try{oldV.pause();oldV.src='';oldV.load();}catch{}videoRefs.current.delete(orig.id);}
           for(let i=0;i<windows.length;i++){
             const w = windows[i];
-            const id=Math.random().toString(36).slice(2);
+            const id=`${Date.now()}-${Math.random().toString(36).slice(2,9)}-${Math.random().toString(36).slice(2,6)}`;
             const nv=document.createElement('video');
             nv.src=orig.url;
             nv.muted=true; nv.playsInline=true; nv.preload='auto';
@@ -12004,7 +12230,7 @@ const recomputeStarts=(arr)=>{
       const storyDuration=Math.max(0.3,Math.min(3,orig.duration||3));
       for(let i=0;i<filterSet.length;i++){
         const f = filterSet[i];
-        const id=Math.random().toString(36).slice(2);
+        const id=`${Date.now()}-${Math.random().toString(36).slice(2,9)}-${Math.random().toString(36).slice(2,6)}`;
         if(isPhoto){
           let img=sourceImage;
           if(!img || !img.complete || !img.naturalWidth){
@@ -13104,7 +13330,11 @@ const recomputeStarts=(arr)=>{
           ? quickPeekVideoRef.current : videoRefs.current.get(clip?.id));
     const sourceWidth=source?.videoWidth||source?.naturalWidth||source?.width||0;
     const sourceHeight=source?.videoHeight||source?.naturalHeight||source?.height||0;
-    if(!source || !sourceWidth || !sourceHeight) return clip?.type==='photo' ? clip.url : '';
+    if(!source || !sourceWidth || !sourceHeight){
+      // バグ修正: videoでsourceが無い時にclip.url(blob)を返すとlocalStorageにblob URLが保存され再起動後に壊れる
+      // photoはdata URL化される前でもurlが使えるが、videoは空を返す
+      return clip?.type==='photo' ? (clip.url && !clip.url.startsWith('blob:') ? clip.url : '') : '';
+    }
     try{
       const thumbCanvas=document.createElement('canvas');
       thumbCanvas.width=108;
@@ -13121,7 +13351,9 @@ const recomputeStarts=(arr)=>{
       thumbCtx.filter='none';
       return thumbCanvas.toDataURL('image/jpeg',0.68);
     }catch{
-      return clip?.type==='photo' ? clip.url : '';
+      // バグ修正: blob URLをそのまま返さない
+      if(clip?.type==='photo' && clip.url && !clip.url.startsWith('blob:')) return clip.url;
+      return '';
     }
   };
   const rememberQuickPeekMaterial=(clip)=>{
@@ -15455,14 +15687,20 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
             React.createElement('button', {
               key:p.id,
               onClick:()=>{
-                const id=Math.random().toString(36).slice(2);
+                const id=`${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
                 const t=timeRef.current;
-                const newItem=textForActiveClip({ id, text:p.text, start:Math.max(0,t), end:Math.max(0.2,t+2), x:50, y:50, anim:'fade', ...p.style, strokeColor:'rgba(0,0,0,0.8)', align:'center' });
+                const newItem=textForActiveClip({ id, text:p.text, start:Math.max(0,t), end:Math.max(0.2,t+2), x:50, y:50, anim:'fade', ...p.style, strokeColor:'rgba(0,0,0,0.8)', align:'center', vertical:false, verticalSpacing:0.15, letterSpacing:0 });
                 setTexts(prev=> [...prev, newItem]);
                 textEditOriginalRef.current={id,text:null};
                 setSelectedTextId(id);
                 setMoveTarget(id,Math.round(t*10)/10);
+                setActiveTab('text');
+                setTextEditorSection('style');
+                requestedTextEditorSectionRef.current='style';
+                modeRef.current='textEdit';
+                setMode('textEdit');
                 setTimeout(()=> drawFrameRef.current(timeRef.current),20);
+                setTimeout(()=>{ textEditorRef.current?.scrollIntoView({behavior:'smooth',block:'start'}); }, 80);
               },
               className:'shrink-0 h-14 px-4 rounded-xl bg-[#111113] border border-white/10 text-[11px] font-bold flex flex-col items-center justify-center gap-0.5'
             },
@@ -15536,7 +15774,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               className:`min-h-[56px] rounded-xl border flex items-center px-2 py-2 ${isSel ? 'bg-yellow-500/20 border-yellow-500 ring-1 ring-yellow-500/50' : 'bg-[#111113] border-white/10'}`
             },
               React.createElement('button', {
-                onClick:()=> selectTextForEditing(t),
+                onClick:()=> selectTextForEditing(t,'style'),
                 className:'flex-1 flex items-center min-w-0 text-left'
               },
                 React.createElement('div', {className:'w-8 h-8 rounded-lg flex items-center justify-center mr-2 text-[12px] shrink-0', style:{background:t.bgColor==='transparent'?'#000':t.bgColor, color:t.color, fontSize:'10px'}}, 'Aa'),
@@ -15671,6 +15909,59 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             )
           ),
           React.createElement('div', {className:'mb-3'},
+            React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '組み方向'),
+            React.createElement('div', {className:'grid grid-cols-2 gap-2 mb-2'},
+              [{k:false,l:'横書き'},{k:true,l:'縦書き・詩'}].map(opt=>
+                React.createElement('button',{
+                  key: String(opt.k),
+                  type:'button',
+                  onClick:()=>{
+                    setTexts(prev=>prev.map(t=>{
+                      if(t.id!==selectedTextId) return t;
+                      const next={...t, vertical:opt.k};
+                      // 縦書きの時は横いっぱい帯だと不自然なのでラベルに自動変更
+                      if(opt.k && next.backgroundMode==='band'){
+                        const bc = next.bandColor||'#f5efe4';
+                        const op = Number.isFinite(next.bandOpacity)?next.bandOpacity:0.72;
+                        // bandColorをrgbaに変換してラベル背景に
+                        let bgc = bc;
+                        if(bc.startsWith('#')){
+                          const r=parseInt(bc.slice(1,3),16), g=parseInt(bc.slice(3,5),16), b=parseInt(bc.slice(5,7),16);
+                          bgc = `rgba(${r},${g},${b},${op})`;
+                        }
+                        next.backgroundMode='label';
+                        next.bgColor=bgc;
+                      }
+                      return next;
+                    }));
+                    setTimeout(()=>drawFrameRef.current(timeRef.current),20);
+                  },
+                  className:`min-h-11 rounded-xl border px-2 text-[11px] ${ (texts.find(t=>t.id===selectedTextId)?.vertical||false)===opt.k ? 'bg-violet-600 border-violet-500 text-white font-bold' : 'bg-white/10 border-white/10 text-white/60'}`
+                }, opt.l)
+              )
+            ),
+            React.createElement('div', {className:'mt-2'},
+              React.createElement('label', {className:'block text-[10px] text-white/60 mb-1'}, 
+                `${texts.find(t=>t.id===selectedTextId)?.vertical ? '縦の字間' : '横の字間'} ${Math.round((texts.find(t=>t.id===selectedTextId)?.vertical ? (texts.find(t=>t.id===selectedTextId)?.verticalSpacing??0.15) : (texts.find(t=>t.id===selectedTextId)?.letterSpacing??0))*100)}%`),
+              React.createElement('input', {
+                type:'range', min:0, max:1.0, step:0.02,
+                value: texts.find(t=>t.id===selectedTextId)?.vertical ? (texts.find(t=>t.id===selectedTextId)?.verticalSpacing??0.15) : (texts.find(t=>t.id===selectedTextId)?.letterSpacing??0),
+                onChange:e=>{
+                  const v=parseFloat(e.target.value);
+                  setTexts(prev=>prev.map(t=>{
+                    if(t.id!==selectedTextId) return t;
+                    if(t.vertical) return {...t, verticalSpacing:v, letterSpacing:v};
+                    return {...t, letterSpacing:v};
+                  }));
+                  setTimeout(()=>drawFrameRef.current(timeRef.current),10);
+                },
+                className:'w-full accent-violet-500'
+              }),
+              React.createElement('div', {className:'text-[9px] text-white/40 mt-1'}, 
+                texts.find(t=>t.id===selectedTextId)?.vertical ? '詩のように余白を持たせるとエモくなります。15文字以内がおすすめ。' : '横書きでも字間を広げるとおしゃれに。ロゴ風にも。')
+            )
+          ),
+          React.createElement('div', {className:'mb-3'},
             React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '色'),
             React.createElement('div', {className:'grid grid-cols-8 gap-2'},
               ['#ffffff','#000000','#ffeb3b','#ff5252','#42a5f5','#66bb6a','#ff80ab','#b39ddb'].map(c=>
@@ -15686,12 +15977,23 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           React.createElement('div', {className:'mb-3'},
             React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '文字の背景'),
             React.createElement('div', {className:'grid grid-cols-3 gap-2 mb-2'},
-              [{key:'none',label:'なし'},{key:'label',label:'文字幅'},{key:'band',label:'横いっぱいの帯'}].map(option=>{
+              (function(){ const sel=texts.find(t=>t.id===selectedTextId); const isVert=!!(sel&&sel.vertical); const opts=[{key:'none',label:'なし'},{key:'label',label:'文字幅'}]; if(!isVert) opts.push({key:'band',label:'横いっぱいの帯'}); return opts; })().map(option=>{
                 const selected=texts.find(t=>t.id===selectedTextId);
                 const current=selected?.backgroundMode || (selected?.bgColor && selected.bgColor!=='transparent'?'label':'none');
                 return React.createElement('button',{key:option.key,type:'button',
                   onClick:()=>setTexts(prev=>prev.map(t=>{
                     if(t.id!==selectedTextId)return t;
+                    // 縦書きの時は横いっぱい帯は使えないのでラベルに変更
+                    if(t.vertical && option.key==='band'){
+                      const bc = t.bandColor||'#f5efe4';
+                      const op = Number.isFinite(t.bandOpacity)?t.bandOpacity:0.72;
+                      let bgc = bc;
+                      if(bc.startsWith('#')){
+                        const r=parseInt(bc.slice(1,3),16), g=parseInt(bc.slice(3,5),16), b=parseInt(bc.slice(5,7),16);
+                        bgc = `rgba(${r},${g},${b},${op})`;
+                      }
+                      return {...t,backgroundMode:'label', bgColor:bgc};
+                    }
                     if(option.key==='none')return {...t,backgroundMode:'none',bgColor:'transparent'};
                     if(option.key==='label')return {...t,backgroundMode:'label',
                       bgColor:t.bgColor && t.bgColor!=='transparent'?t.bgColor:'rgba(0,0,0,0.6)'};
@@ -15729,7 +16031,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                  {color:'#22212a',label:'薄墨'}].map(option=>
                   React.createElement('button',{key:option.color,type:'button',
                     onClick:()=>setTexts(prev=>prev.map(t=>t.id===selectedTextId?
-                      {...t,bandColor:option.color,color:option.color==='#22212a'?'#ffffff':'#1e1d22'}:t)),
+                      {...t,bandColor:option.color}:t)),
                     'aria-label':`帯の色 ${option.label}`,
                     'aria-pressed':texts.find(t=>t.id===selectedTextId)?.bandColor===option.color,
                     style:{background:option.color,color:option.color==='#22212a'?'#fff':'#222'},
@@ -16154,7 +16456,40 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           type:'range', min:20, max:320, step:5, value:timelineZoom,
           onChange:e=>{
             const v=parseInt(e.target.value);
+            const oldZoom = timelineZoomRef.current || timelineZoom;
+            const scroller = bottomTimelineScrollRef.current;
+            let anchor = null;
+            try{
+              const sel = selectedTimelineItem;
+              if(sel?.type==='clip'){
+                const c = (clipsRef.current||[]).find(x=>x.id===sel.id);
+                if(c) anchor = c.timelineStart + c.duration/2;
+              } else if(sel?.type==='text'){
+                const t = (textsRef.current||[]).find(x=>x.id===sel.id);
+                if(t) anchor = (t.start + t.end)/2;
+              }
+            }catch{}
+            if(anchor===null || !Number.isFinite(anchor)){
+              if(scroller){
+                const visibleCenter = (scroller.scrollLeft + scroller.clientWidth/2 - 72)/oldZoom;
+                anchor = Number.isFinite(visibleCenter) ? visibleCenter : timeRef.current;
+              }else{
+                anchor = timeRef.current;
+              }
+            }
+            // 同期的にref更新
+            timelineZoomRef.current = v;
             setTimelineZoom(v);
+            // 2フレーム後にスクロールして、選択中素材/テキストを中心に保つ
+            requestAnimationFrame(()=>{
+              requestAnimationFrame(()=>{
+                const sc = bottomTimelineScrollRef.current;
+                if(!sc) return;
+                const newMid = 72 + anchor * v;
+                const targetLeft = Math.max(0, newMid - sc.clientWidth/2);
+                try{ sc.scrollTo({left: targetLeft, behavior:'auto'}); }catch{ sc.scrollLeft = targetLeft; }
+              });
+            });
           },
           className:'w-28 accent-violet-500'
         })
