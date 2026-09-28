@@ -5899,12 +5899,23 @@ function drawVlogCaption(ctx,txt,width,height,options={}){
   const x=options.x??(txt.x??50)/100*width;
   const y=options.y??(txt.y??50)/100*height;
   const fontSize=options.fontSizePx??(txt.fontSize||0.06)*height;
+  const fullBand=txt.backgroundMode==='band';
+  const pad=Math.max(4,fontSize*0.22);
+  const bandHeight=Math.min(height,Math.max(fontSize+pad*2,fontSize*1.6));
+  const textY=fullBand?Math.max(bandHeight/2,Math.min(height-bandHeight/2,y)):y;
+  const textX=fullBand?width/2:x;
   ctx.save();
   ctx.font=vlogTextFontSpec(txt,fontSize);
   ctx.textAlign='center';ctx.textBaseline='middle';
   const measured=ctx.measureText(content).width;
-  if(txt.bgColor && txt.bgColor!=='transparent'){
-    const pad=Math.max(4,fontSize*0.22);
+  if(fullBand){
+    const opacity=Number.isFinite(Number(txt.bandOpacity)) ?
+      Math.max(0.15,Math.min(0.95,Number(txt.bandOpacity))) : 0.72;
+    ctx.globalAlpha=opacity;
+    ctx.fillStyle=txt.bandColor||'#f5efe4';
+    ctx.fillRect(0,textY-bandHeight/2,width,bandHeight);
+    ctx.globalAlpha=1;
+  }else if(txt.bgColor && txt.bgColor!=='transparent'){
     ctx.fillStyle=txt.bgColor;
     ctx.fillRect(x-measured/2-pad,y-fontSize/2-pad,measured+pad*2,fontSize+pad*2);
   }
@@ -5913,10 +5924,12 @@ function drawVlogCaption(ctx,txt,width,height,options={}){
   if(txt.outline){
     ctx.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
     ctx.lineWidth=Math.max(2,fontSize*0.12);
-    ctx.strokeText(content,x,y);
+    if(fullBand) ctx.strokeText(content,textX,textY,width*0.84);
+    else ctx.strokeText(content,x,y);
   }
   ctx.fillStyle=txt.color||'#fff';
-  ctx.fillText(content,x,y);
+  if(fullBand) ctx.fillText(content,textX,textY,width*0.84);
+  else ctx.fillText(content,x,y);
   ctx.restore();
   return measured;
 }
@@ -5943,6 +5956,12 @@ function getTextCanvasBounds(txt, canvas){
   const ctx=canvas?.getContext('2d');
   if(!ctx || !canvas.width || !canvas.height) return null;
   const fontSize=(txt.fontSize||0.06)*canvas.height;
+  if(txt.backgroundMode==='band'){
+    const pad=Math.max(4,fontSize*0.22);
+    const bandHeight=Math.min(canvas.height,Math.max(fontSize+pad*2,fontSize*1.6));
+    const y=Math.max(bandHeight/2,Math.min(canvas.height-bandHeight/2,(txt.y??50)/100*canvas.height));
+    return {left:0,top:y-bandHeight/2,width:canvas.width,height:bandHeight};
+  }
   ctx.save();
   ctx.font=vlogTextFontSpec(txt,fontSize);
   const width=ctx.measureText(txt.text||'').width;
@@ -6124,7 +6143,7 @@ function TextStylePreview({item,backdrop,onFontReady}){
   return React.createElement('div',null,
     React.createElement('canvas',{ref:canvasRef,width:600,height:180,
       className:'block w-full h-auto rounded-xl border border-white/25',
-      role:'img','aria-label':`文字だけの見本。${backdrop==='white'?'白':'黒'}背景`}),
+      role:'img','aria-label':`テキストと帯の見本。${backdrop==='white'?'白':'黒'}背景`}),
     (fontStatus!=='ready'||overflows) && React.createElement('div',{className:'text-[10px] text-amber-200 mt-1',role:'status'},
       [fontStatus==='loading'?'書体を読み込み中':fontStatus==='fallback'?'書体を読み込めません。代替書体を表示中':null,
         overflows?'文字が表示幅を越えています':null].filter(Boolean).join(' · '))
@@ -7370,7 +7389,12 @@ function App(){
       setLightReferenceHeld(false);
     }
   },[clips.map(clip=>clip.id).join('|'),lightReference?.clipId]);
-  useEffect(()=>{ textsRef.current = texts; },[texts]);
+  useEffect(()=>{
+    textsRef.current=texts;
+    if(playingRef.current || exportJobRef.current) return;
+    const frame=requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+    return ()=>cancelAnimationFrame(frame);
+  },[texts]);
   useEffect(()=>{
     const top=editHistoryRef.current[editHistoryRef.current.length-1];
     if(!top) return;
@@ -12682,8 +12706,8 @@ const recomputeStarts=(arr)=>{
   // A move changes only the source caption's timing. Its composed draft at the
   // same target is already correct, so do not discard all three decoded frames.
   const textMoveVisualKey=JSON.stringify(texts.map(t=>t.id===textMoveReview?.textId
-    ? [t.id,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor]
-    : [t.id,t.start,t.end,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor]));
+    ? [t.id,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor,t.backgroundMode,t.bandColor,t.bandOpacity]
+    : [t.id,t.start,t.end,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor,t.backgroundMode,t.bandColor,t.bandOpacity]));
   // Compose a draft only after the slider settles; keep the playback videos untouched.
   useEffect(()=>{
     if(!textMoveReview || activeTab!=='text'){setTextMoveFrames(null);return;}
@@ -12789,7 +12813,8 @@ const recomputeStarts=(arr)=>{
         selectTextForEditing(txt);
         isDraggingRef.current=true;
         dragTargetRef.current={type:'text',id:txt.id,newX:txt.x ?? 50,newY:txt.y ?? 50,
-          startX:e.clientX,startY:e.clientY,originX:txt.x ?? 50,originY:txt.y ?? 50};
+          startX:e.clientX,startY:e.clientY,originX:txt.x ?? 50,originY:txt.y ?? 50,
+          band:txt.backgroundMode==='band'};
         try{ e.currentTarget.setPointerCapture(e.pointerId); }catch{}
         return;
       }
@@ -12802,7 +12827,7 @@ const recomputeStarts=(arr)=>{
     const rect=c.getBoundingClientRect();
     if(dragTargetRef.current?.type==='text'){
       const target=dragTargetRef.current;
-      const x=Math.max(0,Math.min(100,target.originX+(e.clientX-target.startX)/rect.width*100));
+      const x=target.band?target.originX:Math.max(0,Math.min(100,target.originX+(e.clientX-target.startX)/rect.width*100));
       const y=Math.max(0,Math.min(100,target.originY+(e.clientY-target.startY)/rect.height*100));
       dragTargetRef.current.newX=x; dragTargetRef.current.newY=y;
       setDragPreviewText({id:target.id,x,y});
@@ -15191,7 +15216,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           ),
           React.createElement('div',{className:'mb-3'},
             React.createElement('div',{className:'flex items-center justify-between gap-2 mb-2'},
-              React.createElement('span',{className:'text-[11px] font-bold'},'文字だけの見本'),
+              React.createElement('span',{className:'text-[11px] font-bold'},'文字と背景の見本'),
               React.createElement('div',{className:'flex gap-1','aria-label':'見本の背景色'},
                 [{key:'white',label:'白'},{key:'black',label:'黒'}].map(option=>
                   React.createElement('button',{key:option.key,type:'button',
@@ -15203,7 +15228,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             React.createElement(TextStylePreview,{item:texts.find(t=>t.id===selectedTextId),
               backdrop:textPreviewBackdrop,
               onFontReady:()=>requestAnimationFrame(()=>drawFrameRef.current(timeRef.current))}),
-            React.createElement('div',{className:'text-[9px] text-white/40 mt-1'},'白・黒は見本の背景です。動画内の背景は下の「文字の帯背景」で設定します。')
+            React.createElement('div',{className:'text-[9px] text-white/40 mt-1'},'白・黒は見本の映像代わりです。動画内の帯は下で設定します。')
           ),
           React.createElement('div', {className:'mb-3'},
             React.createElement('div', {className:'text-[10px] text-white/50 mb-1'}, '内容'),
@@ -15254,8 +15279,29 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             )
           ),
           React.createElement('div', {className:'mb-3'},
-            React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '文字の帯背景'),
-            React.createElement('div', {className:'grid grid-cols-5 gap-2'},
+            React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '文字の背景'),
+            React.createElement('div', {className:'grid grid-cols-3 gap-2 mb-2'},
+              [{key:'none',label:'なし'},{key:'label',label:'文字幅'},{key:'band',label:'横いっぱいの帯'}].map(option=>{
+                const selected=texts.find(t=>t.id===selectedTextId);
+                const current=selected?.backgroundMode || (selected?.bgColor && selected.bgColor!=='transparent'?'label':'none');
+                return React.createElement('button',{key:option.key,type:'button',
+                  onClick:()=>setTexts(prev=>prev.map(t=>{
+                    if(t.id!==selectedTextId)return t;
+                    if(option.key==='none')return {...t,backgroundMode:'none',bgColor:'transparent'};
+                    if(option.key==='label')return {...t,backgroundMode:'label',
+                      bgColor:t.bgColor && t.bgColor!=='transparent'?t.bgColor:'rgba(0,0,0,0.6)'};
+                    return {...t,backgroundMode:'band',bandColor:t.bandColor||'#f5efe4',
+                      bandOpacity:t.bandOpacity??0.72,
+                      color:t.color==='#ffffff'||t.color==='#fff'?'#1e1d22':t.color,
+                      outline:false};
+                  })),
+                  'aria-pressed':current===option.key,
+                  className:`min-h-10 rounded-lg border px-1 text-[10px] ${current===option.key?'bg-yellow-500/30 border-yellow-500':'bg-white/10 border-white/10'}`},option.label);
+              })
+            ),
+            (texts.find(t=>t.id===selectedTextId)?.backgroundMode==='label' ||
+              (!texts.find(t=>t.id===selectedTextId)?.backgroundMode &&
+                texts.find(t=>t.id===selectedTextId)?.bgColor!=='transparent')) && React.createElement('div', {className:'grid grid-cols-5 gap-2'},
               [
                 {c:'transparent', l:'なし'},
                 {c:'rgba(0,0,0,0.6)', l:'黒半'},
@@ -15265,10 +15311,42 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               ].map(b=>
                 React.createElement('button', {
                   key:b.c,
-                  onClick:()=> setTexts(prev=> prev.map(t=> t.id===selectedTextId ? {...t, bgColor:b.c} : t)),
+                  onClick:()=> setTexts(prev=> prev.map(t=> t.id===selectedTextId ? {...t, backgroundMode:b.c==='transparent'?'none':'label',bgColor:b.c} : t)),
                   className:`h-8 rounded-lg border text-[10px] ${texts.find(t=>t.id===selectedTextId)?.bgColor===b.c ? 'bg-yellow-500/30 border-yellow-500' : 'bg-white/10 border-white/10'}`
                 }, b.l)
               )
+            ),
+            texts.find(t=>t.id===selectedTextId)?.backgroundMode==='band' && React.createElement('div',{className:'mt-2'},
+              React.createElement('div',{className:'text-[10px] text-white/50 mb-2'},'帯の色'),
+              React.createElement('div',{className:'flex gap-2 flex-wrap'},
+                [{color:'#f5efe4',label:'生成り'},{color:'#f7dce5',label:'淡いピンク'},
+                 {color:'#e8e1f5',label:'ラベンダー'},{color:'#dae9e7',label:'ミント'},
+                 {color:'#22212a',label:'薄墨'}].map(option=>
+                  React.createElement('button',{key:option.color,type:'button',
+                    onClick:()=>setTexts(prev=>prev.map(t=>t.id===selectedTextId?
+                      {...t,bandColor:option.color,color:option.color==='#22212a'?'#ffffff':'#1e1d22'}:t)),
+                    'aria-label':`帯の色 ${option.label}`,
+                    'aria-pressed':texts.find(t=>t.id===selectedTextId)?.bandColor===option.color,
+                    style:{background:option.color,color:option.color==='#22212a'?'#fff':'#222'},
+                    className:`min-h-10 px-2 rounded-lg border-2 text-[10px] ${texts.find(t=>t.id===selectedTextId)?.bandColor===option.color?'border-yellow-500':'border-white/20'}`},option.label)
+                )
+              ),
+              React.createElement('label',{className:'block text-[10px] text-white/60 mt-3'},
+                `帯の濃さ ${Math.round((texts.find(t=>t.id===selectedTextId)?.bandOpacity??0.72)*100)}%`,
+                React.createElement('input',{type:'range',min:0.3,max:0.9,step:0.05,
+                  value:texts.find(t=>t.id===selectedTextId)?.bandOpacity??0.72,
+                  onChange:e=>setTexts(prev=>prev.map(t=>t.id===selectedTextId?
+                    {...t,bandOpacity:Number(e.target.value)}:t)),className:'w-full mt-1'})
+              ),
+              React.createElement('div',{className:'text-[10px] text-white/50 mt-2 mb-1'},'帯の位置'),
+              React.createElement('div',{className:'grid grid-cols-3 gap-2'},
+                [{y:20,label:'上'},{y:50,label:'中央'},{y:80,label:'下'}].map(option=>
+                  React.createElement('button',{key:option.y,type:'button',
+                    onClick:()=>setTexts(prev=>prev.map(t=>t.id===selectedTextId?{...t,y:option.y}:t)),
+                    className:`min-h-10 rounded-lg border text-[10px] ${Math.abs((texts.find(t=>t.id===selectedTextId)?.y??50)-option.y)<1?'border-yellow-500 bg-yellow-500/30':'border-white/10 bg-white/10'}`},option.label)
+                )
+              ),
+              React.createElement('div',{className:'text-[10px] text-white/40 mt-2'},'帯は動画の端まで、文字は中央に配置されます。上下の位置は下のYでも微調整できます。')
             )
           ),
           React.createElement('div', {className:'grid grid-cols-3 gap-3 mb-3'},
@@ -15550,7 +15628,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             );
           })(),
           React.createElement('div', {className:'grid grid-cols-2 gap-3 mb-3'},
-            React.createElement('div', null,
+            texts.find(t=>t.id===selectedTextId)?.backgroundMode!=='band' && React.createElement('div', null,
               React.createElement('div', {className:'text-[10px] text-white/50 mb-1'}, `X ${Math.round(texts.find(t=>t.id===selectedTextId)?.x||50)}%`),
               React.createElement('input', {
                 type:'range', min:0, max:100, step:1,
