@@ -9162,7 +9162,12 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         board:JSON.parse(JSON.stringify(board))
       };
     }
-    function writeSettings(){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(collectSettings()))}catch(e){console.warn('設定の保存に失敗しました',e)}}
+    /* 取り込み・初期化のあとに、いまメモリにある卓を書き戻さないための錠。
+        location.reload() は pagehide を起こし、その先の flushSettings が
+        writeSettings を呼ぶ。錠が無いと、せっかく入れた設定がリロードの直前に
+        既定値で上書きされる（キューだけ別キーなので残り、卓と観客が戻らない）。 */
+    let settingsFrozen=false;
+    function writeSettings(){if(settingsFrozen)return;try{localStorage.setItem(STORAGE_KEY,JSON.stringify(collectSettings()))}catch(e){console.warn('設定の保存に失敗しました',e)}}
     /* スライダーの oninput は指を動かしている間ずっと飛んでくる。その都度
        collectSettings() が卓を丸ごと deep copy し、localStorage へ同期書き込みを
        していたため、ドラッグ中に毎イベント止まっていた。書き込みは最大250msに
@@ -9485,6 +9490,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
           const payload=JSON.parse(reader.result),settings=payload.settings||payload;
           if(!settings||typeof settings!=='object'||!settings.board)throw new Error('invalid');
           cancelPendingSettingsSave();
+          settingsFrozen=true;          // リロードの pagehide で書き戻させない
           localStorage.setItem(STORAGE_KEY,JSON.stringify(settings));
           if(payload.cues&&typeof payload.cues==='object')writeCues(payload.cues);
           location.reload();
@@ -10200,7 +10206,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     q('#exportSettings').onclick=exportSettingsFile;
     q('#importSettings').onclick=()=>q('#importFile').click();
     q('#importFile').onchange=e=>{if(e.target.files[0])importSettingsFile(e.target.files[0]);e.target.value=''};
-    q('#resetSettings').onclick=()=>{if(confirm('設定と保存したキューを初期状態に戻しますか？')){localStorage.removeItem(STORAGE_KEY);localStorage.removeItem(CUE_STORAGE_KEY);location.reload()}};
+    q('#resetSettings').onclick=()=>{if(confirm('設定と保存したキューを初期状態に戻しますか？')){cancelPendingSettingsSave();settingsFrozen=true;localStorage.removeItem(STORAGE_KEY);localStorage.removeItem(CUE_STORAGE_KEY);location.reload()}};
 
     // カメラ側
     document.querySelectorAll('#isoR,#fstopR,#shutterR').forEach(e=>e.oninput=()=>{resetExposureCompareBaseline();saveSettings();refresh()});
@@ -11222,7 +11228,11 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         challenge:challengeResult,
         /* 演出（照明卓）も一緒に残す。sections は折りたたみパネルの開閉状態で
            演出ではないので外す。戻すときも、いま開いているパネルを維持する。 */
-        board:(()=>{const b=JSON.parse(JSON.stringify(board));delete b.sections;return b})()
+        board:(()=>{const b=JSON.parse(JSON.stringify(board));delete b.sections;return b})(),
+        /* サブマスターは board の外にあるので、ここで別に残す。残さないと
+           「演出ごと戻す」で照明だけ戻ってレバーが戻らず、復元した絵が
+           撮った絵と食い違う。bump は押しているあいだだけなので残さない。 */
+        submasters:submastersData.map(s=>({id:s.id,mode:s.mode,target:s.target,pos:s.pos}))
       };
     }
     /* 判定のしきい値は calcExposure と同じものを使う。二重に持たない。 */
@@ -11320,6 +11330,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
            なぜ出ないのかを書く。「撮影設定だけ」は隣に「演出ごと」が並んだとき
            何を指すか読めるように、挙動は変えずに名前だけ具体にした。 */
         (s.meta.board?'':'<div class="roll-detail-note">演出は保存されていない1枚です。</div>')+
+        (s.meta.board&&!Array.isArray(s.meta.submasters)?'<div class="roll-detail-note">サブマスターは保存されていない1枚です。</div>':'')+
         '<div class="io-actions"><button class="mode" type="button" data-roll-restore="1"'
           +(s.meta.board?'':' style="grid-column:1/-1"')+'>撮影設定だけ戻す</button>'+
         (s.meta.board?'<button class="mode" type="button" data-roll-restore-all="1">演出ごと戻す</button>':'')+
@@ -11367,8 +11378,13 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
        sections は写真に入れていないので、いま開いているパネルをそのまま渡して維持する。 */
     function restoreShotAll(m){
       if(m.board)applyBoard({...m.board,sections:board.sections});
+      /* サブマスターも戻す。この1枚より前に撮ったもの（submasters を持たない）は
+         レバーに触らない ― 0 に倒すと、いま上げているものを黙って消すことになる。 */
+      const hadSub=Array.isArray(m.submasters);
+      if(hadSub){sanitizeSubmasters(m.submasters);renderSubUI()}
       restoreShotSettings(m);
-      rollStatus(m.board?'この1枚の撮影設定と演出に戻しました。'
+      rollStatus(m.board?('この1枚の撮影設定と演出に戻しました。'
+                          +(hadSub?'':'（サブマスターは保存されていないので、いまのままです）'))
                         :'演出が保存されていないので、撮影設定だけ戻しました。');
     }
     q('#shutterBtn').onclick=requestShot;
