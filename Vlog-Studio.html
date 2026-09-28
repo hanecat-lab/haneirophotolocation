@@ -7264,6 +7264,13 @@ function App(){
   const [bgmFadeOut, setBgmFadeOut] = useState(1.0);
   const [draggingBgmBar, setDraggingBgmBar] = useState(null);
   const [draggingText, setDraggingText] = useState(null);
+  const textBarDragRef = useRef(null);
+  const suppressTextBarClickRef = useRef(0);
+  const [textSnapEnabled, setTextSnapEnabled] = useState(true);
+  const [timelineTextPrompt, setTimelineTextPrompt] = useState(null);
+  const [textBarPreviewTime, setTextBarPreviewTime] = useState(null);
+  const [textBarFrame, setTextBarFrame] = useState(null);
+  const textBarCanvasRef = useRef(null);
   const [draggingClipBar, setDraggingClipBar] = useState(null);
   const [selectedTextId, setSelectedTextId] = useState(null);
   const [textEditorSection,setTextEditorSection] = useState('time');
@@ -7274,13 +7281,14 @@ function App(){
     return()=>document.body.classList.remove('text-editing-active');
   },[activeTab,selectedTextId]);
   const [textTimingMode,setTextTimingMode] = useState('move');
+  const [showAdvancedTextTime,setShowAdvancedTextTime] = useState(false);
   const [textRangeDraft,setTextRangeDraft] = useState(null);
   const [textRangeFrames,setTextRangeFrames] = useState(null);
   const [textRangeDragging,setTextRangeDragging] = useState(false);
   const [textRangeNotice,setTextRangeNotice] = useState('');
   useEffect(()=>{
     setTextEditorSection('time');setTextTimingMode('length');setTextRangeDraft(null);setTextRangeFrames(null);
-    setTextRangeDragging(false);setTextRangeNotice('');
+    setTextRangeDragging(false);setTextRangeNotice('');setShowAdvancedTextTime(false);
   },[selectedTextId]);
   const [textListFrozenIds, setTextListFrozenIds] = useState(null);
   const textListPositionRef = useRef(null);
@@ -10621,6 +10629,13 @@ const recomputeStarts=(arr)=>{
     clipsRef.current=restored;
     textsRef.current=before.texts.map(t=>({...t}));
     setClips(restored); setTexts(textsRef.current);
+    setTextRangeDraft(previous=>{
+      if(!previous) return previous;
+      const text=textsRef.current.find(t=>t.id===previous.textId);
+      return text?{textId:text.id,start:text.start,end:text.end}:null;
+    });
+    const restoredText=textsRef.current.find(t=>t.id===selectedTimelineItem?.id);
+    if(restoredText) setTextBarPreviewTime(Math.min(restoredText.end-0.01,restoredText.start+0.08));
     const end=restored.length ? Math.max(...restored.map(c=>c.timelineStart+c.duration)) : 3;
     durationRef.current=end; setDuration(end);
     timeRef.current=Math.min(before.time,Math.max(0,end-0.01));
@@ -12505,58 +12520,104 @@ const recomputeStarts=(arr)=>{
 
 
 
-  // TEXT横バー編集
-  const handleTextPointerDown = useCallback((e, txtId, type)=>{
-    e.preventDefault();
-    e.stopPropagation();
-    const container = timelineTextsRef.current;
-    if(!container) return;
-    const txt = textsRef.current.find(t=> t.id===txtId);
-    if(!txt) return;
-    beginTextListTimingEdit();
-    setSelectedTextId(txtId);
-    setMoveTarget(txtId,type==='move' ? txt.start : Math.round(timeRef.current*10)/10);
-    setDraggingText({
-      id: txtId,
-      type,
-      wasAttached:!!txt._clipId,
-      before:editSnapshot(),
-      startX: e.clientX,
-      origStart: txt.start,
-      origEnd: txt.end,
-      containerWidth: (container.scrollWidth || container.getBoundingClientRect().width || 400)
-    });
-    try{ e.currentTarget.setPointerCapture(e.pointerId); }catch{}
-  },[]);
-  const handleTextPointerMove = useCallback((e)=>{
-    if(!draggingText) return;
-    const deltaX = e.clientX - draggingText.startX;
-    const deltaTime = deltaX / timelineZoom;
-    let updated;
-    if(draggingText.type==='left'){
-      const newStart = Math.max(0, Math.min(draggingText.origStart + deltaTime, draggingText.origEnd - 0.2));
-      updated=textsRef.current.map(t=> t.id===draggingText.id ? withTextTiming(t,newStart,t.end,draggingText.wasAttached) : t);
-    } else if(draggingText.type==='right'){
-      const newEnd = Math.max(draggingText.origStart + 0.2, Math.min(draggingText.origEnd + deltaTime, durationRef.current));
-      updated=textsRef.current.map(t=> t.id===draggingText.id ? withTextTiming(t,t.start,newEnd,draggingText.wasAttached) : t);
-    } else if(draggingText.type==='move'){
-      const newStart=Math.max(0,Math.min(durationRef.current,draggingText.origStart+deltaTime));
-      setMoveTarget(draggingText.id,Number(newStart.toFixed(1)));
+  // The inline TEXT track is a direct, transactional editor. A drag never
+  // changes the project until pointer-up; crossing a clip boundary asks first.
+  const selectTimelineText=(txt,atTime)=>{
+    if(playingRef.current) handleStop(false);
+    setSelectedTimelineItem({type:'text',id:txt.id});
+    setTimelineTextPrompt(null);
+    setTextBarPreviewTime(Number.isFinite(atTime)?atTime:
+      Math.min(txt.end-0.01,txt.start+Math.min(0.12,(txt.end-txt.start)/2)));
+    const zoom=Math.min(320,Math.max(timelineZoomRef.current,Math.ceil(160/Math.max(0.2,txt.end-txt.start)/10)*10));
+    if(zoom!==timelineZoomRef.current){timelineZoomRef.current=zoom;setTimelineZoom(zoom);}
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      const scroller=bottomTimelineScrollRef.current;
+      if(scroller) scroller.scrollTo({left:Math.max(0,72+((txt.start+txt.end)/2)*zoom-scroller.clientWidth/2),behavior:'smooth'});
+    }));
+  };
+  const commitTimelineText=(id,start,end,mode='keep',before)=>{
+    const source=textsRef.current.find(t=>t.id===id);
+    if(!source || end-start<0.2-0.0001 || start<0 || end>durationRef.current+0.0001) return;
+    const owner=clipsRef.current.find(c=>c.id===source._clipId);
+    const fits=c=>c && start>=c.timelineStart-0.0001 && end<=c.timelineStart+c.duration+0.0001;
+    if(mode==='keep' && owner && !fits(owner)){
+      setTimelineTextPrompt({id,start,end,
+        clips:clipsRef.current.filter(fits).map(c=>({id:c.id,name:c.name}))});
+      return;
     }
-    if(updated){ textsRef.current=updated; setTexts(updated); }
-    setTimeout(()=> drawFrameRef.current(timeRef.current), 0);
-  },[draggingText,withTextTiming,timelineZoom]);
-  const handleTextPointerUp = useCallback((e)=>{
-    if(!draggingText) return;
-    try{ e.currentTarget.releasePointerCapture(e.pointerId); }catch{}
-    if(draggingText.type==='move'){
-      const source=textsRef.current.find(t=>t.id===draggingText.id);
-      if(e.type==='pointercancel') setMoveTarget(draggingText.id,draggingText.origStart);
-      else if(source) finishTextMove(source);
-    }else recordEdit(draggingText.before);
+    const attached=mode==='global' ? null : mode==='keep' ? owner : clipsRef.current.find(c=>c.id===mode);
+    if(attached && !fits(attached)) return;
+    const snapshot=before||editSnapshot();
+    const next=textsRef.current.map(t=>t.id===id ? {...t,start,end,
+      _clipId:attached?.id||null,
+      _clipStart:attached?start-attached.timelineStart:null,
+      _clipEnd:attached?end-attached.timelineStart:null} : t);
+    textsRef.current=next;setTexts(next);recordEdit(snapshot);
+    setTextRangeDraft(previous=>previous?.textId===id?{textId:id,start,end}:previous);
+    setTextBarPreviewTime(Math.min(end-0.01,start+Math.min(0.12,(end-start)/2)));
+    setTimelineTextPrompt(null);
+    setEditNotice(`文字を ${start.toFixed(1)}〜${end.toFixed(1)}秒に配置しました。`);
+    seekEditorTime(Math.min(end-0.01,start+0.05));
+  };
+  const handleTextPointerDown=(e,txtId,type)=>{
+    e.preventDefault();e.stopPropagation();
+    const txt=textsRef.current.find(t=>t.id===txtId);
+    if(!txt) return;
+    if(playingRef.current) handleStop(false);
+    setSelectedTimelineItem({type:'text',id:txtId});
+    setTimelineTextPrompt(null);
+    const drag={id:txtId,type,pointerId:e.pointerId,before:editSnapshot(),
+      startX:e.clientX,origStart:txt.start,origEnd:txt.end,
+      start:txt.start,end:txt.end,moved:false};
+    textBarDragRef.current=drag;
+    setDraggingText(drag);
+    try{e.currentTarget.setPointerCapture(e.pointerId);}catch{}
+  };
+  const handleTextPointerMove=(e)=>{
+    const drag=textBarDragRef.current;
+    if(!drag || drag.pointerId!==e.pointerId) return;
+    const delta=e.clientX-drag.startX;
+    if(Math.abs(delta)<3 && !drag.moved) return;
+    const offset=delta/timelineZoomRef.current;
+    const span=drag.origEnd-drag.origStart;
+    let start=drag.origStart,end=drag.origEnd;
+    if(drag.type==='left') start=Math.max(0,Math.min(end-0.2,drag.origStart+offset));
+    else if(drag.type==='right') end=Math.min(durationRef.current,Math.max(start+0.2,drag.origEnd+offset));
+    else {start=Math.max(0,Math.min(durationRef.current-span,drag.origStart+offset));end=start+span;}
+    if(textSnapEnabled){
+      const edges=[...clipsRef.current.flatMap(c=>[c.timelineStart,c.timelineStart+c.duration]),
+        ...textsRef.current.filter(t=>t.id!==drag.id).flatMap(t=>[t.start,t.end])];
+      const threshold=Math.min(0.12,10/timelineZoomRef.current);
+      const candidates=drag.type==='move' ? edges.flatMap(value=>[value-start,value-end])
+        : edges.map(value=>value-(drag.type==='left'?start:end));
+      const adjustment=candidates.filter(value=>Math.abs(value)<=threshold)
+        .sort((a,b)=>Math.abs(a)-Math.abs(b))[0];
+      if(Number.isFinite(adjustment)){
+        if(drag.type==='move' && start+adjustment>=0 && end+adjustment<=durationRef.current){start+=adjustment;end+=adjustment;}
+        else if(drag.type==='left' && start+adjustment<=end-0.2) start+=adjustment;
+        else if(drag.type==='right' && end+adjustment>=start+0.2) end+=adjustment;
+      }
+    }
+    const updated={...drag,start:Math.round(start*100)/100,end:Math.round(end*100)/100,moved:true};
+    textBarDragRef.current=updated;setDraggingText(updated);
+    suppressTextBarClickRef.current=performance.now()+350;
+  };
+  const handleTextPointerUp=(e)=>{
+    const drag=textBarDragRef.current;
+    if(!drag || drag.pointerId!==e.pointerId) return;
+    textBarDragRef.current=null;
     setDraggingText(null);
-    endTextListTimingEdit();
-  },[draggingText]);
+    if(e.type!=='pointercancel' && !drag.moved && drag.type==='move'){
+      const at=Math.max(drag.origStart,Math.min(drag.origEnd-0.01,
+        (e.clientX-(timelineTextsRef.current?.getBoundingClientRect().left||0))/timelineZoomRef.current));
+      setTextBarPreviewTime(at);
+      seekEditorTime(at);
+    }
+    if(e.type!=='pointercancel' && drag.moved &&
+       (Math.abs(drag.start-drag.origStart)>0.005 || Math.abs(drag.end-drag.origEnd)>0.005))
+      commitTimelineText(drag.id,drag.start,drag.end,'keep',drag.before);
+    if(drag.moved) suppressTextBarClickRef.current=performance.now()+350;
+  };
 
   // CLIPS横バー編集（v11新規）
   const handleClipBarPointerDown = useCallback((e, clipId, type)=>{
@@ -12891,7 +12952,7 @@ const recomputeStarts=(arr)=>{
     return()=>controller.abort();
   },[textMoveReview?.textId,textMoveReview?.start,textMoveReview?.nonce,clips,textMoveVisualKey,activeTab,activeFilter,filterIntensity]);
   useEffect(()=>{
-    if(textTimingMode!=='length' || !textRangeDraft || activeTab!=='text' || textRangeDragging) return;
+    if(!showAdvancedTextTime || textTimingMode!=='length' || !textRangeDraft || activeTab!=='text' || textRangeDragging) return;
     const source=textsRef.current.find(t=>t.id===textRangeDraft.textId);
     if(!source) return;
     const controller=new AbortController();
@@ -12925,7 +12986,7 @@ const recomputeStarts=(arr)=>{
     },160);
     return()=>{clearTimeout(timer);controller.abort();};
   },[textTimingMode,textRangeDraft?.textId,textRangeDraft?.start,textRangeDraft?.end,
-     textRangeDragging,activeTab,clips,textMoveVisualKey,activeFilter,filterIntensity]);
+     textRangeDragging,activeTab,clips,textMoveVisualKey,activeFilter,filterIntensity,showAdvancedTextTime]);
   const ghostClip=activeTab==='text' && textMoveTarget?.textId===selectedTextId
     ? clips.find(c=>textMoveTarget.start>=c.timelineStart && textMoveTarget.start<c.timelineStart+c.duration)
     : null;
@@ -13234,6 +13295,68 @@ const recomputeStarts=(arr)=>{
   } : null;
   const selectedTimelineClip=selectedTimelineItem?.type==='clip' ? clips.find(c=>c.id===selectedTimelineItem.id) : null;
   const selectedTimelineText=selectedTimelineItem?.type==='text' ? texts.find(t=>t.id===selectedTimelineItem.id) : null;
+  const textBarDisplay=selectedTimelineText && draggingText?.id===selectedTimelineText.id
+    ? {...selectedTimelineText,start:draggingText.start,end:draggingText.end} : selectedTimelineText;
+  useEffect(()=>{
+    const source=selectedTimelineText;
+    if(!source || isPlaying || draggingText || timelineTextPrompt) return;
+    const time=Math.max(source.start,Math.min(source.end-0.01,
+      Number.isFinite(textBarPreviewTime)?textBarPreviewTime:source.start+0.08));
+    const clip=clips.find(c=>time>=c.timelineStart && time<c.timelineStart+c.duration);
+    if(!clip){setTextBarFrame({id:source.id,time,status:'unavailable',url:null});return;}
+    const controller=new AbortController();
+    setTextBarFrame({id:source.id,time,status:'loading',url:null});
+    const timer=setTimeout(async()=>{
+      try{
+        const other=textsRef.current.filter(t=>t.id!==source.id && time>=t.start && time<t.end);
+        const url=await captureTextPlacementFrame(clip,time,source,other,
+          getClipPreviewFilter(clip,activeFilter,filterIntensity),controller.signal);
+        if(!controller.signal.aborted) setTextBarFrame({id:source.id,time,status:'ready',url});
+      }catch{if(!controller.signal.aborted)setTextBarFrame({id:source.id,time,status:'unavailable',url:null});}
+    },180);
+    return()=>{clearTimeout(timer);controller.abort();};
+  },[selectedTimelineText?.id,selectedTimelineText?.start,selectedTimelineText?.end,
+     selectedTimelineText?.text,textBarPreviewTime,isPlaying,!!draggingText,!!timelineTextPrompt,
+     clips,textMoveVisualKey,activeFilter,filterIntensity]);
+  useEffect(()=>{
+    if(!isPlaying || !selectedTimelineText) return;
+    let frame=0,last=0,active=true;
+    const mirror=now=>{
+      if(!active) return;
+      if(now-last>=65){
+        const target=textBarCanvasRef.current,source=canvasRef.current;
+        const ctx=target?.getContext('2d');
+        if(ctx && source?.width && source?.height){
+          try{
+            ctx.fillStyle='#09090b';ctx.fillRect(0,0,target.width,target.height);
+            const scale=Math.min(target.width/source.width,target.height/source.height);
+            const w=source.width*scale,h=source.height*scale;
+            ctx.drawImage(source,(target.width-w)/2,(target.height-h)/2,w,h);
+          }catch{}
+        }
+        last=now;
+      }
+      frame=requestAnimationFrame(mirror);
+    };
+    frame=requestAnimationFrame(mirror);
+    return()=>{active=false;cancelAnimationFrame(frame);};
+  },[isPlaying,selectedTimelineText?.id]);
+  const playTimelineText=()=>{
+    const source=textsRef.current.find(t=>t.id===selectedTimelineItem?.id);
+    if(!source) return;
+    textTrialTokenRef.current+=1;
+    const token=textTrialTokenRef.current;
+    if(playingRef.current) handleStop(false);
+    seekEditorTime(Math.max(0,source.start-0.25));
+    handlePlay();
+    const stopAt=Math.min(durationRef.current-0.01,source.end+0.25);
+    const watch=()=>{
+      if(token!==textTrialTokenRef.current || !playingRef.current) return;
+      if(timeRef.current>=stopAt){handleStop();return;}
+      requestAnimationFrame(watch);
+    };
+    requestAnimationFrame(watch);
+  };
   const focusedClip=clips.find(c=>c.id===focusedClipId)||null;
   const timelineContextClip=focusedClip||previewClip;
   const timelineContextIndex=timelineContextClip ? clips.findIndex(c=>c.id===timelineContextClip.id)+1 : 0;
@@ -15641,7 +15764,25 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           )),
           textEditorSection==='time' && React.createElement('div',{className:'mb-3 rounded-xl border border-violet-400/30 bg-violet-500/10 p-3'},
             React.createElement('div',{className:'text-[12px] font-bold'},'いつ表示するか'),
-            React.createElement('div',{className:'text-[10px] text-white/55 mt-1'},'紫の帯を動かすと表示する場面が変わります。左右の丸で開始と終了を調整できます。')
+            React.createElement('div',{className:'text-[10px] text-white/55 mt-1'},'下のタイムラインにある黄色い文字バーで、場面と表示時間を直接調整できます。')
+          ),
+          textEditorSection==='time' && React.createElement('div',{
+            className:'rounded-xl border border-amber-400/35 bg-amber-500/10 p-3 mb-3 text-[11px]'},
+            React.createElement('div',{className:'font-bold text-amber-100 mb-1'},'表示時間はタイムラインで直接調整'),
+            React.createElement('div',{className:'text-white/65 mb-2'},
+              '黄色い文字バーを選び、中央を動かすと移動、左右の端を動かすと長さを変えられます。'),
+            React.createElement('button',{type:'button',onClick:()=>{
+              const current=textsRef.current.find(t=>t.id===selectedTextId);
+              if(!current) return;
+              setInlineTimelineExpanded(false);
+              selectTimelineText(current);
+              requestAnimationFrame(()=>requestAnimationFrame(()=>inlineTimelineRef.current?.scrollIntoView({behavior:'smooth',block:'end'})));
+            },className:'w-full min-h-11 rounded-full bg-amber-100 text-black font-bold'},
+            '↓ この文字のバーへ'),
+            React.createElement('button',{type:'button',onClick:()=>setShowAdvancedTextTime(v=>!v),
+              'aria-expanded':showAdvancedTextTime,
+              className:'mt-2 w-full text-white/65 underline py-1'},
+              showAdvancedTextTime?'数値による調整を閉じる':'数値で細かく調整する')
           ),
           false && React.createElement('div',{className:'grid grid-cols-2 gap-2 mb-3','aria-label':'文字の時間編集'},
             React.createElement('button',{type:'button',onClick:()=>setTextTimingMode('move'),
@@ -15803,7 +15944,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               )
             );
           })(),
-          textEditorSection==='time' && textTimingMode==='length' && (()=>{
+          textEditorSection==='time' && showAdvancedTextTime && textTimingMode==='length' && (()=>{
             const source=texts.find(t=>t.id===selectedTextId);
             if(!source) return null;
             const draft=textRangeDraft?.textId===source.id?textRangeDraft:
@@ -15986,7 +16127,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         ),
         React.createElement('div', {className:'text-[11px] text-white/50 font-mono'}, `ズーム ×${(timelineZoom/80).toFixed(1)}`),
         React.createElement('input', {
-          type:'range', min:20, max:200, step:5, value:timelineZoom,
+          type:'range', min:20, max:320, step:5, value:timelineZoom,
           onChange:e=>{
             const v=parseInt(e.target.value);
             setTimelineZoom(v);
@@ -16013,6 +16154,84 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         React.createElement('button',{type:'button',onClick:()=>openEditorPreview(true),
           className:'shrink-0 rounded-full bg-emerald-100 px-2 py-2 text-[10px] font-bold text-black',
           'aria-label':`現在の${currentTime.toFixed(1)}秒から再生`},'▶ ここから')
+      ),
+      selectedTimelineText && React.createElement('div',{
+        className:'border-b border-amber-400/35 bg-[#211b20] px-3 py-2 text-[11px]',
+        'aria-label':'タイムライン上の文字編集'
+      },
+        React.createElement('div',{className:'flex gap-3 items-center'},
+          React.createElement('div',{className:'w-[68px] h-[110px] shrink-0 rounded-lg border border-amber-300/50 bg-black overflow-hidden flex items-center justify-center'},
+            isPlaying
+              ? React.createElement('canvas',{ref:textBarCanvasRef,width:216,height:384,
+                  className:'w-full h-full object-contain','aria-label':'文字を重ねた再生映像'})
+              : textBarFrame?.id===selectedTimelineText.id && textBarFrame.url
+                ? React.createElement('img',{src:textBarFrame.url,alt:'文字を重ねた確認画像',className:'w-full h-full object-contain'})
+                : React.createElement('span',{className:'px-1 text-center text-[9px] text-white/55'},
+                    draggingText?'指を離すと更新':textBarFrame?.status==='loading'?'映像を準備中':'映像を確認できません')
+          ),
+          React.createElement('div',{className:'min-w-0 flex-1'},
+            React.createElement('div',{className:'flex items-center gap-2'},
+              React.createElement('strong',{className:'truncate text-[12px] text-amber-100 flex-1'},selectedTimelineText.text||'文字'),
+              React.createElement('button',{type:'button',onClick:()=>{setSelectedTimelineItem(null);setTimelineTextPrompt(null);},
+                className:'rounded-full border border-white/25 px-2 py-1','aria-label':'文字の時間編集を閉じる'},'×')
+            ),
+            React.createElement('div',{className:'mt-1 font-mono text-white/80'},
+              `${textBarDisplay.start.toFixed(2)}〜${textBarDisplay.end.toFixed(2)}秒 · 長さ ${(textBarDisplay.end-textBarDisplay.start).toFixed(2)}秒`),
+            React.createElement('div',{className:'mt-1 text-white/55'},
+              draggingText ? '指を離すと確定します' : 'バーの中央で移動、左右の端で長さを変更'),
+            !isPlaying && React.createElement('div',{className:'mt-1 flex gap-1','aria-label':'確認する位置'},
+              ...[
+                ['開始',selectedTimelineText.start+0.02],
+                ['中',selectedTimelineText.start+(selectedTimelineText.end-selectedTimelineText.start)/2],
+                ['終了',selectedTimelineText.end-0.02]
+              ].map(([label,time])=>React.createElement('button',{key:label,type:'button',
+                onClick:()=>setTextBarPreviewTime(Math.max(selectedTimelineText.start,Math.min(selectedTimelineText.end-0.01,time))),
+                className:`rounded px-2 py-1 border ${Math.abs((textBarPreviewTime??selectedTimelineText.start)-time)<0.04?'border-amber-200 text-amber-100':'border-white/20 text-white/60'}`},label))
+            ),
+            React.createElement('div',{className:'mt-2 flex flex-wrap gap-1.5'},
+              React.createElement('button',{type:'button',onClick:playTimelineText,
+                className:'rounded-full bg-amber-100 px-3 py-2 font-bold text-black'},'▶ 前後を再生'),
+              React.createElement('button',{type:'button',onClick:()=>setTextSnapEnabled(value=>!value),
+                'aria-pressed':textSnapEnabled,className:'rounded-full border border-white/25 px-2 py-2'},
+                textSnapEnabled?'境界に吸着 ON':'境界に吸着 OFF'),
+              React.createElement('button',{type:'button',onClick:undoEdit,disabled:editHistoryCount===0,
+                className:'rounded-full border border-white/25 px-2 py-2 disabled:opacity-35'},'↶ 元に戻す'),
+              React.createElement('button',{type:'button',onClick:()=>{selectTextForEditing(selectedTimelineText);setInlineTimelineExpanded(false);},
+                className:'rounded-full border border-white/25 px-2 py-2'},'文字・見た目')
+            )
+          )
+        ),
+        timelineTextPrompt?.id===selectedTimelineText.id && React.createElement('div',{
+          className:'mt-2 rounded-lg border border-amber-300/50 bg-black/50 p-2',role:'alert'},
+          React.createElement('div',{className:'font-bold'},'素材の境目を越えます。文字をどこに付けますか？'),
+          React.createElement('div',{className:'mt-1 text-white/65'},
+            `${timelineTextPrompt.start.toFixed(2)}〜${timelineTextPrompt.end.toFixed(2)}秒（まだ変更していません）`),
+          React.createElement('div',{className:'mt-2 flex flex-wrap gap-2'},
+            ...timelineTextPrompt.clips.map(c=>React.createElement('button',{key:c.id,type:'button',
+              onClick:()=>commitTimelineText(selectedTimelineText.id,timelineTextPrompt.start,timelineTextPrompt.end,c.id),
+              className:'rounded-full bg-violet-600 px-3 py-2'},`${c.name}に付ける`)),
+            React.createElement('button',{type:'button',
+              onClick:()=>commitTimelineText(selectedTimelineText.id,timelineTextPrompt.start,timelineTextPrompt.end,'global'),
+              className:'rounded-full bg-white/20 px-3 py-2'},'動画全体に置く'),
+            React.createElement('button',{type:'button',onClick:()=>setTimelineTextPrompt(null),
+              className:'rounded-full border border-white/25 px-3 py-2'},'変更しない')
+          )
+        ),
+        React.createElement('details',{className:'mt-2 text-white/70'},
+          React.createElement('summary',{className:'cursor-pointer py-1'},'短い文字の微調整（0.1秒ずつ）'),
+          React.createElement('div',{className:'mt-1 flex flex-wrap gap-2'},
+            ...[
+              ['開始 −0.1',-0.1,0],['開始 ＋0.1',0.1,0],
+              ['終了 −0.1',0,-0.1],['終了 ＋0.1',0,0.1]
+            ].map(([label,ds,de])=>React.createElement('button',{key:label,type:'button',
+              onClick:()=>commitTimelineText(selectedTimelineText.id,
+                Math.round((selectedTimelineText.start+ds)*100)/100,
+                Math.round((selectedTimelineText.end+de)*100)/100),
+              disabled:selectedTimelineText.start+ds<0 || selectedTimelineText.end+de>duration ||
+                selectedTimelineText.end+de-selectedTimelineText.start-ds<0.2-0.0001,
+              className:'rounded-full border border-white/25 px-3 py-2 disabled:opacity-30'},label))
+          )
+        )
       ),
       React.createElement('div', {
         ref:bottomTimelineScrollRef,
@@ -16093,10 +16312,11 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                 onPointerCancel:handleTextPointerUp
               },
                 texts.map(t=>{
-                  const left = t.start * timelineZoom;
-                  const width = Math.max(8,Math.min((t.end-t.start)*timelineZoom-2,Math.max(30,(t.end-t.start)*timelineZoom*0.9)));
+                  const shown=draggingText?.id===t.id?draggingText:t;
+                  const left = shown.start * timelineZoom;
+                  const width = Math.max(8,(shown.end-shown.start)*timelineZoom-2);
                   const selected=selectedTimelineItem?.type==='text' && selectedTimelineItem.id===t.id;
-                  const showHandles=inlineTimelineExpanded && selected && width>=90;
+                  const showHandles=selected && (width>=88 || draggingText?.id===t.id);
                   return React.createElement('div', {
                     key:t.id, 
                     'data-timeline-text-id':t.id,
@@ -16105,32 +16325,32 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                     title:`${t.text} ${t.start.toFixed(1)}s-${t.end.toFixed(1)}s`,
                     onClick:e=>{
                       e.stopPropagation();
-                      setSelectedTimelineItem({type:'text',id:t.id});
-                      setSelectedTextId(t.id);
-                      setMoveTarget(t.id,Math.round(timeRef.current*10)/10);
-                      seekEditorTime(t.start+Math.min(t.end-t.start-0.01,Math.max(0,(e.clientX-e.currentTarget.getBoundingClientRect().left)/e.currentTarget.getBoundingClientRect().width)*(t.end-t.start)));
+                      if(performance.now()<suppressTextBarClickRef.current) return;
+                      const at=t.start+Math.min(t.end-t.start-0.01,
+                        Math.max(0,(e.clientX-e.currentTarget.getBoundingClientRect().left)/e.currentTarget.getBoundingClientRect().width)*(t.end-t.start));
+                      if(!selected) selectTimelineText(t,at);
+                      else setTextBarPreviewTime(at);
+                      seekEditorTime(at);
                     }
                   },
                     showHandles && React.createElement('div', {
                       onPointerDown:e=>handleTextPointerDown(e,t.id,'left'), onClick:e=>e.stopPropagation(),
-                      className:'w-6 h-full shrink-0 bg-yellow-500/40 flex items-center justify-center touch-none cursor-ew-resize'
+                      className:'w-8 h-full shrink-0 bg-yellow-200/35 flex items-center justify-center touch-none cursor-ew-resize text-[16px]',
+                      role:'button','aria-label':`${t.text}の開始を動かす`
                     }, '‹'),
                     React.createElement('div', {
-                      onPointerDown:showHandles ? e=>handleTextPointerDown(e,t.id,'move') : undefined,
-                      onClick:showHandles ? e=>e.stopPropagation() : undefined,
-                      className:`flex-1 min-w-0 truncate px-1 ${showHandles?'touch-none cursor-grab':''}`
+                      onPointerDown:selected ? e=>handleTextPointerDown(e,t.id,'move') : undefined,
+                      onClick:selected ? e=>e.stopPropagation() : undefined,
+                      className:`flex-1 min-w-0 truncate px-1 flex items-center ${selected?'touch-none cursor-grab':''}`,
+                      role:selected?'button':undefined,'aria-label':selected?`${t.text}を移動`:undefined
                     },t.text.slice(0,14)),
                     showHandles && React.createElement('div', {
                       onPointerDown:e=>handleTextPointerDown(e,t.id,'right'), onClick:e=>e.stopPropagation(),
-                      className:'w-6 h-full shrink-0 bg-yellow-500/40 flex items-center justify-center touch-none cursor-ew-resize'
+                      className:'w-8 h-full shrink-0 bg-yellow-200/35 flex items-center justify-center touch-none cursor-ew-resize text-[16px]',
+                      role:'button','aria-label':`${t.text}の終了を動かす`
                     }, '›')
                   );
                 }),
-                draggingText?.type==='move' && textMoveTarget?.textId===draggingText.id && React.createElement('div',{
-                  className:'absolute top-1 bottom-1 rounded border-2 border-dashed border-violet-300 bg-violet-500/30 pointer-events-none z-10 flex items-center px-1 text-[9px] text-white truncate',
-                  style:{left:`${textMoveTarget.start*timelineZoom}px`,width:`${Math.max(8,(draggingText.origEnd-draggingText.origStart)*timelineZoom)}px`},
-                  'aria-hidden':true
-                },'仮置き'),
                 React.createElement('div', {className:'absolute top-0 bottom-0 w-[2px] bg-white/80 pointer-events-none z-20', style:{left:`${currentTime*timelineZoom}px`}})
               )
             )
@@ -16177,45 +16397,14 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           )
         ),
         selectedTimelineText && React.createElement('div', {className:'flex flex-col gap-3'},
-          React.createElement('div', {className:'text-white/50'},selectedTimelineText._clipId?'この素材に連動':'全体の時間に配置'),
-          React.createElement('label', {className:'flex items-center gap-3'},
-            React.createElement('span', {className:'w-16 shrink-0'},`移動先 ${(textMoveTarget?.textId===selectedTimelineText.id?textMoveTarget.start:selectedTimelineText.start).toFixed(1)}s`),
-            React.createElement('input', {
-              type:'range', min:0,max:duration,
-              step:0.1,
-              value:Math.max(0,Math.min(duration,textMoveTarget?.textId===selectedTimelineText.id?textMoveTarget.start:selectedTimelineText.start)),
-              onPointerDown:()=>{textMoveDragOriginRef.current=textMoveTargetRef.current;setTextMoveDragging(true);},
-              onPointerUp:()=>{setTextMoveDragging(false);reviewTextMove(selectedTimelineText.id,textMoveTargetRef.current?.start??selectedTimelineText.start);},
-              onPointerCancel:()=>{
-                setTextMoveDragging(false);
-                const origin=textMoveDragOriginRef.current;
-                if(origin?.textId===selectedTimelineText.id) setMoveTarget(selectedTimelineText.id,origin.start);
-              },
-              onChange:e=>setMoveTarget(selectedTimelineText.id,Number(e.target.value)),
-              className:'flex-1 accent-yellow-500', 'aria-label':'文字の移動先。指を離すと画像で確認'
-            })
-          ),
-          React.createElement('div', {className:'text-white/50'},'長さを保って仮置きします。素材の境目は文字編集で配置先を選びます。'),
+          React.createElement('div', {className:'text-white/60'},
+            selectedTimelineText._clipId?'この素材に連動':'動画全体の時間に配置'),
+          React.createElement('div', {className:'text-white/50'},
+            '文字の時間は上の黄色いバーを直接動かして調整できます。'),
           React.createElement('button', {
-            onClick:()=>finishTextMove(selectedTimelineText,
-              textMoveTarget?.textId===selectedTimelineText.id?textMoveTarget.start:selectedTimelineText.start),
-            className:'rounded-full border border-yellow-500/40 px-3 py-2 self-start'
-          },'この移動先に置く'),
-          React.createElement('label', {className:'flex items-center gap-3'},
-            React.createElement('span', {className:'w-16 shrink-0'},`終了 ${selectedTimelineText.end.toFixed(1)}s`),
-            React.createElement('input', {
-              type:'range', min:selectedTimelineText.start+0.2,max:duration,step:0.1,
-              value:selectedTimelineText.end,
-              onPointerDown:beginRangeEdit,onPointerUp:finishRangeEdit,onPointerCancel:finishRangeEdit,
-              onFocus:beginRangeEdit,onBlur:finishRangeEdit,
-              onChange:e=>{
-                beginRangeEdit();
-                const wasAttached=!!rangeEditRef.current?.texts.find(t=>t.id===selectedTimelineText.id)?._clipId;
-                applyTextTiming(selectedTimelineText.id,selectedTimelineText.start,Number(e.target.value),wasAttached);
-              },className:'flex-1 accent-yellow-500'
-            })
-          ),
-          React.createElement('button', {onClick:()=>{selectTextForEditing(selectedTimelineText);setInlineTimelineExpanded(false);},className:'rounded-full border border-white/20 px-3 py-2 self-start'},'文字・位置を編集')
+            onClick:()=>{selectTextForEditing(selectedTimelineText);setInlineTimelineExpanded(false);},
+            className:'rounded-full border border-white/20 px-3 py-2 self-start'
+          },'文字・見た目を編集')
         ),
         React.createElement('button', {onClick:()=>{handleStop();setReorderInitialId(selectedTimelineClip?.id||null);setReorderOpen(true);},disabled:clips.length<2,className:'text-[11px] rounded-full bg-violet-500/20 border border-violet-400/30 px-3 py-2 mt-3 disabled:opacity-35'},'素材の順番を変える')
       )
