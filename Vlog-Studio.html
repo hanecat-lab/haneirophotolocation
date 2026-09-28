@@ -8843,12 +8843,7 @@ function App(){
       const isIOSExport=/iPhone|iPad|iPod/.test(navigator.userAgent);
       const exportWarmLead=isIOSExport?0:0.09;
       // iOSでは複数の音付き動画が互いを停止させるため、重なる区間も動画再生は1本にする。
-      const iosEntryDelay=new Map(items.map((clip,index)=>{
-        const previous=items[index-1];
-        const overlap=isIOSExport && clip.type==='video' && previous?.type==='video'
-          ? Math.max(0,previous.timelineStart+previous.duration-clip.timelineStart):0;
-        return [clip.id,Math.min(0.35,overlap/2)];
-      }));
+      // 次の素材の開始自体は遅らせない。重なりの間は新しい動画を優先して1本だけ再生する。
       const waitForExportVideo=(video,ready,message)=>new Promise((resolve,reject)=>{
         if(ready()) {resolve();return;}
         let settled=false;
@@ -8893,8 +8888,7 @@ function App(){
             await loading;
           }
           if(job.cancelled) return;
-          // iOSの重なりでは中間時刻から再生する。手前の静止フレームも先に用意する。
-          const target=isIOSExport?(clip.trimStart||0)+(iosEntryDelay.get(clip.id)||0)
+          const target=isIOSExport?(clip.trimStart||0)
             :Math.max(0,(clip.trimStart||0)-
               (clip.timelineStart>0?Math.min(exportWarmLead,clip.trimStart||0):0));
           if(Math.abs(video.currentTime-target)>0.05 || video.readyState<2){
@@ -8927,9 +8921,9 @@ function App(){
         while(first<exportVideoItems.length &&
           exportVideoItems[first].timelineStart+exportVideoItems[first].duration<=t) first++;
         // 切り替え前に読み込みとシークを終える。読み込み数の上限も維持する。
-        const limit=Math.min(exportVideoItems.length,first+(isIOSExport?3:4));
+        const limit=Math.min(exportVideoItems.length,first+(isIOSExport?2:4));
         while(job.prepareCursor<limit && job.prepareInFlight<(isIOSExport?1:2) &&
-          exportVideoItems[job.prepareCursor].timelineStart<=t+6){
+          exportVideoItems[job.prepareCursor].timelineStart<=t+(isIOSExport?4:6)){
           const ahead=exportVideoItems[job.prepareCursor++];
           job.prepareInFlight++;
           prepareExportVideo(ahead).catch(error=>{
@@ -8949,7 +8943,9 @@ function App(){
       timeRef.current=0;
       drawFrameRef.current(0,items,exportTexts);
       if(job.failure) throw new Error(job.failure);
-      const exportFps=30;
+      // 容量優先では録画とCanvasの負荷を抑える。映像フレームが途切れたまま
+      // 30fpsを要求し続けるより、24fpsを一定に保つ方を優先する。
+      const exportFps=exportSizeMode==='smaller'?24:30;
       job.stats.exportFps=exportFps;
       const canvasStream=canvas.captureStream(exportFps);
       const canvasVideoTrack=canvasStream.getVideoTracks()[0];
@@ -9043,7 +9039,7 @@ function App(){
         const liveSoundIds=new Set();
         const primaryVideo=isIOSExport
           ? [...exportVideoItems].reverse().find(clip=>
-              t>=clip.timelineStart+(iosEntryDelay.get(clip.id)||0) &&
+              t>=clip.timelineStart &&
               t<clip.timelineStart+clip.duration)
           : null;
         // paused のまま切り替え点で play() するより、音量 0 で少し早くデコードを始める。
@@ -9194,7 +9190,7 @@ function App(){
           // 実際に表示された映像フレームが追い付いているかを別に確認する。
           if(typeof video.requestVideoFrameCallback==='function' &&
              (!isIOSExport || primaryVideo?.id===clip.id) &&
-             t>clip.timelineStart+(iosEntryDelay.get(clip.id)||0)+0.45){
+             t>clip.timelineStart+0.45){
             if(!Number.isFinite(progress?.mediaTime) ||
                (Number.isFinite(progress.presentedAt) &&
                 now-progress.presentedAt>700 && video.currentTime-progress.mediaTime>0.45))
@@ -9258,7 +9254,7 @@ function App(){
           job.drawTick=drawTick;
           job.stats.frames++;
           job.stats.maxDrawMs=Math.max(job.stats.maxDrawMs,drawMs);
-          if(drawMs>33) job.stats.slowFrames++;
+          if(drawMs>1000/exportFps) job.stats.slowFrames++;
         }
         if(now-lastProgress>500){ lastProgress=now; setExportProgress(Math.min(100,Math.round(t/total*100))); }
         job.frame=requestAnimationFrame(render);
@@ -9302,6 +9298,12 @@ function App(){
         verification=!inspection?'unknown':inspection.samples===0 ||
           (sampleShort && timeShort)?'short':sampleShort || timeShort ||
           !Number.isFinite(inspection.lastVideoTime)?'uncertain':'passed';
+        // 最後まで映像トラックがあることと、十分な動きがあることは別。
+        // 今回のように後半のデコードが止まった場合は確認用として明示する。
+        if(verification==='passed' &&
+           (inspection.samples<expectedFrames*0.8 ||
+            job.stats.notReadyFrames>job.stats.frames*0.1))
+          verification='motion-degraded';
         job.stats.recordingVerification=verification;
         recordExportEvent('recording-verified',null,{verification,
           videoSamples:inspection?.samples??null,
@@ -9331,6 +9333,8 @@ function App(){
         : '';
       const verificationMessage=verification==='short'
         ? `録画した映像が途中で止まった可能性があります（${job.stats.recordedVideoSamples}フレーム、最後の映像 ${Number.isFinite(job.stats.recordedVideoLastTime)?job.stats.recordedVideoLastTime.toFixed(1)+'秒':'時刻不明'}）。確認用動画を保存して再生を確認してください。`
+        :verification==='motion-degraded'
+          ? `映像は最後までありますが、録画フレームまたは素材の更新が不足しています（${job.stats.recordedVideoSamples}フレーム、想定約${Math.round(total*exportFps)}フレーム）。切り替え後に止まる可能性があるため確認用動画として扱ってください。`
         :verification==='unknown' || verification==='uncertain'
           ? '録画した映像の長さを確定できませんでした。確認用動画を保存して再生を確認してください。'
           :'';
@@ -13240,7 +13244,7 @@ const recomputeStarts=(arr)=>{
             onClick:()=>setExportChoiceScope(scope),
             className:`w-full text-left px-4 py-3 mb-2 rounded-xl border text-sm ${exportChoiceScope===scope?'border-violet-400 bg-violet-500/20':'border-white/20 bg-white/5'} disabled:opacity-40`,
             'aria-pressed':exportChoiceScope===scope}, `${exportChoiceScope===scope?'●':'○'} ${label}`)),
-        React.createElement('div',{className:'text-xs text-white/60 mt-2 mb-2'},'画質と容量（720p・30fps）'),
+        React.createElement('div',{className:'text-xs text-white/60 mt-2 mb-2'},'画質と容量（720p）'),
         React.createElement('div',{className:'grid grid-cols-1 gap-2 mb-2'},
           ['quality','compact','smaller'].map(mode=>{
             const profile=VLOG_EXPORT_PROFILES[mode];
@@ -13248,11 +13252,11 @@ const recomputeStarts=(arr)=>{
               'aria-pressed':exportSizeMode===mode,
               className:`min-h-11 rounded-xl border px-3 py-2 text-left flex items-center justify-between gap-2 ${exportSizeMode===mode?'border-violet-400 bg-violet-500/20':'border-white/20 bg-white/5'}`},
               React.createElement('span',{className:'text-xs font-bold'},`${exportSizeMode===mode?'●':'○'} ${profile.label}`),
-              React.createElement('span',{className:'text-[10px] text-white/55 shrink-0'},`約${(profile.videoBitrate/1000000).toFixed(1)}Mbps`));
+              React.createElement('span',{className:'text-[10px] text-white/55 shrink-0'},`約${(profile.videoBitrate/1000000).toFixed(1)}Mbps · ${mode==='smaller'?24:30}fps`));
           })),
         React.createElement('div',{className:'text-[10px] text-white/55 mb-2'},
           exportSizeMode==='smaller'
-            ? '細い文字・暗部・動きの多い場面では画質が下がる場合があります。容量は書き出し後の実測値で確認できます。'
+            ? '24fpsで描画と録画の負荷を抑えます。動きの多い場面は30fpsより滑らかさが下がる場合があります。容量は書き出し後の実測値で確認できます。'
             : '容量は素材と端末の録画方式で変わります。書き出し後に実測値を表示します。'),
         React.createElement('div',{className:'text-[10px] text-amber-100/85 mb-2'},
           '動画は実時間で作成するため、素材の長さ以上かかります。終了までこの画面を開いたままにしてください。'),
@@ -13297,7 +13301,7 @@ const recomputeStarts=(arr)=>{
                 navigator.clipboard?.writeText?.(exportDiagnosticText)?.catch?.(()=>{});
               },className:'mt-2 rounded-full bg-white/10 px-4 py-2 text-xs'},'診断をコピー'))),
           React.createElement('button', {onClick:saveExport, className:'w-full h-11 rounded-full bg-white text-black font-bold mb-3'},
-            ['short','uncertain','unknown'].includes(exportFile?.verification)?'確認用動画を保存':'端末に保存'),
+            ['short','uncertain','unknown','motion-degraded'].includes(exportFile?.verification)?'確認用動画を保存':'端末に保存'),
           React.createElement('button', {onClick:closeExport, className:'w-full h-10 rounded-full bg-white/10'}, '閉じる')
         ),
         exportStatus==='error' && React.createElement(React.Fragment,null,
