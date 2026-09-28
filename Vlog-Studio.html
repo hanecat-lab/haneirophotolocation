@@ -8579,7 +8579,10 @@ function App(){
 
   // 書き出しはプレビューと同じcanvasを描画し、そのフレームと素材の音声を録画する。
   const cancelExport=()=>{
-    if(exportJobRef.current) exportJobRef.current.cancelled=true;
+    if(exportJobRef.current){
+      exportJobRef.current.cancelled=true;
+      exportJobRef.current.stopWaiting?.();
+    }
   };
   const saveExport=()=>{
     if(!exportFile?.url) return;
@@ -8663,6 +8666,7 @@ function App(){
       driftSince:new Map(),lastSeekAt:new Map(),prepareCursor:0,prepareInFlight:0,
       releaseCursor:0,soundCursor:0,liveSoundIds:new Set(),waitingByClip:new Map(),waitSummary:new Map(),gapSummary:new Map(),
       frameProgress:new Map(),frameCallbacks:new Map(),events:[],recorderChunks:[],lastDrawAt:-Infinity,drawTick:-1,
+      wakeLock:null,stopWaiting:null,phase:'preparing',
       stats:{frames:0,slowFrames:0,gaps:0,corrections:0,playRequests:0,notReadyFrames:0,
         waitingFrames:0,maxDrawMs:0,recordedChunks:0,recordedBytes:0,
         sourceAudioVolumePercent:Math.round(sourceAudioVolume*100),
@@ -8699,6 +8703,35 @@ function App(){
       gaps:[...job.gapSummary.values()].sort((a,b)=>b.count-a.count).slice(0,12),
       recorderChunks:job.recorderChunks,recentEvents:job.events},null,2);
     exportJobRef.current=job;
+    // MediaRecorder は実時間で canvas を録画する。画面消灯を防げる端末では
+    // タップ操作の直後にロックを取得し、終了時に必ず解放する。
+    if(navigator.wakeLock?.request && document.visibilityState==='visible'){
+      job.stats.wakeLock='requesting';
+      try{
+        navigator.wakeLock.request('screen').then(lock=>{
+          if(exportJobRef.current!==job || job.cancelled){
+            lock.release().catch(()=>{});
+            return;
+          }
+          job.wakeLock=lock;
+          job.stats.wakeLock='active';
+          lock.addEventListener('release',()=>{
+            if(job.wakeLock===lock) job.wakeLock=null;
+            if(exportJobRef.current===job && !job.cancelled) job.stats.wakeLock='released';
+          });
+        }).catch(error=>{job.stats.wakeLock=`unavailable:${error?.name||'unknown'}`;});
+      }catch(error){job.stats.wakeLock=`unavailable:${error?.name||'unknown'}`;}
+    }else job.stats.wakeLock='unavailable';
+    const onExportVisibility=()=>{
+      if(document.visibilityState!=='hidden' || job.cancelled ||
+         job.phase==='verifying' || exportJobRef.current!==job) return;
+      job.failure='書き出し中に画面が非表示になったため停止しました。画面を開いたまま、もう一度書き出してください。';
+      job.stats.visibilityInterrupted=true;
+      recordExportEvent('page-hidden',null,{phase:job.phase});
+      job.cancelled=true;
+      job.stopWaiting?.();
+    };
+    document.addEventListener('visibilitychange',onExportVisibility);
     setExportProgress(0);
     setExportMessage('');
     setExportDiagnosticText('');
@@ -8920,6 +8953,7 @@ function App(){
       // iPhoneでは録画データを最後まで保持すると、Canvasの映像トラックだけが
       // 約12秒で途切れても音声だけが録り続けられる場合がある。定期的に取り出す。
       recorder.start(2000);
+      job.phase='recording';
       setExportStatus('recording');
       let last=performance.now();
       const recordingStartedAt=last;
@@ -9186,13 +9220,16 @@ function App(){
       };
       job.frame=requestAnimationFrame(render);
       await new Promise(resolve=>{
-        const check=()=>{ if(job.cancelled || elapsed>=total) resolve(); else job.check=setTimeout(check,80); };
+        job.stopWaiting=()=>{clearTimeout(job.check);resolve();};
+        const check=()=>{ if(job.cancelled || elapsed>=total) job.stopWaiting(); else job.check=setTimeout(check,80); };
         check();
       });
+      job.stopWaiting=null;
       cancelAnimationFrame(job.frame);
       if(recorder.state!=='inactive') recorder.stop();
       await stopped;
       if(job.cancelled) throw new Error(job.failure || '書き出しを中止しました。');
+      job.phase='verifying';
       setExportStatus('verifying');
       const type=recorder.mimeType || mime;
       const blob=new Blob(chunks,{type});
@@ -9252,8 +9289,10 @@ function App(){
         :verification==='unknown' || verification==='uncertain'
           ? '録画した映像の長さを確定できませんでした。確認用動画を保存して再生を確認してください。'
           :'';
+      // フレーム時刻の空白だけでは見た目のカクつきは確定できない。
+      // 切り替え時に1秒程度空いても自然に見える例があるため、短い空白は診断値に留める。
       const continuityMessage=verification==='passed' &&
-        Number.isFinite(inspection?.maxActiveGapMs) && inspection.maxActiveGapMs>=750
+        Number.isFinite(inspection?.maxActiveGapMs) && inspection.maxActiveGapMs>=2000
         ? `動画素材の区間で録画映像のフレーム間隔が最大${(inspection.maxActiveGapMs/1000).toFixed(1)}秒空きました（${inspection.maxActiveGapStartTime.toFixed(1)}〜${inspection.maxActiveGapEndTime.toFixed(1)}秒）。保存後にこの部分の動きを確認してください。`
         :'';
       setExportMessage([verificationMessage,continuityMessage,performanceMessage].filter(Boolean).join(' '));
@@ -9269,6 +9308,8 @@ function App(){
       setExportStatus('error');
     }finally{
       job.cancelled=true;
+      document.removeEventListener('visibilitychange',onExportVisibility);
+      job.wakeLock?.release().catch(()=>{});
       clearTimeout(job.check);
       cancelAnimationFrame(job.frame);
       if(job.recorder?.state==='recording') try{ job.recorder.stop(); }catch{}
@@ -13167,6 +13208,8 @@ const recomputeStarts=(arr)=>{
           exportSizeMode==='smaller'
             ? '細い文字・暗部・動きの多い場面では画質が下がる場合があります。容量は書き出し後の実測値で確認できます。'
             : '容量は素材と端末の録画方式で変わります。書き出し後に実測値を表示します。'),
+        React.createElement('div',{className:'text-[10px] text-amber-100/85 mb-2'},
+          '動画は実時間で作成するため、素材の長さ以上かかります。終了までこの画面を開いたままにしてください。'),
         React.createElement('div', {className:'text-xs text-white/60 mt-3 mb-2'}, '書き出し対象（上から順に再生）'),
         React.createElement('div', {className:'max-h-32 overflow-y-auto rounded-lg bg-black/30 p-3 text-xs text-white/80 mb-4', 'aria-live':'polite'},
           (exportChoiceScope==='selected'?clips.filter(c=>selectedClipIds.includes(c.id)):clips).length
@@ -13185,6 +13228,7 @@ const recomputeStarts=(arr)=>{
         React.createElement('div', {className:'text-base font-bold mb-3'}, '動画の書き出し'),
         (exportStatus==='preparing'||exportStatus==='recording'||exportStatus==='verifying') && React.createElement(React.Fragment,null,
           React.createElement('div', {className:'text-sm text-white/70 mb-3'}, exportStatus==='preparing'?'素材を準備しています':exportStatus==='verifying'?'完成した動画を確認しています':`書き出し中 ${exportProgress}%`),
+          React.createElement('div',{className:'text-xs text-amber-100 mb-3'},'書き出し中はこの画面を開いたままにしてください。画面の自動消灯を防止します（端末が許可した場合）。'),
           React.createElement('progress', {value:exportProgress, max:100, className:'w-full h-2 mb-5', 'aria-label':'書き出しの進行状況'}),
           exportStatus!=='verifying' && React.createElement('button', {onClick:cancelExport, className:'w-full h-10 rounded-full bg-white/10'}, '中止')
         ),
