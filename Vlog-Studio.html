@@ -5281,7 +5281,43 @@ body:has(.polaroid-wrapper.hikariyomi-mode) #moodSelector{
 .timeline-safe-wrapper{
   padding-bottom: calc(88px + env(safe-area-inset-bottom, 0px) + 20px) !important;
   position: relative;
+  overscroll-behavior-x: contain;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x pan-y;
+  scroll-snap-type: none;
+  overscroll-behavior: contain;
 }
+.timeline-safe-wrapper *{
+  scroll-snap-type: none;
+}
+.bottom-timeline-scroll{
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
+  scroll-snap-type: none;
+}
+/* 縦スクロールの引っ張り戻し防止 */
+html{
+  overscroll-behavior-y: contain;
+}
+body{
+  overscroll-behavior-y: contain;
+  overscroll-behavior-x: none;
+}
+#root{
+  overscroll-behavior-y: contain;
+}
+/* 編集画面全体の縦スクロールコンテナ */
+.edit-scroll-container{
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+}
+.preview-wrap{
+  overscroll-behavior: contain;
+}
+
 @media (max-width: 768px){
   .timeline-safe-wrapper{
     padding-bottom: calc(110px + env(safe-area-inset-bottom, 0px)) !important;
@@ -10090,6 +10126,74 @@ function App(){
     };
   },[]);
 
+  // v15: ユーザーが手動でタイムラインをスクロール中は自動中央寄せを一時停止（引っ張り戻し防止）
+  useEffect(()=>{
+    const scroller = bottomTimelineScrollRef.current;
+    if(!scroller) return;
+    let timeout;
+    const onScroll = ()=>{
+      window.__userScrolling = true;
+      clearTimeout(timeout);
+      timeout = setTimeout(()=>{
+        window.__userScrolling = false;
+      }, 900);
+    };
+    scroller.addEventListener('scroll', onScroll, {passive:true});
+    return ()=>{
+      scroller.removeEventListener('scroll', onScroll);
+      clearTimeout(timeout);
+    };
+  },[bottomTimelineScrollRef.current]);
+
+  // v16: 縦スクロールの引っ張り戻し防止
+  useEffect(()=>{
+    let timeoutY;
+    const onScrollY = ()=>{
+      window.__userScrollingY = true;
+      clearTimeout(timeoutY);
+      timeoutY = setTimeout(()=>{
+        window.__userScrollingY = false;
+      }, 800);
+    };
+    window.addEventListener('scroll', onScrollY, {passive:true});
+    document.addEventListener('scroll', onScrollY, {passive:true, capture:true});
+    return ()=>{
+      window.removeEventListener('scroll', onScrollY);
+      document.removeEventListener('scroll', onScrollY, true);
+      clearTimeout(timeoutY);
+    };
+  },[]);
+
+  // v15: ドラッグハンドルのタッチがタイムラインの横スクロールを邪魔しないように
+  useEffect(()=>{
+    const handle = document.querySelector('.timeline-drag-handle');
+    if(!handle) return;
+    let startY=0, isDragging=false;
+    const onTouchStart = (e)=>{
+      startY = e.touches[0].clientY;
+      isDragging=false;
+    };
+    const onTouchMove = (e)=>{
+      const diff = Math.abs(e.touches[0].clientY - startY);
+      if(diff>12) isDragging=true;
+      if(isDragging){
+        // 縦ドラッグ中は横スクロールを止めないが、ページの縦スクロールは止める
+        // 何もしない - ブラウザに任せる
+      }
+    };
+    const onTouchEnd = ()=>{
+      isDragging=false;
+    };
+    handle.addEventListener('touchstart', onTouchStart, {passive:true});
+    handle.addEventListener('touchmove', onTouchMove, {passive:true});
+    handle.addEventListener('touchend', onTouchEnd, {passive:true});
+    return ()=>{
+      handle.removeEventListener('touchstart', onTouchStart);
+      handle.removeEventListener('touchmove', onTouchMove);
+      handle.removeEventListener('touchend', onTouchEnd);
+    };
+  },[timelineFullscreen]);
+
 
   // Sample the displayed frame; never infer clipping from a preset or placeholder value.
   useEffect(()=>{
@@ -11089,12 +11193,24 @@ const recomputeStarts=(arr)=>{
     if(selectedTextId){
       setSelectedTimelineItem({type:'clip',id:clip.id});
     }
-    if(center) requestAnimationFrame(()=>{
-      const scroller=bottomTimelineScrollRef.current;
-      if(!scroller) return;
-      const midpoint=72+(clip.timelineStart+clip.duration/2)*timelineZoom;
-      scroller.scrollTo({left:Math.max(0,midpoint-scroller.clientWidth/2),behavior:'smooth'});
-    });
+    if(center){
+      // ユーザーが手動スクロール中は自動中央寄せをスキップ（引っ張り戻し防止）
+      if(window.__userScrolling) return;
+      requestAnimationFrame(()=>{
+        const scroller=bottomTimelineScrollRef.current;
+        if(!scroller || window.__userScrolling) return;
+        const midpoint=72+(clip.timelineStart+clip.duration/2)*timelineZoom;
+        const target=Math.max(0,midpoint-scroller.clientWidth/2);
+        // 初回はsmooth、連続選択時はautoでちらつき防止
+        const behavior = window.__lastCenterTime && Date.now()-window.__lastCenterTime < 800 ? 'auto' : 'smooth';
+        window.__lastCenterTime = Date.now();
+        try{
+          scroller.scrollTo({left:target,behavior});
+        }catch{
+          scroller.scrollLeft=target;
+        }
+      });
+    }
   };
   const openTimelineForClip=(clip)=>{
     closeQuickPeek(false);
@@ -11103,7 +11219,12 @@ const recomputeStarts=(arr)=>{
     setSelectedTextId(null);
     textEditOriginalRef.current=null;
     setSelectedTimelineItem({type:'clip',id:clip.id});
-    inlineTimelineRef.current?.scrollIntoView({behavior:'smooth',block:'center'});
+    // 縦スクロールの引っ張り防止：nearest + auto、ユーザー操作中はスキップ
+    if(!window.__userScrolling && !window.__userScrollingY){
+      try{
+        inlineTimelineRef.current?.scrollIntoView({behavior:'auto',block:'nearest',inline:'nearest'});
+      }catch{}
+    }
   };
   const openEditorPreview=(play=false)=>{
     editReturnScrollRef.current=window.scrollY;
@@ -11116,7 +11237,11 @@ const recomputeStarts=(arr)=>{
       if(playingRef.current) handleStop(false);
       drawFrameRef.current(timeRef.current);
     }
-    previewFrameRef.current?.scrollIntoView({behavior:'smooth',block:'center'});
+    if(!window.__userScrollingY){
+      try{
+        previewFrameRef.current?.scrollIntoView({behavior:'auto',block:'nearest',inline:'nearest'});
+      }catch{}
+    }
   };
   const playClipFromList=(clip)=>{
     closeQuickPeek(false);
@@ -12960,10 +13085,20 @@ const recomputeStarts=(arr)=>{
       Math.min(txt.end-0.01,txt.start+Math.min(0.12,(txt.end-txt.start)/2)));
     const zoom=Math.min(640,Math.max(timelineZoomRef.current,Math.ceil(160/Math.max(0.2,txt.end-txt.start)/10)*10));
     if(zoom!==timelineZoomRef.current){timelineZoomRef.current=zoom;setTimelineZoom(zoom);}
-    requestAnimationFrame(()=>requestAnimationFrame(()=>{
-      const scroller=bottomTimelineScrollRef.current;
-      if(scroller) scroller.scrollTo({left:Math.max(0,72+((txt.start+txt.end)/2)*zoom-scroller.clientWidth/2),behavior:'smooth'});
-    }));
+    if(!window.__userScrolling){
+      requestAnimationFrame(()=>requestAnimationFrame(()=>{
+        const scroller=bottomTimelineScrollRef.current;
+        if(!scroller || window.__userScrolling) return;
+        const target=Math.max(0,72+((txt.start+txt.end)/2)*zoom-scroller.clientWidth/2);
+        const behavior = window.__lastCenterTime && Date.now()-window.__lastCenterTime < 800 ? 'auto' : 'smooth';
+        window.__lastCenterTime = Date.now();
+        try{
+          scroller.scrollTo({left:target,behavior});
+        }catch{
+          scroller.scrollLeft=target;
+        }
+      }));
+    }
   };
   const commitTimelineText=(id,start,end,mode='keep',before)=>{
     const source=textsRef.current.find(t=>t.id===id);
@@ -13117,20 +13252,25 @@ const recomputeStarts=(arr)=>{
     setTextTimingMode('length');
     setTextRangeDraft({textId:txt.id,start:txt.start,end:txt.end});
     setActiveTab('text');
-    // タイムラインをテキストが中心になるようにスクロール
-    requestAnimationFrame(()=>{
+    // タイムラインをテキストが中心になるようにスクロール（引っ張り戻し防止：ユーザー操作中はスキップ）
+    if(!window.__userScrolling){
       requestAnimationFrame(()=>{
-        const scroller=bottomTimelineScrollRef.current;
-        if(!scroller) return;
-        const zoom=timelineZoomRef.current||80;
-        const midpoint=72+((txt.start+txt.end)/2)*zoom;
-        try{
-          scroller.scrollTo({left:Math.max(0,midpoint-scroller.clientWidth/2),behavior:'smooth'});
-        }catch{
-          scroller.scrollLeft=Math.max(0,midpoint-scroller.clientWidth/2);
-        }
+        requestAnimationFrame(()=>{
+          const scroller=bottomTimelineScrollRef.current;
+          if(!scroller || window.__userScrolling) return;
+          const zoom=timelineZoomRef.current||80;
+          const midpoint=72+((txt.start+txt.end)/2)*zoom;
+          const target=Math.max(0,midpoint-scroller.clientWidth/2);
+          const behavior = window.__lastCenterTime && Date.now()-window.__lastCenterTime < 800 ? 'auto' : 'smooth';
+          window.__lastCenterTime = Date.now();
+          try{
+            scroller.scrollTo({left:target,behavior});
+          }catch{
+            scroller.scrollLeft=target;
+          }
+        });
       });
-    });
+    }
     if(timeRef.current<txt.start || timeRef.current>=txt.end){
       timeRef.current=Math.min(txt.end-0.01,txt.start+0.01);
       setCurrentTime(timeRef.current);
@@ -16700,16 +16840,18 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             // 同期的にref更新
             timelineZoomRef.current = v;
             setTimelineZoom(v);
-            // 2フレーム後にスクロールして、選択中素材/テキストを中心に保つ
-            requestAnimationFrame(()=>{
+            // 2フレーム後にスクロールして、選択中素材/テキストを中心に保つ（ユーザー操作中はスキップ）
+            if(!window.__userScrolling){
               requestAnimationFrame(()=>{
-                const sc = bottomTimelineScrollRef.current;
-                if(!sc) return;
-                const newMid = 72 + anchor * v;
-                const targetLeft = Math.max(0, newMid - sc.clientWidth/2);
-                try{ sc.scrollTo({left: targetLeft, behavior:'auto'}); }catch{ sc.scrollLeft = targetLeft; }
+                requestAnimationFrame(()=>{
+                  const sc = bottomTimelineScrollRef.current;
+                  if(!sc || window.__userScrolling) return;
+                  const newMid = 72 + anchor * v;
+                  const targetLeft = Math.max(0, newMid - sc.clientWidth/2);
+                  try{ sc.scrollTo({left: targetLeft, behavior:'auto'}); }catch{ sc.scrollLeft = targetLeft; }
+                });
               });
-            });
+            }
           },
           className:'w-28 accent-violet-500'
         })
@@ -16814,7 +16956,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       ),
       React.createElement('div', {
         ref:bottomTimelineScrollRef,
-        className:'flex-1 overflow-x-auto overflow-y-hidden bg-black',
+        className:'flex-1 overflow-x-auto overflow-y-hidden bg-black bottom-timeline-scroll',
         style:{maxHeight:'140px'}
       },
         React.createElement('div', {className:`flex flex-col timeline-safe-wrapper ${timelineFullscreen ? 'timeline-fullscreen' : ''}`, style:{width:`${Math.max(400, duration*timelineZoom + 72)}px`, minWidth:'100%', ...(timelineFullscreen ? {width:'100%', minWidth:'100%'} : {})}},
