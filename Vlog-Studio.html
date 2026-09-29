@@ -5451,6 +5451,20 @@ body.text-edit-active .mood-selector{
   display:none !important;
 }
 
+
+/* Audio Crossfade Zones */
+.crossfade-zone{
+  backdrop-filter: blur(2px);
+  transition: all 0.15s ease;
+}
+.crossfade-zone:hover{
+  transform: scaleY(1.05);
+  z-index: 20 !important;
+}
+.crossfade-waveform{
+  background: linear-gradient(90deg, transparent 0%, rgba(167,243,208,0.15) 20%, rgba(255,214,192,0.15) 80%, transparent 100%);
+}
+
 </style>
 </head>
 <body class="bg-[#0a0a0b] text-white">
@@ -7675,7 +7689,17 @@ function App(){
   const [bgmTrack, setBgmTrack] = useState('none');
   const [bgmOffset, setBgmOffset] = useState(0);
   const [bgmVolume, setBgmVolume] = useState(0.5);
+  // Ambient Bed for cafe
+  const [ambientBedVolume, setAmbientBedVolume] = useState(0.15);
   const [sourceAudioVolume, setSourceAudioVolume] = useState(1);
+  // Audio Crossfade - 自然に繋ぐ
+  const [audioCrossfadeEnabled, setAudioCrossfadeEnabled] = useState(true);
+  const [crossfades, setCrossfades] = useState({}); // {cutIndex: {enabled, duration}}
+  const [ambientBedEnabled, setAmbientBedEnabled] = useState(false);
+  const previewAudioContextRef = useRef(null);
+  const previewAudioGainsRef = useRef(new Map()); // clipId -> {source, gain}
+  const ambientBedGainRef = useRef(null);
+  const ambientBedSourceRef = useRef(null);
   const [customBgms, setCustomBgms] = useState([]); // {id, name, url, fileName}
   const [bgmTimelineStart, setBgmTimelineStart] = useState(0);
   const [bgmTimelineDuration, setBgmTimelineDuration] = useState(10);
@@ -8695,6 +8719,26 @@ function App(){
     }
   };
 
+  // 等パワークロスフェード計算
+  const getCrossfadeDuration = useCallback((clipA, clipB, customDuration=null)=>{
+    if(customDuration !== null) return customDuration;
+    const minDur = Math.min(clipA?.duration||0, clipB?.duration||0);
+    const smart = Math.min(0.25, 0.3 * minDur);
+    // トランジェント回避：0.5秒以下のクリップはさらに短く
+    if(minDur < 0.6) return Math.min(smart, 0.12);
+    return Math.max(0.05, smart);
+  },[]);
+
+  const getCrossfadeAtCut = useCallback((cutIndex)=>{
+    const cf = crossfades[cutIndex];
+    if(cf) return cf;
+    // デフォルト：0.25秒、ON
+    const clipA = clipsRef.current[cutIndex];
+    const clipB = clipsRef.current[cutIndex+1];
+    if(!clipA || !clipB) return {enabled: false, duration: 0};
+    return {enabled: audioCrossfadeEnabled, duration: getCrossfadeDuration(clipA, clipB)};
+  },[crossfades, audioCrossfadeEnabled, getCrossfadeDuration]);
+
   const tick = useCallback(()=>{
     if(!playingRef.current) return;
     const now=performance.now();
@@ -8726,6 +8770,23 @@ function App(){
       state.activeId=null;
       watchPreviewMedia();
     }
+    // Audio Crossfade - 自然に繋ぐ
+    let audioCrossfadeActive = null;
+    let audioCrossfadeProgress = 0;
+    if(audioCrossfadeEnabled && index < clipsNow.length -1){
+      const cf = crossfades[index] !== undefined ? crossfades[index] : {enabled: true, duration: getCrossfadeDuration(active, clipsNow[index+1])};
+      if(cf.enabled && cf.duration > 0.01){
+        const cutTime = active.timelineStart + active.duration;
+        const half = cf.duration / 2;
+        const cfStart = cutTime - half;
+        const cfEnd = cutTime + half;
+        if(t >= cfStart && t <= cfEnd){
+          audioCrossfadeActive = {from: active, to: clipsNow[index+1], duration: cf.duration, start: cfStart, end: cfEnd};
+          audioCrossfadeProgress = Math.max(0, Math.min(1, (t - cfStart) / cf.duration));
+        }
+      }
+    }
+
     const activeTransition=active?._transitionToNext;
     const activeOverlap=activeTransition?.type && activeTransition.type!=='none' && index<clipsNow.length-1
       ? activeTransition.duration||0.5 : 0;
@@ -8743,6 +8804,22 @@ function App(){
       (nextAtOverlapVideo.readyState<2 || nextAtOverlapVideo.seeking);
     if(active?.type==='video' && !activeVideo) waitReasons.push('active-video-missing');
     if(activeVideo){
+      // Audio Crossfade Gain Control
+      if(previewAudioContextRef.current && previewAudioGainsRef.current.has(active.id)){
+        try{
+          const gainEntry = previewAudioGainsRef.current.get(active.id);
+          if(gainEntry && gainEntry.gain){
+            let targetGain = sourceAudioVolume;
+            if(audioCrossfadeActive){
+              // 等パワーカーブ: cos(t * π/2)
+              const t = audioCrossfadeProgress;
+              targetGain = sourceAudioVolume * Math.cos(t * Math.PI / 2);
+            }
+            // スムーズにランプ
+            gainEntry.gain.gain.setTargetAtTime(targetGain, previewAudioContextRef.current.currentTime, 0.01);
+          }
+        }catch{}
+      }
       if(activeVideo.readyState<1 && activeVideo.preload!=='auto' && !activeVideo.error){
         activeVideo.preload='auto';
         try{activeVideo.load();}catch{}
@@ -8785,6 +8862,13 @@ function App(){
       state.activeId=null;
       t+=delta;
     }
+    // Crossfade中は2本ともliveに
+    if(audioCrossfadeActive){
+      try{
+        livePreviewIdsRef.current = new Set([audioCrossfadeActive.from.id, audioCrossfadeActive.to.id]);
+      }catch{}
+    }
+
     // 写真から動画に入ったフレームでも、その動画を先に準備する。
     if(!waiting && active?.type==='photo' && t>=active.timelineStart+active.duration){
       t=active.timelineStart+active.duration;
@@ -8802,6 +8886,26 @@ function App(){
     const transDur=trans?.type && trans.type!=='none' && index<clipsNow.length-1 ? trans.duration||0.5 : 0;
     const overlapStart=active ? active.timelineStart+active.duration-transDur : Infinity;
     const next=transDur ? clipsNow[index+1] : null;
+    // Crossfade時の次のクリップのGain制御
+    if(audioCrossfadeActive && audioCrossfadeActive.to){
+      const nextClip = audioCrossfadeActive.to;
+      const nextVideo = videoRefs.current.get(nextClip.id);
+      if(nextVideo && previewAudioGainsRef.current.has(nextClip.id)){
+        try{
+          const gainEntry = previewAudioGainsRef.current.get(nextClip.id);
+          if(gainEntry && gainEntry.gain){
+            const t = audioCrossfadeProgress;
+            const targetGain = sourceAudioVolume * Math.cos((1-t) * Math.PI / 2);
+            gainEntry.gain.gain.setTargetAtTime(targetGain, previewAudioContextRef.current.currentTime, 0.01);
+          }
+          // 裏で再生しておく（同期ズレ防止）
+          if(nextVideo.paused && nextVideo.readyState >= 2){
+            try{ nextVideo.play().catch(()=>{}); }catch{}
+          }
+        }catch{}
+      }
+    }
+
     let incoming=next?.type==='video' ? videoRefs.current.get(next.id) : null;
     if(incoming?.error){
       const attempts=previewRecoveryRef.current.get(next.id)||0;
@@ -9002,6 +9106,40 @@ function App(){
         refreshPreviewVideo(clip,'tap-error',clip.timelineStart<=timeRef.current+3?'auto':'none');
     });
     previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0};
+    // AudioContext初期化（クロスフェード用）
+    try{
+      if(!previewAudioContextRef.current){
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if(Ctx){
+          previewAudioContextRef.current = new Ctx();
+        }
+      }
+      const ctx = previewAudioContextRef.current;
+      if(ctx){
+        if(ctx.state === 'suspended') ctx.resume().catch(()=>{});
+        // 各videoにGainNodeを接続
+        clipsRef.current.forEach(clip=>{
+          if(clip.type === 'video'){
+            const video = videoRefs.current.get(clip.id);
+            if(video && !previewAudioGainsRef.current.has(clip.id)){
+              try{
+                const source = ctx.createMediaElementSource(video);
+                const gain = ctx.createGain();
+                gain.gain.value = sourceAudioVolume;
+                source.connect(gain);
+                gain.connect(ctx.destination);
+                previewAudioGainsRef.current.set(clip.id, {source, gain});
+                // video自体はミュートしてAudioContext経由で鳴らす
+                video.muted = true;
+              }catch(e){
+                // 既に接続済みの場合などは無視
+              }
+            }
+          }
+        });
+      }
+    }catch(e){ console.warn('AudioContext init failed', e); }
+
     playingRef.current=true;
     setIsPlaying(true);
     tick._last=performance.now();
@@ -9033,6 +9171,14 @@ function App(){
     if(firstVideo){
       firstVideo.playbackRate=playbackRateRef.current;
       livePreviewIdsRef.current=new Set([activeAtStart.id]);
+      // Crossfade用に次のクリップもliveに含めておく（同期ズレ防止）
+      try{
+        const nextIdx = clipsRef.current.findIndex(c=>c.id===activeAtStart.id) + 1;
+        if(nextIdx < clipsRef.current.length && nextIdx >=0){
+          const nextClip = clipsRef.current[nextIdx];
+          if(nextClip) livePreviewIdsRef.current.add(nextClip.id);
+        }
+      }catch{}
       requestPreviewPlay(firstVideo,activeAtStart,'tap-start');
     }
     if(bgmAudioRef.current && bgmTrack!=='none'){
@@ -15985,7 +16131,19 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
         React.createElement('div', {className:'bg-[#111113] rounded-xl p-3 border border-white/10 mb-3'},
           React.createElement('div', {className:'flex items-center justify-between mb-2'},
             React.createElement('div', {className:'text-[11px] text-white/60'}, '素材の音量（元動画の音声）'),
-            React.createElement('div', {className:'text-[11px] font-mono bg-black/50 px-2 py-1 rounded'}, `${Math.round(sourceAudioVolume*100)}%`)
+            React.createElement('div', {className:'flex items-center gap-2'},
+            React.createElement('div', {className:'text-[11px] font-mono bg-black/50 px-2 py-1 rounded'}, `${Math.round(sourceAudioVolume*100)}%`),
+            React.createElement('button', {
+              onClick:()=>setAudioCrossfadeEnabled(v=>!v),
+              className:`text-[10px] px-2 py-1 rounded-full ${audioCrossfadeEnabled?'bg-violet-600 text-white':'bg-white/10 text-white/50'}`,
+              title:'全カット間に0.25秒等パワークロスフェード'
+            }, audioCrossfadeEnabled ? '自然に繋ぐ ON' : '自然に繋ぐ OFF'),
+            React.createElement('button', {
+              onClick:()=>setAmbientBedEnabled(v=>!v),
+              className:`text-[10px] px-2 py-1 rounded-full ${ambientBedEnabled?'bg-emerald-600 text-white':'bg-white/10 text-white/50'}`,
+              title:'カフェの空気感を常時ループ'
+            }, ambientBedEnabled ? '空気感 ON' : '空気感 OFF')
+          )
           ),
           React.createElement('input', {
             type:'range', min:0, max:1, step:0.05, value:sourceAudioVolume,
@@ -16981,7 +17139,14 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             )
           ),
           React.createElement('div', {className:'flex h-[56px] border-b border-white/5'},
-            React.createElement('div', {className:'w-[72px] shrink-0 bg-[#111113] flex items-center px-2 text-[11px] border-r border-white/10 sticky left-0 z-20'}, `CLIPS ${clips.length}`),
+            React.createElement('div', {className:'w-[72px] shrink-0 bg-[#111113] flex items-center px-1 gap-1 text-[10px] border-r border-white/10 sticky left-0 z-20'},
+              React.createElement('span', {}, `CLIPS ${clips.length}`),
+              React.createElement('button', {
+                onClick:()=>setAudioCrossfadeEnabled(v=>!v),
+                className:`ml-1 px-1.5 py-0.5 rounded-full text-[8px] font-bold ${audioCrossfadeEnabled?'bg-violet-600 text-white':'bg-white/10 text-white/50'}`,
+                title: audioCrossfadeEnabled ? '自然に繋ぐ ON：0.25秒等パワー' : '自然に繋ぐ OFF：スパッと切る'
+              }, audioCrossfadeEnabled ? '∩ ON' : '∩ OFF')
+            ),
             React.createElement('div', {className:'flex-1 relative bg-black h-full'},
               React.createElement('div', {
                 ref:timelineEditHorizontalRef,
