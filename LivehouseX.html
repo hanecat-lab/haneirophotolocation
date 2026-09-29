@@ -2781,31 +2781,76 @@
     const GLOW_POSE_KEYS=Object.keys(GLOW_POSES);
     const GLOW_POSE_DEFAULT='penlight_swing_down';
     const glowPoseOf=d=>GLOW_POSES[d&&d.pose]||GLOW_POSES[GLOW_POSE_DEFAULT];
-    /* 人ごとの時刻。既定は全員そろって動く（以前の 3%／0.4秒 のばらつきは
-       依頼で外した）。波を選んだときだけ、立ち位置に応じて遅らせる ―
-       全員が同じ動きのまま、端から順に伝わる。
-       ずらしはここ1か所。軌跡の測定（glowBlurSample）も ?diag=fan も
-       この関数を通るので、絵と数字と診断が自動で揃う。 */
-    const GLOW_WAVE_LAG_MAX=5;     // 端から端までの遅れ[s]（強さ100%のとき）
+    /* 人ごとの時刻。ずらしはここ1か所だけ。
+       ・波: 立ち位置に応じて遅らせる。遅れは「秒」ではなく**周期の倍数**で
+         持つ ― 秒で持つと、周期の違うポーズ（ケチャ 1.85秒／ロマンス 11.0秒）
+         で同じレバーが別物になり、周期を超えると波の山が2個以上見えて
+         「前から1本来る」にならない。
+       ・ゆっくり: 時間の進みを 1/倍率 にする。倍率を変えた瞬間に位相が飛ばない
+         よう、そのときの時計と姿勢の時刻を起点として控える。
+       軌跡の測定（glowBlurSample）も ?diag=fan もこの関数を通るので、
+       絵と数字と診断が自動で揃う。 */
     const GLOW_WAVE_SPAN_Z=9.0;    // 前後に波が渡る距離[m]
     const GLOW_WAVE_SPAN_X=7.2;    // 左右に波が渡る距離[m]。壁から壁まで
+    const GLOW_WAVE_MAX=120;       // 波の強さの上限[周期の%]。100 で端と端が同位相
     const GLOW_WAVE_MODES=[['off','揃う（波なし）'],['depth','前→後ろ'],['side','下手→上手']];
-    const glowWave={mode:'off',amount:35};
-    const glowWaveLag=()=>GLOW_WAVE_LAG_MAX
-      *THREE.MathUtils.clamp(Number(glowWave.amount)||0,0,100)/100;
-    /* その人の遅れ[s]。立ち位置だけで決まる ― 実際に立っている範囲で
-       正規化すると、1人 ON/OFF するたびに残り全員の位相が飛ぶ。 */
+    /* 動きの速さ。1周を何倍に伸ばすか。自由な倍率ではなく整数にするのは、
+       ポーズが拍で組んであるため ― ×2 は「8拍で1周」のように拍のまま読める。 */
+    const GLOW_SLOW_STEPS=[1,2,3,4];
+    const glowWave={mode:'off',amount:35,slow:1};
+    const glowSlow={t:0,p:0};      // ゆっくりの起点（時計の時刻／姿勢の時刻）
+    /* ポーズ1周の秒数。ケチャは表の period が飾り（静止扱い）なので実体を返し、
+       振り下ろしは角速度から出す。連結は繰り返す側の周期を使う。 */
+    function glowPosePeriod(P){
+      if(!P)return 1;
+      if(P.kind==='kecha')return KECHA_PERIOD;
+      if(P.kind==='chain')return glowPosePeriod(P.loop);
+      if(P.w)return 2*Math.PI/P.w;
+      return Number(P.period)>0?Number(P.period):1;
+    }
+    const glowWaveTurns=()=>THREE.MathUtils.clamp(Number(glowWave.amount)||0,0,GLOW_WAVE_MAX)/100;
+    const glowSlowScale=()=>GLOW_SLOW_STEPS.includes(glowWave.slow)?glowWave.slow:1;
+    /* その人の遅れ[姿勢の秒]。立ち位置だけで決まる ― 実際に立っている範囲で
+       正規化すると、1人 ON/OFF するたびに残り全員の位相が飛ぶ。
+       周期はその人のポーズのもの。混ざっていても各自の見え方は変わらない。 */
     function glowFanDelay(i){
       const d=glowFansData[i]; if(!d||glowWave.mode==='off')return 0;
-      const lag=glowWaveLag(); if(!lag)return 0;
+      const turns=glowWaveTurns(); if(!turns)return 0;
       const u=glowWave.mode==='side'
         ? (Number(d.x)||0)/GLOW_WAVE_SPAN_X+.5                    // 下手（−x）が先
         : ((Number(d.z)||0)-GLOW_FAN_Z_MIN)/GLOW_WAVE_SPAN_Z;     // 最前列が先
-      return lag*THREE.MathUtils.clamp(u,0,1);
+      return turns*glowPosePeriod(glowPoseOf(d))*THREE.MathUtils.clamp(u,0,1);
     }
-    const glowFanTime=(t,i)=>t-glowFanDelay(i);
-    const glowWaveText=()=>glowWave.mode==='off'?'全員そろって動く'
-      :`${Math.round(glowWave.amount)}% · 端から端まで ${glowWaveLag().toFixed(2)}秒`;
+    const glowFanTime=(t,i)=>glowSlow.p+(t-glowSlow.t)/glowSlowScale()-glowFanDelay(i);
+    /* 倍率を変える。変えた瞬間の姿勢の時刻をそのまま引き継ぐので、全員が
+       その場から続けて動く（起点を持たないと、動かすたびに位相が飛ぶ）。
+       i に -1 を渡すのは「誰でもない人＝遅れ 0」の意味。 */
+    function setGlowSlow(v){
+      const t=glowClockNow-glowChainStart;
+      glowSlow.p=glowFanTime(t,-1); glowSlow.t=t;
+      glowWave.slow=GLOW_SLOW_STEPS.includes(+v)?+v:1;
+      return glowWave.slow;
+    }
+    /* 読み出し。ON の人の先頭を代表にして、周期を秒へ直す。 */
+    function glowWaveRep(){
+      const d=glowFansData.find(x=>x.on)||glowFansData[0];
+      const P=glowPoseOf(d);
+      return {P,per:glowPosePeriod(P)*glowSlowScale()};
+    }
+    const glowWaveText=()=>{
+      if(glowWave.mode==='off')return '全員そろって動く';
+      const turns=glowWaveTurns(), {per}=glowWaveRep();
+      return `${turns.toFixed(2)}周期ぶん · ${(turns*per).toFixed(1)}秒 · 山 ${turns.toFixed(1)}個`;
+    };
+    /* 遅くするとペンのブレも同じだけ減る（ブレ＝手の速さ×シャッター）。
+       黙って変えると「止まって写る」の原因が分からないので、ここに出す。 */
+    const glowSlowText=()=>{
+      const {P,per}=glowWaveRep();
+      const bpm=Number(board&&board.timeline&&board.timeline.bpm)||KECHA_BPM;
+      const px=glowBlur.px>0?`　ブレ ${glowBlur.px.toFixed(1)}px`:'';
+      return `×${glowSlowScale()} · ${P.label} 1周 ${per.toFixed(2)}秒`
+        +`（${(per/(60/bpm)).toFixed(1)}拍 @${Math.round(bpm)}BPM）${px}`;
+    };
     /* 棒人間を1体組む。全高 1.660m、脚は全高の 48%。
        両腕とも肩にピボット Group を置く。子を肩から伸ばすので、腕の端が
        肩に一致することが構造的に保証される。片方だけ中心座標を手計算した
@@ -3419,13 +3464,19 @@
          出す（レバーの％だけだと、何秒ずれているのか分からない）。 */
       const wave=document.createElement('div');
       wave.className='fan-bulk';
-      wave.innerHTML=`<div class="fan-pose" style="margin:0"><span>波の向き</span>`
+      wave.innerHTML=`<div class="fan-pose" style="margin:0"><span>動きの速さ</span>`
+        +`<select id="fanSlow">`
+        +GLOW_SLOW_STEPS.map(v=>`<option value="${v}"${v===glowSlowScale()?' selected':''}>`
+          +(v===1?'そのまま（×1）':`ゆっくり ×${v}`)+`</option>`).join('')
+        +`</select></div>`
+        +`<div class="hint" id="v-fanSlow" style="margin:4px 0 0">${glowSlowText()}</div>`
+        +`<div class="fan-pose" style="margin:8px 0 0"><span>波の向き</span>`
         +`<select id="fanWaveMode">`
         +GLOW_WAVE_MODES.map(([k,l])=>`<option value="${k}"${k===glowWave.mode?' selected':''}>${l}</option>`).join('')
         +`</select></div>`
-        +`<div class="slider" style="margin:6px 0 0"><div><span>波の強さ</span>`
+        +`<div class="slider" style="margin:6px 0 0"><div><span>波の広がり</span>`
         +`<strong id="v-fanWave">${glowWaveText()}</strong></div>`
-        +`<input type="range" id="fanWave" min="0" max="100" step="1" value="${Math.round(glowWave.amount)}"></div>`;
+        +`<input type="range" id="fanWave" min="0" max="${GLOW_WAVE_MAX}" step="5" value="${Math.round(glowWave.amount)}"></div>`;
       list.appendChild(wave);
       const bulk=document.createElement('div');
       bulk.className='fan-pose fan-bulk';
@@ -3489,7 +3540,14 @@
          つまんでいるレバーが作り直されてドラッグが切れる。 */
       if(abdInp)abdInp.addEventListener('change',()=>{renderGlowFanUI()});
       /* 波。組み直さずに読み出しだけ書き替える（レバーを掴んだまま効く）。 */
-      const waveShow=()=>{const v=document.getElementById('v-fanWave'); if(v)v.textContent=glowWaveText()};
+      const waveShow=()=>{
+        const v=document.getElementById('v-fanWave'); if(v)v.textContent=glowWaveText();
+        const w=document.getElementById('v-fanSlow'); if(w)w.textContent=glowSlowText();
+      };
+      const slowSel=document.getElementById('fanSlow');
+      if(slowSel)slowSel.addEventListener('change',e=>{
+        setGlowSlow(e.currentTarget.value); waveShow(); saveSettings(); refresh();
+      });
       const waveSel=document.getElementById('fanWaveMode');
       if(waveSel)waveSel.addEventListener('change',e=>{
         const k=e.currentTarget.value;
@@ -3582,7 +3640,8 @@
       if(!w||typeof w!=='object')return;
       if(GLOW_WAVE_MODES.some(m=>m[0]===w.mode))glowWave.mode=w.mode;
       const a=Number(w.amount);
-      if(Number.isFinite(a))glowWave.amount=THREE.MathUtils.clamp(Math.round(a),0,100);
+      if(Number.isFinite(a))glowWave.amount=THREE.MathUtils.clamp(Math.round(a),0,GLOW_WAVE_MAX);
+      if(GLOW_SLOW_STEPS.includes(+w.slow))glowWave.slow=+w.slow;
     }
     function sanitizeGlowFans(list){
       if(!Array.isArray(list))return;
@@ -9365,7 +9424,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         /* サブマスターは board の外。bump は押しているあいだだけなので保存しない。 */
         submasters:submastersData.map(s=>({id:s.id,mode:s.mode,target:s.target,pos:s.pos})),
         glowStance:{abd:Math.round(glowAbd*180/Math.PI)},   // 股の角は30人共通
-        glowWave:{mode:glowWave.mode,amount:glowWave.amount},   // 波も30人共通
+        glowWave:{mode:glowWave.mode,amount:glowWave.amount,slow:glowWave.slow},   // 波と速さは30人共通
         mannequinColor:document.querySelector('#mannequinColor').value,
         costumeColor:document.querySelector('#costumeColor').value,
         wbR:whiteBalanceIndex(),
@@ -10866,7 +10925,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         {
           const mode=(GLOW_WAVE_MODES.find(m=>m[0]===glowWave.mode)||[])[1]||glowWave.mode;
           const lags=glowFansData.map((_,k)=>glowFanDelay(k));
-          lines.push(`  波 ${mode} ${Math.round(glowWave.amount)}%`
+          lines.push(`  波 ${mode} ${glowWaveTurns().toFixed(2)}周期`
+            +`  速さ ×${glowSlowScale()}（1周 ${(glowPosePeriod(P)*glowSlowScale()).toFixed(2)}s）`
             +`  この人の遅れ ${glowFanDelay(i).toFixed(3)}s`
             +`  全員の幅 ${Math.min(...lags).toFixed(3)}〜${Math.max(...lags).toFixed(3)}s`);
         }
