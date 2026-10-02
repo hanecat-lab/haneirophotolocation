@@ -8239,11 +8239,14 @@ const syncVlogSplitMedia=(scene,local,getMedia,playing=false,rate=1,onPlay=video
     const target=Math.max(child.trimStart||0,Math.min(end-0.02,
       (child.trimStart||0)+((scene.trimStart||0)+local)*childRate));
     video.playbackRate=rate*childRate;
-    if(video.readyState<2){if(video.preload!=='auto'){video.preload='auto';video.load();}ready=false;continue;}
+    if(video.readyState<2 && video.preload!=='auto'){
+      video.preload='auto';video.load();ready=false;continue;
+    }
+    if(video.readyState<1){ready=false;continue;}
     if(!video.seeking && Math.abs(video.currentTime-target)>(playing?0.35:0.025)){
       try{video.currentTime=target;}catch{}ready=false;
     }
-    if(video.readyState<2 || video.seeking){ready=false;continue;}
+    if(video.readyState<2 || video.seeking){if(playing && video.paused && !video.seeking) onPlay(video,child);ready=false;continue;}
     if(playing && video.paused){onPlay(video,child);ready=false;}
     if(!playing && !video.paused)video.pause();
   }
@@ -8395,6 +8398,7 @@ function App(){
     stallReported:false,waitReason:'',lastErrorKey:'',lastErrorAt:0,mediaEventAt:{}});
   const previewDiagnosticWatchedRef = useRef(new WeakSet());
   const previewPlayPendingRef = useRef(new WeakMap());
+  const previewPlayAttemptAtRef = useRef(new WeakMap());
   const previewDiagnosticTextRef = useRef(null);
   const timeRef = useRef(0);
   const aspectRef = useRef(16/9);
@@ -11155,7 +11159,14 @@ function App(){
     });
   };
   const requestPreviewPlay=(video,clip,phase)=>{
+    if(!playingRef.current) return;
     if(previewPlayPendingRef.current.has(video)) return;
+    if(clip && video.readyState<2 && phase!=='tap-start'){
+      const lastAttempt=previewPlayAttemptAtRef.current.get(video);
+      const now=performance.now();
+      if(lastAttempt!==undefined && now-lastAttempt<300) return;
+      previewPlayAttemptAtRef.current.set(video,now);
+    }
     try{
       const result=video.play();
       if(!result?.then) return;
@@ -11364,6 +11375,8 @@ function App(){
         // 終了済み動画への play() は冒頭から再開し得るため、次の素材へ進む。
         t=active.timelineStart+active.duration;
       }else if(activeVideo.readyState<2 || activeVideo.seeking){
+        if(activeVideo.paused && activeVideo.readyState>=1 && !activeVideo.seeking)
+          requestPreviewPlay(activeVideo,active,'active-tick');
         waiting=true;waitReasons.push(activeVideo.seeking?'active-seeking':'active-not-ready');
       }
       else{
@@ -11472,12 +11485,14 @@ function App(){
       }
       const clipRateIncoming = next._playbackRate || 1;
       incoming.playbackRate=rate * clipRateIncoming;
+      const activeBlocked=waitReasons.some(reason=>
+        ['active-seeking','active-not-ready','active-clock-behind','clip-switch'].includes(reason));
       if(incoming.readyState<2 || incoming.seeking){
+        if(incoming.paused && incoming.readyState>=1 && !incoming.seeking && !activeBlocked)
+          requestPreviewPlay(incoming,next,'incoming-tick');
         waiting=true;waitReasons.push(incoming.seeking?'incoming-seeking':'incoming-not-ready');
       }
       else{
-        const activeBlocked=waitReasons.some(reason=>
-          ['active-seeking','active-not-ready','active-clock-behind','clip-switch'].includes(reason));
         if(incoming.paused && !activeBlocked) requestPreviewPlay(incoming,next,'incoming-tick');
         if(incoming.paused){ waiting=true;waitReasons.push('incoming-paused'); }
       }
