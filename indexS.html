@@ -8597,7 +8597,8 @@ function App(){
   const previewSessionRef = useRef(0);
   const playingRef = useRef(false);
   const livePreviewIdsRef = useRef(new Set());
-  const previewPlaybackRef = useRef({activeId:null, preparedId:null, incomingId:null, bgmDriftSince:0, lastRenderAt:0});
+  const previewPlaybackRef = useRef({activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0,
+    heldTime:null,resumeSyncTargets:new Map(),splitResumePending:new Set()});
   const previewDiagnosticRef = useRef({events:[],lastTime:null,lastClipId:null,lastProgressAt:0,
     stallReported:false,waitReason:'',lastErrorKey:'',lastErrorAt:0,mediaEventAt:{}});
   const previewDiagnosticWatchedRef = useRef(new WeakSet());
@@ -11364,6 +11365,7 @@ function App(){
     // 書き出し用の待機要素はURLをまだ渡さない。preload=noneだけでは読込抑制を保証できない。
     if(phase!=='export-pool') video.src=clip.url;
     videoRefs.current.set(clip.id,video);
+    previewPlaybackRef.current.resumeSyncTargets?.delete(clip.id);
     if(preload==='auto') video.load();
     const previewContext=previewAudioContextRef.current;
     if(phase!=='export-pool' && phase!=='export-restore')
@@ -11520,7 +11522,9 @@ function App(){
     tick._last=now;
     const clipsNow=clipsRef.current;
     const state=previewPlaybackRef.current;
-    let t=timeRef.current;
+    if(!state.resumeSyncTargets) state.resumeSyncTargets=new Map();
+    if(!state.splitResumePending) state.splitResumePending=new Set();
+    let t=state.heldTime===null || state.heldTime===undefined ? timeRef.current : state.heldTime;
     let index=clipsNow.findIndex(clip=>t>=clip.timelineStart && t<clip.timelineStart+clip.duration);
     let active=clipsNow[index];
     const clockClipId=active?.id;
@@ -11622,7 +11626,7 @@ function App(){
       }
       const clipRateActive = active._playbackRate || 1;
       activeVideo.playbackRate=rate * clipRateActive;
-      if(activeVideo.ended){
+      if(activeVideo.ended && (state.heldTime===null || state.heldTime===undefined)){
         // 終了済み動画への play() は冒頭から再開し得るため、次の素材へ進む。
         t=active.timelineStart+active.duration;
       }else if(activeVideo.readyState<2 || activeVideo.seeking){
@@ -11630,7 +11634,7 @@ function App(){
           requestPreviewPlay(activeVideo,active,'active-tick');
         waiting=true;waitReasons.push(activeVideo.seeking?'active-seeking':'active-not-ready');
       }
-      else{
+      else if(state.heldTime===null || state.heldTime===undefined){
         if(activeVideo.paused && !incomingPreparing){
           requestPreviewPlay(activeVideo,active,'active-tick');
         }
@@ -11651,7 +11655,16 @@ function App(){
         }
       }
     }else if(active?._splitScreen){
-      const ready=syncVlogSplitMedia(active,t-active.timelineStart,child=>child.type==='photo'?photoRefs.current.get(child.id):videoRefs.current.get(child.id),true,rate,
+      if(state.heldTime!==null && state.heldTime!==undefined){
+        active._splitScreen.clips.forEach(child=>{
+          const video=child.type==='video'?videoRefs.current.get(child.id):null;
+          if(video?.paused && video.readyState>=1 && video.readyState<2 && !video.seeking)
+            requestPreviewPlay(video,child,'split-resume-decode');
+        });
+      }
+      const splitResumePending=state.splitResumePending.has(active.id);
+      const ready=syncVlogSplitMedia(active,t-active.timelineStart,child=>child.type==='photo'?photoRefs.current.get(child.id):videoRefs.current.get(child.id),
+        state.heldTime===null || state.heldTime===undefined || splitResumePending,rate,
         (video,child)=>requestPreviewPlay(video,child,'split-tick'));
       for(const child of active._splitScreen.clips){
         const video=videoRefs.current.get(child.id),entry=previewAudioGainsRef.current.get(child.id);
@@ -11661,10 +11674,14 @@ function App(){
           video.muted=volume===0;video.volume=volume;
         }
       }
-      if(ready)t+=delta;else{waiting=true;waitReasons.push('active-not-ready');}
+      if(ready){
+        if(splitResumePending) state.splitResumePending.delete(active.id);
+        if(state.heldTime===null || state.heldTime===undefined)t+=delta;
+      }
+        else{waiting=true;waitReasons.push('active-not-ready');}
     }else if(active?.type==='photo'){
       state.activeId=null;
-      t+=delta;
+      if(state.heldTime===null || state.heldTime===undefined)t+=delta;
     }
     // Crossfade中は2本ともliveに
     if(audioCrossfadeActive){
@@ -11703,7 +11720,8 @@ function App(){
             gainEntry.gain.gain.setTargetAtTime(targetGain, previewAudioContextRef.current.currentTime, 0.01);
           }
           // 裏で再生しておく（同期ズレ防止）
-          if(nextVideo.paused && nextVideo.readyState >= 2){
+          if(nextVideo.paused && nextVideo.readyState >= 2 &&
+             (state.heldTime===null || state.heldTime===undefined)){
             try{ nextVideo.play().catch(()=>{}); }catch{}
           }
         }catch{}
@@ -11712,7 +11730,8 @@ function App(){
           Math.cos((1-audioCrossfadeProgress)*Math.PI/2);
         nextVideo.volume=targetGain;
         nextVideo.muted=targetGain===0;
-        if(targetGain>0 && nextVideo.paused && nextVideo.readyState>=2)
+        if(targetGain>0 && nextVideo.paused && nextVideo.readyState>=2 &&
+           (state.heldTime===null || state.heldTime===undefined))
           requestPreviewPlay(nextVideo,nextClip,'crossfade-incoming');
       }
     }
@@ -11764,8 +11783,11 @@ function App(){
         waiting=true;waitReasons.push(incoming.seeking?'incoming-seeking':'incoming-not-ready');
       }
       else{
-        if(incoming.paused && !activeBlocked) requestPreviewPlay(incoming,next,'incoming-tick');
-        if(incoming.paused){ waiting=true;waitReasons.push('incoming-paused'); }
+        if(incoming.paused && !activeBlocked && (state.heldTime===null || state.heldTime===undefined))
+          requestPreviewPlay(incoming,next,'incoming-tick');
+        if(incoming.paused && (state.heldTime===null || state.heldTime===undefined)){
+          waiting=true;waitReasons.push('incoming-paused');
+        }
       }
     }
     const liveIds=new Set();
@@ -11783,30 +11805,136 @@ function App(){
           video.muted=targetGain===0;
         }
       });
-      const ready=syncVlogSplitMedia(next,Math.max(0,t-overlapStart),child=>child.type==='photo'?photoRefs.current.get(child.id):videoRefs.current.get(child.id),true,rate,
+      if(state.heldTime!==null && state.heldTime!==undefined){
+        next._splitScreen.clips.forEach(child=>{
+          const video=child.type==='video'?videoRefs.current.get(child.id):null;
+          if(video?.paused && video.readyState>=1 && video.readyState<2 && !video.seeking)
+            requestPreviewPlay(video,child,'split-incoming-resume-decode');
+        });
+      }
+      const splitResumePending=state.splitResumePending.has(next.id);
+      const ready=syncVlogSplitMedia(next,Math.max(0,t-overlapStart),child=>child.type==='photo'?photoRefs.current.get(child.id):videoRefs.current.get(child.id),
+        state.heldTime===null || state.heldTime===undefined || splitResumePending,rate,
         (video,child)=>requestPreviewPlay(video,child,'split-incoming'));
+      if(ready && splitResumePending) state.splitResumePending.delete(next.id);
       if(!ready){waiting=true;waitReasons.push('incoming-not-ready');}
+    }
+    if(state.heldTime!==null && state.heldTime!==undefined && !waiting){
+      t=state.heldTime;
+      const syncHeldVideo=(clip,video,target,phase,waitReason)=>{
+        if(!clip || !video)return;
+        if(video.readyState<1 || video.seeking){
+          waiting=true;waitReasons.push(video.seeking?`${waitReason}-seeking`:`${waitReason}-not-ready`);
+          return;
+        }
+        const previous=state.resumeSyncTargets.get(clip.id);
+        if(Math.abs(video.currentTime-target)>0.08){
+          if(previous?.video===video && Math.abs(previous.target-target)<=0.025){
+            if(!video.seeking && (previous.attempts||0)<2 && positionPreviewVideo(video,clip,target,phase,0.08))
+              previous.attempts=(previous.attempts||1)+1;
+          }else if(positionPreviewVideo(video,clip,target,phase,0.08)){
+            state.resumeSyncTargets.set(clip.id,{video,target,attempts:1});
+          }
+          if(!video.seeking && Math.abs(video.currentTime-target)<=0.08){
+            state.resumeSyncTargets.delete(clip.id);
+            return;
+          }
+          waiting=true;waitReasons.push(waitReason==='active'?'active-seeking':'incoming-seeking');
+          return;
+        }
+        state.resumeSyncTargets.delete(clip.id);
+      };
+      if(active?.type==='video'){
+        const local=Math.max(0,state.heldTime-active.timelineStart);
+        syncHeldVideo(active,activeVideo,(active.trimStart||0)+local,'resume-sync','active');
+      }
+      if(inOverlap && incoming){
+        const local=Math.max(0,state.heldTime-overlapStart)*(next._playbackRate||1);
+        syncHeldVideo(next,incoming,(next.trimStart||0)+local,'resume-sync-incoming','incoming');
+      }
+      const resumeSplit=(clip,local,reason)=>{
+        if(!clip?._splitScreen)return;
+        state.splitResumePending.add(clip.id);
+        const ready=syncVlogSplitMedia(clip,local,child=>child.type==='photo'?photoRefs.current.get(child.id):videoRefs.current.get(child.id),
+          true,rate,(video,child)=>requestPreviewPlay(video,child,'split-resume'));
+        if(ready) state.splitResumePending.delete(clip.id);
+        else{waiting=true;waitReasons.push(reason);}
+      };
+      if(active?._splitScreen) resumeSplit(active,state.heldTime-active.timelineStart,'active-not-ready');
+      if(inOverlap && next?._splitScreen)
+        resumeSplit(next,Math.max(0,state.heldTime-overlapStart),'incoming-not-ready');
+      if(!waiting){
+        state.heldTime=null;
+        state.resumeSyncTargets.clear();
+      }
     }
     if(active?.type==='video') liveIds.add(active.id);
     if(inOverlap && incoming) liveIds.add(next.id);
     if(audioCrossfadeActive?.to?.type==='video')liveIds.add(audioCrossfadeActive.to.id);
     livePreviewIdsRef.current=liveIds;
-    const stalledMs=trackPreviewProgress(now,t,active,waitReasons.join(','));
+    if(waiting){
+      if(state.heldTime===null || state.heldTime===undefined) state.heldTime=timeRef.current;
+      timeRef.current=state.heldTime;
+      t=state.heldTime;
+    }else{
+      timeRef.current=t;
+    }
+    const stalledMs=trackPreviewProgress(now,timeRef.current,active,waitReasons.join(','));
     if(stalledMs>=15000 && active?.type==='video' &&
        (previewRecoveryRef.current.get(active.id)||0)>0){
       recordPreviewDiagnostic('media-recovery-failed',{clip:active.name,
-        state:previewDiagnosticSnapshot('再読み込み後も15秒間再生が進まない')});
+        state:previewDiagnosticSnapshot('再読み込みも試みたが、再生が15秒間進んでいない')});
       setPreviewDiagnosticNotice(`「${active.name}」の再生が進みません。診断結果を記録してください。`);
       handleStop(false);
       return;
     }
-    if(stalledMs>=4000 && waiting && activeVideo && activeVideo.seeking &&
+    const incomingWaitReason=waitReasons.some(reason=>
+      ['incoming-seeking','incoming-not-ready','incoming-paused'].includes(reason));
+    const incomingRecoveryCount=incoming ? (previewRecoveryRef.current.get(next.id)||0) : 0;
+    if(stalledMs>=15000 && incomingWaitReason && incomingRecoveryCount>0){
+      recordPreviewDiagnostic('media-recovery-failed',{clip:next.name,
+        state:previewDiagnosticSnapshot('incoming動画の再読み込みも試みたが、再生が15秒間進んでいない')});
+      setPreviewDiagnosticNotice(`「${next.name}」の再生が進みません。診断結果を記録してください。`);
+      handleStop(false);
+      return;
+    }
+    const incomingResumeTarget=state.resumeSyncTargets.get(next?.id);
+    const incomingResumeSeekStuck=!!incomingResumeTarget && incomingResumeTarget.video===incoming &&
+      Math.abs(incoming?.currentTime-incomingResumeTarget.target)>0.08;
+    if(stalledMs>=4000 && incomingWaitReason && (incoming?.seeking || incomingResumeSeekStuck) && !incomingRecoveryCount){
+      previewRecoveryRef.current.set(next.id,1);
+      recordPreviewDiagnostic('media-incoming-seek-recovery',{clip:next.name,
+        state:previewDiagnosticSnapshot('incoming動画のシークが4秒終わらないため動画要素を再生成')});
+      refreshPreviewVideo(next,'long-incoming-seek');
+      state.preparedId=null;state.incomingId=null;
+      state.resumeSyncTargets?.delete(next.id);
+      watchPreviewMedia();
+      rafTickRef.current=requestAnimationFrame(tick);
+      return;
+    }
+    if(stalledMs>=10000 && incomingWaitReason && incoming && incoming.readyState<2 &&
+       !incoming.seeking && !incomingRecoveryCount){
+      previewRecoveryRef.current.set(next.id,1);
+      recordPreviewDiagnostic('media-incoming-wait-recovery',{clip:next.name,
+        state:previewDiagnosticSnapshot('incoming動画の読み込み待ちが10秒続いたため動画要素を再生成')});
+      refreshPreviewVideo(next,'long-incoming-wait');
+      state.preparedId=null;state.incomingId=null;
+      state.resumeSyncTargets?.delete(next.id);
+      watchPreviewMedia();
+      rafTickRef.current=requestAnimationFrame(tick);
+      return;
+    }
+    const activeResumeTarget=state.resumeSyncTargets.get(active?.id);
+    const activeResumeSeekStuck=!!activeResumeTarget && activeResumeTarget.video===activeVideo &&
+      Math.abs(activeVideo?.currentTime-activeResumeTarget.target)>0.08;
+    if(stalledMs>=4000 && waiting && activeVideo && (activeVideo.seeking || activeResumeSeekStuck) &&
        !(previewRecoveryRef.current.get(active.id)||0)){
       previewRecoveryRef.current.set(active.id,1);
       recordPreviewDiagnostic('media-seek-recovery',{clip:active.name,
         state:previewDiagnosticSnapshot('シークが4秒終わらないため動画要素を再生成')});
       refreshPreviewVideo(active,'long-seek');
       state.activeId=null;
+      state.resumeSyncTargets.delete(active.id);
       watchPreviewMedia();
       rafTickRef.current=requestAnimationFrame(tick);
       return;
@@ -11843,10 +11971,9 @@ function App(){
       // play()の完了待ちだけなら停止しない。毎フレーム pause/play すると再生が進めない。
       if(mustHold){
         // シーク中・読み込み中の当該要素を pause() すると iOS で完了が遅れる。
-        const activeLoading=waitReasons.some(reason=>
-          ['active-seeking','active-not-ready','active-clock-behind'].includes(reason));
-        const incomingLoading=waitReasons.some(reason=>
-          ['incoming-seeking','incoming-not-ready'].includes(reason));
+        const activeLoading=waitReasons.includes('active-clock-behind') ||
+          !!activeVideo && (activeVideo.seeking || activeVideo.readyState<2);
+        const incomingLoading=!!incoming && (incoming.seeking || incoming.readyState<2);
         if(activeVideo && !activeVideo.paused && !activeLoading) try{ activeVideo.pause(); }catch{}
         if(incoming && !incoming.paused && !incomingLoading) try{ incoming.pause(); }catch{}
       }
@@ -11854,7 +11981,6 @@ function App(){
       rafTickRef.current=requestAnimationFrame(tick);
       return;
     }
-    timeRef.current=t;
     if(t>=durationRef.current-0.02){
       // シークで canplay が再発火する前に、音の再生要求も失効させる。
       handleStop(false);
@@ -12014,7 +12140,8 @@ function App(){
       if(clip.type==='video' && videoRefs.current.get(clip.id)?.error)
         refreshPreviewVideo(clip,'tap-error',clip.timelineStart<=timeRef.current+3?'auto':'none');
     });
-    previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0};
+    previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0,
+      heldTime:null,resumeSyncTargets:new Map(),splitResumePending:new Set()};
     // AudioContext初期化（クロスフェード用）
     let ctx=previewAudioContextRef.current;
     try{
@@ -12055,10 +12182,12 @@ function App(){
         const local=timeRef.current-clip.timelineStart;
         if(local>=0 && local<clip.duration){
           const target=(clip.trimStart||0)+local*(clip._splitGroupId?(clip._playbackRate||1):1);
-          try{ 
-            if(v.ended || Math.abs(v.currentTime-target)>0.04){
-              positionPreviewVideo(v,clip,target,'tap-start',0.04);
+          try{
+            if(v.ended){
+              positionPreviewVideo(v,clip,target,'tap-start',0);
               needsWait=true;
+            }else if(Math.abs(v.currentTime-target)>0.08){
+              if(positionPreviewVideo(v,clip,target,'tap-start',0.08)) needsWait=true;
             }
           }catch{}
         }
@@ -12127,11 +12256,13 @@ function App(){
     previewStartTimerRef.current=0;
     playingRef.current=false;
     livePreviewIdsRef.current=new Set();
-    previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0};
+    previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0,
+      heldTime:null,resumeSyncTargets:new Map(),splitResumePending:new Set()};
     setIsPlaying(false);
     tick._last=0;
     previewDiagnosticRef.current.lastTime=null;
     previewDiagnosticRef.current.stallReported=false;
+    previewDiagnosticRef.current.waitReason='';
     cancelAnimationFrame(rafTickRef.current);
     videoRefs.current.forEach(v=>{ try{ v.pause(); v.playbackRate=1; }catch{} });
     if(bgmAudioRef.current){ try{ bgmAudioRef.current.pause(); bgmAudioRef.current.loop=false; bgmAudioRef.current.playbackRate=1; }catch{} }
