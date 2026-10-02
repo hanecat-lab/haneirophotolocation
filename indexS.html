@@ -9591,6 +9591,7 @@ function App(){
   const [ambientBedEnabled, setAmbientBedEnabled] = useState(false);
   const previewAudioContextRef = useRef(null);
   const previewAudioGainsRef = useRef(new Map()); // clipId -> {source, gain}
+  const previewAudioGraphFailedRef = useRef(new WeakSet());
 
   // バグ修正: クリップ削除時のAudioContextリーク防止ヘルパー
   const cleanupClipAudioResources = useCallback((clipId)=>{
@@ -11087,12 +11088,29 @@ function App(){
       setPreviewDiagnosticCount(count=>count+1);
   };
   const connectPreviewAudioClip=(clip,video,context=previewAudioContextRef.current)=>{
-    if(!clip || !video || !context || context.state==='closed')return null;
+    if(!clip || !video)return null;
+    if(context?.state==='closed'){
+      previewAudioGraphFailedRef.current.add(video);
+      video.muted=true;
+      return null;
+    }
     const existing=previewAudioGainsRef.current.get(clip.id);
     if(existing?.video===video){
       existing.gain.gain.value=vlogClipSourceGain(clip,sourceAudioVolumeRef.current);
-      video.muted=true;
+      // The element's audio is routed through this GainNode. Keep the media
+      // element itself at unity so only the Web Audio gain applies attenuation.
+      video.volume=1;
+      video.muted=false;
       return existing;
+    }
+    // Without Web Audio, preserve the same source/master gain natively. Do not
+    // use this fallback after a graph connection attempt: a routed element can
+    // otherwise leak audio around a disconnected or failed graph.
+    if(!context){
+      const volume=vlogClipSourceGain(clip,sourceAudioVolumeRef.current);
+      video.volume=volume;
+      video.muted=volume===0;
+      return null;
     }
     cleanupClipAudioResources(clip.id);
     try{
@@ -11102,9 +11120,17 @@ function App(){
       source.connect(gain);gain.connect(context.destination);
       const entry={source,gain,video};
       previewAudioGainsRef.current.set(clip.id,entry);
-      video.muted=true;
+      previewAudioGraphFailedRef.current.delete(video);
+      video.volume=1;
+      video.muted=false;
       return entry;
-    }catch{return null;}
+    }catch{
+      // A failed createMediaElementSource may mean this element was routed
+      // previously; keep it silent instead of exposing an uncontrolled path.
+      previewAudioGraphFailedRef.current.add(video);
+      video.muted=true;
+      return null;
+    }
   };
   const refreshPreviewVideo=(clip,phase,preload='auto')=>{
     if(!clip?.url) return null;
@@ -11122,7 +11148,7 @@ function App(){
     videoRefs.current.set(clip.id,video);
     if(preload==='auto') video.load();
     const previewContext=previewAudioContextRef.current;
-    if(phase!=='export-pool' && phase!=='export-restore' && previewContext && previewContext.state!=='closed')
+    if(phase!=='export-pool' && phase!=='export-restore')
       connectPreviewAudioClip(clip,video,previewContext);
     const redraw=()=>{
       if(videoRefs.current.get(clip.id)===video && !playingRef.current && !exportJobRef.current)
@@ -11358,6 +11384,13 @@ function App(){
           }
         }catch{}
       }
+      if(!previewAudioGainsRef.current.has(active.id) &&
+         !previewAudioGraphFailedRef.current.has(activeVideo)){
+        let fallbackGain=vlogClipSourceGain(active,sourceAudioVolumeRef.current);
+        if(audioCrossfadeActive)fallbackGain*=Math.cos(audioCrossfadeProgress*Math.PI/2);
+        activeVideo.volume=fallbackGain;
+        activeVideo.muted=fallbackGain===0;
+      }
       if(activeVideo.readyState<1 && activeVideo.preload!=='auto' && !activeVideo.error){
         activeVideo.preload='auto';
         try{activeVideo.load();}catch{}
@@ -11406,7 +11439,9 @@ function App(){
         const video=videoRefs.current.get(child.id),entry=previewAudioGainsRef.current.get(child.id);
         const volume=active._splitScreen.audioId===child.id?vlogClipSourceGain(child,sourceAudioVolumeRef.current):0;
         if(entry?.gain)entry.gain.gain.value=volume;
-        else if(video){video.muted=volume===0;video.volume=volume;}
+        else if(video && !previewAudioGraphFailedRef.current.has(video)){
+          video.muted=volume===0;video.volume=volume;
+        }
       }
       if(ready)t+=delta;else{waiting=true;waitReasons.push('active-not-ready');}
     }else if(active?.type==='photo'){
@@ -11454,6 +11489,13 @@ function App(){
             try{ nextVideo.play().catch(()=>{}); }catch{}
           }
         }catch{}
+      }else if(nextVideo && !previewAudioGraphFailedRef.current.has(nextVideo)){
+        const targetGain=vlogClipSourceGain(nextClip,sourceAudioVolumeRef.current) *
+          Math.cos((1-audioCrossfadeProgress)*Math.PI/2);
+        nextVideo.volume=targetGain;
+        nextVideo.muted=targetGain===0;
+        if(targetGain>0 && nextVideo.paused && nextVideo.readyState>=2)
+          requestPreviewPlay(nextVideo,nextClip,'crossfade-incoming');
       }
     }
 
@@ -11477,6 +11519,17 @@ function App(){
     }
     const inOverlap=!!next && t>=overlapStart;
     if(inOverlap && incoming){
+      const incomingUsesCrossfade=audioCrossfadeActive?.to?.id===next.id;
+      const incomingGain=vlogClipSourceGain(next,sourceAudioVolumeRef.current);
+      const incomingGainEntry=previewAudioGainsRef.current.get(next.id);
+      if(incomingGainEntry?.gain){
+        if(!incomingUsesCrossfade)
+          incomingGainEntry.gain.gain.setTargetAtTime(incomingGain,
+            previewAudioContextRef.current.currentTime,0.01);
+      }else if(!incomingUsesCrossfade && !previewAudioGraphFailedRef.current.has(incoming)){
+        incoming.volume=incomingGain;
+        incoming.muted=incomingGain===0;
+      }
       if(state.incomingId!==next.id){
         const clipRateNext = next._playbackRate || 1;
         const target=(next.trimStart||0)+Math.max(0,t-overlapStart) * clipRateNext;
@@ -11501,12 +11554,24 @@ function App(){
     if(active?._splitScreen)active._splitScreen.clips.filter(child=>child.type==='video').forEach(child=>liveIds.add(child.id));
     if(inOverlap && next?._splitScreen){
       next._splitScreen.clips.filter(child=>child.type==='video').forEach(child=>liveIds.add(child.id));
+      next._splitScreen.clips.filter(child=>child.type==='video').forEach(child=>{
+        const video=videoRefs.current.get(child.id);
+        const selected=next._splitScreen.audioId===child.id;
+        const targetGain=selected?vlogClipSourceGain(child,sourceAudioVolumeRef.current):0;
+        const entry=previewAudioGainsRef.current.get(child.id);
+        if(entry?.gain)entry.gain.gain.value=targetGain;
+        else if(video && !previewAudioGraphFailedRef.current.has(video)){
+          video.volume=targetGain;
+          video.muted=targetGain===0;
+        }
+      });
       const ready=syncVlogSplitMedia(next,Math.max(0,t-overlapStart),child=>child.type==='photo'?photoRefs.current.get(child.id):videoRefs.current.get(child.id),true,rate,
         (video,child)=>requestPreviewPlay(video,child,'split-incoming'));
       if(!ready){waiting=true;waitReasons.push('incoming-not-ready');}
     }
     if(active?.type==='video') liveIds.add(active.id);
     if(inOverlap && incoming) liveIds.add(next.id);
+    if(audioCrossfadeActive?.to?.type==='video')liveIds.add(audioCrossfadeActive.to.id);
     livePreviewIdsRef.current=liveIds;
     const stalledMs=trackPreviewProgress(now,t,active,waitReasons.join(','));
     if(stalledMs>=15000 && active?.type==='video' &&
@@ -11733,6 +11798,7 @@ function App(){
     });
     previewPlaybackRef.current={activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0};
     // AudioContext初期化（クロスフェード用）
+    let ctx=previewAudioContextRef.current;
     try{
       if(!previewAudioContextRef.current){
         const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -11740,20 +11806,21 @@ function App(){
           previewAudioContextRef.current = new Ctx();
         }
       }
-      const ctx = previewAudioContextRef.current;
+      ctx = previewAudioContextRef.current;
       if(ctx){
         try{ if(ctx.state === 'suspended') ctx.resume().catch(()=>{}); }catch{}
         // バグ修正: 再生前に必ずresumeを試みる（iOSの自動再生ポリシー対策）
         try{ const p=ctx.resume(); if(p && p.catch) p.catch(()=>{}); }catch{}
-        // 各videoにGainNodeを接続
-        vlogMediaClips(clipsRef.current).forEach(clip=>{
-          if(clip.type === 'video'){
-            const video = videoRefs.current.get(clip.id);
-            if(video)connectPreviewAudioClip(clip,video,ctx);
-          }
-        });
       }
     }catch(e){ console.warn('AudioContext init failed', e); }
+    // Configure every source before the tap-start play request, including
+    // native-output fallback when AudioContext creation is unavailable.
+    vlogMediaClips(clipsRef.current).forEach(clip=>{
+      if(clip.type === 'video'){
+        const video = videoRefs.current.get(clip.id);
+        if(video)connectPreviewAudioClip(clip,video,ctx);
+      }
+    });
 
     playingRef.current=true;
     setIsPlaying(true);
