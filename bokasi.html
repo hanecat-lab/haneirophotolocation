@@ -158,7 +158,7 @@ function ynLoadCV(){
   if(!embedded?.textContent?.trim()){reject(Error('HTML内の画像追従エンジンが見つかりません。修正版HTMLを読み込んでください。'));return}
   let finished=false,url;const script=document.createElement('script');
   const timeout=setTimeout(()=>finish(Error('画像追従エンジンの初期化が時間内に完了しませんでした。ページを開き直してください。')),45000);
-  function finish(err,cv){if(finished)return;finished=true;clearTimeout(timeout);if(url)URL.revokeObjectURL(url);script.remove();err?reject(err):resolve({cv})}
+  function finish(err,cv){if(finished)return;finished=true;clearTimeout(timeout);if(url)URL.revokeObjectURL(url);script.remove();if(!err&&cv)delete cv.then;err?reject(err):resolve({cv})}
   try{
    url=URL.createObjectURL(new Blob([embedded.textContent],{type:'text/javascript'}));script.src=url;script.async=true;
    script.onerror=()=>finish(Error('HTML内の画像追従エンジンを起動できませんでした。ページを開き直してください。'));
@@ -170,7 +170,7 @@ function ynLoadCV(){
 // A seek time and the decoded frame PTS are different, especially in variable-rate videos.
 async function ynAnalysisVideo(preview){
  const video=document.createElement('video');video.muted=true;video.playsInline=true;video.preload='auto';video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');video.setAttribute('aria-hidden','true');
- video.style.cssText='position:fixed;left:0;top:0;width:1px;height:1px;opacity:.001;pointer-events:none';document.body.appendChild(video);
+ video.style.cssText='position:fixed;left:0;top:0;width:1px;height:1px;opacity:.1;z-index:2147483646;pointer-events:none';document.body.appendChild(video);
  try{await new Promise((resolve,reject)=>{
   let timer;const clean=()=>{clearTimeout(timer);video.removeEventListener('loadeddata',ready);video.removeEventListener('error',failed)};
   const ready=()=>{if(video.readyState>=2){clean();resolve()}};
@@ -265,6 +265,55 @@ class ynPlaneTracker{
  }
  close(){this.gray?.delete();this.gray=null}
 }
+// Faces deform; fit local translation, rotation and scale rather than a paper homography.
+function ynSimilarity(points,next){
+ const fit=indices=>{let x=0,y=0,u=0,v=0;for(const i of indices){x+=points[i].x;y+=points[i].y;u+=next[i].x;v+=next[i].y}const n=indices.length;x/=n;y/=n;u/=n;v/=n;let den=0,aa=0,bb=0;for(const i of indices){const dx=points[i].x-x,dy=points[i].y-y,du=next[i].x-u,dv=next[i].y-v;den+=dx*dx+dy*dy;aa+=dx*du+dy*dv;bb+=dx*dv-dy*du}if(den<1)return null;const a=aa/den,b=bb/den;return [a,-b,u-a*x+b*y,b,a,v-b*x-a*y,0,0,1]};
+ const evaluate=H=>{const good=[],errors=[];for(let i=0;i<points.length;i++){const p=ynProject(H,points[i]),error=Math.hypot(p.x-next[i].x,p.y-next[i].y);if(error<2){good.push(i);errors.push(error)}}return {H,good,errors}};
+ let best=null;
+ for(let k=0;k<160;k++){const i=k%points.length,j=(Math.floor(k/points.length)*13+i*7+1)%points.length;if(i===j||Math.hypot(points[i].x-points[j].x,points[i].y-points[j].y)<6)continue;const H=fit([i,j]);if(!H)continue;const result=evaluate(H);if(!best||result.good.length>best.good.length||result.good.length===best.good.length&&result.errors.reduce((a,b)=>a+b,0)<best.errors.reduce((a,b)=>a+b,0))best=result}
+ if(!best||best.good.length<6)return null;let H=fit(best.good);if(!H)return null;best=evaluate(H);H=fit(best.good);if(!H)return null;return evaluate(H);
+}
+function ynCompose(a,b){const out=Array(9).fill(0);for(let i=0;i<3;i++)for(let j=0;j<3;j++)for(let k=0;k<3;k++)out[i*3+j]+=a[i*3+k]*b[k*3+j];return out}
+function ynFaceQuadValid(poly,w,h){if(poly?.length!==4||poly.some(p=>!Number.isFinite(p.x+p.y)||p.x<-w*.5||p.x>w*1.5||p.y<-h*.5||p.y>h*1.5)||ynPolyArea(poly)<60)return false;const xs=poly.map(p=>p.x),ys=poly.map(p=>p.y);return Math.max(...xs)>0&&Math.min(...xs)<w&&Math.max(...ys)>0&&Math.min(...ys)<h}
+class ynFaceTracker extends ynPlaneTracker{
+ correct(next,H){if(this.gray!==next){this.gray.delete();this.gray=next}this.H=H;this.lastPlane=this.initial.map(p=>ynProject(H,p));this.current=[];this.reference=[];this.seed(next,this.lastPlane);return {ok:true,H,plane:this.lastPlane,quality:1,features:this.current.length,error:0,recovered:true}}
+
+ seed(gray,plane,merge=false){const center=plane.reduce((a,p)=>({x:a.x+p.x/4,y:a.y+p.y/4}),{x:0,y:0});super.seed(gray,plane.map(p=>({x:center.x+(p.x-center.x)*.6,y:center.y+(p.y-center.y)*.6})),merge)}
+ step(next){
+  const cv=this.cv,objects=[],alloc=m=>(objects.push(m),m),fail=reason=>({ok:false,reason});
+  try{
+   if(this.current.length<8)return fail('顔の特徴点不足');
+   const prevPts=alloc(cv.matFromArray(this.current.length,1,cv.CV_32FC2,this.current.flatMap(p=>[p.x,p.y]))),nextPts=alloc(new cv.Mat()),status=alloc(new cv.Mat()),err=alloc(new cv.Mat()),back=alloc(new cv.Mat()),backStatus=alloc(new cv.Mat()),backErr=alloc(new cv.Mat());
+   const size=new cv.Size(21,21),criteria=new cv.TermCriteria(cv.TermCriteria_EPS|cv.TermCriteria_COUNT,30,0.01);
+   cv.calcOpticalFlowPyrLK(this.gray,next,prevPts,nextPts,status,err,size,3,criteria,0,0.001);cv.calcOpticalFlowPyrLK(next,this.gray,nextPts,back,backStatus,backErr,size,3,criteria,0,0.001);
+   const before=[],after=[];
+   for(let i=0;i<this.current.length;i++){const p={x:nextPts.data32F[i*2],y:nextPts.data32F[i*2+1]},distance=Math.hypot(back.data32F[i*2]-this.current[i].x,back.data32F[i*2+1]-this.current[i].y);if(status.data[i]&&backStatus.data[i]&&distance<1.5&&err.data32F[i]<35&&p.x>=0&&p.y>=0&&p.x<this.w&&p.y<this.h){before.push(this.current[i]);after.push(p)}}
+   if(before.length<8||before.length/this.current.length<.5)return fail('顔の特徴点の対応不足');
+   const result=ynSimilarity(before,after);if(!result||result.good.length<8||result.good.length/before.length<.55)return fail('顔の移動を推定できません');
+   const step=result.H,scale=Math.hypot(step[0],step[3]),angle=Math.abs(Math.atan2(step[3],step[0]));if(scale<.9||scale>1.11||angle>.2)return fail('顔の急な変化・場面切替');
+   const H=ynCompose(step,this.H),quad=this.initial.map(p=>ynProject(H,p));if(!ynFaceQuadValid(quad,this.w,this.h))return fail('顔の範囲が画面外です');
+   const distance=Math.max(...quad.map((p,i)=>Math.hypot(p.x-this.lastPlane[i].x,p.y-this.lastPlane[i].y)));if(distance>Math.max(18,Math.sqrt(Math.abs(ynPolyArea(this.lastPlane)))*.2))return fail('顔の急な移動・場面切替');
+   this.gray.delete();this.gray=next;this.H=H;this.lastPlane=quad;this.current=result.good.map(i=>after[i]);const inv=ynInverse(H);this.reference=this.current.map(p=>ynProject(inv,p));this.count++;
+   if(this.count%5===0||this.current.length<35)this.seed(next,quad,true);
+   result.errors.sort((a,b)=>a-b);return {ok:true,H,plane:quad,quality:result.good.length/before.length,features:result.good.length,error:result.errors[Math.floor(result.errors.length*.9)]||0};
+  }finally{objects.forEach(m=>m.delete())}
+ }
+}
+function ynFaceDetection(detector,source,poly,preferred=null){
+ if(!detector)return null;
+ const xs=poly.map(p=>p.x),ys=poly.map(p=>p.y),w=Math.max(...xs)-Math.min(...xs),h=Math.max(...ys)-Math.min(...ys),cx=(Math.max(...xs)+Math.min(...xs))/2,cy=(Math.max(...ys)+Math.min(...ys))/2;
+ const side=Math.max(w,h)*3.2,x=cx-side/2,y=cy-side/2,size=256,scale=size/side;
+ const canvas=document.createElement('canvas');canvas.width=canvas.height=size;const ctx=canvas.getContext('2d');let best=null;
+ const angles=preferred===null?[0,90,-90,180]:[preferred,...[0,90,-90,180].filter(a=>a!==preferred)];
+ for(const angle of angles){ctx.clearRect(0,0,size,size);ctx.save();ctx.translate(size/2,size/2);ctx.rotate(-angle*Math.PI/180);ctx.translate(-size/2,-size/2);ctx.drawImage(source,x,y,side,side,0,0,size,size);ctx.restore();
+  const detections=detector.detect(canvas)?.detections||[];
+  for(const item of detections){const box=item.boundingBox,score=item.categories?.[0]?.score||0;if(!box||score<.45)continue;const face=ynRestoreFace({x:box.originX,y:box.originY,w:box.width,h:box.height,score},{x,y,sx:scale,sy:scale,angle:-angle*Math.PI/180,cx:size/2,cy:size/2}),distance=Math.hypot(face.x+face.w/2-cx,face.y+face.h/2-cy)/Math.max(w,h),ratio=Math.sqrt(face.w*face.h/(w*h));if(distance>.65||ratio<.3||ratio>1.7)continue;const rank=score-distance*.7;if(!best||rank>best.rank)best={...face,angle,rank};}
+  if(best&&angle===preferred&&best.score>.65)break;
+ }
+ return best;
+}
+function ynDetectionH(base,face){const sx=face.w/base.w,sy=face.h/base.h;return [sx,0,face.x-sx*base.x,0,sy,face.y-sy*base.y,0,0,1]}
+
 function ynMotionPanel(p){
  const btn=(text,fn,disabled=false)=>D('button',{onClick:fn,disabled:disabled||p.busy,className:'yn-button',children:text});
  const group=p.groups.find(g=>g.id===p.selected),frame=group&&ynMotionAt(group,p.time);
@@ -283,6 +332,7 @@ function ynMotionPanel(p){
  p.diagnostic&&G('details',{children:[D('summary',{children:`検出器の入力 · ${p.diagnostic.source} / ${p.diagnostic.time.toFixed(2)}秒（最終タスク）`}),D('p',{children:'下の入力枠と「検出位置」は同じ番号。現在の映像と時刻が異なる場合は「この検出位置へ」を押してください。'}),D('img',{src:p.diagnostic.image,alt:'検出器入力と生の検出枠',style:{width:'100%',maxHeight:220,objectFit:'contain'}}),btn('この検出位置へ',p.diagnosticSeek)]}),
  ]});
 }
+
 
 function As(){let n=E.useRef(null),t=E.useRef(null),e=E.useRef(null),l=E.useRef(null),r=E.useRef(null),u=E.useRef(null),o=E.useRef(null),f=E.useRef(null),c=E.useRef(new Map),h=E.useRef(null),U=E.useRef(-999),V=E.useRef([]),T=E.useRef(null),k=E.useRef(new Map),Z=E.useRef(null),[J,b]=E.useState(0),m=E.useCallback((i)=>Math.round(i*25)/25,[]),p=E.useRef(!1),[S,w]=E.useState(!1),K=E.useRef(null),B=E.useRef(null),q=E.useRef(null),P=E.useRef(null),yn=E.useRef(null),M=E.useRef(null),Rn=E.useRef(null),Ke=E.useRef(null),Fr=E.useRef(null),Bo=E.useRef(null),Pr=E.useRef(null),qo=E.useRef(null),jr=E.useRef(null),Cr=E.useRef(null),Sn=E.useCallback((i,s,y,g=!0)=>{let d=i.current;if(!d)return d=document.createElement("canvas"),d.width=s,d.height=y,i.current=d,d;if(d.width!==s||d.height!==y)d.width=s,d.height=y;else if(g){let N=d.getContext("2d");if(N)N.clearRect(0,0,s,y)}return d},[]),Et=E.useCallback((i)=>{
  const video=n.current,vw=video?.videoWidth||960,vh=video?.videoHeight||540,scale=Math.min(1,640/Math.max(vw,vh)),w=Math.round(vw*scale),h=Math.round(vh*scale);
@@ -362,7 +412,9 @@ const ynMotionAnalyse=async()=>{
  ynBusy.current=true;ynCancel.current=false;ynSetMotionBusy(true);ynSetMotionNotice(true);ynSetEdit(null);preview.pause();xn(false);Dl(0);const session=ynSession.current;let video=null;
  const updated=JSON.parse(JSON.stringify(group));let completed=0;
  try{
-  ynSetMessage('解析用の動画を準備しています…');video=await ynAnalysisVideo(preview);ynSetMessage('画像追従エンジンを読み込んでいます…');const {cv}=await ynLoadCV();if(ynCancel.current)throw Error('中止しました。指定位置は保持しました。');
+  ynSetMessage('解析用の動画を準備しています…');video=await ynAnalysisVideo(preview);if(updated.type==='face'&&!T.current){ynSetMessage('顔検出AIの準備を待っています…');const deadline=performance.now()+90000;while(!T.current&&performance.now()<deadline&&!ynCancel.current)await new Promise(r=>setTimeout(r,100));if(ynCancel.current)throw Error('中止しました。指定位置は保持しました。');if(!T.current)throw Error('顔検出AIを読み込めませんでした。上部のAI読込状態を確認してください。写真の画像追従は顔検出AIなしでも利用できます。')}
+  ynSetMessage('画像追従エンジンを読み込んでいます…');const {cv}=await ynLoadCV();if(ynCancel.current)throw Error('中止しました。指定位置は保持しました。');
+  
   const vw=video.videoWidth,vh=video.videoHeight,minFace=Math.min(...updated.anchors.flatMap(a=>a.faces.map(f=>Math.min(Math.hypot(f.poly[1].x-f.poly[0].x,f.poly[1].y-f.poly[0].y),Math.hypot(f.poly[3].x-f.poly[0].x,f.poly[3].y-f.poly[0].y))))),long=Math.min(1280,Math.max(640,20*Math.max(vw,vh)/minFace)),scale=Math.min(1,long/Math.max(vw,vh)),width=Math.round(vw*scale),height=Math.round(vh*scale),sx=width/vw,sy=height/vh;
   if(minFace*Math.min(sx,sy)<12)throw Error('顔が小さすぎます。より高解像度の素材か、写真を大きく写した素材を使用してください。');
   const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;const ctx=canvas.getContext('2d',{willReadFrequently:true});
@@ -374,12 +426,17 @@ const ynMotionAnalyse=async()=>{
    const anchor=anchors[ai],left=Math.max(from,ai?anchors[ai-1].time:updated.start),right=Math.min(to,ai<anchors.length-1?anchors[ai+1].time:updated.end);if(right<from||left>to)continue;
    for(const direction of [-1,1]){
     const targets=unique.filter(t=>direction<0?t<anchor.time-.0001&&t>=left-.001:t>anchor.time+.0001&&t<=right+.001);if(direction<0)targets.reverse();if(!targets.length)continue;
-    const plane=anchor.plane.map(p=>({x:p.x*sx,y:p.y*sy})),gray=await grab(anchor.time),tracker=new ynPlaneTracker(cv,gray,plane,width,height,updated.type);records.set(gray.ynTimestamp,{...anchor,time:gray.ynTimestamp,ok:true,quality:1,anchor:true,mediaTime:gray.ynTimestamp,exact:gray.ynExact});let lost=false;
+    const plane=anchor.plane.map(p=>({x:p.x*sx,y:p.y*sy})),gray=await grab(anchor.time),tracker=updated.type==='face'?new ynFaceTracker(cv,gray,plane,width,height,updated.type):new ynPlaneTracker(cv,gray,plane,width,height,updated.type),faceSeed=anchor.faces[0].poly.map(p=>({x:p.x*sx,y:p.y*sy})),baseDetection=updated.type==='face'?ynFaceDetection(T.current,canvas,faceSeed):null;let lastDetection=anchor.time;if(updated.type==='face'&&!baseDetection){tracker.close();throw Error('指定位置で顔を確認できませんでした。顔がはっきり映る場面で囲み直してください。')}records.set(gray.ynTimestamp,{...anchor,time:gray.ynTimestamp,ok:true,quality:1,anchor:true,mediaTime:gray.ynTimestamp,exact:gray.ynExact});let lost=false;
     const save=frame=>{frame.observedUntil=frame.requestedTime??frame.time;const old=records.get(frame.time);if(old?.ok&&frame.ok){frame.observedUntil=Math.max(frame.observedUntil,old.observedUntil??old.time);old.observedUntil=frame.observedUntil;}if(old?.ok&&frame.ok){const disagreement=Math.max(...frame.faces.flatMap((f,i)=>f.poly.map((p,j)=>Math.hypot((p.x-old.faces[i].poly[j].x)*sx,(p.y-old.faces[i].poly[j].y)*sy))));if(disagreement>Math.max(2,minFace*Math.min(sx,sy)*.1))records.set(frame.time,{time:frame.time,ok:false,conflict:true});else if(frame.quality>old.quality)records.set(frame.time,frame)}else if(!old?.ok&&!old?.conflict)records.set(frame.time,frame)};
     try{for(const time of targets){
      if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。前回の結果を保持しました。');
-     if(lost){save({time,ok:false});continue}
-     const next=await grab(time,true),mediaTime=next.ynTimestamp,exact=next.ynExact,result=tracker.step(next);if(!result.ok){next.delete();lost=true;save({time:mediaTime,requestedTime:time,ok:false,reason:result.reason})}
+     if(lost&&updated.type!=='face'){save({time,ok:false});continue}
+     const next=await grab(time,true),mediaTime=next.ynTimestamp,exact=next.ynExact;let result=lost?{ok:false,reason:'顔の再検出待ち'}:tracker.step(next);
+     if(updated.type==='face'){
+      if(completed%Math.max(1,Math.round(fps/5))===0||!result.ok){const prediction=faceSeed.map(p=>ynProject(result.ok?result.H:tracker.H,p)),detection=ynFaceDetection(T.current,canvas,prediction,baseDetection.angle);if(detection){const H=ynDetectionH(baseDetection,detection),quad=plane.map(p=>ynProject(H,p));if(ynFaceQuadValid(quad,width,height)){result=tracker.correct(next,H);lastDetection=mediaTime;lost=false}}}
+      if(result.ok&&Math.abs(mediaTime-lastDetection)>.8){result={ok:false,reason:'顔を0.8秒以上確認できませんでした'};lost=true}
+     }
+     if(!result.ok){if(tracker.gray!==next)next.delete();lost=true;save({time:mediaTime,requestedTime:time,ok:false,reason:result.reason})}
      else{const faces=anchor.faces.map(face=>({id:face.id,poly:face.poly.map(p=>{const v=ynProject(result.H,{x:p.x*sx,y:p.y*sy});return {x:v.x/sx,y:v.y/sy}})})),errorLimit=Math.max(.5,minFace*Math.min(sx,sy)*ynPadding*.6);
       if(result.error>errorLimit&&!ynFallback){lost=true;save({time:mediaTime,requestedTime:time,ok:false,reason:'顔の余白に対して追従誤差が大きい'})}
       else save({time:mediaTime,requestedTime:time,mediaTime,exact,ok:true,plane:result.plane.map(p=>({x:p.x/sx,y:p.y/sy})),faces,quality:result.quality,H:result.H,features:result.features,fallback:updated.type==='plane'&&ynFallback&&(result.quality<.75||result.error>errorLimit)});
@@ -392,7 +449,7 @@ const ynMotionAnalyse=async()=>{
   if(!records.size)for(const time of unique)records.set(time,{time,ok:false});
   updated.frames=[...(updated.frames||[]).filter(f=>f.time<from-.001||f.time>to+.001),...records.values()].sort((a,b)=>a.time-b.time);updated.fps=fps;updated.analysisPadding=ynPadding;updated.fallbackPolicy=ynFallback;updated.dirty=null;updated.cacheRevision=updated.revision;updated.workSize={width,height};
   if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。前回の結果を保持しました。');
-  ynGroups.current=ynGroups.current.map(g=>g.id===updated.id?updated:g);ynIssuesRefresh();const issues=ynMotionIssues(updated);ynSetMessage(`画像追従完了 · ${updated.frames.length}位置 / ${fps}fpsの解析間隔 · 要修正${issues.length}区間。元映像と処理範囲を確認してください。`);Dl(100);qs('track');ynSetInspect('tracked');
+  ynGroups.current=ynGroups.current.map(g=>g.id===updated.id?updated:g);ynIssuesRefresh();const issues=ynMotionIssues(updated);ynSetMessage(`${issues.length?'追従に未処理区間があります':'画像追従完了'} · 有効${updated.frames.filter(f=>f.ok).length}/${updated.frames.length}位置 · 要修正${issues.length}区間。${issues.length?'要確認へ移動し、顔の位置を直して再解析してください。':'元映像と処理範囲を確認してください。'}`);Dl(100);qs('track');ynSetInspect('tracked');
  }catch(error){ynSetMessage(error.message)}finally{if(video){video.pause();video.removeAttribute('src');video.load();video.remove()}ynBusy.current=false;ynSetMotionBusy(false);ynRefresh()}
 };
 const ynMotionOverlay=(ctx,time,w,h,autoFaces)=>{
