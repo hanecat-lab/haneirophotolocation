@@ -6566,7 +6566,7 @@ const vlogExportProfileMeasure=(name,run)=>{
   try{return run();}finally{profiler.end(token);}
 };
 const createVlogExportDrawProfiler=()=>{
-  const stack=[],metrics=new Map(),backendCalls={webgl:0,cpu:0},fallbackErrors=new Set(),contexts=new Map();
+  const stack=[],metrics=new Map(),backendCalls={webgl:0,cpu:0,backgroundCpu:0},fallbackErrors=new Set(),contexts=new Map();
   const sampleLimit=512;
   const add=(name,exclusiveMs)=>{
     let metric=metrics.get(name);
@@ -6592,6 +6592,7 @@ const createVlogExportDrawProfiler=()=>{
       return {scope:'synchronous drawFrame work; timings exclude nested measured stages',sampleLimit,
         percentileMethod:'p50/p95 use up to the most recent 512 samples per stage; totalMs/count cover every sample',
         timingCaveat:'WebGL drawSubmit measures synchronous API submission on the main thread, not GPU completion',
+        backendScope:'canvas filter backend; backgroundCpu is intentional grading of the small blur image',
         backendCalls:{...backendCalls},fallbackErrors:[...fallbackErrors],contexts:[...contexts.values()],
         stages:Object.fromEntries([...metrics].map(([name,m])=>[
           name,{count:m.count,totalMs:Number(m.totalMs.toFixed(2)),p50Ms:Number(percentile(m.samples,.5).toFixed(2)),
@@ -6816,7 +6817,9 @@ const createVlogFilterRenderer=()=>{
   return (canvas,steps)=>{
     if(gl.isContextLost())throw new Error('WebGL context lost');
     if(surface.width!==canvas.width||surface.height!==canvas.height){
-      surface.width=canvas.width;surface.height=canvas.height;gl.viewport(0,0,surface.width,surface.height);
+      vlogExportProfileMeasure('filter.webgl.resize',()=>{
+        surface.width=canvas.width;surface.height=canvas.height;gl.viewport(0,0,surface.width,surface.height);
+      });
     }
     gl.bindTexture(gl.TEXTURE_2D,texture);
     vlogExportProfileMeasure('filter.webgl.upload',()=>gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,canvas));
@@ -6830,6 +6833,26 @@ const createVlogFilterRenderer=()=>{
     });
   };
 };
+// CPU色処理を背景とフォールバックで共有する。色相行列は各画素で再計算しない。
+const prepareVlogCpuFilterSteps=steps=>{
+  const cpuSteps=steps.map(([kind,value])=>{
+    if(kind!==6)return [kind,value];
+    const c=Math.cos(value*Math.PI/180),s=Math.sin(value*Math.PI/180);
+    return [kind,value,c,s,[
+      .213+.787*c-.213*s,.715-.715*c-.715*s,.072-.072*c+.928*s,
+      .213-.213*c+.143*s,.715+.285*c+.140*s,.072-.072*c-.283*s,
+      .213-.213*c-.787*s,.715-.715*c+.715*s,.072+.928*c+.072*s
+    ]];
+  });
+  return cpuSteps;
+};
+const applyVlogPixelsFilter=(image,cpuSteps)=>{
+  const data=image.data;
+  for(let i=0;i<data.length;i+=4)vlogFilterColor(data,i,cpuSteps);
+  return image;
+};
+const vlogBackgroundCpuFilterSteps=prepareVlogCpuFilterSteps(
+  parseVlogFilter('brightness(0.88) saturate(0.62) sepia(0.06)'));
 let vlogFilterRenderer, vlogFilterFallbackReason=null;
 const applyVlogCanvasFilter=(canvas,css)=>{
   return vlogExportProfileMeasure('filter.apply',()=>{
@@ -6850,20 +6873,9 @@ const applyVlogCanvasFilter=(canvas,css)=>{
   vlogExportDrawProfiler?.noteBackend('cpu');
   if(vlogFilterRenderer===null)vlogExportDrawProfiler?.noteFallbackError(vlogFilterFallbackReason||'WebGL unavailable');
   const ctx=canvas.getContext('2d');
-  const image=vlogExportProfileMeasure('filter.cpu.read',()=>ctx.getImageData(0,0,canvas.width,canvas.height)),data=image.data;
-  // 色相回転の行列は全画素で同じ。式・演算順・各段階のclampを保ち、1回だけ計算する。
-  const cpuSteps=steps.map(([kind,value])=>{
-    if(kind!==6)return [kind,value];
-    const c=Math.cos(value*Math.PI/180),s=Math.sin(value*Math.PI/180);
-    return [kind,value,c,s,[
-      .213+.787*c-.213*s,.715-.715*c-.715*s,.072-.072*c+.928*s,
-      .213-.213*c+.143*s,.715+.285*c+.140*s,.072-.072*c-.283*s,
-      .213-.213*c-.787*s,.715-.715*c+.715*s,.072+.928*c+.072*s
-    ]];
-  });
-  vlogExportProfileMeasure('filter.cpu.pixels',()=>{
-    for(let i=0;i<data.length;i+=4)vlogFilterColor(data,i,cpuSteps);
-  });
+  const image=vlogExportProfileMeasure('filter.cpu.read',()=>ctx.getImageData(0,0,canvas.width,canvas.height));
+  const cpuSteps=prepareVlogCpuFilterSteps(steps);
+  vlogExportProfileMeasure('filter.cpu.pixels',()=>applyVlogPixelsFilter(image,cpuSteps));
   vlogExportProfileMeasure('filter.cpu.write',()=>ctx.putImageData(image,0,0));
   });
 };
@@ -6935,12 +6947,17 @@ const drawVlogBlurredBackground=(ctx,media,cw,ch,x,y,width,height,radius)=>{
   sourceCtx.imageSmoothingQuality='high';
   sourceCtx.filter='none';
   sourceCtx.fillStyle=getMoodPaperColor();
-  sourceCtx.fillRect(0,0,smallW,smallH);
-  sourceCtx.drawImage(media,x*smallW/cw,y*smallH/ch,width*smallW/cw,height*smallH/ch);
-  try{applyVlogCanvasFilter(source,'brightness(0.88) saturate(0.62) sepia(0.06)');}
-  catch{} // 色処理に失敗しても、背景のぼかしを維持する。
+  vlogExportProfileMeasure('blur.sourceDraw',()=>{
+    sourceCtx.fillRect(0,0,smallW,smallH);
+    sourceCtx.drawImage(media,x*smallW/cw,y*smallH/ch,width*smallW/cw,height*smallH/ch);
+  });
   try{
     const image=vlogExportProfileMeasure('blur.read',()=>sourceCtx.getImageData(0,0,smallW,smallH));
+    // 背景は最大96x256。ぼかし用の画素で同じ色式を処理し、WebGLへの往復を省く。
+    try{
+      vlogExportProfileMeasure('blur.colorPixels',()=>applyVlogPixelsFilter(image,vlogBackgroundCpuFilterSteps));
+      vlogExportDrawProfiler?.noteBackend('backgroundCpu');
+    }catch{} // 色処理に失敗しても、背景のぼかしを継続する。
     // 幅640の旧ぼかし量を基準にし、出力解像度が変わっても画面に対する強さをそろえる。
     blurVlogBackgroundPixels(image,smallW,smallH,radius*1.4*smallW/640);
     vlogExportProfileMeasure('blur.write',()=>sourceCtx.putImageData(image,0,0));
@@ -6953,13 +6970,13 @@ const drawVlogBlurredBackground=(ctx,media,cw,ch,x,y,width,height,radius)=>{
   smoothCtx.imageSmoothingEnabled=true;
   smoothCtx.imageSmoothingQuality='high';
   smoothCtx.filter='none';
-  smoothCtx.drawImage(source,0,0,smoothW,smoothH);
+  vlogExportProfileMeasure('blur.upscale',()=>smoothCtx.drawImage(source,0,0,smoothW,smoothH));
 
   ctx.save();
   ctx.filter='none';
   ctx.imageSmoothingEnabled=true;
   ctx.imageSmoothingQuality='high';
-  ctx.drawImage(smooth,0,0,cw,ch);
+  vlogExportProfileMeasure('blur.composite',()=>ctx.drawImage(smooth,0,0,cw,ch));
   ctx.restore();
   });
 };
@@ -8454,16 +8471,16 @@ const drawVlogSideBySideFrame=(canvas,scene,getMedia,filterId,intensity)=>{
       const cover=Math.max(pane.width/mw,pane.height/mh)*1.4;
       drawVlogBlurredBackground(pc,media,pane.width,pane.height,(pane.width-mw*cover)/2,(pane.height-mh*cover)/2,mw*cover,mh*cover,child.type==='photo'?40:32);
     }
-    pc.drawImage(media,placement.drawX,placement.drawY,placement.drawWidth,placement.drawHeight);pc.restore();
+    vlogExportProfileMeasure('material.foregroundDraw',()=>pc.drawImage(media,placement.drawX,placement.drawY,placement.drawWidth,placement.drawHeight));pc.restore();
     if(hasLightCorrection(child._light)){const pixels=pc.getImageData(0,0,pane.width,pane.height);pc.putImageData(correctLightPixels(pixels,child._light),0,0);}
     applyVlogCanvasFilter(pane,getClipPreviewFilter(child,filterId,intensity));
-    bandCtx.drawImage(pane,placement.bandOffset,0);
+    vlogExportProfileMeasure('material.composite',()=>bandCtx.drawImage(pane,placement.bandOffset,0));
   });
   ctx.save();ctx.filter='none';ctx.globalAlpha=1;
   const cover=Math.max(width/band.width,height/band.height)*1.4;
   drawVlogBlurredBackground(ctx,band,width,height,(width-band.width*cover)/2,(height-band.height*cover)/2,band.width*cover,band.height*cover,
     scene._splitScreen.clips.every(child=>child.type==='photo')?40:32);
-  ctx.drawImage(band,bounds.bandX,bounds.bandY);
+  vlogExportProfileMeasure('material.composite',()=>ctx.drawImage(band,bounds.bandX,bounds.bandY));
   if(hasLightCorrection(scene._light)){const pixels=ctx.getImageData(0,0,width,height);ctx.putImageData(correctLightPixels(pixels,scene._light),0,0);}
   ctx.restore();return true;
 };
@@ -8490,12 +8507,12 @@ const drawVlogSplitFrame=(canvas,scene,getMedia,filterId='none',intensity=100)=>
     const freeY=Math.max(0,paneHeight-mh*fit);
     const foregroundY=freeY*(scene._splitScreen.centered?(index?0.25:0.75):0.5);
     pc.save();pc.filter='none';pc.globalAlpha=1;
-    pc.drawImage(media,(width-mw*fit)/2,foregroundY,mw*fit,mh*fit);pc.restore();
+    vlogExportProfileMeasure('material.foregroundDraw',()=>pc.drawImage(media,(width-mw*fit)/2,foregroundY,mw*fit,mh*fit));pc.restore();
     if(hasLightCorrection(child._light)){
       const pixels=pc.getImageData(0,0,width,paneHeight);pc.putImageData(correctLightPixels(pixels,child._light),0,0);
     }
     applyVlogCanvasFilter(pane,getClipPreviewFilter(child,filterId,intensity));
-    ctx.drawImage(pane,0,top);
+    vlogExportProfileMeasure('material.composite',()=>ctx.drawImage(pane,0,top));
   });
   if(hasLightCorrection(scene._light)){
     const pixels=ctx.getImageData(0,0,width,height);ctx.putImageData(correctLightPixels(pixels,scene._light),0,0);
@@ -10356,7 +10373,7 @@ function App(){
         const kusumi=kusumiFilterRef.current;
         if(kusumi)applyVlogCanvasFilter(surface,kusumi==='mauve'?'sepia(0.8) hue-rotate(-25deg) saturate(2.2) brightness(1.15) contrast(0.9)':'sepia(0.7) hue-rotate(55deg) saturate(1.9) brightness(1.12) contrast(0.92)');
         const target=c.getContext('2d');target.save();target.globalAlpha=alpha;
-        target.drawImage(surface,offsetX+(cw-cw*scale)/2,offsetY+(ch-ch*scale)/2,cw*scale,ch*scale);target.restore();
+        vlogExportProfileMeasure('material.composite',()=>target.drawImage(surface,offsetX+(cw-cw*scale)/2,offsetY+(ch-ch*scale)/2,cw*scale,ch*scale));target.restore();
         return true;
       }
       const isPhoto = clip.type==='photo';
@@ -10395,7 +10412,7 @@ function App(){
             outputCtx.save();
             outputCtx.filter=creativeFilter;
             outputCtx.globalAlpha=1;
-            outputCtx.drawImage(lightCanvas,0,0);
+            vlogExportProfileMeasure('material.composite',()=>outputCtx.drawImage(lightCanvas,0,0));
             outputCtx.restore();
           }
           if(separateTransitionFilters){
@@ -10403,7 +10420,7 @@ function App(){
             const compositeCtx=c.getContext('2d');
             compositeCtx.save();
             compositeCtx.filter='none';compositeCtx.globalAlpha=1;
-            compositeCtx.drawImage(outputSurface,0,0);
+            vlogExportProfileMeasure('material.composite',()=>compositeCtx.drawImage(outputSurface,0,0));
             compositeCtx.restore();
           }
           return true;
@@ -10494,7 +10511,7 @@ function App(){
               if(ir > targetAspect){ sh = ih; sw = ih * targetAspect; sx = (iw - sw)/2; sy = 0; }
               else { sw = iw; sh = iw / targetAspect; sx = 0; sy = (ih - sh)/2; }
               dw=cw*zoom; dh=ch*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY;
-              ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+              vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh));
               return finishClip();
             } else {
               if(ir>cr){ dh=ch*zoom; dw=ch*ir*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY; }
@@ -10518,10 +10535,10 @@ function App(){
             ctx.shadowColor='rgba(0,0,0,0.18)';
             ctx.shadowBlur=24;
             ctx.shadowOffsetY=8;
-            ctx.drawImage(img,dx,dy,dw,dh);
+            vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(img,dx,dy,dw,dh));
             ctx.restore();
           } else {
-            ctx.drawImage(img,dx,dy,dw,dh);
+            vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(img,dx,dy,dw,dh));
           }
           return finishClip();
         } else {
@@ -10593,7 +10610,7 @@ function App(){
               let sx, sy, sw, sh;
               if(vr > targetAspect){ sh = vh; sw = vh * targetAspect; sx = (vw - sw)/2; sy = 0; }
               else { sw = vw; sh = vw / targetAspect; sx = 0; sy = (vh - sh)/2; }
-              ctx.drawImage(v, sx, sy, sw, sh, dx, dy, dw, dh);
+              vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(v, sx, sy, sw, sh, dx, dy, dw, dh));
               return finishClip();
             } else {
               if(vr>cr){ dh=ch*scale; dw=ch*vr*scale; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY; }
@@ -10613,10 +10630,10 @@ function App(){
             ctx.shadowColor='rgba(0,0,0,0.18)';
             ctx.shadowBlur=24;
             ctx.shadowOffsetY=8;
-            ctx.drawImage(v,dx,dy,dw,dh);
+            vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(v,dx,dy,dw,dh));
             ctx.restore();
           } else {
-            ctx.drawImage(v,dx,dy,dw,dh);
+            vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(v,dx,dy,dw,dh));
           }
           return finishClip();
         }
