@@ -769,6 +769,10 @@
     function tagHighlightSubject(root){if(root?.traverse)root.traverse(o=>o.layers.enable(HIGHLIGHT_SUBJECT_LAYER));return root}
     camera.position.set(0,.84,6.4);
     const controls=new OrbitControls(camera,renderer.domElement); controls.target.set(0,1.10,0); controls.enableDamping=true; controls.enablePan=true; controls.enableRotate=false; controls.screenSpacePanning=true; controls.zoomToCursor=true; controls.mouseButtons.RIGHT=THREE.MOUSE.PAN; controls.minPolarAngle=THREE.MathUtils.degToRad(8); controls.maxPolarAngle=THREE.MathUtils.degToRad(120); controls.minDistance=.65; controls.maxDistance=28;
+    /* 俯瞰では図面が入る高さまで引く必要があるので、この上限を一時的に外す。
+       外さないと controls.update() が毎フレーム 28m へ引き戻す ― 以前の
+       俯瞰が「高さ48m以上」と書いてあるのに実測 27.5m だったのはこれが原因。 */
+    const CONTROLS_MAX_DISTANCE=controls.maxDistance;
     renderer.domElement.addEventListener('contextmenu',e=>e.preventDefault());
     const CAMERA_PRESETS={
       audience:{position:[0,.84,8.5],target:[0,1.10,0]},
@@ -3985,18 +3989,117 @@
       ceiling.visible=camera.position.y<2.75;
       wall.visible=camera.position.z>-2.85;
     }
-    const markerMaterial=new THREE.MeshBasicMaterial({color:'#ffd65c',transparent:true,opacity:.92,depthTest:false,depthWrite:false});
+    /* fog:false ― 図面は 200m 上から見るので、霧を通すと全部その色に沈む
+       （実測で図面が丸ごと消えた）。toneMapped:false も同じ理由。 */
+    const markerMaterial=new THREE.MeshBasicMaterial({color:'#ffd65c',transparent:true,opacity:.92,depthTest:false,depthWrite:false,toneMapped:false,fog:false});
     const positionMarker=new THREE.Group();positionMarker.name='ShootingPositionMarker';positionMarker.visible=false;scene.add(positionMarker);
-    const markerRing=new THREE.Mesh(new THREE.RingGeometry(.18,.31,32),markerMaterial);markerRing.rotation.x=-Math.PI/2;markerRing.renderOrder=20;positionMarker.add(markerRing);
-    const markerBeam=new THREE.Mesh(new THREE.CylinderGeometry(.018,.018,1.25,8),markerMaterial);markerBeam.position.y=.625;markerBeam.renderOrder=20;positionMarker.add(markerBeam);
-    const markerHead=new THREE.Mesh(new THREE.SphereGeometry(.095,16,10),markerMaterial);markerHead.position.y=1.25;markerHead.renderOrder=20;positionMarker.add(markerHead);
+    const markerRing=new THREE.Mesh(new THREE.RingGeometry(.18,.31,32),markerMaterial);markerRing.rotation.x=-Math.PI/2;markerRing.renderOrder=50;positionMarker.add(markerRing);
+    const markerBeam=new THREE.Mesh(new THREE.CylinderGeometry(.018,.018,1.25,8),markerMaterial);markerBeam.position.y=.625;markerBeam.renderOrder=50;positionMarker.add(markerBeam);
+    const markerHead=new THREE.Mesh(new THREE.SphereGeometry(.095,16,10),markerMaterial);markerHead.position.y=1.25;markerHead.renderOrder=50;positionMarker.add(markerHead);
     const positionArrow=new THREE.ArrowHelper(new THREE.Vector3(0,0,-1),new THREE.Vector3(0,.035,0),.82,'#ffd65c',.22,.12);positionMarker.add(positionArrow);
-    positionArrow.line.material.depthTest=false;positionArrow.line.material.transparent=true;positionArrow.line.material.opacity=.92;positionArrow.line.renderOrder=20;
-    positionArrow.cone.material.depthTest=false;positionArrow.cone.material.transparent=true;positionArrow.cone.material.opacity=.92;positionArrow.cone.renderOrder=20;
+    positionArrow.line.material.depthTest=false;positionArrow.line.material.transparent=true;positionArrow.line.material.opacity=.92;positionArrow.line.renderOrder=50;
+    positionArrow.line.material.fog=false;positionArrow.line.material.toneMapped=false;
+    positionArrow.cone.material.depthTest=false;positionArrow.cone.material.transparent=true;positionArrow.cone.material.opacity=.92;positionArrow.cone.renderOrder=50;
+    positionArrow.cone.material.fog=false;positionArrow.cone.material.toneMapped=false;
     // 俯瞰ビュー用の撮影视錐台。撮影時の焦点距離とアスペクト比から水平FOVを再現する。
-    const shootingFrustumMat=new THREE.LineBasicMaterial({color:'#ffd65c',transparent:true,opacity:.72,depthTest:false,depthWrite:false});
+    const shootingFrustumMat=new THREE.LineBasicMaterial({color:'#ffd65c',transparent:true,opacity:.72,depthTest:false,depthWrite:false,toneMapped:false,fog:false});
     const shootingFrustumGeo=new THREE.BufferGeometry();
-    const shootingFrustum=new THREE.LineSegments(shootingFrustumGeo,shootingFrustumMat);shootingFrustum.name='ShootingFrustum';shootingFrustum.visible=false;shootingFrustum.renderOrder=19;scene.add(shootingFrustum);
+    const shootingFrustum=new THREE.LineSegments(shootingFrustumGeo,shootingFrustumMat);shootingFrustum.name='ShootingFrustum';shootingFrustum.visible=false;shootingFrustum.renderOrder=48;scene.add(shootingFrustum);
+    /* ===== 俯瞰の図面 =====================================================
+       俯瞰を「会場を真上から撮った写真」として出すのをやめ、図面として描く。
+       真上から見ると舞台照明は床をほとんど照らさないので、写真のままだと
+       ほぼ真っ黒になる（実測）。ここでは照明を通さない平らな塗り（Basic）で
+       床・ステージ・壁・PA卓・バー・モニターの輪郭を重ね、その上に
+       演者と観客を記号で置く。人は上から見ると 6px ほどにしかならないので、
+       3Dの姿のままでは位置が読めない。 */
+    const MAP_PLAN_Y=6.2;            // 図面を描く高さ[m]。会場の造作より上
+    const MAP_PLAN_MARK_PX=34;       // 自分のマーカーの画面上の直径[px]
+    const MAP_PLAN_FIT=.92;          // 会場を画面の何割に収めるか
+    const MAP_PLAN_FOV=10;           // 俯瞰の画角[°]。狭いほど平行投影に近い
+    const mapPlan=new THREE.Group();mapPlan.name='MapPlan';mapPlan.visible=false;scene.add(mapPlan);
+    /* 図面の1枚。y は重なり順（大きいほど上）。 */
+    function planRect(w,d,x,z,color,opacity,order){
+      const m=new THREE.Mesh(new THREE.PlaneGeometry(w,d),
+        /* toneMapped:false ― 図面は写真ではないので、露出のトーンマップを
+           通さない。通すと暗い現場では図面ごと黒く潰れる（実測で真っ黒）。 */
+        new THREE.MeshBasicMaterial({color,transparent:true,opacity,depthTest:false,depthWrite:false,toneMapped:false,fog:false}));
+      m.rotation.x=-Math.PI/2;m.position.set(x,MAP_PLAN_Y+order*.01,z);m.renderOrder=30+order;
+      mapPlan.add(m);return m;
+    }
+    function planLine(pts,color,opacity,order){
+      const g=new THREE.BufferGeometry().setFromPoints(
+        pts.map(([x,z])=>new THREE.Vector3(x,MAP_PLAN_Y+order*.01,z)));
+      const l=new THREE.Line(g,new THREE.LineBasicMaterial({color,transparent:true,opacity,depthTest:false,depthWrite:false,toneMapped:false,fog:false}));
+      l.renderOrder=30+order;mapPlan.add(l);return l;
+    }
+    /* 名札。画面上の大きさを一定にするので、板ではなくスプライトで作る。 */
+    function planLabel(text,x,z,color){
+      const c=document.createElement('canvas');c.width=256;c.height=64;
+      const g=c.getContext('2d');
+      g.font='600 34px ui-monospace,SFMono-Regular,Menlo,monospace';
+      g.textAlign='center';g.textBaseline='middle';g.fillStyle=color;g.fillText(text,128,34);
+      const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),
+        transparent:true,depthTest:false,depthWrite:false,opacity:.95,toneMapped:false,fog:false}));
+      sp.position.set(x,MAP_PLAN_Y+.1,z);sp.renderOrder=46;mapPlan.add(sp);
+      sp.userData.planLabel=true;return sp;
+    }
+    const MAP_FLOOR_Z0=STAGE_FRONT, MAP_FLOOR_Z1=STAGE_FRONT+24.8;   // 客席床の実寸
+    const MAP_WALL_X=3.72;
+    {
+      /* 下地。これで下の暗い会場を完全に隠す（図面の背景）。 */
+      planRect(MAP_WALL_X*2+1.6,MAP_FLOOR_Z1-(STAGE_Z-STAGE_D/2)+2.4,0,
+        (MAP_FLOOR_Z1+STAGE_Z-STAGE_D/2)/2,'#11181a',1,0);
+      planRect(8.4,MAP_FLOOR_Z1-MAP_FLOOR_Z0,0,(MAP_FLOOR_Z0+MAP_FLOOR_Z1)/2,'#1e282a',1,1);  // 客席床
+      planRect(STAGE_W,STAGE_D,0,STAGE_Z,'#33403f',1,2);                                      // ステージ
+      planLine([[-STAGE_W/2,STAGE_FRONT],[STAGE_W/2,STAGE_FRONT]],'#ffd65c',.75,3);           // ステージ前端
+      [-1,1].forEach(side=>planLine([[side*MAP_WALL_X,STAGE_Z-STAGE_D/2],[side*MAP_WALL_X,MAP_FLOOR_Z1]],'#7a8f91',.95,3));
+      planRect(.65,3.2,BAR_X,BAR_Z,'#44382c',1,4);          // バーカウンター
+      planRect(1.6,1.2,PA_X,PA_Z,'#2d3a46',1,4);            // PAブース
+      [-0.9,0.9].forEach(x=>planRect(.55,.45,x,STAGE_Z+1.35,'#4c5456',1,4));   // 返しモニター
+      /* 5m ごとの目盛り。縮尺が一定（ほぼ平行投影）なので距離が読める。 */
+      for(let z=0;z<=25;z+=5)
+        planLine([[-MAP_WALL_X,z],[MAP_WALL_X,z]],'#44565a',z===0?.95:.6,5);
+      planLabel('ステージ',0,STAGE_Z-STAGE_D/2+.6,'#cfd8d6');
+      planLabel('最前',-MAP_WALL_X-1.0,STAGE_FRONT+.4,'#8e9a98');
+      planLabel('PA',PA_X,PA_Z-1.3,'#8e9a98');
+      planLabel('バー',BAR_X,BAR_Z-2.2,'#8e9a98');
+      for(let z=5;z<=25;z+=5)planLabel(z+'m',-MAP_WALL_X-.9,z,'#6c7a79');
+    }
+    /* 演者と観客の記号。観客は人数ぶんの入れ物を1度だけ作る。 */
+    const planSubject=new THREE.Mesh(new THREE.CircleGeometry(.5,24),
+      new THREE.MeshBasicMaterial({color:'#ffb4c4',transparent:true,opacity:.95,depthTest:false,depthWrite:false,toneMapped:false,fog:false}));
+    planSubject.rotation.x=-Math.PI/2;planSubject.renderOrder=42;mapPlan.add(planSubject);
+    const planFanMat=new THREE.MeshBasicMaterial({color:'#39ffb0',transparent:true,opacity:.8,depthTest:false,depthWrite:false,toneMapped:false,fog:false});
+    const planFanGeo=new THREE.CircleGeometry(.5,12);
+    const planFans=[];
+    /* 画角の楔の塗り。線だけだと「どこまで入るか」が読めない。 */
+    const planWedge=new THREE.Mesh(new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({color:'#ffd65c',transparent:true,opacity:.14,depthTest:false,depthWrite:false,side:THREE.DoubleSide,toneMapped:false,fog:false}));
+    planWedge.renderOrder=44;planWedge.visible=false;mapPlan.add(planWedge);
+    /* 1px が何メートルか。マーカーと名札を画面基準の大きさにするのに使う。 */
+    function mapWorldPerPixel(){
+      const h=Math.max(1,renderer.domElement.clientHeight);
+      return 2*(camera.position.y-MAP_PLAN_Y)*Math.tan(THREE.MathUtils.degToRad(camera.fov)/2)/h;
+    }
+    function updateMapPlan(){
+      if(cameraMode!=='map'){mapPlan.visible=false;return}
+      mapPlan.visible=true;
+      const wpp=mapWorldPerPixel();
+      planSubject.position.set(SUBJECT.x,MAP_PLAN_Y+.042,SUBJECT.z);
+      planSubject.scale.setScalar(wpp*16/.5);           // 直径32px
+      /* 観客。ON の人だけ出す。足りなければ作り足す（上限は人数ぶん）。 */
+      glowFansData.forEach((d,i)=>{
+        let m=planFans[i];
+        if(!m){m=new THREE.Mesh(planFanGeo,planFanMat);m.rotation.x=-Math.PI/2;m.renderOrder=41;
+          mapPlan.add(m);planFans[i]=m}
+        m.visible=!!d.on;
+        if(!d.on)return;
+        m.position.set(d.x,MAP_PLAN_Y+.04,d.z);
+        m.scale.setScalar(wpp*5/.5);                   // 直径10px
+      });
+      mapPlan.children.forEach(o=>{if(o.userData.planLabel)o.scale.set(wpp*128,wpp*32,1)});
+      positionMarker.scale.setScalar(wpp*MAP_PLAN_MARK_PX/.62);
+    }
     function shootingLookState(){
       if(cameraMode==='map'&&mapReturnState){
         const p=new THREE.Vector3().fromArray(mapReturnState.position),t=new THREE.Vector3().fromArray(mapReturnState.target);
@@ -4045,19 +4148,28 @@
     }
     function updateShootingFrustum(){
       if(!shootingFrustum)return;
-      if(cameraMode!=='map'||!mapReturnState){shootingFrustum.visible=false;return}
+      if(cameraMode!=='map'||!mapReturnState){shootingFrustum.visible=false;planWedge.visible=false;return}
       const state=shootingLookState(),origin=state.position.clone();
-      origin.y=shootingFloorY(origin.x,origin.z)+.045;
+      origin.y=MAP_PLAN_Y+.05;
       const forward=state.target.clone().sub(state.position);forward.y=0;
       if(forward.lengthSq()<1e-8)forward.set(0,0,-1);else forward.normalize();
       const right=new THREE.Vector3(-forward.z,0,forward.x).normalize();
       const vFov=THREE.MathUtils.degToRad(frameVerticalFov(focalLength));
       const hFov=2*Math.atan(Math.tan(vFov/2)*Math.max(.2,shootingAspect));
-      const length=5.2,halfWidth=Math.min(12,length*Math.tan(hFov/2));
+      /* 長さは固定値ではなく「演者まで」。固定 5.2m だと、客席中央(8.5m)から
+         でも楔が演者に届かず、何が入るのか読めなかった。演者より手前に
+         立っているときは最低 3m は伸ばす。 */
+      const toSubject=new THREE.Vector3(SUBJECT.x-origin.x,0,SUBJECT.z-origin.z);
+      const length=THREE.MathUtils.clamp(toSubject.dot(forward),3,34);
+      const halfWidth=length*Math.tan(hFov/2);
       const farCenter=origin.clone().addScaledVector(forward,length);
       const left=farCenter.clone().addScaledVector(right,-halfWidth),rightPt=farCenter.clone().addScaledVector(right,halfWidth);
       const pts=[origin,left,origin,rightPt,left,rightPt];
       shootingFrustum.geometry.setFromPoints(pts);shootingFrustum.geometry.computeBoundingSphere();shootingFrustum.visible=true;
+      /* 塗り。線だけだと「どこまで入るか」が読めない。 */
+      const fill=[origin.clone(),left.clone(),rightPt.clone()].map(v=>{v.y=MAP_PLAN_Y+.035;return v});
+      planWedge.geometry.setFromPoints(fill);planWedge.geometry.computeBoundingSphere();
+      planWedge.visible=true;
     }
     function shootingFloorY(x,z){
       const onStage=Math.abs(x)<=STAGE_W/2&&z>=STAGE_Z-STAGE_D/2&&z<=STAGE_FRONT;
@@ -4081,7 +4193,9 @@
     function syncMapShootingMarker(){
       if(cameraMode!=='map'||!mapReturnState)return;
       const state=mapShootingVectors();if(!state)return;
-      positionMarker.position.set(state.position.x,shootingFloorY(state.position.x,state.position.z),state.position.z);
+      updateMapPlan();
+      /* 図面の上へ置く。床の高さのままだと、図面の塗りに隠れる。 */
+      positionMarker.position.set(state.position.x,MAP_PLAN_Y+.06,state.position.z);
       const forward=new THREE.Vector3(state.delta.x,0,state.delta.z);if(forward.lengthSq()<1e-8)forward.set(0,0,-1);else forward.normalize();
       positionArrow.setDirection(forward);
       updateShootingFrustum();
@@ -4125,28 +4239,44 @@
       if(shell)shell.classList.toggle('map-view',cameraMode==='map');
       if(button){button.classList.toggle('active',cameraMode==='map');button.textContent=cameraMode==='map'?'↩ 撮影画面へ戻る':'⌖ 撮影位置を俯瞰';}
     }
+    /* 図面を画面へ収める。入るのは会場の造作（ステージ奥〜客席の最後尾、
+       壁から壁）＋余白で、撮影位置がその外にあるときはそこまで広げる。
+       画面の縦は世界の Z（camera.up を −Z にしているため）。
+       画角を狭くして高いところから見るのは、縮尺を場所によらず一定にする
+       ため ― 27m上からの広角だと、背の高い造作が外へ倒れて図面にならない。 */
+    function fitPositionMapCamera(){
+      const z0=Math.min(STAGE_Z-STAGE_D/2-1.5,camera.position.z-1.5);
+      const z1=Math.max(MAP_FLOOR_Z1+1.5,camera.position.z+1.5);
+      const x0=Math.min(-MAP_WALL_X-1.2,camera.position.x-1.2);
+      const x1=Math.max(MAP_WALL_X+1.2,camera.position.x+1.2);
+      const mapX=(x0+x1)/2,mapZ=(z0+z1)/2;
+      const aspect=Math.max(.2,camera.aspect);
+      const tan=Math.tan(THREE.MathUtils.degToRad(MAP_PLAN_FOV)/2);
+      const height=Math.max((z1-z0)/MAP_PLAN_FIT,(x1-x0)/MAP_PLAN_FIT/aspect)/(2*tan)+MAP_PLAN_Y;
+      controls.maxDistance=Math.max(CONTROLS_MAX_DISTANCE,(height-MAP_PLAN_Y)*1.3);
+      camera.position.set(mapX,height,mapZ);controls.target.set(mapX,MAP_PLAN_Y,mapZ);
+      camera.fov=MAP_PLAN_FOV;camera.near=Math.max(1,height*.2);camera.far=height*2+40;
+      camera.updateProjectionMatrix();
+    }
         function enterPositionMap(){
       if(cameraMode==='map')return;
       controls.update();
-      shootingAspect=camera.aspect;
+      /* 楔は「写真に入る範囲」なので、キャンバスの比ではなく**枠の比**で測る。
+         ここを camera.aspect にしていたため、縦位置(3:4)のとき楔が約2倍
+         広く描かれていた。撮影画面側の syncShootingAspect と同じ式にする。 */
+      shootingAspect=frameAspect()||camera.aspect;
       mapReturnState={preset:cameraPresetId,position:camera.position.toArray(),target:controls.target.toArray(),aspect:shootingAspect};
       positionMarker.visible=true;
-      const BAR_Z_EXT = (typeof BAR_Z!=='undefined'?BAR_Z:22.2);
-      const PA_Z_EXT = (typeof PA_Z!=='undefined'?PA_Z:22.5);
-      const PA_X_EXT = (typeof PA_X!=='undefined'?PA_X:-3.0);
-      const VENUE_MIN_Z = Math.min(STAGE_Z-STAGE_D/2, BAR_Z_EXT-3.0, PA_Z_EXT-3.0);
-      const VENUE_MAX_Z = Math.max(STAGE_FRONT, BAR_Z_EXT+4.0, PA_Z_EXT+4.0);
-      const VENUE_MIN_X = Math.min(-STAGE_W/2-2.0, PA_X_EXT-2.0, BAR_X-1.5);
-      const VENUE_MAX_X = Math.max(STAGE_W/2+2.0, BAR_X+1.5, PA_X_EXT+2.0);
-      const minX=Math.min(VENUE_MIN_X,camera.position.x),maxX=Math.max(VENUE_MAX_X,camera.position.x);
-      const minZ=Math.min(VENUE_MIN_Z,camera.position.z),maxZ=Math.max(VENUE_MAX_Z,camera.position.z);
-      const mapX=(minX+maxX)/2,mapZ=(minZ+maxZ)/2,mapHeight=Math.max(48,(maxZ-minZ)*1.8,(maxX-minX)*3.0);
       cameraMode='map';controls.enabled=false;camera.up.set(0,0,-1);
-      camera.position.set(mapX,mapHeight,mapZ);controls.target.set(mapX,-.2,mapZ);applyPhysicalLens(24,camera,false);controls.update();syncPositionMapUI();syncMapShootingMarker();
+      fitPositionMapCamera();controls.update();syncPositionMapUI();updateMapPlan();syncMapShootingMarker();
     }
     function exitPositionMap(restore=true){
       const saved=mapReturnState;
       cameraMode='fps';controls.enabled=true;camera.up.set(0,1,0);
+      // 俯瞰で広げた near/far と引きの上限を戻す（戻さないと手前が切れる）
+      camera.near=.1;camera.far=120;camera.updateProjectionMatrix();
+      controls.maxDistance=CONTROLS_MAX_DISTANCE;
+      mapPlan.visible=false;
       if(restore&&saved){camera.position.fromArray(saved.position);controls.target.fromArray(saved.target);cameraPresetId=saved.preset;}
       applyPhysicalLens(focalLength);controls.update();positionMarker.visible=false;shootingFrustum.visible=false;mapReturnState=null;syncPositionMapUI();
       if(restore)saveSettings();
@@ -11097,7 +11227,10 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     function resize(){
       const w=host.clientWidth,h=host.clientHeight;
       camera.aspect=w/h;
-      if(cameraMode==='map')applyPhysicalLens(35,camera,false);else{syncShootingAspect();applyPhysicalLens(focalLength)}
+      /* 俯瞰では図面の縮尺を測り直す。ここで通常のレンズを入れ直すと、
+         図面用に決めた高さと画角が壊れる。 */
+      if(cameraMode==='map'){fitPositionMapCamera();updateMapPlan()}
+      else{syncShootingAspect();applyPhysicalLens(focalLength)}
       updateFrameOverlay();
       updateShootingFrustum();
       renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.setSize(w,h);resizeHighlightTargets(w,h);
