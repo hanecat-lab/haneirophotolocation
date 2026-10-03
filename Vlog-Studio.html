@@ -6881,10 +6881,42 @@ const applyVlogCanvasFilter=(canvas,css)=>{
 };
 // Canvas の SVG フィルター対応に依存せず、素材だけを同じ画素処理で着色する。
 // サムネイルの紙色や文字を巻き込まないよう、透明な一時面で処理する。
-const drawVlogDarkCinemaMaterial=(ctx,source,x,y,width,height,css)=>{
+// 回転は素材の描画だけに適用し、字幕やフレームは回転させない。
+const vlogClipRotation=clip=>{
+  const value=Number(clip?._rotation);
+  return Number.isFinite(value)?((Math.round(value/90)*90)%360+360)%360:0;
+};
+const vlogMediaDimensions=(media,clip)=>{
+  const width=media?.videoWidth||media?.naturalWidth||media?.width||0;
+  const height=media?.videoHeight||media?.naturalHeight||media?.height||0;
+  return vlogClipRotation(clip)%180?{width:height,height:width}:{width,height};
+};
+// クロップ座標は回転後の素材を基準とする。追加の全解像度Canvasは作らない。
+const drawVlogMedia=(ctx,media,clip,...args)=>{
+  const angle=vlogClipRotation(clip);
+  if(!angle){ctx.drawImage(media,...args);return;}
+  const cropped=args.length===8;
+  let source=cropped?args.slice(0,4):null;
+  const [x,y,width,height]=args.slice(cropped?4:0);
+  if(cropped){
+    const [sx,sy,sw,sh]=source;
+    const raw=vlogMediaDimensions(media,null);
+    source=angle===90?[sy,raw.height-sx-sw,sh,sw]:angle===180?
+      [raw.width-sx-sw,raw.height-sy-sh,sw,sh]:[raw.width-sy-sh,sx,sh,sw];
+  }
+  ctx.save();
+  try{
+    ctx.translate(x+width/2,y+height/2);ctx.rotate(angle*Math.PI/180);
+    const w=angle%180?height:width,h=angle%180?width:height;
+    if(cropped)ctx.drawImage(media,...source,-w/2,-h/2,w,h);
+    else ctx.drawImage(media,-w/2,-h/2,w,h);
+  }finally{ctx.restore();}
+};
+
+const drawVlogDarkCinemaMaterial=(ctx,source,x,y,width,height,css,clip=null)=>{
   const surface=document.createElement('canvas');
   surface.width=Math.max(1,Math.ceil(width));surface.height=Math.max(1,Math.ceil(height));
-  surface.getContext('2d').drawImage(source,0,0,surface.width,surface.height);
+  drawVlogMedia(surface.getContext('2d'),source,clip,0,0,surface.width,surface.height);
   applyVlogCanvasFilter(surface,css);
   ctx.filter='none';ctx.drawImage(surface,x,y,width,height);
 };
@@ -6935,7 +6967,7 @@ const blurVlogBackgroundPixels=(image,width,height,sigma)=>{
   for(let p=0,i=0;p<count;p+=3,i+=4){data[i]=pixels[p];data[i+1]=pixels[p+1];data[i+2]=pixels[p+2];}
   });
 };
-const drawVlogBlurredBackground=(ctx,media,cw,ch,x,y,width,height,radius)=>{
+const drawVlogBlurredBackground=(ctx,media,cw,ch,x,y,width,height,radius,clip=null)=>{
   return vlogExportProfileMeasure('blur.background',()=>{
   const reduction=Math.min(1,96/cw,256/ch);
   const smallW=Math.max(1,Math.round(cw*reduction));
@@ -6949,7 +6981,7 @@ const drawVlogBlurredBackground=(ctx,media,cw,ch,x,y,width,height,radius)=>{
   sourceCtx.fillStyle=getMoodPaperColor();
   vlogExportProfileMeasure('blur.sourceDraw',()=>{
     sourceCtx.fillRect(0,0,smallW,smallH);
-    sourceCtx.drawImage(media,x*smallW/cw,y*smallH/ch,width*smallW/cw,height*smallH/ch);
+    drawVlogMedia(sourceCtx,media,clip,x*smallW/cw,y*smallH/ch,width*smallW/cw,height*smallH/ch);
   });
   try{
     const image=vlogExportProfileMeasure('blur.read',()=>sourceCtx.getImageData(0,0,smallW,smallH));
@@ -7932,10 +7964,11 @@ async function captureMaterialEdge(clip,edge,signal,localTime=null,filter='none'
     context.fillStyle=frameSize?.background||'#09090b';context.fillRect(0,0,canvas.width,canvas.height);
     const darkCinema=filter.includes('url(#vlog-dark-cinema-');
     context.filter=darkCinema?'none':filter;
-    const ratio=Math.min(canvas.width/video.videoWidth,canvas.height/video.videoHeight);
-    const width=video.videoWidth*ratio,height=video.videoHeight*ratio;
-    if(darkCinema)drawVlogDarkCinemaMaterial(context,video,(canvas.width-width)/2,(canvas.height-height)/2,width,height,filter);
-    else context.drawImage(video,(canvas.width-width)/2,(canvas.height-height)/2,width,height);
+    const dimensions=vlogMediaDimensions(video,clip);
+    const ratio=Math.min(canvas.width/dimensions.width,canvas.height/dimensions.height);
+    const width=dimensions.width*ratio,height=dimensions.height*ratio;
+    if(darkCinema)drawVlogDarkCinemaMaterial(context,video,(canvas.width-width)/2,(canvas.height-height)/2,width,height,filter,clip);
+    else drawVlogMedia(context,video,clip,(canvas.width-width)/2,(canvas.height-height)/2,width,height);
     return canvas.toDataURL('image/jpeg',0.7);
   }finally{
     video.pause();video.removeAttribute('src');try{video.load();}catch{}
@@ -7967,10 +8000,12 @@ async function captureTextPlacementFrame(clip,time,caption,texts,filter,signal){
   ctx.save();
   const darkCinema=clip.type==='photo' && filter.includes('url(#vlog-dark-cinema-');
   ctx.filter=clip.type==='photo' && !darkCinema?filter:'none';
-  const ratio=Math.min(width/img.naturalWidth,height/img.naturalHeight);
-  const w=img.naturalWidth*ratio,h=img.naturalHeight*ratio;
-  if(darkCinema)drawVlogDarkCinemaMaterial(ctx,img,(width-w)/2,(height-h)/2,w,h,filter);
-  else ctx.drawImage(img,(width-w)/2,(height-h)/2,w,h);
+  const photoClip=clip.type==='photo'?clip:null;
+  const dimensions=vlogMediaDimensions(img,photoClip);
+  const ratio=Math.min(width/dimensions.width,height/dimensions.height);
+  const w=dimensions.width*ratio,h=dimensions.height*ratio;
+  if(darkCinema)drawVlogDarkCinemaMaterial(ctx,img,(width-w)/2,(height-h)/2,w,h,filter,photoClip);
+  else drawVlogMedia(ctx,img,photoClip,(width-w)/2,(height-h)/2,w,h);
   ctx.restore();
   for(const txt of [...texts, ...(caption?[caption]:[])]){
     drawVlogCaption(ctx,txt,width,height);
@@ -8319,7 +8354,7 @@ function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
           React.createElement('div',{className:'w-10 h-10 shrink-0 rounded-md bg-black overflow-hidden flex items-center justify-center text-[9px] text-white/50 text-center'},
             frames[sourceFrameKey]===null ? '画像を確認できません'
               : (source.type==='photo'?source.url:frames[sourceFrameKey])
-                ? React.createElement('img',{src:source.type==='photo'?source.url:frames[sourceFrameKey],alt:source.name,onError:()=>setFrames(prev=>({...prev,[sourceFrameKey]:null})),className:'w-full h-full object-cover'})
+                ? React.createElement(VlogRotatedMedia,{as:'img',clip:source.type==='photo'?source:null,src:source.type==='photo'?source.url:frames[sourceFrameKey],alt:source.name,onError:()=>setFrames(prev=>({...prev,[sourceFrameKey]:null})),className:'w-full h-full object-cover'})
                 : '映像を準備中'),
           React.createElement('div',{className:'min-w-0 flex-1'},
             React.createElement('div',{className:'text-[10px] text-violet-200'},`移動中 · 元${originalIndex+1}番目 → 仮${currentIndex+1}番目 / ${clips.length}件`),
@@ -8340,8 +8375,8 @@ function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
           React.createElement('div',null,`全体の長さ：${materialTimelineEnd(clips).toFixed(1)}秒 → ${materialTimelineEnd(draftItems).toFixed(1)}秒${Math.abs(durationChange)<0.05?'（変更なし）':''}`),
           React.createElement('div',{className:'text-white/45 mt-1'},'素材付きテキストは一緒に移動。全体テキストとBGMの時刻は固定。')),
         React.createElement('div',{className:`rounded-xl bg-black mb-2 overflow-hidden ${trial?'h-28':'h-0'}`},
-          trial?.clip.type==='photo' && React.createElement('img',{src:trial.clip.url,alt:trial.clip.name,className:'w-full h-full object-contain'}),
-          React.createElement('video',{ref:trialVideoRef,muted:true,playsInline:true,className:`w-full h-full object-contain ${trial?.clip.type==='video'?'':'hidden'}`})),
+          trial?.clip.type==='photo' && React.createElement(VlogRotatedMedia,{as:'img',clip:trial.clip,src:trial.clip.url,alt:trial.clip.name,className:'w-full h-full object-contain'}),
+          React.createElement(VlogRotatedMedia,{as:'video',clip:trial?.clip,ref:trialVideoRef,muted:true,playsInline:true,className:`w-full h-full object-contain ${trial?.clip.type==='video'?'':'hidden'}`})),
         trial && React.createElement('div',{className:'text-xs text-white/60 mb-2 truncate'},`試写中：${trial.clip.name} ${trial.edge==='last'?'末尾':'冒頭'}`),
         trialNotice && React.createElement('div',{role:'status',className:'text-xs text-amber-200 mb-2'},trialNotice),
         React.createElement('div',{className:'text-xs font-bold mt-4 mb-1'},'仮の並び · 素材の間をタップして移動'),
@@ -8462,16 +8497,16 @@ const drawVlogSideBySideFrame=(canvas,scene,getMedia,filterId,intensity)=>{
   if(band.width!==bounds.bandWidth||band.height!==bounds.bandHeight){band.width=bounds.bandWidth;band.height=bounds.bandHeight;}
   const bandCtx=band.getContext('2d');bandCtx.filter='none';bandCtx.globalAlpha=1;
   scene._splitScreen.clips.forEach((child,index)=>{
-    const media=getMedia(child),mw=media.videoWidth||media.naturalWidth,mh=media.videoHeight||media.naturalHeight;
+    const media=getMedia(child),{width:mw,height:mh}=vlogMediaDimensions(media,child);
     const placement=vlogSplitSidePlacement(scene,index,mw,mh,width,height),pane=surfaces.panes[index];
     if(pane.width!==placement.width||pane.height!==placement.height){pane.width=placement.width;pane.height=placement.height;}
     const pc=pane.getContext('2d');pc.save();pc.filter='none';pc.globalAlpha=1;
     pc.fillStyle=getMoodPaperColor();pc.fillRect(0,0,pane.width,pane.height);
     if(vlogSplitFraming(scene,child.id).contain){
       const cover=Math.max(pane.width/mw,pane.height/mh)*1.4;
-      drawVlogBlurredBackground(pc,media,pane.width,pane.height,(pane.width-mw*cover)/2,(pane.height-mh*cover)/2,mw*cover,mh*cover,child.type==='photo'?40:32);
+      drawVlogBlurredBackground(pc,media,pane.width,pane.height,(pane.width-mw*cover)/2,(pane.height-mh*cover)/2,mw*cover,mh*cover,child.type==='photo'?40:32,child);
     }
-    vlogExportProfileMeasure('material.foregroundDraw',()=>pc.drawImage(media,placement.drawX,placement.drawY,placement.drawWidth,placement.drawHeight));pc.restore();
+    vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(pc,media,child,placement.drawX,placement.drawY,placement.drawWidth,placement.drawHeight));pc.restore();
     if(hasLightCorrection(child._light)){const pixels=pc.getImageData(0,0,pane.width,pane.height);pc.putImageData(correctLightPixels(pixels,child._light),0,0);}
     applyVlogCanvasFilter(pane,getClipPreviewFilter(child,filterId,intensity));
     vlogExportProfileMeasure('material.composite',()=>bandCtx.drawImage(pane,placement.bandOffset,0));
@@ -8500,14 +8535,14 @@ const drawVlogSplitFrame=(canvas,scene,getMedia,filterId='none',intensity=100)=>
     const paneHeight=index?height-top:Math.floor(height/2);
     if(pane.width!==width || pane.height!==paneHeight){pane.width=width;pane.height=paneHeight;}
     const pc=pane.getContext('2d'),media=getMedia(child);
-    const mw=media.videoWidth||media.naturalWidth,mh=media.videoHeight||media.naturalHeight;
+    const {width:mw,height:mh}=vlogMediaDimensions(media,child);
     const cover=Math.max(width/mw,paneHeight/mh)*1.4;
-    drawVlogBlurredBackground(pc,media,width,paneHeight,(width-mw*cover)/2,(paneHeight-mh*cover)/2,mw*cover,mh*cover,child.type==='photo'?40:32);
+    drawVlogBlurredBackground(pc,media,width,paneHeight,(width-mw*cover)/2,(paneHeight-mh*cover)/2,mw*cover,mh*cover,child.type==='photo'?40:32,child);
     const fit=Math.min(width/mw,paneHeight/mh);
     const freeY=Math.max(0,paneHeight-mh*fit);
     const foregroundY=freeY*(scene._splitScreen.centered?(index?0.25:0.75):0.5);
     pc.save();pc.filter='none';pc.globalAlpha=1;
-    vlogExportProfileMeasure('material.foregroundDraw',()=>pc.drawImage(media,(width-mw*fit)/2,foregroundY,mw*fit,mh*fit));pc.restore();
+    vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(pc,media,child,(width-mw*fit)/2,foregroundY,mw*fit,mh*fit));pc.restore();
     if(hasLightCorrection(child._light)){
       const pixels=pc.getImageData(0,0,width,paneHeight);pc.putImageData(correctLightPixels(pixels,child._light),0,0);
     }
@@ -8617,7 +8652,7 @@ function VlogSplitPreview({scene,activeFilter='none',intensity=100,audible=false
       e.preventDefault();e.stopPropagation();skipClickRef.current=true;
       const child=scene._splitScreen.clips[index],media=sourcesRef.current.get(child.id);
       onSelectSource?.(child.id);
-      const mw=media?.videoWidth||media?.naturalWidth,mh=media?.videoHeight||media?.naturalHeight;
+      const {width:mw,height:mh}=vlogMediaDimensions(media,child);
       if(!mw||!mh)return;
       dragRef.current={pointerId:e.pointerId,id:child.id,startX:e.clientX,startY:e.clientY,scale:point.scale,
         origin:vlogSplitFraming(scene,child.id),placement:vlogSplitSidePlacement(scene,index,mw,mh,canvas.width,canvas.height)};
@@ -8645,7 +8680,7 @@ const vlogMaterialKindLabel=(clip,media)=>{
   if(clip._splitScreen) return vlogSplitLabel(clip);
   if(clip.type==='photo') return '写真';
   // 描画と同じ表示寸法を使う。ファイル名や未回転の符号化寸法では判定しない。
-  const width=media?.videoWidth,height=media?.videoHeight;
+  const {width,height}=vlogMediaDimensions(media,clip);
   if(!Number.isFinite(width)||!Number.isFinite(height)||width<=0||height<=0) return '動画';
   return width===height?'正方動画':width>height?'横動画':'縦動画';
 };
@@ -8669,6 +8704,29 @@ function VlogMaterialKindBadge({clip,media}){
     className:`absolute bottom-0.5 right-0.5 px-0.5 py-0.5 rounded-[2px] bg-black/60 text-white/90 leading-none font-normal whitespace-nowrap pointer-events-none ${label.length>3?'text-[7px]':'text-[8px]'}`
   },label);
 }
+
+// 確認用のDOM映像も、回転後の枠に収める。0度は既存の要素をそのまま使う。
+const VlogRotatedMedia=React.forwardRef(function VlogRotatedMedia({as='img',clip,...props},mediaRef){
+  const angle=vlogClipRotation(clip),boxRef=useRef(null);
+  const [box,setBox]=useState({width:0,height:0});
+  useEffect(()=>{
+    const node=boxRef.current;if(!angle||!node)return;
+    const measure=()=>{const {width,height}=node.getBoundingClientRect();
+      setBox(old=>old.width===width&&old.height===height?old:{width,height});};
+    measure();
+    if(typeof ResizeObserver==='undefined'){window.addEventListener('resize',measure);return()=>window.removeEventListener('resize',measure);}
+    const observer=new ResizeObserver(measure);observer.observe(node);return()=>observer.disconnect();
+  },[angle]);
+  if(!angle)return React.createElement(as,{...props,ref:mediaRef});
+  const swapped=angle%180!==0;
+  return React.createElement('div',{ref:boxRef,className:props.className,
+    style:{...props.style,position:'relative',width:'100%',height:props.style?.maxHeight||'100%',overflow:'hidden'}},
+    React.createElement(as,{...props,ref:mediaRef,className:undefined,
+      style:{position:'absolute',left:'50%',top:'50%',maxWidth:'none',maxHeight:'none',
+        width:swapped?box.height:box.width,height:swapped?box.width:box.height,
+        objectFit:props.className?.includes('object-cover')?'cover':'contain',
+        transform:`translate(-50%,-50%) rotate(${angle}deg)`}}));
+});
 
 function App(){
   const canvasRef = useRef(null);
@@ -9262,9 +9320,10 @@ function App(){
         const photo=active.type==='photo';
         const media=photo ? photoRefs.current.get(active.id) : videoRefs.current.get(active.id);
         if(photo ? !(media?.complete && media.naturalWidth>1) : !(media?.readyState>=2 && media.videoWidth>0)){ setLumaHistogram(null); return; }
-        const signature=`${active.id}:${t}:${canvas.width}x${canvas.height}:${fitMode}:${getClipPreviewFilter(active,activeFilterRef.current,filterIntensityRef.current)}`;
+        const signature=`${active.id}:${vlogClipRotation(active)}:${t}:${canvas.width}x${canvas.height}:${fitMode}:${getClipPreviewFilter(active,activeFilterRef.current,filterIntensityRef.current)}`;
         if(!isPlaying && signature===lastSignature && sameFrameSamples>=2) return;
-        const ratio=photo ? media.naturalWidth/media.naturalHeight : media.videoWidth/media.videoHeight;
+        const dimensions=vlogMediaDimensions(media,active);
+        const ratio=dimensions.width/dimensions.height;
         if(!Number.isFinite(ratio) || ratio<=0){ setLumaHistogram(null); return; }
         const w=canvas.width, h=canvas.height, frameRatio=w/h;
         const verticalMode=active._verticalMode || 'contain-black';
@@ -10034,6 +10093,7 @@ function App(){
   const [focusedClipId, setFocusedClipId] = useState(null);
   const [materialThumbnails, setMaterialThumbnailsState] = useState({});
   const materialThumbnailsRef=useRef({});
+  const materialThumbnailRotationsRef=useRef(new Map());
   const setMaterialThumbnails=useCallback(update=>{
     const previous=materialThumbnailsRef.current;
     const next=typeof update==='function'?update(previous):update;
@@ -10456,8 +10516,7 @@ function App(){
           if(pan==='kenburns-in') zoom = 1.0 + progress*0.15;
           else if(pan==='kenburns-out') zoom = 1.15 - progress*0.15;
           zoom *= scale;
-          const iw=img.naturalWidth||16;
-          const ih=img.naturalHeight||9;
+          const {width:iw,height:ih}=vlogMediaDimensions(img,clip);
           const ir=iw/ih;
           const cr=cw/ch;
           let dw,dh,dx,dy;
@@ -10481,7 +10540,7 @@ function App(){
               ctx.save();
               // カフェブラー: ミルクティー色でふんわり
               ctx.globalAlpha=1.0;
-              drawVlogBlurredBackground(ctx,img,cw,ch,bgX,bgY,bgW,bgH,40);
+              drawVlogBlurredBackground(ctx,img,cw,ch,bgX,bgY,bgW,bgH,40,clip);
               ctx.restore();
               // 上下に vignette で視線を中央に
               ctx.save();
@@ -10511,7 +10570,7 @@ function App(){
               if(ir > targetAspect){ sh = ih; sw = ih * targetAspect; sx = (iw - sw)/2; sy = 0; }
               else { sw = iw; sh = iw / targetAspect; sx = 0; sy = (ih - sh)/2; }
               dw=cw*zoom; dh=ch*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY;
-              vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh));
+              vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(ctx,img,clip,sx,sy,sw,sh,dx,dy,dw,dh));
               return finishClip();
             } else {
               if(ir>cr){ dh=ch*zoom; dw=ch*ir*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY; }
@@ -10535,10 +10594,10 @@ function App(){
             ctx.shadowColor='rgba(0,0,0,0.18)';
             ctx.shadowBlur=24;
             ctx.shadowOffsetY=8;
-            vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(img,dx,dy,dw,dh));
+            vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(ctx,img,clip,dx,dy,dw,dh));
             ctx.restore();
           } else {
-            vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(img,dx,dy,dw,dh));
+            vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(ctx,img,clip,dx,dy,dw,dh));
           }
           return finishClip();
         } else {
@@ -10564,8 +10623,8 @@ function App(){
               v.currentTime = Math.max(0, Math.min(targetTime, (v.duration||999)-0.1));
             }
           }catch{}
-          let vr = 16/9;
-          try{ vr = (v.videoWidth && v.videoHeight) ? v.videoWidth/v.videoHeight : 16/9; }catch{}
+          const dimensions=vlogMediaDimensions(v,clip);
+          const vr=dimensions.width && dimensions.height?dimensions.width/dimensions.height:16/9;
           const cr=cw/ch;
           let dw,dh,dx,dy;
           const verticalMode = clip._verticalMode || 'contain-black';
@@ -10581,12 +10640,12 @@ function App(){
               paintMargins(dy,dh);
             } else if(effectiveMode2==='blur-bg'){
               // === 案1+案3ハイブリッド: カフェブラー + スマート適応 (動画は軽量化) ===
-              const bgZoom = Math.max(cw/(v.videoWidth||16), ch/(v.videoHeight||9)) * 1.4;
-              const bgW = (v.videoWidth||16)*bgZoom; const bgH = (v.videoHeight||9)*bgZoom;
+              const bgZoom = Math.max(cw/(dimensions.width||16), ch/(dimensions.height||9)) * 1.4;
+              const bgW = (dimensions.width||16)*bgZoom; const bgH = (dimensions.height||9)*bgZoom;
               const bgX = (cw-bgW)/2; const bgY = (ch-bgH)/2;
               ctx.save();
               ctx.globalAlpha=1.0;
-              drawVlogBlurredBackground(ctx,v,cw,ch,bgX,bgY,bgW,bgH,32);
+              drawVlogBlurredBackground(ctx,v,cw,ch,bgX,bgY,bgW,bgH,32,clip);
               ctx.restore();
               ctx.save();
               ctx.globalAlpha=alpha;
@@ -10606,11 +10665,11 @@ function App(){
             } else if(effectiveMode2==='vertical-crop'){
               dw=cw*scale; dh=ch*scale; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY;
               const targetAspect = 9/16;
-              const vw = v.videoWidth||16; const vh = v.videoHeight||9;
+              const vw = dimensions.width||16; const vh = dimensions.height||9;
               let sx, sy, sw, sh;
               if(vr > targetAspect){ sh = vh; sw = vh * targetAspect; sx = (vw - sw)/2; sy = 0; }
               else { sw = vw; sh = vw / targetAspect; sx = 0; sy = (vh - sh)/2; }
-              vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(v, sx, sy, sw, sh, dx, dy, dw, dh));
+              vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(ctx,v,clip,sx,sy,sw,sh,dx,dy,dw,dh));
               return finishClip();
             } else {
               if(vr>cr){ dh=ch*scale; dw=ch*vr*scale; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY; }
@@ -10630,10 +10689,10 @@ function App(){
             ctx.shadowColor='rgba(0,0,0,0.18)';
             ctx.shadowBlur=24;
             ctx.shadowOffsetY=8;
-            vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(v,dx,dy,dw,dh));
+            vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(ctx,v,clip,dx,dy,dw,dh));
             ctx.restore();
           } else {
-            vlogExportProfileMeasure('material.foregroundDraw',()=>ctx.drawImage(v,dx,dy,dw,dh));
+            vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(ctx,v,clip,dx,dy,dw,dh));
           }
           return finishClip();
         }
@@ -11060,12 +11119,12 @@ function App(){
           if(activeClip.type==='photo'){
             const img = photoRefs.current.get(activeClip.id);
             if(img && img.naturalWidth && img.naturalHeight){
-              contentAspect = img.naturalWidth / img.naturalHeight;
+              const dims=vlogMediaDimensions(img,activeClip);contentAspect = dims.width/dims.height;
             }
           } else {
             const v = videoRefs.current.get(activeClip.id);
             if(v && v.videoWidth && v.videoHeight){
-              contentAspect = v.videoWidth / v.videoHeight;
+              const dims=vlogMediaDimensions(v,activeClip);contentAspect = dims.width/dims.height;
             }
           }
         }
@@ -11128,10 +11187,10 @@ function App(){
           if(ac){
             if(ac.type==='photo'){
               const img = photoRefs.current.get(ac.id);
-              if(img && img.naturalWidth && img.naturalHeight) forceVertical = img.naturalHeight > img.naturalWidth;
+              if(img && img.naturalWidth && img.naturalHeight) {const dims=vlogMediaDimensions(img,ac);forceVertical=dims.width<dims.height;}
             } else {
               const v = videoRefs.current.get(ac.id);
-              if(v && v.videoWidth && v.videoHeight) forceVertical = v.videoHeight > v.videoWidth;
+              if(v && v.videoWidth && v.videoHeight) {const dims=vlogMediaDimensions(v,ac);forceVertical=dims.width<dims.height;}
             }
           }
         }
@@ -11142,10 +11201,10 @@ function App(){
           if(ac2){
             if(ac2.type==='photo'){
               const img2 = photoRefs.current.get(ac2.id);
-              if(img2 && img2.naturalWidth && img2.naturalHeight) isHorizontalMaterial = img2.naturalWidth > img2.naturalHeight;
+              if(img2 && img2.naturalWidth && img2.naturalHeight) {const dims=vlogMediaDimensions(img2,ac2);isHorizontalMaterial=dims.width>dims.height;}
             } else {
               const v2 = videoRefs.current.get(ac2.id);
-              if(v2 && v2.videoWidth && v2.videoHeight) isHorizontalMaterial = v2.videoWidth > v2.videoHeight;
+              if(v2 && v2.videoWidth && v2.videoHeight) {const dims=vlogMediaDimensions(v2,ac2);isHorizontalMaterial=dims.width>dims.height;}
             }
           }
         }catch{}
@@ -15138,6 +15197,7 @@ const recomputeStarts=(arr)=>{
       const previousStyle=video.style.cssText;
       video.style.width='100%'; video.style.height='100%';
       video.style.objectFit='contain'; video.style.display='block';
+      video.style.transform=`rotate(${vlogClipRotation(clip)}deg)`;
       slot.appendChild(video);
       attached.push({clip,slot,video,previousTime,previousStyle});
     });
@@ -15969,6 +16029,7 @@ const recomputeStarts=(arr)=>{
               trimStart: (orig.trimStart||0)+w.time,
               _fromFiveShot: true,
               _parentId: orig.id,
+              _rotation:orig._rotation,
               _sourceAudioGain:orig._sourceAudioGain,
               _sourceAudioMuted:orig._sourceAudioMuted,
               _smartScore: w.score,
@@ -16114,6 +16175,7 @@ const recomputeStarts=(arr)=>{
           _photoZoom:orig._photoZoom,
           _photoPan:orig._photoPan,
           _verticalMode:orig._verticalMode,
+          _rotation:orig._rotation,
           _fromFiveShot: true,
           _parentId: orig.id,
           _sourceAudioGain:orig._sourceAudioGain,
@@ -17340,6 +17402,18 @@ const recomputeStarts=(arr)=>{
     setSelectedTimelineItem(focused?{type:'clip',id:focusId}:null);
     recordEdit(before);requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
+  const rotateMaterialClip=(clipId)=>{
+    const current=clipsRef.current.find(clip=>clip.id===clipId);
+    if(!current || current._splitScreen || exportJobRef.current)return;
+    const before=editSnapshot();
+    const updatedClip={...current,_rotation:(vlogClipRotation(current)+90)%360};
+    const next=clipsRef.current.map(clip=>clip.id===clipId?updatedClip:clip);
+    clipsRef.current=next;setClips(next);
+    const thumb=makeRecentMaterialThumb(updatedClip,current.type==='video'?videoRefs.current.get(clipId):null);
+    setMaterialThumbnails(previous=>{const updated={...previous};if(thumb)updated[clipId]=thumb;else delete updated[clipId];return updated;});
+    recordEdit(before);
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
   const confirmSplitDraft=()=>{
     if(!splitDraft || exportJobRef.current)return;
     const list=clipsRef.current,before=editSnapshot();
@@ -17526,8 +17600,7 @@ const recomputeStarts=(arr)=>{
       : (quickPeekId===clip?.id && quickPeekVideoRef.current?.readyState>=2
           ? quickPeekVideoRef.current : videoRefs.current.get(clip?.id)));
     if(clip?.type==='video' && (!source || !(source.readyState>=2) || source.seeking || !source.videoWidth || !source.videoHeight)) return '';
-    const sourceWidth=source?.videoWidth||source?.naturalWidth||source?.width||0;
-    const sourceHeight=source?.videoHeight||source?.naturalHeight||source?.height||0;
+    const {width:sourceWidth,height:sourceHeight}=vlogMediaDimensions(source,clip);
     if(!source || !sourceWidth || !sourceHeight){
       // バグ修正: videoでsourceが無い時にclip.url(blob)を返すとlocalStorageにblob URLが保存され再起動後に壊れる
       // photoはdata URL化される前でもurlが使えるが、videoは空を返す
@@ -17547,8 +17620,8 @@ const recomputeStarts=(arr)=>{
       const scale=Math.min(thumbCanvas.width/sourceWidth,thumbCanvas.height/sourceHeight);
       const drawW=sourceWidth*scale;
       const drawH=sourceHeight*scale;
-      if(darkCinema)drawVlogDarkCinemaMaterial(thumbCtx,source,(thumbCanvas.width-drawW)/2,(thumbCanvas.height-drawH)/2,drawW,drawH,css);
-      else thumbCtx.drawImage(source,(thumbCanvas.width-drawW)/2,(thumbCanvas.height-drawH)/2,drawW,drawH);
+      if(darkCinema)drawVlogDarkCinemaMaterial(thumbCtx,source,(thumbCanvas.width-drawW)/2,(thumbCanvas.height-drawH)/2,drawW,drawH,css,clip);
+      else drawVlogMedia(thumbCtx,source,clip,(thumbCanvas.width-drawW)/2,(thumbCanvas.height-drawH)/2,drawW,drawH);
       thumbCtx.filter='none';
       return thumbCanvas.toDataURL('image/jpeg',0.68);
     }catch{
@@ -17608,9 +17681,16 @@ const recomputeStarts=(arr)=>{
     const subscriptions=[];
     const controller=new AbortController();
     const videos=vlogMediaClips(clips).filter(clip=>clip.type==='video');
+    // 組の編集・取り消しでも、回転前の保存サムネイルを残さない。
+    const angles=materialThumbnailRotationsRef.current;
+    const changed=videos.filter(clip=>angles.has(clip.id)&&angles.get(clip.id)!==vlogClipRotation(clip));
+    if(changed.length)setMaterialThumbnails(previous=>{const next={...previous};changed.forEach(clip=>delete next[clip.id]);return next;});
+    const ids=new Set(videos.map(clip=>clip.id));
+    for(const id of angles.keys())if(!ids.has(id))angles.delete(id);
+    videos.forEach(clip=>angles.set(clip.id,vlogClipRotation(clip)));
     const store=(clip,thumb)=>{
       if(controller.signal.aborted || !thumb) return;
-      if(!vlogMediaClips(clipsRef.current).some(current=>current.id===clip.id && current.url===clip.url)) return;
+      if(!vlogMediaClips(clipsRef.current).some(current=>current.id===clip.id && current.url===clip.url && vlogClipRotation(current)===vlogClipRotation(clip))) return;
       setMaterialThumbnails(previous=>previous[clip.id]?previous:{...previous,[clip.id]:thumb});
     };
     videos.forEach(clip=>{
@@ -17782,8 +17862,7 @@ const recomputeStarts=(arr)=>{
   const previewClip=clips.find(c=>currentTime>=c.timelineStart && currentTime<c.timelineStart+c.duration) || clips[0];
   const finderMarks=clips.flatMap(clip=>(clip._finderMarks||[]).map(mark=>({clip,mark})));
   const previewMedia=previewClip?.type==='photo' ? photoRefs.current.get(previewClip.id) : videoRefs.current.get(previewClip?.id);
-  const previewWidth=previewClip?.type==='photo' ? previewMedia?.naturalWidth : previewMedia?.videoWidth;
-  const previewHeight=previewClip?.type==='photo' ? previewMedia?.naturalHeight : previewMedia?.videoHeight;
+  const {width:previewWidth,height:previewHeight}=vlogMediaDimensions(previewMedia,previewClip);
   const previewResolution=previewWidth>0 && previewHeight>0 ? `${previewWidth}×${previewHeight}` : null;
   const isPreviewLetterboxTap=(event)=>{
     const canvas=canvasRef.current;
@@ -19152,7 +19231,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 React.createElement('button', {onClick:()=>adoptGood3Sec(review),
                   className:'camera-key-primary flex-1 h-9 rounded-full bg-violet-600 text-[11px] font-bold'}, 'この3秒を採用')
               ),
-              analysisPreviewId===review.clipId && React.createElement('video', {
+              analysisPreviewId===review.clipId && React.createElement(VlogRotatedMedia, {as:'video',clip:clips.find(item=>item.id===review.clipId),
                 key:`${review.clipId}-${review.start}`,src:review.url,controls:true,muted:true,playsInline:true,preload:'metadata',
                 className:'w-full mt-2 rounded-lg bg-black',style:{maxHeight:'220px',objectFit:'contain'},
                 onLoadedMetadata:e=>{ try{ e.currentTarget.currentTime=review.start; }catch{} },
@@ -19588,8 +19667,8 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   className:'w-9 h-11 rounded-md bg-black/70 border border-white/15 overflow-hidden shrink-0 flex items-center justify-center relative',
                   'aria-label':`${i+1}番目の素材 ${c.name} を素材だけ確認`,
                   'aria-describedby':`material-kind-${c.id}`
-                }, c._splitScreen?React.createElement('div',{className:'w-full h-full flex '+(vlogSplitIsSideBySide(c)?'flex-row':'flex-col')},c._splitScreen.clips.map(child=>React.createElement('div',{key:child.id,className:(vlogSplitIsSideBySide(c)?'w-1/2 h-full':'h-1/2 w-full')+' overflow-hidden flex items-center justify-center'},(child.type==='photo'?child.url:materialThumbnails[child.id])?React.createElement('img',{src:child.type==='photo'?child.url:materialThumbnails[child.id],alt:'',className:'w-full h-full object-cover'}):React.createElement('span',{className:'text-[7px] text-white/45'},child.type==='photo'?'写真':'動画')))):(isPhoto?c.url:materialThumbnails[c.id])
-                  ? React.createElement('img',{src:isPhoto?c.url:materialThumbnails[c.id],alt:'',loading:'lazy',className:'w-full h-full object-cover'})
+                }, c._splitScreen?React.createElement('div',{className:'w-full h-full flex '+(vlogSplitIsSideBySide(c)?'flex-row':'flex-col')},c._splitScreen.clips.map(child=>React.createElement('div',{key:child.id,className:(vlogSplitIsSideBySide(c)?'w-1/2 h-full':'h-1/2 w-full')+' overflow-hidden flex items-center justify-center'},(child.type==='photo'?child.url:materialThumbnails[child.id])?React.createElement(VlogRotatedMedia,{as:'img',clip:child.type==='photo'?child:null,src:child.type==='photo'?child.url:materialThumbnails[child.id],alt:'',className:'w-full h-full object-cover'}):React.createElement('span',{className:'text-[7px] text-white/45'},child.type==='photo'?'写真':'動画')))):(isPhoto?c.url:materialThumbnails[c.id])
+                  ? React.createElement(VlogRotatedMedia,{as:'img',clip:isPhoto?c:null,src:isPhoto?c.url:materialThumbnails[c.id],alt:'',loading:'lazy',className:'w-full h-full object-cover'})
                   : React.createElement('span',{className:'text-white/45 text-base'},'▣'),
                   React.createElement(VlogMaterialKindBadge,{clip:c,media:videoRefs.current.get(c.id)})),
                 React.createElement('div', {
@@ -19639,7 +19718,8 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     ),
                     verticalPriority && (()=>{ 
                       const img=photoRefs.current.get(c.id); 
-                      const isH = img && img.naturalWidth>=img.naturalHeight; 
+                      const dims=vlogMediaDimensions(img,c);
+                      const isH = img && dims.width>=dims.height; 
                       return isH ? React.createElement('div', {className:'flex gap-0.5 mt-0.5'},
                         [
                           {id:'contain-black', label:'黒帯'},
@@ -19788,7 +19868,12 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   React.createElement('button',{type:'button',onClick:()=>playClipFromList(c),
                     className:'rounded-full bg-emerald-100 px-3 py-2 text-[10px] font-bold text-black'},'▶ ここから再生'),
                   React.createElement('button',{type:'button',onClick:()=>openTimelineForClip(c),
-                    className:'rounded-full border border-white/25 px-3 py-2 text-[10px] text-white/85'},'タイムラインへ')
+                    className:'rounded-full border border-white/25 px-3 py-2 text-[10px] text-white/85'},'タイムラインへ'),
+                  !c._splitScreen && React.createElement('button',{type:'button',
+                    onClick:e=>{e.stopPropagation();rotateMaterialClip(c.id);},
+                    className:'shrink-0 px-2 py-2 rounded-full bg-white/10 text-[10px] text-white/80',
+                    'aria-label':`${c.name}を90度回転`,title:'右に90度ずつ回転（4回で元に戻る）'
+                  },`↻ 回転 ${vlogClipRotation(c)}°`)
                 )
               ),
 
@@ -19805,8 +19890,8 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 ),
                 React.createElement('div',{className:'relative'},
                 c._splitScreen ? React.createElement('div',{className:'w-full',style:{height:'220px'}},React.createElement(VlogSplitPreview,{scene:c,activeFilter,intensity:filterIntensity,autoplay:false})) : isPhoto ? 
-                  React.createElement('img', {src:c.url, alt:c.name, className:'w-full object-contain bg-black', style:{maxHeight:'200px',filter:getClipPreviewFilter(c,activeFilter,filterIntensity)}}) :
-                  React.createElement('video', {
+                  React.createElement(VlogRotatedMedia, {as:'img',clip:c,src:c.url, alt:c.name, className:'w-full object-contain bg-black', style:{maxHeight:'200px',filter:getClipPreviewFilter(c,activeFilter,filterIntensity)}}) :
+                  React.createElement(VlogRotatedMedia, {as:'video',clip:c,
                     src:c.url,autoPlay:false,muted:true,playsInline:true,loop:false,controls:false,preload:'none',
                     onVolumeChange:e=>{if(!e.currentTarget.muted)e.currentTarget.muted=true;},
                     className:'w-full bg-black object-contain',style:{maxHeight:'220px',filter:getClipPreviewFilter(c,activeFilter,filterIntensity)},
@@ -19944,7 +20029,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     clip.type==='photo'?`表示時間 ${length.toFixed(1)}秒`:`開始 ${start.toFixed(1)}秒・長さ ${length.toFixed(1)}秒`),
                   clip.type==='photo' ? 
                     React.createElement('div', {className:'mt-2'},
-                      React.createElement('img', {src:clip.url, alt:clip.name, className:'w-full rounded-xl bg-black object-contain', style:{maxHeight:'140px', aspectRatio:'16/9'}}),
+                      React.createElement(VlogRotatedMedia, {as:'img',clip,src:clip.url, alt:clip.name, className:'w-full rounded-xl bg-black object-contain', style:{maxHeight:'140px', aspectRatio:'16/9'}}),
                       React.createElement('label',{className:'block mt-2 rounded-xl border border-white/15 bg-black/30 px-2 py-3 text-[10px] text-white/70'},
                         React.createElement('span',null,'表示時間 0.5〜10秒'),
                         React.createElement('input',{type:'range',min:0.5,max:10,step:0.1,value:length,
@@ -19952,7 +20037,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                           className:'block w-full mt-2 accent-violet-500'}))
                     ) :
                     React.createElement('div',{className:'mt-2 flex flex-col gap-2'},
-                      React.createElement('video', {
+                      React.createElement(VlogRotatedMedia, {as:'video',clip,
                         ref:good3AdjustVideoRef,src:clip.url,muted:true,playsInline:true,preload:'metadata',
                         className:'w-full rounded-xl bg-black object-contain',style:{maxHeight:'140px', aspectRatio:'16/9'},
                         onLoadedMetadata:e=>{
@@ -21521,7 +21606,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         timelineContextClip && React.createElement('div',{className:'flex items-center gap-1.5 min-w-0 flex-1'},
           React.createElement('div',{className:'w-7 h-9 rounded-sm bg-white/10 border border-white/20 overflow-hidden shrink-0 flex items-center justify-center'},
             (timelineContextClip.type==='photo'?timelineContextClip.url:materialThumbnails[timelineContextClip.id])
-              ? React.createElement('img',{src:timelineContextClip.type==='photo'?timelineContextClip.url:materialThumbnails[timelineContextClip.id],alt:'',className:'h-full w-full object-cover'})
+              ? React.createElement(VlogRotatedMedia,{as:'img',clip:timelineContextClip.type==='photo'?timelineContextClip:null,src:timelineContextClip.type==='photo'?timelineContextClip.url:materialThumbnails[timelineContextClip.id],alt:'',className:'h-full w-full object-cover'})
               : React.createElement('span',{className:'text-[11px] text-white/50'},'▣')
           ),
           React.createElement('div',{className:'min-w-0 flex-1'},
@@ -22344,11 +22429,11 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       ),
       React.createElement('div', {className:'flex-1 flex flex-col items-center justify-center p-6 gap-4'},
         React.createElement('div', {className:'w-full max-w-[320px] aspect-[9/16] bg-black rounded-2xl border border-white/20 flex items-center justify-center relative overflow-hidden'},
-          clips[swipeIndex]?.type==='photo' && React.createElement('img',{
+          clips[swipeIndex]?.type==='photo' && React.createElement(VlogRotatedMedia,{as:'img',clip:clips[swipeIndex],
             key:clips[swipeIndex].id,src:clips[swipeIndex].url,alt:clips[swipeIndex].name,
             className:'w-full h-full object-contain',style:{filter:getClipPreviewFilter(clips[swipeIndex],activeFilter,filterIntensity)},
             onError:()=>setSwipeMediaError('写真を表示できません。元素材を確認してください。')}),
-          clips[swipeIndex]?.type==='video' && React.createElement('video',{
+          clips[swipeIndex]?.type==='video' && React.createElement(VlogRotatedMedia,{as:'video',clip:clips[swipeIndex],
             key:clips[swipeIndex].id,ref:swipeVideoRef,src:clips[swipeIndex].url,
             className:'w-full h-full object-contain',style:{filter:getClipPreviewFilter(clips[swipeIndex],activeFilter,filterIntensity)},
             muted:true,playsInline:true,autoPlay:true,preload:'auto',loop:false,
@@ -22459,7 +22544,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       const side=vlogSplitIsSideBySide(splitDraft),label=vlogSplitLabel(splitDraft);
       const selected=splitDraft._splitScreen.clips.find(child=>child.id===splitAdjustId)||splitDraft._splitScreen.clips[0];
       const framing=vlogSplitFraming(splitDraft,selected.id),selectedMedia=splitMediaLookup(selected);
-      const mw=selectedMedia?.videoWidth||selectedMedia?.naturalWidth,mh=selectedMedia?.videoHeight||selectedMedia?.naturalHeight;
+      const {width:mw,height:mh}=vlogMediaDimensions(selectedMedia,selected);
       const selectedIndex=splitDraft._splitScreen.clips.findIndex(child=>child.id===selected.id);
       const placement=side&&mw&&mh?vlogSplitSidePlacement(splitDraft,selectedIndex,mw,mh,360,640):null;
       const hint=framing.contain?'全体表示中':!placement?'読み込み中':placement.cropY>0.5?'上下にドラッグして位置を調整':placement.cropX>0.5?'左右にドラッグして位置を調整':'中央に収まっています';
@@ -22487,12 +22572,22 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           selectedSourceId:selected.id,onSelectSource:setSplitAdjustId,
           onPositionChange:side?(id,position)=>setSplitDraft(scene=>vlogSetSplitFraming(scene,id,position)):null})),
       React.createElement('div',{className:'text-[10px] text-white/60 mt-2'},
-        splitDraft._splitScreen.clips.map((child,index)=>React.createElement(side?'button':'div',{
-          key:child.id,type:side?'button':undefined,
-          className:side?'truncate w-full text-left px-2 py-1 rounded '+(selected.id===child.id?'bg-white/10 text-white':''):'truncate',
-          'aria-pressed':side?selected.id===child.id:undefined,
-          onClick:side?()=>setSplitAdjustId(child.id):undefined
-        },(side?(index?'右':'左'):(index?'下':'上'))+'：'+child.name))),
+        splitDraft._splitScreen.clips.map((child,index)=>React.createElement('div',{
+          key:child.id,className:'flex items-center gap-1 min-w-0'
+        },
+          React.createElement('button',{type:'button',
+            className:'truncate flex-1 min-w-0 text-left px-2 py-1 rounded '+(selected.id===child.id?'bg-white/10 text-white':'text-white/75'),
+            'aria-pressed':selected.id===child.id,
+            onClick:()=>setSplitAdjustId(child.id)
+          },(side?(index?'右':'左'):(index?'下':'上'))+'：'+child.name),
+          React.createElement('button',{type:'button',
+            className:'shrink-0 px-2 py-1 rounded-full bg-white/10 text-[9px]',
+            'aria-label':(side?(index?'右':'左'):(index?'下':'上'))+'素材を90度回転',
+            'aria-pressed':!!vlogClipRotation(child),
+            onClick:()=>setSplitDraft(scene=>({...scene,_splitScreen:{...scene._splitScreen,
+              clips:scene._splitScreen.clips.map(item=>item.id===child.id
+                ? {...item,_rotation:(vlogClipRotation(item)+90)%360} : item)}}))
+          },`↻ 回転 ${vlogClipRotation(child)}°`)))),
       React.createElement('button',{type:'button',className:'text-[10px] px-3 py-1.5 rounded-full bg-white/10 mt-2',
         onClick:()=>setSplitDraft(scene=>({...scene,name:scene._splitScreen.clips.slice().reverse().map(child=>child.name).join(' / '),
           _splitScreen:{...scene._splitScreen,clips:scene._splitScreen.clips.slice().reverse()}}))},label+'を入れ替える'),
@@ -22557,11 +22652,11 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             className:'relative w-full aspect-[9/16] bg-black overflow-hidden flex items-center justify-center cursor-pointer',
             onClick:()=>{ if(!quickPeekSkipTapRef.current) toggleQuickPeekPlayback(); }
           },
-            clip._splitScreen ? React.createElement(VlogSplitPreview,{scene:clip,activeFilter,intensity:filterIntensity}) : isPhoto ? React.createElement('img', {
+            clip._splitScreen ? React.createElement(VlogSplitPreview,{scene:clip,activeFilter,intensity:filterIntensity}) : isPhoto ? React.createElement(VlogRotatedMedia, {as:'img',clip,
               src:clip.url, alt:clip.name, draggable:false,
               className:'w-full h-full object-contain',
               style:{filter:quickPeekFilter}
-            }) : React.createElement('video', {
+            }) : React.createElement(VlogRotatedMedia, {as:'video',clip,
               key:clip.id, ref:quickPeekVideoRef, src:clip.url, muted:true, playsInline:true, autoPlay:true,
               className:'w-full h-full object-contain',
               style:{filter:quickPeekFilter},
@@ -22591,6 +22686,12 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   className:'absolute top-2 right-2 z-20 px-3 py-1.5 rounded-full bg-black/60 backdrop-blur border border-white/20 text-[11px] font-bold text-white flex items-center gap-1.5',
                   style:{backdropFilter:'blur(8px)'},'aria-label':`${clip.name}のフィルターを変更`
                 },React.createElement('span',null,'🎨'),'フィルター'),
+            !clip._splitScreen && React.createElement('button',{type:'button',
+              onClick:e=>{e.stopPropagation();rotateMaterialClip(clip.id);},
+              className:'absolute bottom-2 left-2 z-20 px-3 py-1.5 rounded-full bg-black/65 border border-white/20 text-[11px] font-bold text-white',
+              'aria-label':`${clip.name}を90度回転`,
+              'aria-pressed':!!vlogClipRotation(clip)
+            },`↻ 回転 ${vlogClipRotation(clip)}°`),
             !clip._splitScreen && !isPhoto && !quickPeekPlaying && React.createElement('div', {
               className:'absolute inset-0 flex items-center justify-center pointer-events-none'
             }, React.createElement('div', {className:'w-11 h-11 rounded-full bg-white/90 text-black flex items-center justify-center text-[17px] pl-0.5 shadow-lg'}, '▶')),
@@ -22690,7 +22791,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           React.createElement('div', {className:'shrink-0 p-3 pb-2'},
             React.createElement('div', {className:'rounded-[18px] bg-black overflow-hidden border border-white/10 relative', style:{height:'20vh', minHeight:'160px', maxHeight:'210px'}},
               React.createElement('div', {className:'absolute inset-0 flex items-center justify-center', style:{filter:currentClip?._splitScreen?'none':displayFilterCss}},
-                currentClip?._splitScreen ? React.createElement(VlogSplitPreview,{scene:setVlogClipFilter(currentClip,isBeforePreview?'none':filterDraft.id,isBeforePreview?0:filterDraft.intensity),activeFilter,intensity:filterIntensity}) : thumbUrl ? (isPhoto ? React.createElement('img', {src:thumbUrl, alt:'preview', className:'w-full h-full object-contain'}) : React.createElement('video', {key:currentClip.id,src:thumbUrl,muted:true,playsInline:true,autoPlay:true,
+                currentClip?._splitScreen ? React.createElement(VlogSplitPreview,{scene:setVlogClipFilter(currentClip,isBeforePreview?'none':filterDraft.id,isBeforePreview?0:filterDraft.intensity),activeFilter,intensity:filterIntensity}) : thumbUrl ? (isPhoto ? React.createElement(VlogRotatedMedia, {as:'img',clip:currentClip,src:thumbUrl, alt:'preview', className:'w-full h-full object-contain'}) : React.createElement(VlogRotatedMedia, {as:'video',clip:currentClip,key:currentClip.id,src:thumbUrl,muted:true,playsInline:true,autoPlay:true,
                   className:'w-full h-full object-contain',
                   onLoadedMetadata:e=>{try{
                     const video=e.currentTarget;
@@ -22912,7 +23013,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           (right ? [[left,'left','前のラスト'],[right,'right','次の冒頭']] : [[left,'left','このカットのラスト']]).map(([clip,side,label])=>
             React.createElement('div', {key:clip.id, className:'min-w-0'},
               React.createElement('div', {className:`relative aspect-square bg-black rounded-lg overflow-hidden flex items-center justify-center text-[10px] text-white/40 ${connectionTrialSide===side?'ring-2 ring-blue-300':''}`},
-                clip.type==='photo' ? React.createElement('img', {src:clip.url, alt:label, className:'w-full h-full object-contain'}) : React.createElement('div', {
+                clip.type==='photo' ? React.createElement(VlogRotatedMedia, {as:'img',clip,src:clip.url, alt:label, className:'w-full h-full object-contain'}) : React.createElement('div', {
                   ref:side==='left' ? connectionLeftSlotRef : connectionRightSlotRef,
                   className:'w-full h-full'
                 }),
