@@ -3441,6 +3441,145 @@
       for(let i=a;i<b;i++)updateGlowFan(i);
       glowFanRestart(); renderGlowFanUI(); saveSettings(); refresh();
     }
+    /* ===== 波を見せるフォーメーション =====
+       波の遅れは「前後なら z だけ」「左右なら x だけ」から決まる（glowFanDelay）。
+       つまり**位相を決める軸だけ**を揃えれば、もう一方の軸と向きは散らしてよい。
+       全部を格子に並べるとコーラス隊に見えるので、散らせるところは散らす。 */
+    const GLOW_FORM_Z1=8.0;        // 置く奥行きの上限[m]。客席カメラ(z=8.5)の手前まで
+    const GLOW_FORM_GAP=.20;       // 足の箱どうしの余白[m]。散らすぶんの余地も含む
+    const GLOW_FORM_ROWS_MAX=16;   // 行の最大数。足の開きが大きいほど多く要る
+    /* 行の最小数。定員が足りていても行を減らさない ― 行の数がそのまま波の
+       段数（位相の刻み）になるので、少ないと波がカクつく。 */
+    const GLOW_FORM_ROWS_MIN=6;
+    const GLOW_FORM_DZ_MIN=.40;    // 行間の下限[m]。これより詰めると足が重なる
+    const GLOW_FORM_ZPITCH=.70;    // 左右の波のとき、同じ列の人を前後へずらす間隔[m]
+    const glowFormSnap=v=>Math.round(v/GLOW_FAN_STEP)*GLOW_FAN_STEP;
+    const glowFormUp=v=>Math.ceil(v/GLOW_FAN_STEP-1e-9)*GLOW_FAN_STEP;   // 刻みへ切り上げ
+    /* 隣との間隔。刻みに切り上げてから使う ― 刻みへ丸めるのは最後、という
+       作りにすると、丸めたぶん（最大 2.5cm×2）だけ足が食い込むことがある。 */
+    const glowFormPitch=()=>glowFormUp(2*glowFanFoot().halfW+GLOW_FORM_GAP);
+    /* 横へ散らせる量。刻みの整数倍で、散らしても間隔が足の幅を割らない範囲。
+       足を開くほど 0 に近づく（開いた足には余白が無い）。 */
+    function glowFormJitter(){
+      const {halfW}=glowFanFoot();
+      /* 刻みの半分を安全代として引く。ぴったり 0 の隙間を許すと、丸め誤差で
+         1e-17m だけ食い込んだ組が出る（実測で1組）。 */
+      const k=Math.floor((glowFormPitch()-2*halfW-GLOW_FAN_STEP*.5)/(2*GLOW_FAN_STEP));
+      return Math.max(0,k)*GLOW_FAN_STEP;
+    }
+    /* 1行に置ける x の候補。中央は通路なので必ず空ける（演者が隠れる）。
+       stagger の行は**外側へ1/4ピッチ**ずらす ― 半ピッチずらすと内側の枠が
+       通路に食われて定員が減り、あぶれた人の置き場が無くなる（実測で8人が
+       同じ場所に積み上がった）。1/4なら定員は変わらず、隣の行とも重ならない。 */
+    function glowFormSlotsX(stagger){
+      const {halfW}=glowFanFoot();
+      const pitch=glowFormPitch(), xMax=glowFanXMax();
+      /* いちばん内側は「通路＋足の半幅」に散らしぶんを足した位置から。
+         足さないと、内側へ散らした人が通路に入って演者を隠す。 */
+      const inner=glowFormUp(GLOW_FAN_LANE+halfW)+glowFormJitter();
+      const off=stagger?glowFormSnap(pitch*.25):0;
+      const out=[];
+      [-1,1].forEach(sx=>{
+        for(let k=0;;k++){
+          const r=inner+off+k*pitch;
+          if(r>xMax+1e-9)break;
+          out.push(glowFormSnap(sx*r));
+        }
+      });
+      return out.sort((a,b)=>a-b);
+    }
+    /* 前詰めの人数配分。手前ほど多い ― 前に行きたい人が押すので前が密になる。
+       合計は必ず n にする（端数は手前の行から足す）。 */
+    function glowFormCounts(n,caps){
+      const rows=caps.length;
+      const w=caps.map((_,k)=>rows-k*.55);                  // 手前ほど重い
+      const sum=w.reduce((a,b)=>a+b,0);
+      const c=w.map((v,k)=>Math.min(caps[k],Math.max(1,Math.round(n*v/sum))));
+      /* 端数は手前の行から足し、あふれたら後ろの行から引く。定員は必ず守る
+         ― 守らないと置けない人が出て、その人が前の位置に取り残される。 */
+      let diff=n-c.reduce((a,b)=>a+b,0);
+      for(let k=0;diff>0&&k<rows*8;k++){const i=k%rows; if(c[i]<caps[i]){c[i]++;diff--}}
+      for(let k=0;diff<0&&k<rows*8;k++){const i=rows-1-(k%rows); if(c[i]>0){c[i]--;diff++}}
+      return c;
+    }
+    let glowFanUndo=null;          // 並べ替える直前の配置。1手だけ戻せる
+    const glowFormHas=()=>!!glowFanUndo;
+    function glowFanUndoApply(){
+      if(!glowFanUndo)return;
+      glowFanUndo.forEach((v,i)=>{const d=glowFansData[i]; if(!d)return; d.x=v.x; d.z=v.z; d.rot=v.rot});
+      glowFanUndo=null;
+      glowFansData.forEach((_,i)=>updateGlowFan(i));
+      glowFanRestart(); renderGlowFanUI(); saveSettings(); refresh();
+    }
+    /* 並べる。mode は 'depth'（前→後ろ）／'side'（下手→上手）。
+       揃えるのは位相の軸だけ: depth なら z を行でピタリ、x は行の中で散らす。
+       side なら x を列でピタリ、z を散らす。 */
+    function glowFormation(mode){
+      const n=glowFansData.length; if(!n)return;
+      glowFanUndo=glowFansData.map(d=>({x:d.x,z:d.z,rot:d.rot}));
+      /* 散らす量は刻みの整数倍。中途半端な値を丸めると、丸めたぶんだけ
+         間隔が縮んで足が重なる（股15°で実測4組）。 */
+      const j=glowFormJitter();
+      const jit=()=>j?[-j,0,j][Math.floor(Math.random()*3)]:0;
+      const rot=()=>Math.round((Math.random()*2-1)*GLOW_FAN_ROT);
+      const z0=GLOW_FAN_Z_MIN, z1=GLOW_FORM_Z1;
+      if(mode==='side'){
+        /* 列＝x。列の数は足の開きで決まる（開くほど減る）。 */
+        const xs=glowFormSlotsX(false), cols=xs.length;
+        const per=Math.ceil(n/cols), zp=Math.min(GLOW_FORM_ZPITCH,(z1-z0)/Math.max(per,1));
+        glowFansData.forEach((d,i)=>{
+          const c=i%cols, j=Math.floor(i/cols);
+          d.x=xs[c];
+          d.z=glowFormSnap(THREE.MathUtils.clamp(z0+j*zp+(c%2?zp*.5:0)+jit(),z0,z1));
+          d.rot=rot();
+        });
+      }else{
+        /* 行＝z。1行おきに千鳥。全員ぶんの定員が埋まるまで行を増やす。 */
+        const slotsOf=r=>glowFormSlotsX(r%2===1);
+        const want=Math.min(GLOW_FORM_ROWS_MIN,n);
+        let rows=1, caps=[slotsOf(0).length];
+        while((caps.reduce((a,b)=>a+b,0)<n||rows<want)&&rows<GLOW_FORM_ROWS_MAX){
+          caps.push(slotsOf(rows).length); rows++;
+        }
+        /* 行間。カメラの手前（z1）に収めるのが基本だが、足の開きが大きくて
+           行数が要るときは詰めすぎないよう下限を優先し、奥へはみ出させる
+           （はみ出した行はカメラに写らないので、読み出しに実寸を出す）。 */
+        const dz=rows>1?Math.max((z1-z0)/(rows-1),GLOW_FORM_DZ_MIN):0;
+        const counts=glowFormCounts(n,caps);
+        let i=0;
+        counts.forEach((cnt,r)=>{
+          /* 定員より少ないときは中央寄りから埋める ― 端から埋めると
+             前の行だけ横に広く、画の中で散漫になる。 */
+          const pick=slotsOf(r).slice().sort((a,b)=>Math.abs(a)-Math.abs(b)).slice(0,cnt);
+          const zr=glowFormSnap(Math.min(z0+r*dz,GLOW_FAN_Z_MAX));
+          pick.forEach(x=>{
+            const d=glowFansData[i++]; if(!d)return;
+            /* 横の散らしは「隙間の半分」まで。ここを超えると足の箱が重なる。 */
+            d.x=glowFormSnap(THREE.MathUtils.clamp(x+jit(),-glowFanXMax(),glowFanXMax()));
+            d.z=zr; d.rot=rot();
+          });
+        });
+      }
+      /* 並べたら波の向きも合わせる。向きが合っていないとボタンの意味が半分になる。
+         強さは触らない（0 のときだけ既定へ起こす ― 0 のままだと何も起きない）。 */
+      glowWave.mode=mode;
+      if(glowWaveTurns()<=0)glowWave.amount=80;
+      glowFansData.forEach((_,k)=>updateGlowFan(k));
+      glowFanRestart(); renderGlowFanUI(); saveSettings(); refresh();
+    }
+    /* 並びの読み出し。実際に使った前後／左右の幅が、波の基準距離の何割かを出す
+       ― ここが 100% でないと、レバー 100% でも 1周期ぶん広がらない。 */
+    function glowFormText(){
+      const zs=glowFansData.map(d=>d.z), xs=glowFansData.map(d=>d.x);
+      const dz=Math.max(...zs)-Math.min(...zs), dx=Math.max(...xs)-Math.min(...xs);
+      const rowsZ=new Set(glowFansData.map(d=>d.z.toFixed(2))).size;
+      const colsX=new Set(glowFansData.map(d=>d.x.toFixed(2))).size;
+      const useZ=dz/GLOW_WAVE_SPAN_Z, useX=dx/GLOW_WAVE_SPAN_X;
+      const cap=glowFormSlotsX(false).length;
+      return `前後 ${rowsZ}段 ${dz.toFixed(1)}m（基準の${Math.round(useZ*100)}%）`
+        +` · 左右 ${colsX}列 ${dx.toFixed(1)}m（${Math.round(useX*100)}%）`
+        +` · いまの足の開きでは1行${cap}人`;
+    }
     // UI生成。renderMicStandUI（1793付近）と同じ作り
     function renderGlowFanUI(){
       const list=document.getElementById('glowFanList'); if(!list)return;
@@ -3476,7 +3615,13 @@
         +`</select></div>`
         +`<div class="slider" style="margin:6px 0 0"><div><span>波の広がり</span>`
         +`<strong id="v-fanWave">${glowWaveText()}</strong></div>`
-        +`<input type="range" id="fanWave" min="0" max="${GLOW_WAVE_MAX}" step="5" value="${Math.round(glowWave.amount)}"></div>`;
+        +`<input type="range" id="fanWave" min="0" max="${GLOW_WAVE_MAX}" step="5" value="${Math.round(glowWave.amount)}"></div>`
+        /* 並べ替えは波の向きも一緒に設定する。押す前の配置は1手だけ戻せる。 */
+        +`<div class="fan-tabs" style="margin:8px 0 0">`
+        +`<button class="mode" id="fanFormDepth" type="button">前後の波に並べる</button>`
+        +`<button class="mode" id="fanFormSide" type="button">左右の波に並べる</button>`
+        +(glowFormHas()?`<button class="mode" id="fanFormUndo" type="button">元に戻す</button>`:'')
+        +`</div><div class="hint" id="v-fanForm" style="margin:4px 0 0">${glowFormText()}</div>`;
       list.appendChild(wave);
       const bulk=document.createElement('div');
       bulk.className='fan-pose fan-bulk';
@@ -3544,6 +3689,10 @@
         const v=document.getElementById('v-fanWave'); if(v)v.textContent=glowWaveText();
         const w=document.getElementById('v-fanSlow'); if(w)w.textContent=glowSlowText();
       };
+      [['fanFormDepth',()=>glowFormation('depth')],['fanFormSide',()=>glowFormation('side')],
+       ['fanFormUndo',glowFanUndoApply]].forEach(([id,fn])=>{
+        const b=document.getElementById(id); if(b)b.addEventListener('click',fn);
+      });
       const slowSel=document.getElementById('fanSlow');
       if(slowSel)slowSel.addEventListener('change',e=>{
         setGlowSlow(e.currentTarget.value); waveShow(); saveSettings(); refresh();
