@@ -66,6 +66,23 @@
     .finder-band.row b{display:none}
     .finder-band i{font-style:normal;color:#ffe3a8;font-size:11px;font-weight:600}
     .finder-band b{font-weight:400;color:#c3b696;font-size:9px}
+    .finder-band .fb-scale{display:none;width:100%;max-width:260px;height:26px}
+    .finder-band .fb-hist{display:none;width:100%;max-width:240px;height:40px}
+    .finder-band.has-scale .fb-scale{display:block}
+    .finder-band.has-hist .fb-hist{display:block}
+    /* 枠の中の線。グリッド・水平器・測光点。DOM のオーバーレイなので
+       撮った写真（renderer.domElement から取る）には入らない。 */
+    .finder-marks{position:absolute;z-index:2;pointer-events:none;display:none;overflow:visible}
+    .finder-marks.enabled{display:block}
+    .finder-marks line,.finder-marks path,.finder-marks circle{fill:none;vector-effect:non-scaling-stroke}
+    .fm-grid line{stroke:rgba(255,255,255,.26);stroke-width:1}
+    .fm-level line{stroke:rgba(255,214,92,.85);stroke-width:1.5}
+    .fm-level.lv-flat line{stroke:rgba(159,224,184,.95)}
+    .fm-level .fm-ref{stroke:rgba(255,255,255,.45);stroke-width:1}
+    .fm-meter path{stroke:rgba(103,174,245,.95);stroke-width:1.5}
+    .fm-meter line{stroke:rgba(103,174,245,.95);stroke-width:1}
+    .fm-meter.fm-out path,.fm-meter.fm-out line{stroke:rgba(255,180,168,.95)}
+    .fm-off{display:none}
     /* PC で卓を開いているあいだは卓のぶん描画面を狭める。枠はキャンバスの中央に
        内接させるので、空けないと枠の右が卓の下に隠れる（4:3横で約17%）。
        卓の開閉では setDrawerCollapsed が resize を呼ぶので、配線は要らない。 */
@@ -317,6 +334,7 @@
           <div class="two" id="frameModes" role="group" aria-label="画角の枠"><button class="mode active" type="button" data-frame="off" aria-pressed="true">枠なし</button><button class="mode" type="button" data-frame="land43" aria-pressed="false">横 4:3</button><button class="mode" type="button" data-frame="port34" aria-pressed="false">縦 3:4</button></div>
           <div class="slider" style="margin-top:8px"><div><span>構図の傾き</span><strong id="v-roll">0°</strong></div><input type="range" id="rollR" min="-45" max="45" step="1" value="0" /></div>
           <button class="mode" id="rollReset" type="button" style="width:100%">⌒ 水平に戻す</button>
+          <div class="two" style="margin-top:8px"><button class="mode" id="finderGuideToggle" type="button">○ 構図の線</button><button class="mode" id="finderMeterToggle" type="button">○ 測光点</button></div>
           <div class="hint">実機と同じ範囲だけを見ます。枠の外は写らないので、白飛び・色飽和の判定とゼブラも枠の中だけを見ます。縦位置はカメラを倒すのと同じで、長辺が縦に来るぶん垂直の画角が広がります。</div>
           <div class="slider"><div><span>ホワイトバランス</span><strong id="v-wb">5600K デイライト</strong></div><input type="range" id="wbR" min="0" max="8" step="1" value="6" /><button class="mode wb-auto-toggle" id="wbAutoToggle" type="button" aria-pressed="false">○ AW（オート）</button></div>
         </details></section>
@@ -4144,24 +4162,168 @@
     const finderBand=document.createElement('div');
     finderBand.className='finder-band';finderBand.setAttribute('aria-hidden','true');
     const finderExpoLabel=document.createElement('i'),frameOverlayLabel=document.createElement('b');
-    finderBand.append(finderExpoLabel,frameOverlayLabel);host.append(finderBand);
+    const SVGNS='http://www.w3.org/2000/svg';
+    const svgEl=(name,attrs)=>{const e=document.createElementNS(SVGNS,name);
+      for(const k in attrs)e.setAttribute(k,attrs[k]);return e};
+    /* 露出補正のスケール。±4段ぶんを viewBox で持つので、帯の広さに合わせて
+       CSS が伸縮する（下帯でも左帯でも同じものが使える）。 */
+    const FINDER_EV_MAX=4;
+    const finderScale=svgEl('svg',{class:'fb-scale',viewBox:'0 0 260 26',preserveAspectRatio:'xMidYMid meet'});
+    (()=>{
+      const x0=14,x1=246,mid=(x0+x1)/2,y=17;
+      finderScale.append(svgEl('line',{x1:x0,y1:y,x2:x1,y2:y,stroke:'rgba(255,255,255,.5)','stroke-width':1}));
+      for(let i=-FINDER_EV_MAX*3;i<=FINDER_EV_MAX*3;i++){
+        const x=mid+(x1-x0)/2*(i/(FINDER_EV_MAX*3)), whole=i%3===0;
+        finderScale.append(svgEl('line',{x1:x,y1:y,x2:x,y2:y-(whole?8:4),
+          stroke:whole?'rgba(255,255,255,.85)':'rgba(255,255,255,.4)','stroke-width':1}));
+        if(whole){const t=svgEl('text',{x,y:26,fill:'#c3b696','font-size':8,'text-anchor':'middle'});
+          t.textContent=String(i/3);finderScale.append(t)}
+      }
+    })();
+    const finderEvMark=svgEl('path',{d:'M0,0 L-5,-7 L5,-7 Z',fill:'#ffe3a8'});
+    finderScale.append(finderEvMark);
+    /* ヒストグラム。白飛び警告が毎回読んでいる縮小画像を使うので、
+       新しい読み出しはしない（updateFinderHistogram）。 */
+    const finderHist=document.createElement('canvas');
+    finderHist.className='fb-hist';finderHist.width=240;finderHist.height=40;
+    finderBand.append(finderExpoLabel,frameOverlayLabel,finderScale,finderHist);host.append(finderBand);
     /* 帯の最小の広さ。下帯は 100px 以上で2行、44px 以上で1行（撮影条件のみ）。
        下帯が足りなければ左帯へ逃がす（PC は帯が左右に出る）。どれも足りなければ
        帯を出さない ― iPhone縦の3:4（帯23px）と PC横（帯30px）は枠が最大の状態で、
        帯が無いのはその帰結。そのときはヘッダだけで読む。 */
-    const FINDER_BAND_2=100, FINDER_BAND_1=44, FINDER_BAND_SIDE=120;
+    const FINDER_BAND_2=100, FINDER_BAND_1=44, FINDER_BAND_SIDE=120, FINDER_BAND_HIST=120;
     function finderBandPlace(r){
       const bh=r.hostH-(r.y+r.h);
-      if(bh>=FINDER_BAND_1)return{x:r.x,y:r.y+r.h,w:r.w,h:bh,row:bh<FINDER_BAND_2};
-      if(r.x>=FINDER_BAND_SIDE)return{x:0,y:r.y,w:r.x,h:r.h,row:false};
+      const mk=(x,y,w,h,row)=>({x,y,w,h,row,scale:!row,
+        hist:!row&&w>=FINDER_BAND_HIST&&h>=FINDER_BAND_HIST});
+      if(bh>=FINDER_BAND_1)return mk(r.x,r.y+r.h,r.w,bh,bh<FINDER_BAND_2);
+      if(r.x>=FINDER_BAND_SIDE)return mk(0,r.y,r.x,r.h,false);
       return null;
     }
-    /* 撮影条件の1行。毎フレーム呼ばれるので、変わったときだけ DOM を触る。 */
+    /* 撮影条件の1行と露出補正のスケール。毎フレーム呼ばれるので、
+       変わったときだけ DOM を触る。 */
+    /* 残り枚数は撮ったもの側から push してもらう。ここから ROLL_MAX / rollShots を
+       読むと、restoreSettings(11362行)→setFrameMode→ここ の順で評価されるのに
+       宣言が 12094行 以降なので TDZ になる（8ff457f と同じ型）。 */
+    let finderShotsLeft=null;
+    const setFinderShotsLeft=n=>{finderShotsLeft=Number.isFinite(n)?n:null};
     function updateFinderExpo(){
       if(!finderBand.classList.contains('enabled'))return;
       const txt='ISO'+expo.iso+' · F'+expo.fstop+' · 1/'+Math.round(1/Math.max(expo.shutter,1e-9))
-        +' · '+Math.round(focalLength)+'mm';
+        +' · '+Math.round(focalLength)+'mm · '+(whiteBalanceAutoOn?'AWB':WB_STOPS[whiteBalanceIndex()]+'K')
+        +(finderShotsLeft===null?'':' · 残り'+finderShotsLeft+'枚');
       if(finderExpoLabel.textContent!==txt)finderExpoLabel.textContent=txt;
+      const ev=THREE.MathUtils.clamp(Number(expo.over)||0,-FINDER_EV_MAX,FINDER_EV_MAX);
+      const x=130+116*(ev/FINDER_EV_MAX);
+      finderEvMark.setAttribute('transform','translate('+x.toFixed(1)+',17)');
+      finderEvMark.setAttribute('fill',Math.abs(expo.over)>FINDER_EV_MAX?'#ffb4a8'
+        :(Math.abs(expo.over)<.3?'#9fe0b8':'#ffe3a8'));
+    }
+    /* ヒストグラム。白飛び警告が毎回読んでいる縮小画像（highlightColorPixels、
+       長辺224px）をそのまま数える。枠の外は写真に入らないので frameSampleRect で
+       枠の内側に限る。更新は白飛び判定と同じ約3Hz。 */
+    const FINDER_HIST_BINS=64;
+    const finderHistBins=new Float32Array(FINDER_HIST_BINS);
+    let finderHistAt=-1;
+    function updateFinderHistogram(){
+      if(!finderBand.classList.contains('has-hist'))return;
+      if(finderHistAt===highlightLastSampleAt)return;
+      finderHistAt=highlightLastSampleAt;
+      const ctx=finderHist.getContext('2d');if(!ctx)return;
+      const W=finderHist.width,H=finderHist.height;
+      ctx.clearRect(0,0,W,H);
+      const px=highlightColorPixels,sr=frameSampleRect();
+      if(!px||!sr){return}
+      finderHistBins.fill(0);
+      const sw=highlightSampleWidth;
+      const x0=Math.max(0,sr.x0),x1=Math.min(highlightSampleWidth,sr.x1);
+      const y0=Math.max(0,sr.y0),y1=Math.min(highlightSampleHeight,sr.y1);
+      let n=0,clip=0;
+      for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
+        const i=(y*sw+x)*4;
+        const lum=.2126*px[i]+.7152*px[i+1]+.0722*px[i+2];
+        finderHistBins[Math.min(FINDER_HIST_BINS-1,lum*FINDER_HIST_BINS/256|0)]++;
+        if(lum>=HIGHLIGHT_CLIP)clip++;
+        n++;
+      }
+      if(!n)return;
+      let peak=0;for(let i=0;i<FINDER_HIST_BINS;i++)if(finderHistBins[i]>peak)peak=finderHistBins[i];
+      if(peak<=0)return;
+      const bw=W/FINDER_HIST_BINS;
+      ctx.fillStyle='rgba(255,227,168,.78)';
+      for(let i=0;i<FINDER_HIST_BINS;i++){
+        const h=Math.round(finderHistBins[i]/peak*(H-2));
+        if(h>0)ctx.fillRect(i*bw,H-h,Math.max(1,bw-.5),h);
+      }
+      // 白飛びしている画素があれば右端に印を出す（HLバッジと同じ 252/255 の判定）
+      if(clip>0){ctx.fillStyle='rgba(255,180,168,.95)';ctx.fillRect(W-2,0,2,H)}
+    }
+    /* 枠の中の線。三分割グリッド・水平器・測光点。卓で2つに分けて切る。 */
+    const finderView={guides:true,meter:true};
+    const finderMarks=svgEl('svg',{class:'finder-marks','aria-hidden':'true'});
+    const fmGrid=svgEl('g',{class:'fm-grid'}), fmLevel=svgEl('g',{class:'fm-level'}),
+          fmMeter=svgEl('g',{class:'fm-meter'});
+    const fmGridLines=[0,1,2,3].map(()=>{const l=svgEl('line',{});fmGrid.append(l);return l});
+    const fmRefL=svgEl('line',{class:'fm-ref'}),fmRefR=svgEl('line',{class:'fm-ref'}),
+          fmHorizon=svgEl('line',{});
+    fmLevel.append(fmRefL,fmRefR,fmHorizon);
+    /* 測光点の印。四隅の括弧と十字。AF枠ではない ― faceExposureOf が実際に
+       測っている点（SUBJECT）そのものを指す。 */
+    const fmBox=svgEl('path',{d:'M-11,-5 L-11,-11 L-5,-11 M5,-11 L11,-11 L11,-5'
+      +' M11,5 L11,11 L5,11 M-5,11 L-11,11 L-11,5'});
+    const fmCrossH=svgEl('line',{x1:-4,y1:0,x2:4,y2:0}),fmCrossV=svgEl('line',{x1:0,y1:-4,x2:0,y2:4});
+    const fmMeterG=svgEl('g',{});fmMeterG.append(fmBox,fmCrossH,fmCrossV);fmMeter.append(fmMeterG);
+    finderMarks.append(fmGrid,fmLevel,fmMeter);host.append(finderMarks);
+    const _fmV=new THREE.Vector3();
+    /* 線の置き場。枠があれば枠に、無ければキャンバス全体に合わせる。 */
+    function finderMarksRect(){
+      if(cameraMode==='map')return null;
+      const r=frameRect();
+      return r||{x:0,y:0,w:host.clientWidth,h:host.clientHeight,
+                 hostW:host.clientWidth,hostH:host.clientHeight};
+    }
+    /* 毎フレーム、本描画のあとに呼ぶ。project() は render() のあとでないと
+       matrixWorldInverse が古いままになる。 */
+    function updateFinderMarks(){
+      const r=finderMarksRect();
+      const on=!!r&&(finderView.guides||finderView.meter)&&r.w>1&&r.h>1;
+      finderMarks.classList.toggle('enabled',on);
+      if(!on)return;
+      finderMarks.setAttribute('style','left:'+r.x+'px;top:'+r.y+'px;width:'+r.w+'px;height:'+r.h+'px');
+      finderMarks.setAttribute('viewBox','0 0 '+r.w+' '+r.h);
+      fmGrid.classList.toggle('fm-off',!finderView.guides);
+      fmLevel.classList.toggle('fm-off',!finderView.guides);
+      fmMeter.classList.toggle('fm-off',!finderView.meter);
+      if(finderView.guides){
+        const x1=r.w/3,x2=r.w*2/3,y1=r.h/3,y2=r.h*2/3;
+        [[x1,0,x1,r.h],[x2,0,x2,r.h],[0,y1,r.w,y1],[0,y2,r.w,y2]].forEach((v,i)=>{
+          const l=fmGridLines[i];
+          l.setAttribute('x1',v[0]);l.setAttribute('y1',v[1]);
+          l.setAttribute('x2',v[2]);l.setAttribute('y2',v[3]);
+        });
+        /* 水平器。構図の傾き（cameraRoll）ぶんカメラが回っているので、
+           世界の水平は画面上で逆向きに傾いて見える。 */
+        const cx=r.w/2,cy=r.h/2,half=Math.min(r.w,r.h)*.30;
+        const a=-THREE.MathUtils.degToRad(cameraRoll),ca=Math.cos(a),sa=Math.sin(a);
+        fmHorizon.setAttribute('x1',cx-half*ca);fmHorizon.setAttribute('y1',cy-half*sa);
+        fmHorizon.setAttribute('x2',cx+half*ca);fmHorizon.setAttribute('y2',cy+half*sa);
+        fmRefL.setAttribute('x1',cx-half-10);fmRefL.setAttribute('y1',cy);
+        fmRefL.setAttribute('x2',cx-half-2);fmRefL.setAttribute('y2',cy);
+        fmRefR.setAttribute('x1',cx+half+2);fmRefR.setAttribute('y1',cy);
+        fmRefR.setAttribute('x2',cx+half+10);fmRefR.setAttribute('y2',cy);
+        fmLevel.classList.toggle('lv-flat',Math.abs(cameraRoll)<1);
+      }
+      if(finderView.meter){
+        const p=_fmV.copy(SUBJECT).project(camera);
+        const behind=!(p.z>-1&&p.z<1);
+        let x=(p.x*.5+.5)*r.hostW-r.x, y=(1-(p.y*.5+.5))*r.hostH-r.y;
+        const out=behind||x<12||y<12||x>r.w-12||y>r.h-12;
+        if(behind){x=r.w/2;y=r.h/2}
+        x=THREE.MathUtils.clamp(x,12,Math.max(12,r.w-12));
+        y=THREE.MathUtils.clamp(y,12,Math.max(12,r.h-12));
+        fmMeterG.setAttribute('transform','translate('+x.toFixed(1)+','+y.toFixed(1)+')');
+        fmMeter.classList.toggle('fm-out',out);
+      }
     }
     function syncShootingAspect(){
       if(cameraMode==='map')return;
@@ -4173,6 +4335,8 @@
       const b=r?finderBandPlace(r):null;
       finderBand.classList.toggle('enabled',!!b);
       finderBand.classList.toggle('row',!!b&&b.row);
+      finderBand.classList.toggle('has-scale',!!b&&b.scale);
+      finderBand.classList.toggle('has-hist',!!b&&b.hist);
       if(b){
         finderBand.style.left=b.x+'px';finderBand.style.top=b.y+'px';
         finderBand.style.width=b.w+'px';finderBand.style.height=b.h+'px';
@@ -9952,7 +10116,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         shutterValue:SHUTTER_STOPS[+document.querySelector('#shutterR').value],
         highlightZebraEnabled,
         wbAuto:whiteBalanceAutoOn,
-        camera:{preset:cameraState.preset,focalLength,focalStopsVersion:1,frame:frameMode,roll:cameraRoll,position:cameraState.position,target:cameraState.target},
+        camera:{preset:cameraState.preset,focalLength,focalStopsVersion:1,frame:frameMode,roll:cameraRoll,guides:finderView.guides,meter:finderView.meter,position:cameraState.position,target:cameraState.target},
         board:JSON.parse(JSON.stringify(board))
       };
     }
@@ -10335,6 +10499,10 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
         document.querySelector('#isoR').value=nearestIsoIndex(legacyValue);
       }
       if(s.camera){
+        // 既定は ON。古い保存データにキーが無いときは触らない
+        if(typeof s.camera.guides==='boolean')finderView.guides=s.camera.guides;
+        if(typeof s.camera.meter==='boolean')finderView.meter=s.camera.meter;
+        syncFinderViewUI();
         setFrameMode(s.camera.frame);setCameraRoll(s.camera.roll);
         applyFocalLength(s.camera.focalStopsVersion===1?s.camera.focalLength:50);
         if(CAMERA_PRESETS[s.camera.preset])applyCameraPreset(s.camera.preset);
@@ -11088,6 +11256,16 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       if(b.dataset.frame===frameMode)return;
       setFrameMode(b.dataset.frame);saveSettings();
     });
+    /* ファインダーの線。線は DOM のオーバーレイなので、撮った写真には入らない。 */
+    function syncFinderViewUI(){
+      setToggle('finderGuideToggle',finderView.guides,'構図の線');
+      setToggle('finderMeterToggle',finderView.meter,'測光点');
+    }
+    q('#finderGuideToggle').onclick=()=>{finderView.guides=!finderView.guides;
+      syncFinderViewUI();updateFinderMarks();saveSettings()};
+    q('#finderMeterToggle').onclick=()=>{finderView.meter=!finderView.meter;
+      syncFinderViewUI();updateFinderMarks();saveSettings()};
+    syncFinderViewUI();
     q('#positionMapToggle').onclick=()=>cameraMode==='map'?exitPositionMap(true):enterPositionMap();
     controls.addEventListener('start',markCameraCustom);
     controls.addEventListener('end',saveSettings);
@@ -12023,6 +12201,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       }catch(e){console.warn('撮ったものの読み込みに失敗しました',e);return[]}
     }
     function writeRoll(){
+      // ファインダーの帯へ残り枚数を押し込む（向こうから読むと TDZ になる）
+      setFinderShotsLeft(Math.max(0,ROLL_MAX-rollShots.length));
       try{localStorage.setItem(ROLL_STORAGE_KEY,JSON.stringify(rollShots));return true}
       catch(e){
         // 容量あふれ。古い方から落として、入るところまで縮める。
@@ -12262,6 +12442,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       e.preventDefault();requestShot();
     });
     rollShots=readRoll();
+    setFinderShotsLeft(Math.max(0,ROLL_MAX-rollShots.length));
     if(rollShots.length)rollSelectedId=rollShots[rollShots.length-1].id;
     renderContactSheet();
 
@@ -12314,6 +12495,8 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       // シャッターは本描画の直後だけ取れる（バッファはフレーム末で捨てられる）。
       if(rollPendingShot)takePendingShot();
       sampleSubjectHighlights(now);
+      // 線は本描画のあと。project() は render() の前だと行列が古い。
+      updateFinderMarks();updateFinderHistogram();
       if(diagSpeckle)diagSpeckle.tick(now);
       if(diagMic)diagMic.tick(now);
       if(diagPerf)diagPerf.tick(now);
