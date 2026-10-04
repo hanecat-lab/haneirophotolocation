@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-04-advance-probe';
+const VLOG_PREVIEW_BUILD='2026-10-04-freeze-outgoing';
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -12219,7 +12219,18 @@ function App(){
       }
       const clipRateActive = active._playbackRate || 1;
       activeVideo.playbackRate=rate * clipRateActive;
-      if(activeVideo.ended && (state.heldTime===null || state.heldTime===undefined)){
+      if(state.frozenOutgoingId===active.id){
+        // トランジション中は前の素材を最後の絵で止め、時計は次の素材の再生位置から進める。
+        const frozenNext=clipsNow[index+1];
+        const frozenNextVideo=frozenNext?.type==='video'?videoRefs.current.get(frozenNext.id):null;
+        const frozenTrans=active._transitionToNext;
+        const frozenOverlapStart=active.timelineStart+active.duration-(frozenTrans?.duration||0.5);
+        if(frozenNextVideo && !frozenNextVideo.paused && !frozenNextVideo.seeking && frozenNextVideo.readyState>=2 &&
+           (state.heldTime===null || state.heldTime===undefined)){
+          const nextLocal=(frozenNextVideo.currentTime-(frozenNext.trimStart||0))/(frozenNext._playbackRate||1);
+          t=Math.max(t,Math.min(active.timelineStart+active.duration,frozenOverlapStart+Math.max(0,nextLocal)));
+        }
+      }else if(activeVideo.ended && (state.heldTime===null || state.heldTime===undefined)){
         // 終了済み動画への play() は冒頭から再開し得るため、次の素材へ進む。
         t=active.timelineStart+active.duration;
       }else if(activeVideo.readyState<2 || activeVideo.seeking){
@@ -12295,6 +12306,7 @@ function App(){
       state.activeId=null;
       waiting=true;
       waitReasons.push('clip-switch');
+      state.frozenOutgoingId=null;
     }
     const trans=active?._transitionToNext;
     const transDur=trans?.type && trans.type!=='none' && index<clipsNow.length-1 ? trans.duration||0.5 : 0;
@@ -12356,6 +12368,13 @@ function App(){
         activeVideo.muted=true;
         recordPreviewDiagnostic('overlap-mute',{clip:active.name,next:next.name,
           timelineTime:Number(t.toFixed(3))});
+      }
+      // この端末では2本の動画が同時に進まないため、前の素材は止めて次の素材だけを動かす。
+      if(activeVideo && activeVideo!==incoming && active?.type==='video' && state.frozenOutgoingId!==active.id){
+        try{ activeVideo.pause(); }catch{}
+        state.frozenOutgoingId=active.id;
+        recordPreviewDiagnostic('overlap-freeze',{clip:active.name,next:next.name,
+          frozenAt:Number(activeVideo.currentTime.toFixed(3)),timelineTime:Number(t.toFixed(3))});
       }
       const incomingUsesCrossfade=audioCrossfadeActive?.to?.id===next.id;
       const incomingGain=vlogClipSourceGain(next,sourceAudioVolumeRef.current);
@@ -12458,7 +12477,7 @@ function App(){
         }
         state.resumeSyncTargets.delete(clip.id);
       };
-      if(active?.type==='video'){
+      if(active?.type==='video' && state.frozenOutgoingId!==active.id){
         const local=Math.max(0,state.heldTime-active.timelineStart);
         syncHeldVideo(active,activeVideo,(active.trimStart||0)+local*(active._cutGroupId?(active._playbackRate||1):1),'resume-sync','active');
       }
