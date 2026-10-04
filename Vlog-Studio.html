@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-04-freeze-outgoing';
+const VLOG_PREVIEW_BUILD='2026-10-04-prewarm';
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -12351,7 +12351,7 @@ function App(){
         watchPreviewMedia();
       }
     }
-    if(incoming && t>=overlapStart-0.5 && state.preparedId!==next.id){
+    if(incoming && t>=overlapStart-1.2 && state.preparedId!==next.id){
       if(incoming.preload!=='auto'){
         incoming.preload='auto';
         if(incoming.readyState<1) try{ incoming.load(); }catch{}
@@ -12359,8 +12359,34 @@ function App(){
       if(positionPreviewVideo(incoming,next,next.trimStart||0,'incoming-prepare'))
         state.preparedId=next.id;
     }
+    // 予熱: 動き出しに0.3〜0.6秒かかるため、トランジション前に音なしで一度動かして頭へ戻しておく。
+    if(incoming && next && state.preparedId===next.id && t<overlapStart &&
+       (state.heldTime===null || state.heldTime===undefined)){
+      const warm=state.prewarm;
+      if(!warm || warm.id!==next.id){
+        if(!incoming.seeking && incoming.readyState>=2 && incoming.paused){
+          incoming.muted=true;
+          state.prewarm={id:next.id,phase:'playing',startAt:now,from:incoming.currentTime,unmuted:false};
+          requestPreviewPlay(incoming,next,'incoming-prewarm');
+        }
+      }else if(warm.phase==='playing'){
+        const moved=incoming.currentTime-warm.from;
+        if(moved>=0.02 || now-warm.startAt>=900){
+          try{ incoming.pause(); }catch{}
+          warm.phase='done';
+          recordPreviewDiagnostic('incoming-prewarm',{clip:next.name,ms:Math.round(now-warm.startAt),
+            moved:Number(moved.toFixed(3)),timelineTime:Number(t.toFixed(3))});
+          positionPreviewVideo(incoming,next,next.trimStart||0,'incoming-prewarm-rewind',0.02);
+        }
+      }
+    }
     const inOverlap=!!next && t>=overlapStart;
     if(inOverlap && incoming){
+      if(state.prewarm?.id===next.id && !state.prewarm.unmuted){
+        state.prewarm.unmuted=true;
+        state.prewarm.phase='done';
+        if(!previewAutoplayMutedRef.current.has(incoming)) incoming.muted=false;
+      }
       // iOS は音の出る動画を同時に1本しか再生させず、もう片方を止める。
       // 重なり中は前の素材を消音し、2本が交互に止め合わないようにする。
       if(activeVideo && activeVideo!==incoming && !previewAutoplayMutedRef.current.has(activeVideo)){
@@ -12503,6 +12529,7 @@ function App(){
     }
     if(active?.type==='video') liveIds.add(active.id);
     if(inOverlap && incoming) liveIds.add(next.id);
+    if(state.prewarm?.phase==='playing') liveIds.add(state.prewarm.id);
     if(audioCrossfadeActive?.to?.type==='video')liveIds.add(audioCrossfadeActive.to.id);
     livePreviewIdsRef.current=liveIds;
     if(waiting){
