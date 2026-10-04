@@ -8320,25 +8320,15 @@ function TextStylePreview({item,backdrop,onFontReady}){
   );
 }
 
-// A local ruler keeps tenths of a second reachable even in a long vlog.
+// The bar always shows the whole range, so only the edge the user touches ever moves.
 // Values remain a draft until the owning editor explicitly applies them.
-function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragStart,onDragEnd,label,removed=false,zoomable=false}){
-  const [full,setFull]=useState(false);
-  const [focus,setFocus]=useState(null);
-  const [windowStart,setWindowStart]=useState(null);
-  const [zoom,setZoom]=useState(1);
+function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragStart,onDragEnd,onSelectEdge,getCurrentTime,label,removed=false}){
+  const [focus,setFocus]=useState('start');
+  const [notice,setNotice]=useState('');
   const drag=useRef(null);
-  const detailWidthRef=useRef(null);
   const safeMax=Math.max(min+minSpan,max);
-  const span=Math.max(minSpan,end-start);
-  if(detailWidthRef.current?.key!==scopeKey)
-    detailWidthRef.current={key:scopeKey,width:Math.max(4.5,span+3)};
-  const detailWidth=Math.min(safeMax-min,detailWidthRef.current.width);
-  const initialWindow=Math.max(min,Math.min(safeMax-detailWidth,(start+end-detailWidth)/2));
-  const width=full?safeMax-min:zoomable?Math.max(Math.min(0.6,safeMax-min),detailWidth/zoom):detailWidth;
-  const left=full?min:Math.max(min,Math.min(safeMax-width,windowStart??initialWindow));
-  const right=left+width;
-  useEffect(()=>{setFull(false);setFocus(null);setWindowStart(null);setZoom(1);drag.current=null;},[scopeKey]);
+  const width=Math.max(0.1,safeMax-min);
+  useEffect(()=>{setFocus('start');setNotice('');drag.current=null;},[scopeKey]);
   const round=value=>Math.round(value*10)/10;
   const change=(kind,rawStart,rawEnd)=>{
     let nextStart=rawStart,nextEnd=rawEnd;
@@ -8354,108 +8344,81 @@ function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragSt
       if(kind==='start') nextStart=round(nextEnd-minSpan);
       else nextEnd=round(nextStart+minSpan);
     }
+    setNotice('');
     onChange(nextStart,nextEnd,kind);
-    if(!full && !drag.current) followEdge(kind,nextStart,nextEnd);
   };
-  // Scroll the ruler only toward the edge that was edited, so the other edge stays put.
-  const followEdge=(kind,edgeStart,edgeEnd)=>{
-    const toLeft=value=>setWindowStart(Math.max(min,value-0.75));
-    const toRight=value=>setWindowStart(Math.min(safeMax-width,value-width+0.75));
-    if(kind==='start'){
-      if(edgeStart<left+0.35) toLeft(edgeStart);
-      else if(edgeStart>right-0.35) toRight(edgeStart);
-    }else if(kind==='end'){
-      if(edgeEnd>right-0.35) toRight(edgeEnd);
-      else if(edgeEnd<left+0.35) toLeft(edgeEnd);
-    }else{
-      if(edgeStart<left+0.35) toLeft(edgeStart);
-      else if(edgeEnd>right-0.35) toRight(edgeEnd);
-    }
-  };
+  const selectEdge=kind=>{setFocus(kind);setNotice('');onSelectEdge?.(kind);};
   const pointerDown=(event,kind)=>{
     event.preventDefault();event.stopPropagation();
     onDragStart?.();
-    if(!full) setWindowStart(left);
-    setFocus(kind);
+    if(kind!=='move') setFocus(kind);
     const box=event.currentTarget.parentElement.getBoundingClientRect();
-    const outside=value=>value<left-0.01||value>right+0.01;
-    drag.current={kind,x:event.clientX,start,end,width:Math.max(1,box.width),scale:width,left,
-      outside:!full&&(kind==='start'?outside(start):kind==='end'?outside(end):outside(start)||outside(end))};
+    drag.current={kind,x:event.clientX,start,end,width:Math.max(1,box.width)};
     try{event.currentTarget.setPointerCapture(event.pointerId);}catch{}
   };
   const pointerMove=event=>{
     if(!drag.current) return;
     const d=drag.current;
-    let delta=round((event.clientX-d.x)/d.width*d.scale);
-    // Keep the ruler still while dragging; the grabbed edge stops at the visible edge.
-    if(!full && !d.outside){
-      const low=d.left-(d.kind==='end'?d.end:d.start),high=d.left+d.scale-(d.kind==='start'?d.start:d.end);
-      if(low<=high) delta=Math.max(low,Math.min(high,delta));
-    }
+    const delta=round((event.clientX-d.x)/d.width*width);
     if(d.kind==='start') change('start',d.start+delta,d.end);
     else if(d.kind==='end') change('end',d.start,d.end+delta);
     else change('move',d.start+delta,d.end+delta);
-    if(!full && d.outside){
-      const nextEdge=d.kind==='start'?d.start+delta:d.end+delta;
-      if(nextEdge<left+0.35) setWindowStart(Math.max(min,nextEdge-0.75));
-      if(nextEdge>right-0.35) setWindowStart(Math.min(safeMax-width,nextEdge-width+0.75));
-    }
   };
   const pointerUp=event=>{
     if(!drag.current) return;
     if(event.type==='pointercancel') onChange(drag.current.start,drag.current.end);
     try{event.currentTarget.releasePointerCapture(event.pointerId);}catch{}
-    const d=drag.current;
     drag.current=null;
-    if(event.type!=='pointercancel' && !full && !d.outside) followEdge(d.kind,start,end);
     onDragEnd?.();
   };
-  const percent=value=>Math.max(0,Math.min(100,(value-left)/Math.max(0.1,width)*100));
+  const nudge=amount=>{
+    if(focus==='start') change('start',start+amount,end);
+    else change('end',start,end+amount);
+    onDragEnd?.();
+  };
+  const edgeName=kind=>`${removed?'カット':''}${kind==='start'?'開始':'終了'}`;
+  const setFromCurrent=()=>{
+    const time=round(Number(getCurrentTime?.()));
+    if(!Number.isFinite(time)) return;
+    if(focus==='start' && time>end-minSpan+0.001){setNotice(`${edgeName('end')}より前の位置で押してください`);return;}
+    if(focus==='end' && time<start+minSpan-0.001){setNotice(`${edgeName('start')}より後の位置で押してください`);return;}
+    if(focus==='start') change('start',time,end);
+    else change('end',start,time);
+    onDragEnd?.();
+  };
+  const percent=value=>Math.max(0,Math.min(100,(value-min)/width*100));
   return React.createElement('div',{className:'rounded-xl border border-white/15 bg-black/30 px-3 py-3','aria-label':label,'data-range-band':true},
-    React.createElement('div',{className:'flex flex-wrap items-center justify-between gap-1 text-[10px] text-white/60 mb-3'},
-      React.createElement('span',null,`${left.toFixed(1)}〜${right.toFixed(1)}秒`),
-      React.createElement('div',{className:'flex flex-wrap items-center justify-end gap-1'},
-        zoomable && !full && [1,2,4].map(level=>React.createElement('button',{key:level,type:'button',
-          onClick:()=>{const nextWidth=Math.max(Math.min(0.6,safeMax-min),detailWidth/level);const center=focus==='start'?start:focus==='end'?end:(start+end)/2;setZoom(level);setWindowStart(Math.max(min,Math.min(safeMax-nextWidth,center-nextWidth/2)));},
-          'aria-pressed':zoom===level,className:`min-h-9 rounded-full border px-2 ${zoom===level?'border-violet-300 bg-violet-500/20':'border-white/20'}`},`×${level}`)),
-        !full && start<left-0.01 && React.createElement('button',{type:'button',
-          onClick:()=>{setWindowStart(Math.max(min,start-0.5));setFocus('start');},
-          className:'min-h-9 rounded-full border border-white/20 px-2'},'‹ 開始'),
-        !full && end>right+0.01 && React.createElement('button',{type:'button',
-          onClick:()=>{setWindowStart(Math.min(safeMax-width,end-width+0.5));setFocus('end');},
-          className:'min-h-9 rounded-full border border-white/20 px-2'},'終了 ›'),
-        React.createElement('button',{type:'button',onClick:()=>{setFull(value=>!value);setWindowStart(null);},
-          className:'min-h-9 rounded-full border border-white/25 px-3 text-white/80'},full?'選択範囲を拡大':'全体を見る')
-      )
+    React.createElement('div',{className:'flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-[11px] text-white/80 mb-3',role:'status'},
+      React.createElement('span',null,`${edgeName('start')} ${start.toFixed(1)}秒`),
+      React.createElement('span',{className:'text-white/40'},'／'),
+      React.createElement('span',null,`${edgeName('end')} ${end.toFixed(1)}秒`),
+      React.createElement('span',{className:'text-white/40'},'／'),
+      React.createElement('span',null,`${removed?'カットする長さ':'長さ'} ${Math.max(0,end-start).toFixed(1)}秒`)
     ),
     React.createElement('div',{className:'relative h-14 mx-4',style:{touchAction:'none'}},
       React.createElement('div',{className:'absolute inset-x-0 top-5 h-3 rounded-full bg-white/20'}),
-      React.createElement('div',{className:`absolute top-5 h-3 rounded-full ${removed?'border border-rose-200/70':'bg-violet-400'}`,style:{left:`${percent(start)}%`,width:`${Math.max(0,percent(end)-percent(start))}%`,...(removed?{background:'repeating-linear-gradient(135deg,rgba(251,113,133,.85) 0 4px,rgba(127,29,29,.75) 4px 8px)'}:{})},
+      React.createElement('div',{className:`absolute top-5 h-3 rounded-full ${removed?'border border-rose-200/70':'bg-violet-400'}`,style:{left:`${percent(start)}%`,width:`${Math.max(0,percent(end)-percent(start))}%`,...(removed?{background:'repeating-linear-gradient(135deg,rgba(251,113,133,.85) 0 4px,rgba(127,29,29,.75) 4px 8px)'}:{background:'var(--paper-accent)'})},
         onPointerDown:event=>pointerDown(event,'move'),onPointerMove:pointerMove,onPointerUp:pointerUp,onPointerCancel:pointerUp,
         role:'slider','aria-label':'長さを保って範囲を移動','aria-valuenow':start,'aria-valuemin':min,'aria-valuemax':safeMax}),
       ['start','end'].map((kind,index)=>React.createElement('button',{
         key:kind,type:'button',
         onPointerDown:event=>pointerDown(event,kind),onPointerMove:pointerMove,onPointerUp:pointerUp,onPointerCancel:pointerUp,
-        onClick:()=>setFocus(kind),
+        onClick:()=>selectEdge(kind),
         style:{left:`${percent(index?end:start)}%`,transform:'translateX(-50%)',touchAction:'none',zIndex:focus===kind?4:index?3:2},
         className:'absolute top-1 h-11 w-11 rounded-full bg-white text-black border-2 border-violet-300 shadow-lg flex items-center justify-center text-[9px] font-bold',
         'aria-label':index?'終了位置を調整':'開始位置を調整'
       },index?'終了':'開始'))
     ),
-    span/Math.max(0.1,width)<0.18 && React.createElement('div',{className:'flex justify-center gap-2 text-[10px]'},
-      ['start','end'].map(kind=>React.createElement('button',{key:kind,type:'button',
-        onClick:()=>setFocus(kind),className:`min-h-9 rounded-full px-3 border ${focus===kind?'border-violet-300 bg-violet-500/30':'border-white/20'}`},
-        kind==='start'?'開始を選択':'終了を選択'))),
-    focus && React.createElement('div',{className:'flex items-center justify-center gap-2 mt-2 text-[11px]'},
-      React.createElement('span',{className:'text-white/65'},focus==='move'?'範囲':focus==='start'?'開始':'終了'),
-      [-0.1,0.1].map(amount=>React.createElement('button',{key:amount,type:'button',
-        onClick:()=>{
-          if(focus==='start') change('start',start+amount,end);
-          else if(focus==='end') change('end',start,end+amount);
-          else change('move',start+amount,end+amount);
-          onDragEnd?.();
-        },className:'min-h-10 rounded-full border border-white/20 bg-white/10 px-4'},amount<0?'−0.1秒':'＋0.1秒'))
-    )
+    React.createElement('div',{className:'flex items-center justify-center gap-2 mt-2 text-[11px]'},
+      React.createElement('span',{className:'text-white/65'},'動かす端'),
+      ['start','end'].map(kind=>React.createElement('button',{key:kind,type:'button',onClick:()=>selectEdge(kind),'aria-pressed':focus===kind,
+        className:`min-h-9 rounded-full px-4 border ${focus===kind?'border-violet-300 bg-violet-500/30':'border-white/20'}`},edgeName(kind)))),
+    React.createElement('div',{className:'flex items-center justify-center gap-1.5 mt-2 text-[11px]'},
+      [-1,-0.1,0.1,1].map(amount=>React.createElement('button',{key:amount,type:'button',onClick:()=>nudge(amount),
+        className:'min-h-10 rounded-full border border-white/20 bg-white/10 px-3'},`${amount<0?'−':'＋'}${Math.abs(amount)}秒`))),
+    getCurrentTime && React.createElement('button',{type:'button',onClick:setFromCurrent,
+      className:'block w-full min-h-10 mt-2 rounded-full border border-white/20 bg-white/10 px-3 text-[11px]'},`今の再生位置を${edgeName(focus)}にする`),
+    notice && React.createElement('div',{className:'text-[10px] text-amber-200 mt-2 text-center',role:'status'},notice)
   );
 }
 
@@ -8558,8 +8521,6 @@ function VlogMiddleCutControls({clip,start,end,onChange,plan,sourceAudioVolume})
     run.phase='after';
   };
   const planOk=!!plan && !plan.error;
-  const nudge=amount=>setRange(focus==='start'?Math.max(0,Math.min(end-0.1,start+amount)):start,
-    focus==='end'?Math.min(clip.duration,Math.max(start+0.1,end+amount)):end);
   return React.createElement('div',{className:'mt-2 flex flex-col gap-2'},
     React.createElement('div',{className:'sticky top-14 z-20 flex flex-col gap-2 bg-[#1a1a1c] py-1'},
       React.createElement('button',{type:'button',onClick:()=>setPreviewLarge(value=>!value),
@@ -8571,14 +8532,9 @@ function VlogMiddleCutControls({clip,start,end,onChange,plan,sourceAudioVolume})
       React.createElement('div',{className:'flex gap-2'},
       React.createElement('button',{type:'button',onClick:preview,disabled:!planOk,className:'flex-1 h-8 rounded-full bg-rose-500/20 border border-rose-300/30 text-[10px] disabled:opacity-40'},'▶ つながりを確認')),
     ),
-    clip.duration>=0.2 ? React.createElement(TimeRangeBand,{scopeKey:`cut-${clip.id}`,start,end,min:0,max:clip.duration,minSpan:0.1,zoomable:true,
-      label:'途中をカットする範囲',removed:true,onChange:setRange,onDragStart:stopPreview,onDragEnd:setSelectedFrame})
-      : React.createElement('div',{className:'rounded-xl border border-rose-300/30 bg-rose-500/10 px-3 py-2 text-[10px] text-rose-100'},'この動画は短いため、カットできる有効範囲がありません'),
-    clip.duration>=0.2 && React.createElement('div',{className:'flex items-center justify-center gap-2 text-[10px]'},
-      React.createElement('button',{type:'button',onClick:()=>selectEdge('start'),'aria-pressed':focus==='start',className:`min-h-9 rounded-full border px-3 ${focus==='start'?'border-rose-300 bg-rose-500/25':'border-white/20'}`},'カット開始を選択'),
-      React.createElement('button',{type:'button',onClick:()=>selectEdge('end'),'aria-pressed':focus==='end',className:`min-h-9 rounded-full border px-3 ${focus==='end'?'border-rose-300 bg-rose-500/25':'border-white/20'}`},'カット終了を選択'),
-      React.createElement('button',{type:'button',onClick:()=>nudge(-0.1),className:'min-h-9 rounded-full border border-white/20 px-3'},'−0.1秒'),
-      React.createElement('button',{type:'button',onClick:()=>nudge(0.1),className:'min-h-9 rounded-full border border-white/20 px-3'},'+0.1秒'))
+    clip.duration>=0.2 ? React.createElement(TimeRangeBand,{scopeKey:`cut-${clip.id}`,start,end,min:0,max:clip.duration,minSpan:0.1,
+      label:'途中をカットする範囲',removed:true,onChange:setRange,onDragStart:stopPreview,onDragEnd:setSelectedFrame,onSelectEdge:selectEdge})
+      : React.createElement('div',{className:'rounded-xl border border-rose-300/30 bg-rose-500/10 px-3 py-2 text-[10px] text-rose-100'},'この動画は短いため、カットできる有効範囲がありません')
   );
 }
 
@@ -10337,6 +10293,7 @@ function App(){
   const [good3AdjustNotice, setGood3AdjustNotice] = useState('');
   const [rangePreviewLarge,setRangePreviewLarge] = useState(true);
   const good3AdjustVideoRef = useRef(null);
+  const [rangePreviewPlaying,setRangePreviewPlaying] = useState(false);
   const analysisBusyRef = useRef(false);
   const [bgmTrack, setBgmTrack] = useState('none');
   const [bgmOffset, setBgmOffset] = useState(0);
@@ -16100,6 +16057,7 @@ const recomputeStarts=(arr)=>{
     handleStop();
     closeQuickPeek(false);
     setRangePreviewLarge(true);
+    setRangePreviewPlaying(false);
     const sourceSpan=clip._cutGroupId?(clip._sourceRangeDuration||clip.duration*(clip._playbackRate||1)):clip.duration;
     setGood3Adjust({clipId,mode:'keep',start:clip.type==='photo'?0:clip.trimStart||0,
       end:(clip.type==='photo'?0:clip.trimStart||0)+sourceSpan,overflowChoice:null});
@@ -20417,15 +20375,17 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                           if(Number.isFinite(sd) && sd>0) setGood3Adjust(prev=>prev?.clipId===clip.id && Math.abs((prev.sourceDuration||0)-sd)>0.001?{...prev,sourceDuration:sd}:prev);
                           try{ e.currentTarget.currentTime=start; }catch{}
                         },
-                        onPlay:e=>{ const v=e.currentTarget; if(v.currentTime<start-0.05||v.currentTime>=end) v.currentTime=start; },
+                        onPlay:e=>{ const v=e.currentTarget; setRangePreviewPlaying(true); if(v.currentTime<start-0.05||v.currentTime>=end) v.currentTime=start; },
+                        onPause:()=>setRangePreviewPlaying(false),
                         onTimeUpdate:e=>{ const v=e.currentTarget; if(!v.paused && v.currentTime>=end-0.04){ v.pause(); v.currentTime=start; } }
                       }),
                       React.createElement('div', {className:'flex gap-2'},
-                        React.createElement('button', {type:'button',onClick:()=>{ const v=good3AdjustVideoRef.current; if(v){ try{ v.currentTime=start; v.play()?.catch?.(()=>{}); }catch{} } }, className:'flex-1 h-7 rounded-full bg-white/10 text-[9px]'}, '▶ 開始プレビュー'),
-                        React.createElement('button', {type:'button',onClick:()=>{ const v=good3AdjustVideoRef.current; if(v){ try{ v.currentTime=Math.max(start,end-1.2); v.play()?.catch?.(()=>{}); }catch{} } }, className:'flex-1 h-7 rounded-full bg-white/10 text-[9px]'}, '▶ 終了付近')
+                        React.createElement('button', {type:'button',onClick:()=>{ const v=good3AdjustVideoRef.current; if(!v) return; try{ if(!v.paused){ v.pause(); return; } v.currentTime=start; v.play()?.catch?.(()=>{}); }catch{} }, className:'flex-1 h-7 rounded-full bg-white/10 text-[9px]'}, rangePreviewPlaying?'■ 止める':'▶ 選んだ範囲を再生')
                       )),
                       React.createElement(TimeRangeBand,{
-                        scopeKey:`material-${clip.id}`,start,end,min:bounds.min,max:bounds.max,minSpan:bounds.minSpan,zoomable:true,
+                        scopeKey:`material-${clip.id}`,start,end,min:bounds.min,max:bounds.max,minSpan:bounds.minSpan,
+                        getCurrentTime:()=>good3AdjustVideoRef.current?.currentTime,
+                        onSelectEdge:kind=>{const v=good3AdjustVideoRef.current;if(v){if(!v.paused)v.pause();if(v.readyState>=1){try{v.currentTime=kind==='end'?end:start;}catch{}}}},
                         label:'元動画から使う範囲',onChange:(a,b,kind)=>{setDraftRange(a,b);const v=good3AdjustVideoRef.current;if(v){if(!v.paused)v.pause();if(v.readyState>=1){try{v.currentTime=kind==='end'?b:a;}catch{}}}},
                         onDragStart:()=>{const v=good3AdjustVideoRef.current;if(v&&!v.paused)v.pause();}
                       })
