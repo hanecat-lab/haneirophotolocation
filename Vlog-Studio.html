@@ -9118,7 +9118,8 @@ function App(){
   const previewPlaybackRef = useRef({activeId:null,preparedId:null,incomingId:null,bgmDriftSince:0,lastRenderAt:0,
     heldTime:null,resumeSyncTargets:new Map(),splitResumePending:new Set()});
   const previewDiagnosticRef = useRef({events:[],lastTime:null,lastClipId:null,lastProgressAt:0,
-    stallReported:false,waitReason:'',lastErrorKey:'',lastErrorAt:0,mediaEventAt:{}});
+    stallReported:false,waitReason:'',lastErrorKey:'',lastErrorAt:0,mediaEventAt:{},
+    hitches:[],hitchCount:0,hitchSummary:new Map(),drawMs:[],drawCount:0,drawMaxMs:0,drawSlow:0,drawProfiler:null});
   const previewDiagnosticWatchedRef = useRef(new WeakSet());
   const previewPlayPendingRef = useRef(new WeakMap());
   const previewPlayAttemptAtRef = useRef(new WeakMap());
@@ -11721,6 +11722,36 @@ function App(){
       bgm:bgmAudioRef.current ? {paused:bgmAudioRef.current.paused,
         readyState:bgmAudioRef.current.readyState,currentTime:Number(bgmAudioRef.current.currentTime.toFixed(3))} : null};
   };
+  // 1.5秒未満の短い詰まりも残す。毎フレーム呼ばれるため、数値だけを記録する。
+  const notePreviewHitch=(gapMs,t,list,index)=>{
+    const diag=previewDiagnosticRef.current;
+    const active=list[index]||null,next=list[index+1]||null;
+    const video=active?.type==='video'?videoRefs.current.get(active.id):null;
+    diag.hitchCount++;
+    diag.hitches.push({at:new Date().toISOString(),gapMs:Math.round(gapMs),timelineTime:Number(t.toFixed(3)),
+      clip:active?.name||null,next:next?.name||null,
+      sinceClipStart:active?Number((t-active.timelineStart).toFixed(3)):null,
+      untilClipEnd:active?Number((active.timelineStart+active.duration-t).toFixed(3)):null,
+      waitReason:diag.waitReason||null,
+      video:video?{readyState:video.readyState,paused:video.paused,seeking:video.seeking,
+        currentTime:Number(video.currentTime.toFixed(3))}:null});
+    if(diag.hitches.length>40) diag.hitches.splice(0,diag.hitches.length-40);
+    const key=active?.id||'none';
+    const summary=diag.hitchSummary.get(key)||{name:active?.name||'素材なし',count:0,maxMs:0};
+    summary.count++;summary.maxMs=Math.max(summary.maxMs,Math.round(gapMs));
+    if(diag.hitchSummary.has(key) || diag.hitchSummary.size<30) diag.hitchSummary.set(key,summary);
+  };
+  const notePreviewDrawTime=ms=>{
+    const diag=previewDiagnosticRef.current;
+    diag.drawCount++;diag.drawMaxMs=Math.max(diag.drawMaxMs,ms);
+    if(ms>33) diag.drawSlow++;
+    if(diag.drawMs.length<512) diag.drawMs.push(ms);
+    else diag.drawMs[(diag.drawCount-1)%512]=ms;
+  };
+  const resetPreviewHitchStats=()=>{
+    Object.assign(previewDiagnosticRef.current,{hitches:[],hitchCount:0,hitchSummary:new Map(),
+      drawMs:[],drawCount:0,drawMaxMs:0,drawSlow:0,drawProfiler:createVlogExportDrawProfiler()});
+  };
   const recordPreviewDiagnostic=(type,detail={})=>{
     const diag=previewDiagnosticRef.current;
     diag.events.push({at:new Date().toISOString(),type,...detail});
@@ -11890,6 +11921,16 @@ function App(){
     const diag=previewDiagnosticRef.current;
     return JSON.stringify({report:'Vlog Studio 再生診断',capturedAt:new Date().toISOString(),
       browser:navigator.userAgent,now:previewDiagnosticSnapshot('手動で状態を記録'),
+      hitchThresholdMs:80,hitchCount:diag.hitchCount,
+      hitchSummary:[...diag.hitchSummary.values()].sort((a,b)=>b.count-a.count),
+      hitches:diag.hitches.slice(),
+      frameTiming:(()=>{
+        const sorted=diag.drawMs.slice().sort((a,b)=>a-b);
+        const pick=p=>sorted.length?Number(sorted[Math.min(sorted.length-1,Math.ceil(sorted.length*p)-1)].toFixed(1)):0;
+        return {unit:'1回の描画処理(ms)。約30fps(33ms間隔)で描画',count:diag.drawCount,
+          p50Ms:pick(.5),p95Ms:pick(.95),maxMs:Number(diag.drawMaxMs.toFixed(1)),over33Ms:diag.drawSlow,
+          profiler:diag.drawProfiler?.summary()||null};
+      })(),
       recentEvents:diag.events.slice(-40)},null,2);
   };
   const capturePreviewDiagnostic=()=>{
@@ -11940,6 +11981,7 @@ function App(){
     if(!playingRef.current) return;
     const now=performance.now();
     const last=tick._last||now;
+    const frameGapMs=now-last;
     const rate=playbackRateRef.current;
     // 停止復帰時の経過時間だけを制限し、選んだ倍率そのものは制限しない。
     const delta=Math.max(0,Math.min(0.1,(now-last)/1000))*rate;
@@ -11951,6 +11993,7 @@ function App(){
     let t=state.heldTime===null || state.heldTime===undefined ? timeRef.current : state.heldTime;
     let index=clipsNow.findIndex(clip=>t>=clip.timelineStart && t<clip.timelineStart+clip.duration);
     let active=clipsNow[index];
+    if(frameGapMs>80) notePreviewHitch(frameGapMs,t,clipsNow,index);
     const clockClipId=active?.id;
     let waiting=false;
     const waitReasons=[];
@@ -12522,7 +12565,12 @@ function App(){
     }
     // 動画素材の書き出しと同じ約30fpsで描画し、60Hz画面での重複処理を避ける。
     if(now-state.lastRenderAt>=30){
-      drawFrameRef.current(t);
+      const profiler=previewDiagnosticRef.current.drawProfiler,previousProfiler=vlogExportDrawProfiler;
+      const drawStartedAt=performance.now(),profileToken=profiler?.begin('frame.drawFrame');
+      vlogExportDrawProfiler=profiler;
+      try{ drawFrameRef.current(t); }
+      finally{ if(profileToken)profiler.end(profileToken); vlogExportDrawProfiler=previousProfiler; }
+      notePreviewDrawTime(performance.now()-drawStartedAt);
       state.lastRenderAt=now;
     }
     rafTickRef.current=requestAnimationFrame(tick);
@@ -12598,6 +12646,7 @@ function App(){
     watchPreviewMedia();
     Object.assign(previewDiagnosticRef.current,{lastTime:timeRef.current,lastClipId:null,
       lastProgressAt:tick._last,stallReported:false,waitReason:''});
+    resetPreviewHitchStats();
     recordPreviewDiagnostic('play',{state:previewDiagnosticSnapshot('再生開始')});
     // 解析後の再生停止バグ修正: 再生前に全videoのreadyStateを確認して必要なら少し待つ
     let needsWait=false;
