@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-04-reuse-element';
+const VLOG_PREVIEW_BUILD='2026-10-04-advance-probe';
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -9132,6 +9132,8 @@ function App(){
   // 診断用: 動画要素がいつ・なぜ作られたかと、再生タップの時刻・周回数。
   const previewVideoBirthRef = useRef(new WeakMap());
   const previewTapRef = useRef({at:null,run:0});
+  // 診断用: 再生中になってから再生位置が実際に進み出すまでを要素ごとに測る。
+  const previewAdvanceProbeRef = useRef(new WeakMap());
   const previewDiagnosticTextRef = useRef(null);
   const timeRef = useRef(0);
   const aspectRef = useRef(16/9);
@@ -11779,7 +11781,40 @@ function App(){
     if(diag.drawMs.length<512) diag.drawMs.push(ms);
     else diag.drawMs[(diag.drawCount-1)%512]=ms;
   };
+  const previewDecodedFrames=video=>{
+    try{
+      const quality=video.getVideoPlaybackQuality?.();
+      if(quality && Number.isFinite(quality.totalVideoFrames)) return quality.totalVideoFrames;
+    }catch{}
+    return Number.isFinite(video.webkitDecodedFrameCount)?video.webkitDecodedFrameCount:null;
+  };
+  const probePreviewAdvance=(video,clip,kind)=>{
+    if(!video || !clip || video.paused || video.seeking) return;
+    const probes=previewAdvanceProbeRef.current;
+    const now=performance.now();
+    let probe=probes.get(video);
+    if(!probe){
+      probes.set(video,{start:now,from:video.currentTime,frames:previewDecodedFrames(video),done:false,stuckLogged:false});
+      return;
+    }
+    if(probe.done) return;
+    const frames=previewDecodedFrames(video);
+    const framesDelta=frames!==null && probe.frames!==null ? frames-probe.frames : null;
+    const moved=video.currentTime-probe.from;
+    if(moved>=0.02){
+      probe.done=true;
+      recordPreviewDiagnostic(`${kind}-first-advance`,{clip:clip.name,ms:Math.round(now-probe.start),
+        moved:Number(moved.toFixed(3)),framesDecoded:framesDelta,timelineTime:Number(timeRef.current.toFixed(3))});
+    }else if(!probe.stuckLogged && now-probe.start>=500){
+      probe.stuckLogged=true;
+      recordPreviewDiagnostic(`${kind}-not-advancing`,{clip:clip.name,ms:Math.round(now-probe.start),
+        readyState:video.readyState,paused:video.paused,muted:video.muted,
+        audioRouted:previewAudioGainsRef.current.has(clip.id),framesDecoded:framesDelta,
+        currentTime:Number(video.currentTime.toFixed(3)),timelineTime:Number(timeRef.current.toFixed(3))});
+    }
+  };
   const resetPreviewHitchStats=()=>{
+    previewAdvanceProbeRef.current=new WeakMap();
     Object.assign(previewDiagnosticRef.current,{hitches:[],hitchCount:0,hitchSummary:new Map(),
       drawMs:[],drawCount:0,drawMaxMs:0,drawSlow:0,drawProfiler:createVlogExportDrawProfiler(),mediaActivity:new Map()});
   };
@@ -12087,6 +12122,7 @@ function App(){
     let waiting=false;
     const waitReasons=[];
     let activeVideo=active?.type==='video' ? videoRefs.current.get(active.id) : null;
+    probePreviewAdvance(activeVideo,active,'active');
     if(activeVideo?.error){
       const attempts=previewRecoveryRef.current.get(active.id)||0;
       if(attempts>=1){
@@ -12354,6 +12390,7 @@ function App(){
           waiting=true;waitReasons.push('incoming-paused');
         }
       }
+      probePreviewAdvance(incoming,next,'incoming');
     }
     const liveIds=new Set();
     if(active?._splitScreen)active._splitScreen.clips.filter(child=>child.type==='video').forEach(child=>liveIds.add(child.id));
