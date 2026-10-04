@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-04-resume-sync-r2';
+const VLOG_PREVIEW_BUILD='2026-10-04-gesture-probe';
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -9129,6 +9129,9 @@ function App(){
   // タップ外の再生を iOS に拒否された要素と、重なり中に消音した前の素材。
   // 次に再生ボタンを押すまで消音のまま再生する。
   const previewAutoplayMutedRef = useRef(new WeakSet());
+  // 診断用: 動画要素がいつ・なぜ作られたかと、再生タップの時刻・周回数。
+  const previewVideoBirthRef = useRef(new WeakMap());
+  const previewTapRef = useRef({at:null,run:0});
   const previewDiagnosticTextRef = useRef(null);
   const timeRef = useRef(0);
   const aspectRef = useRef(16/9);
@@ -11841,6 +11844,7 @@ function App(){
     }
     cleanupClipAudioResources(clip.id);
     const video=document.createElement('video');
+    previewVideoBirthRef.current.set(video,{at:performance.now(),phase,run:previewTapRef.current.run});
     video.muted=true;video.playsInline=true;video.preload=preload;
     video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');
     // 書き出し用の待機要素はURLをまだ渡さない。preload=noneだけでは読込抑制を保証できない。
@@ -11907,6 +11911,22 @@ function App(){
       const activity=previewMediaActivity(clip);
       if(activity){activity.playRequests++;activity.lastRequestAt=performance.now();activity.lastRequestPhase=phase;}
     }
+    const describeRequest=()=>{
+      const birth=previewVideoBirthRef.current.get(video);
+      const tapAt=previewTapRef.current.at;
+      const audibleOthers=[];
+      videoRefs.current.forEach((other,id)=>{
+        if(other!==video && !other.paused && !other.muted)
+          audibleOthers.push(clipsRef.current.find(item=>item.id===id)?.name||String(id));
+      });
+      return {elementMuted:video.muted,
+        birth:birth?{phase:birth.phase,run:birth.run,
+          createdAfterLastTap:tapAt!==null && birth.at>tapAt,
+          msBeforeRequest:Math.round(performance.now()-birth.at)}:{phase:'initial'},
+        msSinceTap:tapAt===null?null:Math.round(performance.now()-tapAt),
+        audibleOthers};
+    };
+    const requestInfo=clip?describeRequest():null;
     try{
       const result=video.play();
       if(!result?.then) return;
@@ -11919,7 +11939,7 @@ function App(){
           previewAutoplayMutedRef.current.add(video);
           video.muted=true;
           recordPreviewDiagnostic('play-muted-fallback',{clip:clip.name,phase,
-            timelineTime:Number(timeRef.current.toFixed(3))});
+            timelineTime:Number(timeRef.current.toFixed(3)),request:requestInfo});
         }
         const key=`${clip?.id||'bgm'}|${phase}|${name}`;
         const now=performance.now();
@@ -11927,7 +11947,7 @@ function App(){
         diag.lastErrorKey=key;diag.lastErrorAt=now;
         recordPreviewDiagnostic(name==='AbortError'?'play-aborted':'play-error',
           {clip:clip?.name||'BGM',phase,error:name,message:String(error?.message||'').slice(0,160),
-            state:previewDiagnosticSnapshot('再生要求の失敗')});
+            request:requestInfo,state:previewDiagnosticSnapshot('再生要求の失敗')});
       }).finally(()=>{
         if(previewPlayPendingRef.current.get(video)===pending)
           previewPlayPendingRef.current.delete(video);
@@ -11969,7 +11989,9 @@ function App(){
   };
   const formatPreviewDiagnostic=()=>{
     const diag=previewDiagnosticRef.current;
-    return JSON.stringify({report:'Vlog Studio 再生診断',build:VLOG_PREVIEW_BUILD,capturedAt:new Date().toISOString(),
+    return JSON.stringify({report:'Vlog Studio 再生診断',build:VLOG_PREVIEW_BUILD,run:previewTapRef.current.run,
+      msSinceLastTap:previewTapRef.current.at===null?null:Math.round(performance.now()-previewTapRef.current.at),
+      capturedAt:new Date().toISOString(),
       browser:navigator.userAgent,now:previewDiagnosticSnapshot('手動で状態を記録'),
       hitchThresholdMs:80,hitchCount:diag.hitchCount,
       hitchSummary:[...diag.hitchSummary.values()].sort((a,b)=>b.count-a.count),
@@ -12670,6 +12692,7 @@ function App(){
     
     if(playingRef.current) return;
     clearTimeout(previewStartTimerRef.current);
+    previewTapRef.current={at:performance.now(),run:previewTapRef.current.run+1};
     const previewSession=++previewSessionRef.current;
     if(timeRef.current>=durationRef.current-0.05){
       timeRef.current=0;
