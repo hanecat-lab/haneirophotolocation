@@ -7897,14 +7897,33 @@ async function ensureVlogTextFonts(texts){
   });
   if(!used.size)return;
   let timer;
+  const startedAt=performance.now();
+  // 診断用: 書体ごとの待ち時間と、その書体の分割ファイルの読み込み状態。
+  const progress=[...used].map(([key,content])=>{
+    const [family,weight]=key.split('|');
+    return {key:family,family:String(vlogTextFont(family)).split(',')[0].replace(/["']/g,'').trim(),
+      weight,chars:new Set(content).size,doneMs:null};
+  });
+  const fontDetail=()=>progress.map(item=>{
+    const states={loaded:0,loading:0,unloaded:0,error:0};
+    try{document.fonts.forEach(face=>{
+      if(String(face.family).replace(/["']/g,'').trim()===item.family && face.status in states) states[face.status]++;
+    });}catch{}
+    return {...item,waitedMs:Math.round(performance.now()-startedAt),files:states};
+  });
   try{
     const loaded=await Promise.race([
-      Promise.all([...used].map(([key,content])=>{
+      Promise.all([...used].map(([key,content],index)=>{
         const [family,weight]=key.split('|');
         // 日本語の分割Webフォントも、書き出す文字が含まれる範囲を先に読み込む。
-        return document.fonts.load(`${weight} 32px ${vlogTextFont(family)}`,[...new Set(content)].join(''));
+        return document.fonts.load(`${weight} 32px ${vlogTextFont(family)}`,[...new Set(content)].join(''))
+          .then(faces=>{progress[index].doneMs=Math.round(performance.now()-startedAt);return faces;});
       })),
-      new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('書体の読み込みが終わりません。通信を確認して再試行してください。')),5000);})
+      new Promise((_,reject)=>{timer=setTimeout(()=>{
+        const error=new Error('書体の読み込みが終わりません。通信を確認して再試行してください。');
+        error.fontDetail=fontDetail();
+        reject(error);
+      },15000);})
     ]);
     if(loaded.some(faces=>!faces.length)) throw new Error('書体を読み込めません。通信を確認して再試行してください。');
   }finally{clearTimeout(timer);}
@@ -13292,7 +13311,16 @@ function App(){
         }
       };
       if(job.cancelled) throw new Error('書き出しを中止しました。');
-      await ensureVlogTextFonts(exportTexts);
+      let fontSlowShown=false;
+      const fontSlowTimer=setTimeout(()=>{fontSlowShown=true;setExportMessage('書体を読み込み中…');},3000);
+      try{ await ensureVlogTextFonts(exportTexts); }
+      catch(error){
+        if(error?.fontDetail) recordExportEvent('font-timeout',null,{fonts:error.fontDetail});
+        throw error;
+      }finally{
+        clearTimeout(fontSlowTimer);
+        if(fontSlowShown) setExportMessage('');
+      }
       if(job.cancelled) throw new Error('書き出しを中止しました。');
       canvas.width=aspectModeRef.current==='16:9'?1280:720;
       canvas.height=aspectModeRef.current==='16:9'?720:1280;
