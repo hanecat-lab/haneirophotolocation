@@ -8343,7 +8343,7 @@ function TextStylePreview({item,backdrop,onFontReady}){
 
 // The bar always shows the whole range, so only the edge the user touches ever moves.
 // Values remain a draft until the owning editor explicitly applies them.
-function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragStart,onDragEnd,onSelectEdge,getCurrentTime,label,removed=false}){
+function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragStart,onDragEnd,onSelectEdge,getCurrentTime,label,removed=false,segments=null,snapPoints=null}){
   const [focus,setFocus]=useState('start');
   const [notice,setNotice]=useState('');
   const drag=useRef(null);
@@ -8385,11 +8385,30 @@ function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragSt
     else if(d.kind==='end') change('end',d.start,d.end+delta);
     else change('move',d.start+delta,d.end+delta);
   };
+  // 指を離したとき、近くの素材の切れ目やほかの文字の端に吸い付かせる。
+  const snapOnRelease=(kind,box)=>{
+    if(!snapPoints?.length) return;
+    const threshold=Math.min(0.3,10/Math.max(1,box)*width);
+    const edges=kind==='start'?[start]:kind==='end'?[end]:[start,end];
+    let best=null;
+    snapPoints.forEach(point=>edges.forEach((edge,index)=>{
+      const shift=point.at-edge;
+      if(Math.abs(shift)>threshold || Math.abs(shift)<0.001) return;
+      if(!best || Math.abs(shift)<Math.abs(best.shift)) best={shift,label:point.label,edge:kind==='move'?(index?'end':'start'):kind};
+    }));
+    if(!best) return;
+    if(kind==='start') change('start',start+best.shift,end);
+    else if(kind==='end') change('end',start,end+best.shift);
+    else change('move',start+best.shift,end+best.shift);
+    setNotice(`${best.edge==='start'?edgeName('start'):edgeName('end')}を${best.label}にそろえました`);
+  };
   const pointerUp=event=>{
     if(!drag.current) return;
-    if(event.type==='pointercancel') onChange(drag.current.start,drag.current.end);
+    const d=drag.current;
+    if(event.type==='pointercancel') onChange(d.start,d.end);
     try{event.currentTarget.releasePointerCapture(event.pointerId);}catch{}
     drag.current=null;
+    if(event.type!=='pointercancel') snapOnRelease(d.kind,d.width);
     onDragEnd?.();
   };
   const nudge=amount=>{
@@ -8418,6 +8437,10 @@ function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragSt
     ),
     React.createElement('div',{className:'relative h-14 mx-4',style:{touchAction:'none'}},
       React.createElement('div',{className:'absolute inset-x-0 top-5 h-3 rounded-full bg-white/20'}),
+      segments?.length>0 && React.createElement('div',{className:'absolute inset-x-0 top-5 h-3 rounded-full overflow-hidden pointer-events-none','aria-hidden':true},
+        segments.map((segment,index)=>React.createElement('div',{key:index,className:'absolute top-0 bottom-0',
+          style:{left:`${percent(segment.start)}%`,width:`${Math.max(0,percent(segment.end)-percent(segment.start))}%`,
+            background:index%2?'rgba(82,125,112,0.16)':'rgba(82,125,112,0.32)',borderLeft:index?'1px solid rgba(255,255,255,0.85)':'none'}}))),
       React.createElement('div',{className:`absolute top-5 h-3 rounded-full ${removed?'border border-rose-200/70':'bg-violet-400'}`,style:{left:`${percent(start)}%`,width:`${Math.max(0,percent(end)-percent(start))}%`,...(removed?{background:'repeating-linear-gradient(135deg,rgba(251,113,133,.85) 0 4px,rgba(127,29,29,.75) 4px 8px)'}:{background:'var(--paper-accent)'})},
         onPointerDown:event=>pointerDown(event,'move'),onPointerMove:pointerMove,onPointerUp:pointerUp,onPointerCancel:pointerUp,
         role:'slider','aria-label':'長さを保って範囲を移動','aria-valuenow':start,'aria-valuemin':min,'aria-valuemax':safeMax}),
@@ -10416,6 +10439,7 @@ function App(){
   const [textTimingMode,setTextTimingMode] = useState('move');
   const [showAdvancedTextTime,setShowAdvancedTextTime] = useState(false);
   const [textRangeDraft,setTextRangeDraft] = useState(null);
+  const textRangeLatestRef = useRef(null);
   const [textRangeFrames,setTextRangeFrames] = useState(null);
   const [textRangeDragging,setTextRangeDragging] = useState(false);
   const [textRangeNotice,setTextRangeNotice] = useState('');
@@ -17436,7 +17460,7 @@ const recomputeStarts=(arr)=>{
       }));
     }
   };
-  const commitTimelineText=(id,start,end,before)=>{
+  const commitTimelineText=(id,start,end,before,snapLabel=null)=>{
     const source=textsRef.current.find(t=>t.id===id);
     if(!source || end-start<0.2-0.0001 || start<0 || end>durationRef.current+0.0001) return;
     const owner=clipsRef.current.find(c=>c.id===source._clipId);
@@ -17450,7 +17474,7 @@ const recomputeStarts=(arr)=>{
     textsRef.current=next;setTexts(next);recordEdit(snapshot);
     setTextRangeDraft(previous=>previous?.textId===id?{textId:id,start,end}:previous);
     setTextBarPreviewTime(Math.min(end-0.01,start+Math.min(0.12,(end-start)/2)));
-    setEditNotice(`文字を ${start.toFixed(1)}〜${end.toFixed(1)}秒に配置しました。`);
+    setEditNotice(`文字を ${start.toFixed(1)}〜${end.toFixed(1)}秒に配置しました（${attached?`${attached.name} にくっつく`:'動画全体の時間に固定'}${snapLabel?`・${snapLabel}にそろえました`:''}）。`);
     seekEditorTime(Math.min(end-0.01,start+0.05));
   };
   const handleTextPointerDown=(e,txtId,type)=>{
@@ -17477,21 +17501,23 @@ const recomputeStarts=(arr)=>{
     if(drag.type==='left') start=Math.max(0,Math.min(end-0.2,drag.origStart+offset));
     else if(drag.type==='right') end=Math.min(durationRef.current,Math.max(start+0.2,drag.origEnd+offset));
     else {start=Math.max(0,Math.min(durationRef.current-span,drag.origStart+offset));end=start+span;}
+    let snapLabel=null;
     if(textSnapEnabled){
-      const edges=[...clipsRef.current.flatMap(c=>[c.timelineStart,c.timelineStart+c.duration]),
-        ...textsRef.current.filter(t=>t.id!==drag.id).flatMap(t=>[t.start,t.end])];
+      const edges=[...clipsRef.current.flatMap(c=>[c.timelineStart,c.timelineStart+c.duration]).map(at=>({at,label:'素材の切れ目'})),
+        ...textsRef.current.filter(t=>t.id!==drag.id).flatMap(t=>[t.start,t.end]).map(at=>({at,label:'ほかの文字の端'}))];
       const threshold=Math.min(0.12,10/timelineZoomRef.current);
-      const candidates=drag.type==='move' ? edges.flatMap(value=>[value-start,value-end])
-        : edges.map(value=>value-(drag.type==='left'?start:end));
-      const adjustment=candidates.filter(value=>Math.abs(value)<=threshold)
-        .sort((a,b)=>Math.abs(a)-Math.abs(b))[0];
+      const candidates=drag.type==='move' ? edges.flatMap(edge=>[{shift:edge.at-start,label:edge.label},{shift:edge.at-end,label:edge.label}])
+        : edges.map(edge=>({shift:edge.at-(drag.type==='left'?start:end),label:edge.label}));
+      const best=candidates.filter(item=>Math.abs(item.shift)<=threshold)
+        .sort((a,b)=>Math.abs(a.shift)-Math.abs(b.shift))[0];
+      const adjustment=best?.shift;
       if(Number.isFinite(adjustment)){
-        if(drag.type==='move' && start+adjustment>=0 && end+adjustment<=durationRef.current){start+=adjustment;end+=adjustment;}
-        else if(drag.type==='left' && start+adjustment<=end-0.2) start+=adjustment;
-        else if(drag.type==='right' && end+adjustment>=start+0.2) end+=adjustment;
+        if(drag.type==='move' && start+adjustment>=0 && end+adjustment<=durationRef.current){start+=adjustment;end+=adjustment;snapLabel=best.label;}
+        else if(drag.type==='left' && start+adjustment<=end-0.2){start+=adjustment;snapLabel=best.label;}
+        else if(drag.type==='right' && end+adjustment>=start+0.2){end+=adjustment;snapLabel=best.label;}
       }
     }
-    const updated={...drag,start:Math.round(start*100)/100,end:Math.round(end*100)/100,moved:true};
+    const updated={...drag,start:Math.round(start*100)/100,end:Math.round(end*100)/100,moved:true,snapLabel};
     textBarDragRef.current=updated;setDraggingText(updated);
     suppressTextBarClickRef.current=performance.now()+350;
   };
@@ -17508,7 +17534,7 @@ const recomputeStarts=(arr)=>{
     }
     if(e.type!=='pointercancel' && drag.moved &&
        (Math.abs(drag.start-drag.origStart)>0.005 || Math.abs(drag.end-drag.origEnd)>0.005))
-      commitTimelineText(drag.id,drag.start,drag.end,drag.before);
+      commitTimelineText(drag.id,drag.start,drag.end,drag.before,drag.snapLabel);
     if(drag.moved) suppressTextBarClickRef.current=performance.now()+350;
   };
 
@@ -17663,8 +17689,8 @@ const recomputeStarts=(arr)=>{
     setTextRangeDraft({textId:id,start,end});
     setTextRangeNotice('');
   };
-  const commitTextRange=(choice=null)=>{
-    const draft=textRangeDraft;
+  const commitTextRange=(choice=null,range=null)=>{
+    const draft=range||textRangeDraft;
     const source=draft && textsRef.current.find(t=>t.id===draft.textId);
     if(!source) return;
     const owner=clipsRef.current.find(c=>c.id===source._clipId);
@@ -17679,7 +17705,8 @@ const recomputeStarts=(arr)=>{
       end=Math.min(end,owner.timelineStart+owner.duration);
       if(end-start<0.2-0.001){setTextRangeNotice('素材内に0.2秒以上の表示範囲がありません。');return;}
     }
-    if(Math.abs(start-source.start)<0.001 && Math.abs(end-source.end)<0.001 && !outside){
+    if(Math.abs(start-source.start)<0.001 && Math.abs(end-source.end)<0.001 && !outside &&
+       !(choice==='global' && source._clipId)){
       setTextRangeNotice('この長さで表示中です。');return;
     }
     const before=editSnapshot();
@@ -17697,6 +17724,31 @@ const recomputeStarts=(arr)=>{
     setTextRangeDraft({textId:source.id,start,end});
     setTextRangeNotice('表示時間を変更しました。');
     requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
+  // 決定ボタンを使わず、指を離したときやボタンを押したときにその場で反映する。
+  const applyTextRange=(id,start,end)=>{
+    const source=textsRef.current.find(t=>t.id===id);
+    if(!source) return;
+    textRangeLatestRef.current=null;
+    if(Math.abs(start-source.start)<0.001 && Math.abs(end-source.end)<0.001){
+      setTextRangeDraft({textId:id,start:source.start,end:source.end});return;
+    }
+    const owner=clipsRef.current.find(c=>c.id===source._clipId);
+    const outside=!!owner && (start<owner.timelineStart-0.001 || end>owner.timelineStart+owner.duration+0.001);
+    setTextRangeDraft({textId:id,start,end});
+    commitTextRange(outside?'global':null,{textId:id,start,end});
+    if(outside && textsRef.current.find(t=>t.id===id)?._clipId===null)
+      setTextRangeNotice('素材の外まで届くため、動画全体の時間に固定しました。');
+  };
+  const attachTextToClip=(id,clipId)=>{
+    const source=textsRef.current.find(t=>t.id===id);
+    const clip=clipsRef.current.find(c=>c.id===clipId);
+    if(!source || !clip || source.start<clip.timelineStart-0.001 || source.end>clip.timelineStart+clip.duration+0.001) return;
+    const before=editSnapshot();
+    const next=textsRef.current.map(t=>t.id===id?{...t,_clipId:clip.id,
+      _clipStart:source.start-clip.timelineStart,_clipEnd:source.end-clip.timelineStart}:t);
+    textsRef.current=next;setTexts(next);recordEdit(before);
+    setTextRangeNotice(`${clip.name} にくっつけました。素材を動かすと一緒に動きます。`);
   };
   const previewTextRange=()=>{
     const draft=textRangeDraft;
@@ -21788,10 +21840,6 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               requestAnimationFrame(()=>requestAnimationFrame(()=>inlineTimelineRef.current?.scrollIntoView({behavior:'smooth',block:'end'})));
             },className:'w-full min-h-11 rounded-full bg-amber-100 text-black font-bold'},
             '↓ この文字のバーへ'),
-            React.createElement('button',{type:'button',onClick:()=>setShowAdvancedTextTime(v=>!v),
-              'aria-expanded':showAdvancedTextTime,
-              className:'mt-2 w-full text-white/65 underline py-1'},
-              showAdvancedTextTime?'数値調整を閉じる':'数値で調整')
           ),
           false && React.createElement('div',{className:'grid grid-cols-2 gap-2 mb-3','aria-label':'文字の時間編集'},
             React.createElement('button',{type:'button',onClick:()=>setTextTimingMode('move'),
@@ -21953,37 +22001,54 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               )
             );
           })(),
-          textEditorSection==='time' && showAdvancedTextTime && textTimingMode==='length' && (()=>{
+          textEditorSection==='time' && textTimingMode==='length' && (()=>{
             const source=texts.find(t=>t.id===selectedTextId);
             if(!source) return null;
             const draft=textRangeDraft?.textId===source.id?textRangeDraft:
               {textId:source.id,start:source.start,end:source.end};
             const owner=clips.find(c=>c.id===source._clipId);
-            const anchor=owner||clips.find(c=>source.start>=c.timelineStart && source.start<c.timelineStart+c.duration);
-            const anchorStart=anchor?.timelineStart;
-            const anchorEnd=anchor && anchor.timelineStart+anchor.duration;
-            const outside=owner && (draft.start<anchorStart-0.001 || draft.end>anchorEnd+0.001);
-            const nextWord=texts.filter(t=>t.id!==source.id && t.start>=draft.start+0.2).sort((a,b)=>a.start-b.start)[0];
+            const anchor=owner||clips.find(c=>draft.start>=c.timelineStart && draft.start<c.timelineStart+c.duration);
+            const container=!owner && clips.find(c=>draft.start>=c.timelineStart-0.001 && draft.end<=c.timelineStart+c.duration+0.001);
             const frames=textRangeFrames?.textId===source.id?textRangeFrames:null;
             const framesUpdating=textRangeDragging || !frames || frames.status==='loading' ||
               Math.abs(frames.start-draft.start)>0.001 || Math.abs(frames.end-draft.end)>0.001;
             const canUndo=textMoveUndo?.textId===source.id &&
               Math.abs(source.start-textMoveUndo.after.start)<0.001 &&
               Math.abs(source.end-textMoveUndo.after.end)<0.001;
+            const playhead=Number(currentTime.toFixed(1));
+            const segments=clips.map(c=>({start:c.timelineStart,end:c.timelineStart+c.duration}));
+            const snapPoints=[
+              ...clips.flatMap(c=>[{at:c.timelineStart,label:'素材の切れ目'},{at:c.timelineStart+c.duration,label:'素材の切れ目'}]),
+              ...texts.filter(t=>t.id!==source.id).flatMap(t=>[{at:t.start,label:'ほかの文字の端'},{at:t.end,label:'ほかの文字の端'}])
+            ];
+            const shortcut='min-h-12 rounded-xl border border-white/15 bg-white/10 px-1 text-[10px] disabled:opacity-35';
             return React.createElement('div',{className:'rounded-xl border border-violet-400/30 bg-violet-500/10 p-3 mb-3'},
-              React.createElement('div',{className:'grid grid-cols-3 gap-1.5 mb-3'},
+              React.createElement('div',{className:'text-[12px] font-bold text-center',role:'status'},
+                `${draft.start.toFixed(1)}秒〜${draft.end.toFixed(1)}秒（${(draft.end-draft.start).toFixed(1)}秒間）`),
+              React.createElement('div',{className:'text-[10px] text-white/60 text-center mt-1 mb-3 truncate'},
+                owner?`${owner.name} にくっつく`:'動画全体の時間に固定'),
+              React.createElement(TimeRangeBand,{scopeKey:`text-${source.id}`,start:draft.start,end:draft.end,
+                min:0,max:duration,minSpan:0.2,label:'文字の表示範囲',segments,snapPoints,
+                onDragStart:()=>setTextRangeDragging(true),
+                onDragEnd:()=>{setTextRangeDragging(false);const latest=textRangeLatestRef.current;
+                  if(latest?.textId===source.id) applyTextRange(source.id,latest.start,latest.end);},
+                onChange:(start,end)=>{textRangeLatestRef.current={textId:source.id,start,end};updateTextRangeDraft(source.id,start,end);}}),
+              React.createElement('div',{className:'text-[10px] text-white/60 text-center mt-3 mb-2'},`再生位置 ${playhead.toFixed(1)}秒`),
+              React.createElement('div',{className:'grid grid-cols-3 gap-1.5'},
+                React.createElement('button',{type:'button',disabled:playhead>draft.end-0.2,
+                  onClick:()=>applyTextRange(source.id,playhead,draft.end),className:shortcut},'再生位置から表示'),
+                React.createElement('button',{type:'button',disabled:playhead<draft.start+0.2,
+                  onClick:()=>applyTextRange(source.id,draft.start,playhead),className:shortcut},'再生位置で消す'),
                 React.createElement('button',{type:'button',disabled:!anchor,
-                  onClick:()=>anchor&&updateTextRangeDraft(source.id,Number(anchorStart.toFixed(1)),Number(anchorEnd.toFixed(1))),
-                  className:'min-h-12 rounded-xl border border-violet-300/40 bg-violet-500/20 px-1 text-[10px] font-bold disabled:opacity-35'},'素材いっぱい'),
-                React.createElement('button',{type:'button',disabled:timeRef.current>draft.end-0.2,
-                  onClick:()=>updateTextRangeDraft(source.id,Number(timeRef.current.toFixed(1)),draft.end),
-                  className:'min-h-12 rounded-xl border border-white/15 bg-white/10 px-1 text-[10px] disabled:opacity-35'},'ここから表示'),
-                React.createElement('button',{type:'button',disabled:timeRef.current<draft.start+0.2,
-                  onClick:()=>updateTextRangeDraft(source.id,draft.start,Number(timeRef.current.toFixed(1))),
-                  className:'min-h-12 rounded-xl border border-white/15 bg-white/10 px-1 text-[10px] disabled:opacity-35'},'ここで消す')
+                  onClick:()=>anchor&&applyTextRange(source.id,Number(anchor.timelineStart.toFixed(1)),Number((anchor.timelineStart+anchor.duration).toFixed(1))),
+                  className:'min-h-12 rounded-xl border border-violet-300/40 bg-violet-500/20 px-1 text-[10px] font-bold disabled:opacity-35'},'この素材いっぱい')
               ),
-              React.createElement('details',{className:'mb-2 rounded-xl border border-white/10 bg-black/20 px-2 py-1 text-[11px] text-white/70'},
-                React.createElement('summary',{className:'cursor-pointer py-2'},'開始前・表示中・終了後を画像で確認'),
+              textRangeNotice && React.createElement('div',{role:'status',className:'text-[11px] text-amber-200 mt-2 text-center'},textRangeNotice),
+              canUndo && React.createElement('button',{type:'button',onClick:undoTextPlacement,
+                className:'mt-2 w-full min-h-10 rounded-full border border-white/25 px-3 text-[11px]'},'元に戻す'),
+              React.createElement('details',{className:'mt-3 rounded-xl border border-white/10 bg-black/20 px-2 py-1 text-[11px] text-white/70',
+                open:showAdvancedTextTime,onToggle:e=>setShowAdvancedTextTime(e.currentTarget.open)},
+                React.createElement('summary',{className:'cursor-pointer py-2'},'仕上げ'),
                 React.createElement('div',{className:'grid grid-cols-3 gap-1.5 pb-2','aria-label':'開始と終了の確認画像'},
                   ...['開始直前','表示中','終了直後'].map((name,index)=>React.createElement('div',{key:name,className:'min-w-0'},
                     React.createElement('div',{className:`relative aspect-[9/16] rounded-lg bg-black border overflow-hidden flex items-center justify-center ${index===1?'border-violet-400':'border-white/15'}`},
@@ -21997,56 +22062,18 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                     React.createElement('div',{className:'text-[10px] text-center mt-1'},name),
                     React.createElement('div',{className:'text-[9px] text-white/40 truncate text-center'},frames?.frames[index]?.clipName||'')
                   ))
+                ),
+                React.createElement('div',{className:'grid grid-cols-2 gap-2 pb-2'},
+                  React.createElement('button',{type:'button',onClick:previewTextRange,
+                    className:'min-h-11 rounded-full border border-white/25 bg-white/10 text-[11px]'},'▶ 前後を再生'),
+                  owner
+                    ? React.createElement('button',{type:'button',onClick:()=>commitTextRange('global',{textId:source.id,start:draft.start,end:draft.end}),
+                        className:'min-h-11 rounded-full border border-white/25 bg-white/10 text-[11px]'},'動画全体の時間に固定')
+                    : React.createElement('button',{type:'button',disabled:!container,onClick:()=>container&&attachTextToClip(source.id,container.id),
+                        className:'min-h-11 rounded-full border border-white/25 bg-white/10 text-[11px] disabled:opacity-35'},
+                        container?'この素材にくっつける':'1つの素材に収まっていません')
                 )
-              ),
-              React.createElement('div',{className:'text-[11px] text-center bg-black/30 rounded-lg py-2 mb-2'},
-                `${draft.start.toFixed(1)}秒から → ${draft.end.toFixed(1)}秒まで · ${(draft.end-draft.start).toFixed(1)}秒間`),
-              React.createElement(TimeRangeBand,{scopeKey:`text-${source.id}`,start:draft.start,end:draft.end,
-                min:0,max:duration,minSpan:0.2,label:'文字の表示範囲',
-                onDragStart:()=>setTextRangeDragging(true),onDragEnd:()=>setTextRangeDragging(false),
-                onChange:(start,end)=>updateTextRangeDraft(source.id,start,end)}),
-              anchor && React.createElement('div',{className:'text-[10px] text-white/50 mt-2 truncate'},`基準の素材：${anchor.name}`),
-              anchor && React.createElement('div',{className:'grid grid-cols-2 gap-2 mt-2'},
-                React.createElement('button',{type:'button',disabled:anchorStart>draft.end-0.2,
-                  onClick:()=>updateTextRangeDraft(source.id,Number(anchorStart.toFixed(1)),draft.end),
-                  className:'min-h-11 rounded-full border border-violet-300/40 bg-violet-500/15 px-2 text-[11px] disabled:opacity-35'},'開始を素材の先頭へ'),
-                React.createElement('button',{type:'button',disabled:anchorEnd<draft.start+0.2,
-                  onClick:()=>updateTextRangeDraft(source.id,draft.start,Number(anchorEnd.toFixed(1))),
-                  className:'min-h-11 rounded-full border border-violet-300/40 bg-violet-500/15 px-2 text-[11px] disabled:opacity-35'},'終了を素材の終わりへ')
-              ),
-              React.createElement('details',{className:'mt-2 text-[11px] text-white/70'},
-                React.createElement('summary',{className:'cursor-pointer py-1'},'ほかの合わせ方'),
-                React.createElement('div',{className:'flex flex-wrap gap-2 pt-2'},
-                  nextWord && React.createElement('button',{type:'button',
-                    onClick:()=>updateTextRangeDraft(source.id,draft.start,nextWord.start),
-                    className:'rounded-full bg-white/10 px-3 py-2'},'終了を次の言葉へ'),
-                  React.createElement('button',{type:'button',disabled:timeRef.current>draft.end-0.2,
-                    onClick:()=>updateTextRangeDraft(source.id,Number(timeRef.current.toFixed(1)),draft.end),
-                    className:'rounded-full bg-white/10 px-3 py-2 disabled:opacity-35'},'開始を再生位置へ'),
-                  React.createElement('button',{type:'button',disabled:timeRef.current<draft.start+0.2,
-                    onClick:()=>updateTextRangeDraft(source.id,draft.start,Number(timeRef.current.toFixed(1))),
-                    className:'rounded-full bg-white/10 px-3 py-2 disabled:opacity-35'},'終了を再生位置へ'),
-                  React.createElement('button',{type:'button',onClick:()=>previewTextBoundary(source),
-                    className:'rounded-full bg-white/10 px-3 py-2'},'現在の時間を試写')
-                )
-              ),
-              outside && React.createElement('div',{className:'mt-2 text-[11px] text-amber-200'},'2つの素材にまたがって表示されます。'),
-              textRangeNotice && React.createElement('div',{role:'status',className:'text-[11px] text-amber-200 mt-2'},textRangeNotice),
-              outside && !!textRangeNotice && React.createElement('div',{className:'flex gap-2 mt-2'},
-                React.createElement('button',{type:'button',onClick:()=>commitTextRange('inside'),
-                  className:'flex-1 min-h-11 rounded-full bg-white/15 text-[11px]'},'素材内に収める'),
-                React.createElement('button',{type:'button',onClick:()=>commitTextRange('global'),
-                  className:'flex-1 min-h-11 rounded-full bg-violet-600 text-[11px]'},'動画全体に置く')
-              ),
-              React.createElement('div',{className:'grid grid-cols-2 gap-2 mt-3'},
-                React.createElement('button',{type:'button',onClick:previewTextRange,
-                  className:'min-h-11 rounded-full border border-white/25 bg-white/10 text-[11px]'},'▶ 前後を再生'),
-                React.createElement('button',{type:'button',onClick:()=>commitTextRange(),
-                  disabled:Math.abs(source.start-draft.start)<0.001 && Math.abs(source.end-draft.end)<0.001,
-                  className:'min-h-11 rounded-full bg-violet-500 text-white text-[11px] font-bold disabled:opacity-35'},'表示時間を決定')
-              ),
-              canUndo && React.createElement('button',{type:'button',onClick:undoTextPlacement,
-                className:'mt-2 rounded-full border border-white/25 px-3 py-2 text-[11px]'},'直前の変更を元に戻す')
+              )
             );
           })(),
           textEditorSection==='position' && React.createElement(React.Fragment,null,
@@ -22790,11 +22817,15 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   const left = shown.start * timelineZoom;
                   const width = Math.max(8,(shown.end-shown.start)*timelineZoom-2);
                   const selected=selectedTimelineItem?.type==='text' && selectedTimelineItem.id===t.id;
-                  const showHandles=selected && (width>=88 || draggingText?.id===t.id);
+                  // 選択中は幅に関係なく端のつまみを出す。狭いバーではつまみをバーの外側に出す。
+                  const showHandles=selected;
+                  const narrow=width<88;
+                  const dragging=draggingText?.id===t.id && draggingText.moved;
+                  const handleClass='h-full shrink-0 bg-yellow-200/35 flex items-center justify-center touch-none cursor-ew-resize text-[16px]';
                   return React.createElement('div', {
                     key:t.id, 
                     'data-timeline-text-id':t.id,
-                    className:`absolute top-1 bottom-1 rounded border text-[9px] flex items-center overflow-hidden ${selected?'bg-yellow-500/60 border-white':'bg-yellow-500/30 border-yellow-500'}`,
+                    className:`absolute top-1 bottom-1 rounded border text-[9px] flex items-center ${selected?'bg-yellow-500/60 border-white z-10':'bg-yellow-500/30 border-yellow-500 overflow-hidden'}`,
                     style:{left:`${left}px`, width:`${width}px`},
                     title:`${(t.text||t.content||'')} ${t.start.toFixed(1)}s-${t.end.toFixed(1)}s`,
                     onClick:e=>{
@@ -22807,9 +22838,11 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                       seekEditorTime(at);
                     }
                   },
+                    dragging && React.createElement('div',{className:'absolute top-0 left-1/2 -translate-x-1/2 z-30 rounded bg-black/80 px-1 text-[9px] text-white whitespace-nowrap pointer-events-none'},
+                      `${shown.start.toFixed(1)}〜${shown.end.toFixed(1)}秒`),
                     showHandles && React.createElement('div', {
                       onPointerDown:e=>handleTextPointerDown(e,t.id,'left'), onClick:e=>e.stopPropagation(),
-                      className:'w-8 h-full shrink-0 bg-yellow-200/35 flex items-center justify-center touch-none cursor-ew-resize text-[16px]',
+                      className:`${handleClass} w-8 ${narrow?'absolute -left-8 top-0 bottom-0 rounded-l border border-white':''}`,
                       role:'button','aria-label':`${(t.text||t.content||'')}の開始を動かす`
                     }, '‹'),
                     React.createElement('div', {
@@ -22820,7 +22853,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                     },(t.text||'').slice(0,14)),
                     showHandles && React.createElement('div', {
                       onPointerDown:e=>handleTextPointerDown(e,t.id,'right'), onClick:e=>e.stopPropagation(),
-                      className:'w-8 h-full shrink-0 bg-yellow-200/35 flex items-center justify-center touch-none cursor-ew-resize text-[16px]',
+                      className:`${handleClass} w-8 ${narrow?'absolute -right-8 top-0 bottom-0 rounded-r border border-white':''}`,
                       role:'button','aria-label':`${(t.text||t.content||'')}の終了を動かす`
                     }, '›')
                   );
@@ -22899,7 +22932,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         ),
         selectedTimelineText && React.createElement('div', {className:'flex flex-col gap-3'},
           React.createElement('div', {className:'text-white/60'},
-            selectedTimelineText._clipId?'この素材に連動':'動画全体の時間に配置'),
+            selectedTimelineText._clipId?`${clips.find(c=>c.id===selectedTimelineText._clipId)?.name||'素材'} にくっつく`:'動画全体の時間に固定'),
           React.createElement('div', {className:'text-white/50'},
             '文字の時間は上の黄色いバーを直接動かして調整できます。'),
           React.createElement('button', {
