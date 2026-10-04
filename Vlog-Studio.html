@@ -8000,6 +8000,109 @@ function planMaterialMove(clips,clipId,toIndex){
   return {items,removed,fromIndex};
 }
 
+// Cut an output-time interval from one ordinary video clip. start/end are
+// local timeline seconds; media source positions are derived using playback rate.
+function vlogCutPlan(clips,texts,clipId,start,end,makeId=()=>`cut-${Date.now()}-${Math.random().toString(36).slice(2,9)}`){
+  const index=clips.findIndex(c=>c.id===clipId),clip=clips[index];
+  if(!clip || clip.type!=='video' || clip._splitScreen) return {error:'single-video-required'};
+  const rate=Math.max(0.1,Number(clip._playbackRate)||1),duration=Number(clip.duration)||0;
+  if(!Number.isFinite(start)||!Number.isFinite(end)||start<=0.001||end>=duration-0.001||end<=start)
+    return {error:'invalid-range'};
+  const incoming=index>0 ? clips[index-1]._transitionToNext : null;
+  const outgoing=clip._transitionToNext;
+  const minFront=Math.max(0.3,incoming&&incoming.type!=='none'?(incoming.duration||0.5)+0.1:0.3);
+  const minBack=Math.max(0.3,outgoing&&outgoing.type!=='none'?(outgoing.duration||0.5)+0.1:0.3);
+  const frontDuration=start,backDuration=duration-end,removedDuration=end-start;
+  if(frontDuration<minFront-0.001 || backDuration<minBack-0.001)
+    return {error:'transition-span',minFront,minBack};
+  const sourceBase=Number(clip.trimStart)||0,sourceEnd=Number.isFinite(clip._sourceDuration)&&clip._sourceDuration>0
+    ? clip._sourceDuration : sourceBase+duration*rate;
+  const allowed=clip._good3SourceRange;
+  const sourceFinish=sourceBase+duration*rate;
+  if(sourceBase<-0.001 || sourceFinish>sourceEnd+0.001 ||
+     (allowed && (sourceBase<(allowed.start??0)-0.001 || sourceFinish>(allowed.end??sourceEnd)+0.001)))
+    return {error:'source-range'};
+  const cutGroupId=makeId();
+  const backId=makeId();
+  const sourceStart=sourceBase,sourceCutStart=sourceBase+start*rate,sourceCutEnd=sourceBase+end*rate;
+  const rootName=clip._cutSegment?.rootName||String(clip.name||'動画').replace(/\s*[（(]\d+\s*\/\s*\d+[）)]\s*$/,'').replace(/・区間\d+$/,'');
+  const group=clip._cutGroupId||cutGroupId;
+  const base={...clip,_cutGroupId:group};
+  delete base._splitScreen;
+  // Previous boundary cuts are baked into these new, bounded source intervals.
+  delete base._connectionBase;delete base._connectionInCut;delete base._connectionOutCut;
+  const front={...base,id:clip.id,trimStart:sourceStart,duration:frontDuration,_sourceRangeDuration:sourceCutStart-sourceStart,
+    _good3SourceRange:{start:sourceStart,end:sourceCutStart},_cutSegment:{number:1,rootName},name:`${rootName}・区間1`,
+    _transitionToNext:{type:'none',duration:0}};
+  const back={...base,id:backId,trimStart:sourceCutEnd,duration:backDuration,_sourceRangeDuration:sourceFinish-sourceCutEnd,
+    _good3SourceRange:{start:sourceCutEnd,end:Math.min(sourceEnd,sourceFinish)},_cutSegment:{number:2,rootName},name:`${rootName}・区間2`,
+    _transitionToNext:outgoing?{...outgoing}:undefined};
+  if(!outgoing) delete back._transitionToNext;
+  let cursor=0;
+  let next=[...clips.slice(0,index),front,back,...clips.slice(index+1)].map((c,i,arr)=>{
+    const safeDuration=Math.max(0.3,Number(c.duration)||0.3),item={...c,duration:safeDuration,timelineStart:cursor};
+    const overlap=i<arr.length-1 && c._transitionToNext&&c._transitionToNext.type!=='none'?(c._transitionToNext.duration||0.5):0;
+    cursor+=overlap>0?Math.max(0.1,safeDuration-overlap):safeDuration;
+    return item;
+  });
+  const groupItems=next.filter(c=>c._cutGroupId===group);
+  if(groupItems.length>2) next=next.map(c=>{
+    if(c._cutGroupId!==group) return c;
+    const number=groupItems.findIndex(item=>item.id===c.id)+1,baseName=c._cutSegment?.rootName||rootName;
+    return {...c,_cutSegment:{number,rootName:baseName},name:`${baseName}・区間${number}`};
+  });
+  const newFront=next.find(c=>c.id===front.id),newBack=next.find(c=>c.id===back.id);
+  const oldById=new Map(clips.map(c=>[c.id,c])),newById=new Map(next.map(c=>[c.id,c]));
+  const cutStart=clip.timelineStart+start,cutEnd=clip.timelineStart+end;
+  let affectedTextCount=0;
+  const nextTexts=[];
+  for(const t of texts){
+    const attached=t._clipId===clipId;
+    const oldClip=attached?clip:(t._clipId?oldById.get(t._clipId):null);
+    const absStart=Number(t.start),absEnd=Number(t.end);
+    if(!Number.isFinite(absStart)||!Number.isFinite(absEnd)||absEnd<=absStart){nextTexts.push(t);continue;}
+    if(attached){
+      const localStart=Number.isFinite(t._clipStart)?t._clipStart:absStart-clip.timelineStart;
+      const localEnd=Number.isFinite(t._clipEnd)?t._clipEnd:absEnd-clip.timelineStart;
+      const hasFront=localStart<start-0.001,hasBack=localEnd>end+0.001;
+      if(localStart>=start-0.001 && localEnd<=end+0.001){affectedTextCount++;continue;}
+      if(hasFront&&hasBack){
+        affectedTextCount++;
+        const s=newFront.timelineStart+localStart,e=newBack.timelineStart+(localEnd-end);
+        nextTexts.push({...t,_clipId:null,_clipStart:null,_clipEnd:null,start:s,end:e});
+      }else if(hasFront){
+        const e=Math.min(localEnd,start),s=localStart;
+        if(e-s<0.2-0.001){affectedTextCount++;continue;}
+        if(localEnd>start+0.001) affectedTextCount++;
+        nextTexts.push({...t,start:newFront.timelineStart+s,end:newFront.timelineStart+Math.max(s+0.2,e),_clipStart:s,_clipEnd:Math.max(s+0.2,e)});
+      }else if(hasBack){
+        const s=Math.max(0,localStart-end),e=localEnd-end;
+        if(e-s<0.2-0.001){affectedTextCount++;continue;}
+        affectedTextCount++;
+        nextTexts.push({...t,_clipId:backId,start:newBack.timelineStart+s,end:newBack.timelineStart+e,_clipStart:s,_clipEnd:e});
+      }else { nextTexts.push(t); }
+      continue;
+    }
+    if(t._clipId){
+      if(!oldClip || !newById.has(oldClip.id)){nextTexts.push(t);continue;}
+      const target=newById.get(oldClip.id),localStart=Number.isFinite(t._clipStart)?t._clipStart:absStart-oldClip.timelineStart;
+      const localEnd=Number.isFinite(t._clipEnd)?t._clipEnd:absEnd-oldClip.timelineStart;
+      nextTexts.push({...t,start:target.timelineStart+localStart,end:target.timelineStart+localEnd});
+      continue;
+    }
+    // Timeline-anchored text ripples with the removed output interval.
+    if(absStart>=cutStart-0.001 && absEnd<=cutEnd+0.001){affectedTextCount++;continue;}
+    const mapTime=t=>t<cutStart? t : t<=cutEnd ? cutStart : t-removedDuration;
+    const s=mapTime(absStart),e=mapTime(absEnd);
+    if(s!==absStart || e!==absEnd) affectedTextCount++;
+    if(e-s<0.2-0.001){affectedTextCount++;continue;}
+    nextTexts.push({...t,start:s,end:e});
+  }
+  const textById=new Map(nextTexts.map(t=>[t.id,t]));
+  affectedTextCount=texts.filter(t=>{const updated=textById.get(t.id);return !updated || ['start','end','_clipId','_clipStart','_clipEnd'].some(key=>updated[key]!==t[key]);}).length;
+  return {clips:next,texts:nextTexts,removedDuration,affectedTextCount,segments:[newFront,newBack],cutGroupId,backId};
+}
+
 // テキストを素材にひっつけてトランジションで見た目が変わらないようにする
 function recomputeTextsForTransition(oldClips, newClips, oldTexts){
   const oldById = new Map(oldClips.map(c=>[c.id, c]));
@@ -8111,7 +8214,7 @@ async function captureMaterialEdge(clip,edge,signal,localTime=null,filter='none'
     if(video.readyState<2 || !video.videoWidth || !video.videoHeight) throw new Error('frame-unavailable');
     const raw=(clip.trimStart||0)+(Number.isFinite(localTime)
       ? Math.max(0,Math.min(clip.duration-0.04,localTime))
-      : edge==='last'?Math.max(0,clip.duration-0.08):Math.min(0.08,clip.duration/2));
+      : edge==='last'?Math.max(0,clip.duration-0.08):Math.min(0.08,clip.duration/2))*(clip._cutGroupId?(clip._playbackRate||1):1);
     const target=Math.max(0,Math.min(raw,Number.isFinite(video.duration)?Math.max(0,video.duration-0.04):raw));
     if(Math.abs(video.currentTime-target)>0.04){
       const seeked=wait(['seeked'],2500);
@@ -8219,7 +8322,7 @@ function TextStylePreview({item,backdrop,onFontReady}){
 
 // A local ruler keeps tenths of a second reachable even in a long vlog.
 // Values remain a draft until the owning editor explicitly applies them.
-function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragStart,onDragEnd,label}){
+function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragStart,onDragEnd,label,removed=false}){
   const [full,setFull]=useState(false);
   const [focus,setFocus]=useState(null);
   const [windowStart,setWindowStart]=useState(null);
@@ -8302,7 +8405,7 @@ function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragSt
     ),
     React.createElement('div',{className:'relative h-14 mx-4',style:{touchAction:'none'}},
       React.createElement('div',{className:'absolute inset-x-0 top-5 h-3 rounded-full bg-white/20'}),
-      React.createElement('div',{className:'absolute top-5 h-3 rounded-full bg-violet-400',style:{left:`${percent(start)}%`,width:`${Math.max(0,percent(end)-percent(start))}%`},
+      React.createElement('div',{className:`absolute top-5 h-3 rounded-full ${removed?'border border-rose-200/70':'bg-violet-400'}`,style:{left:`${percent(start)}%`,width:`${Math.max(0,percent(end)-percent(start))}%`,...(removed?{background:'repeating-linear-gradient(135deg,rgba(251,113,133,.85) 0 4px,rgba(127,29,29,.75) 4px 8px)'}:{})},
         onPointerDown:event=>pointerDown(event,'move'),onPointerMove:pointerMove,onPointerUp:pointerUp,onPointerCancel:pointerUp,
         role:'slider','aria-label':'長さを保って範囲を移動','aria-valuenow':start,'aria-valuemin':min,'aria-valuemax':safeMax}),
       ['start','end'].map((kind,index)=>React.createElement('button',{
@@ -8328,6 +8431,123 @@ function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragSt
           onDragEnd?.();
         },className:'min-h-10 rounded-full border border-white/20 bg-white/10 px-4'},amount<0?'−0.1秒':'＋0.1秒'))
     )
+  );
+}
+
+function VlogMiddleCutControls({clip,start,end,onChange,plan,sourceAudioVolume}){
+  const videoRef=useRef(null);
+  const auditionRef=useRef(null);
+  const auditionTokenRef=useRef(0);
+  const audioContextRef=useRef(null);
+  const audioEntryRef=useRef(null);
+  const audioGraphFailedRef=useRef(false);
+  const [focus,setFocus]=useState('start');
+  const rate=Math.max(0.1,Number(clip._playbackRate)||1);
+  const stopPreview=(restoreEnd=false)=>{
+    const video=videoRef.current;
+    if(auditionRef.current?.raf) cancelAnimationFrame(auditionRef.current.raf);
+    auditionTokenRef.current++;
+    auditionRef.current=null;
+    if(video){try{video.pause();if(restoreEnd && video.readyState>=1){const sourceTime=(clip.trimStart||0)+end*rate;video.currentTime=Math.min(Math.max(0,video.duration-0.001),sourceTime);}}catch{}}
+  };
+  useEffect(()=>()=>{
+    stopPreview();
+    const entry=audioEntryRef.current;
+    if(entry){try{entry.source.disconnect();}catch{}try{entry.gain.disconnect();}catch{}audioEntryRef.current=null;}
+    try{if(audioContextRef.current && audioContextRef.current.state!=='closed')audioContextRef.current.close();}catch{}
+    audioContextRef.current=null;
+  },[clip.id]);
+  const showFrame=outputTime=>{
+    const video=videoRef.current;
+    if(!video || video.readyState<1 || auditionRef.current) return;
+    const sourceTime=(clip.trimStart||0)+outputTime*rate;
+    try{video.currentTime=Math.min(Math.max(0,video.duration-0.001),sourceTime);}catch{}
+  };
+  const setRange=(nextStart,nextEnd)=>{
+    stopPreview();
+    const edge=Math.abs(nextStart-start)>0.0001?'start':Math.abs(nextEnd-end)>0.0001?'end':focus;
+    setFocus(edge);onChange(nextStart,nextEnd);
+    showFrame(edge==='start'?nextStart:nextEnd);
+  };
+  const setSelectedFrame=()=>showFrame(focus==='start'?start:end);
+  const selectEdge=edge=>{stopPreview();setFocus(edge);showFrame(edge==='start'?start:end);};
+  const preview=()=>{
+    const video=videoRef.current;
+    if(!video || !plan || plan.error || video.readyState<1) return;
+    stopPreview();
+    const trimStart=clip.trimStart||0;
+    const cutStart=trimStart+start*rate;
+    const cutEnd=trimStart+end*rate;
+    const outputEnd=trimStart+clip.duration*rate;
+    const beforeStart=Math.max(trimStart,cutStart-rate);
+    const afterEnd=Math.min(outputEnd,cutEnd+rate);
+    const token=++auditionTokenRef.current;
+    auditionRef.current={token,phase:'before',cutStart,cutEnd,afterEnd,raf:0};
+    try{
+      video.playbackRate=rate;video.preservesPitch=false;
+      const gain=vlogClipSourceGain(clip,sourceAudioVolume);
+      const Context=window.AudioContext||window.webkitAudioContext;
+      if(!audioContextRef.current && Context){try{audioContextRef.current=new Context();}catch{audioGraphFailedRef.current=true;}}
+      const context=audioContextRef.current;
+      if(context && !audioEntryRef.current && !audioGraphFailedRef.current){
+        try{
+          const source=context.createMediaElementSource(video),gainNode=context.createGain();
+          source.connect(gainNode);gainNode.connect(context.destination);
+          audioEntryRef.current={source,gain:gainNode};
+        }catch{audioGraphFailedRef.current=true;}
+      }
+      if(audioEntryRef.current){
+        if(context?.state==='suspended')context.resume().catch(()=>{});
+        audioEntryRef.current.gain.gain.value=gain;video.volume=1;video.muted=false;
+      }else if(audioGraphFailedRef.current){video.muted=true;}
+      else {video.volume=Math.max(0,Math.min(1,gain));video.muted=gain===0;}
+      video.currentTime=beforeStart;
+    }catch{stopPreview();return;}
+    const playPromise=video.play();
+    if(playPromise?.then) playPromise.catch(()=>{if(auditionRef.current?.token===token)stopPreview();});
+    const monitor=()=>{
+      const run=auditionRef.current;
+      if(!run || run.token!==token) return;
+      tick({currentTarget:video});
+      if(auditionRef.current?.token===token)auditionRef.current.raf=requestAnimationFrame(monitor);
+    };
+    auditionRef.current.raf=requestAnimationFrame(monitor);
+  };
+  const tick=e=>{
+    const video=e.currentTarget,run=auditionRef.current;
+    if(!run) return;
+    if(run.phase==='before' && video.currentTime>=run.cutStart-0.015){
+      run.phase='seeking';
+      if(audioEntryRef.current)audioEntryRef.current.gain.gain.value=0;
+      else video.muted=true;
+      try{video.currentTime=run.cutEnd;}catch{stopPreview();}
+    }else if(run.phase==='after' && video.currentTime>=run.afterEnd-0.015) stopPreview(true);
+  };
+  const onSeeked=e=>{
+    const run=auditionRef.current;
+    if(!run || run.phase!=='seeking') return;
+    const gain=vlogClipSourceGain(clip,sourceAudioVolume);
+    if(audioEntryRef.current)audioEntryRef.current.gain.gain.value=gain;
+    else if(!audioGraphFailedRef.current){e.currentTarget.muted=gain===0;e.currentTarget.volume=Math.max(0,Math.min(1,gain));}
+    run.phase='after';
+  };
+  const planOk=!!plan && !plan.error;
+  const nudge=amount=>setRange(focus==='start'?Math.max(0,Math.min(end-0.1,start+amount)):start,
+    focus==='end'?Math.min(clip.duration,Math.max(start+0.1,end+amount)):end);
+  return React.createElement('div',{className:'mt-2 flex flex-col gap-2'},
+    React.createElement(VlogRotatedMedia,{as:'video',clip,ref:videoRef,src:clip.url,muted:true,playsInline:true,preload:'metadata',
+      className:'w-full rounded-xl bg-black object-contain',style:{maxHeight:'140px',aspectRatio:'16/9'},onTimeUpdate:tick,onSeeked,
+      onLoadedMetadata:setSelectedFrame}),
+    React.createElement('div',{className:'flex gap-2'},
+      React.createElement('button',{type:'button',onClick:preview,disabled:!planOk,className:'flex-1 h-8 rounded-full bg-rose-500/20 border border-rose-300/30 text-[10px] disabled:opacity-40'},'▶ つながりを確認')),
+    clip.duration>=0.2 ? React.createElement(TimeRangeBand,{scopeKey:`cut-${clip.id}`,start,end,min:0,max:clip.duration,minSpan:0.1,
+      label:'途中をカットする範囲',removed:true,onChange:setRange,onDragStart:stopPreview,onDragEnd:setSelectedFrame})
+      : React.createElement('div',{className:'rounded-xl border border-rose-300/30 bg-rose-500/10 px-3 py-2 text-[10px] text-rose-100'},'この動画は短いため、カットできる有効範囲がありません'),
+    clip.duration>=0.2 && React.createElement('div',{className:'flex items-center justify-center gap-2 text-[10px]'},
+      React.createElement('button',{type:'button',onClick:()=>selectEdge('start'),'aria-pressed':focus==='start',className:`min-h-9 rounded-full border px-3 ${focus==='start'?'border-rose-300 bg-rose-500/25':'border-white/20'}`},'カット開始を選択'),
+      React.createElement('button',{type:'button',onClick:()=>selectEdge('end'),'aria-pressed':focus==='end',className:`min-h-9 rounded-full border px-3 ${focus==='end'?'border-rose-300 bg-rose-500/25':'border-white/20'}`},'カット終了を選択'),
+      React.createElement('button',{type:'button',onClick:()=>nudge(-0.1),className:'min-h-9 rounded-full border border-white/20 px-3'},'−0.1秒'),
+      React.createElement('button',{type:'button',onClick:()=>nudge(0.1),className:'min-h-9 rounded-full border border-white/20 px-3'},'+0.1秒'))
   );
 }
 
@@ -9903,8 +10123,12 @@ function App(){
     try{ materialListRef.current?.querySelectorAll('video').forEach(video=>video.pause()); }catch{}
     const rootEl=document.getElementById('root');
     const scope=individual?'current':'all';
-    const settings=individual ? getClipFilterSettings(target,activeFilterRef.current,filterIntensityRef.current)
+    const initialSettings=individual ? getClipFilterSettings(target,activeFilterRef.current,filterIntensityRef.current)
       : {id:activeFilterRef.current,intensity:filterIntensityRef.current};
+    // The draft and native range must start within the selected filter's scale.
+    // Opening/canceling the sheet leaves saved material settings unchanged.
+    const settings={...initialSettings,intensity:Math.max(0,Math.min(
+      FILTERS.find(f=>f.id===initialSettings.id)?.intensityMax || 200,initialSettings.intensity))};
     const sample=individual
       ? Math.max(0,target.trimStart||0)
       : Math.max(0,target.trimStart||0)+Math.max(0,timeRef.current-target.timelineStart)*(target._playbackRate||1);
@@ -11709,6 +11933,8 @@ function App(){
   },[]);
 
   const getCrossfadeAtCut = useCallback((cutIndex)=>{
+    const left=clipsRef.current[cutIndex],right=clipsRef.current[cutIndex+1];
+    if(left?._cutGroupId && left._cutGroupId===right?._cutGroupId)return {enabled:false,duration:0};
     const cf = crossfades[cutIndex];
     if(cf) return cf;
     // デフォルト：0.25秒、ON
@@ -11754,7 +11980,8 @@ function App(){
     // Audio Crossfade - 自然に繋ぐ
     let audioCrossfadeActive = null;
     let audioCrossfadeProgress = 0;
-    if(audioCrossfadeEnabled && index < clipsNow.length -1){
+    if(audioCrossfadeEnabled && index < clipsNow.length -1 &&
+       !(active?._cutGroupId && active._cutGroupId===clipsNow[index+1]?._cutGroupId)){
       const cf = crossfades[index] !== undefined ? crossfades[index] : {enabled: true, duration: getCrossfadeDuration(active, clipsNow[index+1])};
       if(cf.enabled && cf.duration > 0.01){
         const cutTime = active.timelineStart + active.duration;
@@ -11824,7 +12051,7 @@ function App(){
         try{activeVideo.load();}catch{}
       }
       if(state.activeId!==active.id){
-        const target=(active.trimStart||0)+t-active.timelineStart;
+        const target=(active.trimStart||0)+(t-active.timelineStart)*(active._cutGroupId?(active._playbackRate||1):1);
         // フェード中に再生を始めた次素材は、そのまま主素材へ引き継ぐ。
         if((state.incomingId===active.id && activeVideo.readyState>=2) ||
            positionPreviewVideo(activeVideo,active,target,'active-entry',0.08))
@@ -11849,7 +12076,7 @@ function App(){
         }
         else{
           const mediaTime=Math.max(active.timelineStart,Math.min(active.timelineStart+active.duration,
-            active.timelineStart+activeVideo.currentTime-(active.trimStart||0)));
+            active.timelineStart+(activeVideo.currentTime-(active.trimStart||0))/(active._cutGroupId?clipRateActive:1)));
           if(mediaTime<t-0.12){
             // 数フレームの遅れは動画の時計が自然に追いつくまで待つ。
             waiting=true;
@@ -12052,7 +12279,7 @@ function App(){
       };
       if(active?.type==='video'){
         const local=Math.max(0,state.heldTime-active.timelineStart);
-        syncHeldVideo(active,activeVideo,(active.trimStart||0)+local,'resume-sync','active');
+        syncHeldVideo(active,activeVideo,(active.trimStart||0)+local*(active._cutGroupId?(active._playbackRate||1):1),'resume-sync','active');
       }
       if(inOverlap && incoming){
         const local=Math.max(0,state.heldTime-overlapStart)*(next._playbackRate||1);
@@ -12387,7 +12614,7 @@ function App(){
       if(v){
         const local=timeRef.current-clip.timelineStart;
         if(local>=0 && local<clip.duration){
-          const target=(clip.trimStart||0)+local*(clip._splitGroupId?(clip._playbackRate||1):1);
+          const target=(clip.trimStart||0)+local*((clip._splitGroupId||clip._cutGroupId)?(clip._playbackRate||1):1);
           try{
             if(v.ended){
               positionPreviewVideo(v,clip,target,'tap-start',0);
@@ -12958,8 +13185,8 @@ function App(){
               progress.advancedAt=now;
             }
             job.frameProgress.set(clip.id,progress);
-            const target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart)*(clip._splitGroupId?(clip._playbackRate||1):1);
-            if(clip._splitGroupId)video.playbackRate=clip._playbackRate||1;
+            const target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart)*((clip._splitGroupId||clip._cutGroupId)?(clip._playbackRate||1):1);
+            if(clip._splitGroupId||clip._cutGroupId)video.playbackRate=clip._playbackRate||1;
             if(job.preparedIds.has(clip.id) && !job.startedIds.has(clip.id)){
               // クリップへの入場時だけ位置合わせする。再生中は短い遅れでシークしない。
               if(!video.seeking && Math.abs(video.currentTime-target)>
@@ -13096,7 +13323,7 @@ function App(){
           }
           if(progress && t>clip.timelineStart+0.25 &&
              now-progress.advancedAt>750 &&
-             video.currentTime<(clip.trimStart||0)+clip.duration-0.12)
+             video.currentTime<(clip.trimStart||0)+clip.duration*(clip._cutGroupId?(clip._playbackRate||1):1)-0.12)
             return 'time-stalled';
           return null;
         };
@@ -14175,10 +14402,17 @@ const recomputeStarts=(arr)=>{
     setClips(prev=>{
       const newClips = prev.map(c=>{
         if(c.id !== clipId) return c;
-        const sourceDur = c._sourceDuration || c.duration || 2.5;
         const rate = Math.max(0.1, Math.min(3, newRate));
+        const sourceDur = c._cutGroupId
+          ? (Number(c._sourceRangeDuration)||Math.max(0,(c.duration||0)*(c._playbackRate||1)))
+          : (c._sourceDuration || c.duration || 2.5);
         const newDuration = sourceDur / rate;
         if(c.type === 'photo') return c;
+        if(c._cutGroupId){
+          const {_connectionBase,_connectionInCut,_connectionOutCut,...retained}=c;
+          return {...retained,_playbackRate:rate,duration:newDuration,_sourceRangeDuration:sourceDur,
+            _good3SourceRange:{start:c.trimStart||0,end:(c.trimStart||0)+sourceDur}};
+        }
         return {...c, _playbackRate: rate, duration: newDuration, _sourceDuration: sourceDur};
       });
       const recomputed = recomputeStarts(newClips);
@@ -14758,7 +14992,7 @@ const recomputeStarts=(arr)=>{
     }
     const video=clip && videoRefs.current.get(clip.id);
     if(video){
-      const target=(clip.trimStart||0)+t-clip.timelineStart;
+      const target=(clip.trimStart||0)+(t-clip.timelineStart)*(clip._cutGroupId?(clip._playbackRate||1):1);
       const position=()=>{
         if(videoRefs.current.get(clip.id)!==video || playingRef.current ||
            Math.abs(timeRef.current-t)>0.02) return;
@@ -14842,9 +15076,9 @@ const recomputeStarts=(arr)=>{
   };
   const markInClip=(clip,mark)=>clip?.type==='photo' ||
     (Number.isFinite(mark?.sourceTime) && mark.sourceTime >= (clip.trimStart||0)-0.001 &&
-     mark.sourceTime < (clip.trimStart||0)+clip.duration-0.001);
+     mark.sourceTime < (clip.trimStart||0)+clip.duration*(clip._cutGroupId?(clip._playbackRate||1):1)-0.001);
   const markTimelineTime=(clip,mark)=>clip.type==='photo' ? clip.timelineStart :
-    clip.timelineStart+mark.sourceTime-(clip.trimStart||0);
+    clip.timelineStart+(mark.sourceTime-(clip.trimStart||0))/(clip._cutGroupId?(clip._playbackRate||1):1);
   const updateFinderMarks=(clipId,change)=>{
     const before=editSnapshot();
     const next=clipsRef.current.map(c=>c.id===clipId ? {...c,_finderMarks:change(c._finderMarks||[])} : c);
@@ -14873,11 +15107,11 @@ const recomputeStarts=(arr)=>{
     try{
       let sourceTime=0;
       if(clip._splitScreen){
-        sourceTime=(clip.trimStart||0)+t-clip.timelineStart;
+        sourceTime=(clip.trimStart||0)+(t-clip.timelineStart)*(clip._cutGroupId?(clip._playbackRate||1):1);
       }else if(clip.type!=='photo'){
         const video=videoRefs.current.get(clip.id);
         if(!video) throw new Error('video-not-ready');
-        const target=(clip.trimStart||0)+t-clip.timelineStart;
+        const target=(clip.trimStart||0)+(t-clip.timelineStart)*(clip._cutGroupId?(clip._playbackRate||1):1);
         const waitFor=(name,timeout)=>new Promise((resolve,reject)=>{
           const timer=setTimeout(()=>{video.removeEventListener(name,onEvent);reject(new Error('video-timeout'));},timeout);
           const onEvent=()=>{clearTimeout(timer);video.removeEventListener(name,onEvent);resolve();};
@@ -15024,9 +15258,11 @@ const recomputeStarts=(arr)=>{
     const video=videoRefs.current.get(clip.id);
     if(!video){ setConnectionFrameStatus(prev=>({...prev,[side]:'retry'})); return Promise.resolve(); }
     const base=clip._connectionBase || {duration:clip.duration,trimStart:clip.trimStart||0};
-    const raw=markedTime===null ? (side==='left' ? base.trimStart+base.duration-cut-0.05 : base.trimStart+cut) : markedTime;
+    const cutRate=clip._cutGroupId?(clip._playbackRate||1):1;
+    const raw=markedTime===null ? (side==='left' ? base.trimStart+(base.duration-cut)*cutRate-0.05 : base.trimStart+cut*cutRate) : markedTime;
     const maxTime=isFinite(video.duration) && video.duration>0 ? video.duration-0.05 : raw;
-    const target=Math.max(0,Math.min(raw,maxTime));
+    const target=Math.max(clip._cutGroupId?(clip._good3SourceRange?.start??clip.trimStart??0):0,
+      Math.min(raw,maxTime,clip._cutGroupId?(clip._good3SourceRange?.end??maxTime)-0.001:maxTime));
     const activeTask=connectionSeekTasksRef.current.get(clip.id);
     if(activeTask && Math.abs(activeTask.target-target)<0.005) return activeTask.promise;
     activeTask?.stop(null);
@@ -15109,13 +15345,16 @@ const recomputeStarts=(arr)=>{
     const sourceEnd=Number.isFinite(video?.duration) && video.duration>0
       ? video.duration : Number.isFinite(clip._sourceDuration) && clip._sourceDuration>0
         ? clip._sourceDuration : (clip.trimStart||0)+clip.duration;
+    const cutRate=clip._cutGroupId?(clip._playbackRate||1):1;
+    const sourceMin=clip._cutGroupId?(clip._good3SourceRange?.start??clip.trimStart??0):0;
+    const sourceMax=clip._cutGroupId?Math.min(sourceEnd,clip._good3SourceRange?.end??sourceEnd):sourceEnd;
     const start=clip.trimStart||0;
-    const end=start+clip.duration;
+    const end=start+clip.duration*cutRate;
     // 長さを変えずに窓全体を動かす。元動画の先頭・末尾を越える値は選ばせない。
-    const min=side==='left' ? Math.max(0,initialCut-Math.max(0,sourceEnd-end))
-      : Math.max(0,initialCut-start);
-    const max=side==='left' ? Math.min(ordinaryMax,initialCut+start)
-      : Math.min(ordinaryMax,initialCut+Math.max(0,sourceEnd-end));
+    const min=side==='left' ? Math.max(0,initialCut-Math.max(0,sourceMax-end)/cutRate)
+      : Math.max(0,initialCut-(start-sourceMin)/cutRate);
+    const max=side==='left' ? Math.min(ordinaryMax,initialCut+(start-sourceMin)/cutRate)
+      : Math.min(ordinaryMax,initialCut+Math.max(0,sourceMax-end)/cutRate);
     return {min:Math.min(min,initialCut),max:Math.max(initialCut,max)};
   };
   const beginConnectionCandidate=()=>{
@@ -15130,7 +15369,8 @@ const recomputeStarts=(arr)=>{
     if(!mark || clip.type==='photo' || !markInClip(clip,mark)) return;
     const limits=connectionCutLimits(left,right);
     const base=side==='left'?limits.leftBase:limits.rightBase;
-    const cut=side==='left' ? base.trimStart+base.duration-mark.sourceTime : mark.sourceTime-base.trimStart;
+    const cutRate=clip._cutGroupId?(clip._playbackRate||1):1;
+    const cut=side==='left' ? base.duration-(mark.sourceTime-base.trimStart)/cutRate : (mark.sourceTime-base.trimStart)/cutRate;
     const max=side==='left'?limits.leftMax:limits.rightMax;
     const fixed=connectionEditor.keepDuration ? connectionFixedRange(clip,side,
       side==='left'?connectionEditor.initialOutCut:connectionEditor.initialInCut,max) : {min:0,max};
@@ -15186,12 +15426,13 @@ const recomputeStarts=(arr)=>{
       }
       if(video.readyState<2) throw new Error('video-not-ready');
       const base=clip._connectionBase || {trimStart:clip.trimStart||0,duration:clip.duration};
-      const boundary=side==='left' ? base.trimStart+base.duration-cut : base.trimStart+cut;
+      const cutRate=clip._cutGroupId?(clip._playbackRate||1):1;
+      const boundary=side==='left' ? base.trimStart+(base.duration-cut)*cutRate : base.trimStart+cut*cutRate;
       const windowStart=connectionEditor.keepDuration
-        ? (clip.trimStart||0)+(side==='left' ? connectionEditor.initialOutCut-cut : cut-connectionEditor.initialInCut)
+        ? (clip.trimStart||0)+(side==='left' ? connectionEditor.initialOutCut-cut : cut-connectionEditor.initialInCut)*cutRate
         : (side==='left' ? clip.trimStart||0 : boundary);
       const windowEnd=connectionEditor.keepDuration
-        ? windowStart+clip.duration : base.trimStart+base.duration-(clip._connectionOutCut||0);
+        ? windowStart+clip.duration*cutRate : base.trimStart+(base.duration-(clip._connectionOutCut||0))*cutRate;
       const start=side==='left' ? Math.max(windowStart,boundary-0.8) : boundary;
       const end=side==='left' ? boundary : Math.min(windowEnd,boundary+0.8);
       if(end-start<=0.02) return;
@@ -15330,18 +15571,19 @@ const recomputeStarts=(arr)=>{
     const edited=list.map((c,index)=>{
       if(c.type==='photo' || (index!==i && index!==i+1)) return c;
       const base=c._connectionBase || {duration:c.duration,trimStart:c.trimStart||0};
+      const cutRate=c._cutGroupId?(c._playbackRate||1):1;
       const nextIn=index===i+1 ? inCut : (c._connectionInCut||0);
       const nextOut=index===i ? outCut : (c._connectionOutCut||0);
       if(keepDuration){
         const shift=index===i ? connectionEditor.initialOutCut-nextOut
           : nextIn-connectionEditor.initialInCut;
-        const trimStart=(c.trimStart||0)+shift;
+        const trimStart=(c.trimStart||0)+shift*cutRate;
         const duration=c.duration;
         if(nextIn===0 && nextOut===0){
           const {_connectionBase,_connectionInCut,_connectionOutCut,...rest}=c;
           return {...rest,trimStart,duration};
         }
-        return {...c,_connectionBase:{trimStart:trimStart-nextIn,duration:duration+nextIn+nextOut},
+        return {...c,_connectionBase:{trimStart:trimStart-nextIn*cutRate,duration:duration+nextIn+nextOut},
           _connectionInCut:nextIn,_connectionOutCut:nextOut,trimStart,duration};
       }
       if(nextIn===0 && nextOut===0){
@@ -15349,9 +15591,14 @@ const recomputeStarts=(arr)=>{
         return {...rest,trimStart:base.trimStart,duration:base.duration};
       }
       return {...c,_connectionBase:base,_connectionInCut:nextIn,_connectionOutCut:nextOut,
-        trimStart:base.trimStart+nextIn,duration:Math.max(0.3,base.duration-nextIn-nextOut)};
+        trimStart:base.trimStart+nextIn*cutRate,duration:Math.max(0.3,base.duration-nextIn-nextOut)};
     });
-    const result=recomputeStarts(edited);
+    if(edited.some(c=>c._cutGroupId && c._good3SourceRange &&
+      ((c.trimStart||0)<c._good3SourceRange.start-0.001 || (c.trimStart||0)+c.duration*(c._playbackRate||1)>c._good3SourceRange.end+0.001))){
+      setConnectionCandidateNotice('カット後に残した映像の範囲を越えています');return;
+    }
+    const bounded=edited.map(c=>c._cutGroupId?{...c,_sourceRangeDuration:c.duration*(c._playbackRate||1)}:c);
+    const result=recomputeStarts(bounded);
     clipsRef.current=result;
     setClips(result);
     recordEdit(before);
@@ -15463,8 +15710,10 @@ const recomputeStarts=(arr)=>{
   // いいとこ3秒専用: 画面に提示された時刻を確認してから画素を読む。
   const analyzeGood3SecClip = useCallback(async (video, clip, onProgress)=>{
     const sourceStart=clip.trimStart||0;
+    const cutRate=clip._cutGroupId?(clip._playbackRate||1):1;
     const realDuration=Number.isFinite(video.duration) && video.duration>0 ? video.duration : sourceStart+clip.duration;
-    const span=Math.min(clip.duration,realDuration-sourceStart);
+    const span=Math.min(clip.duration,(realDuration-sourceStart)/cutRate,
+      clip._cutGroupId?((clip._good3SourceRange?.end??realDuration)-sourceStart)/cutRate:Infinity);
     if(!Number.isFinite(span) || span<=0) return {status:'error',reason:'動画の再生範囲を確認できません',candidates:[],attempted:0,valid:0,verified:0};
     if(span<=3.1) return {status:'short',reason:'3秒以下のため現在の長さを維持',candidates:[],attempted:0,valid:0,verified:0};
     if(video.error || !(video.currentSrc || video.src)) return {status:'error',reason:'動画を読み込めません',candidates:[],attempted:0,valid:0,verified:0};
@@ -15517,7 +15766,7 @@ const recomputeStarts=(arr)=>{
             try{ video.play()?.catch?.(()=>{}); }catch{}
             await loaded;
           }
-          const target=sourceStart+t;
+          const target=sourceStart+t*cutRate;
           if(Math.abs(video.currentTime-target)>0.025 || video.seeking){
             const seeked=waitFor('seeked',1800);
             video.currentTime=target;
@@ -15613,8 +15862,8 @@ const recomputeStarts=(arr)=>{
       const medianContrast=sortedContrast[Math.floor(sortedContrast.length/2)];
       const maxStart=span-3;
       const marks=(clip._finderMarks||[]).filter(mark=>Number.isFinite(mark.sourceTime) &&
-        mark.sourceTime>=sourceStart && mark.sourceTime<sourceStart+span);
-      const markStarts=marks.map(mark=>Math.max(0,Math.min(maxStart,mark.sourceTime-sourceStart-1.5)));
+        mark.sourceTime>=sourceStart && mark.sourceTime<sourceStart+span*cutRate);
+      const markStarts=marks.map(mark=>Math.max(0,Math.min(maxStart,(mark.sourceTime-sourceStart)/cutRate-1.5)));
       const rank=(samples,starts,minCount)=>starts.map(start=>{
         const frames=samples.filter(s=>s && s.t>=start-0.01 && s.t<start+3-0.01).sort((a,b)=>a.t-b.t);
         if(frames.length<minCount) return null;
@@ -15635,7 +15884,7 @@ const recomputeStarts=(arr)=>{
         const brightnessDrift=Math.abs(avg-medianBrightness);
         const score=contrast*0.8+detail*0.6-clipped*60-brightnessDrift*0.18+
           Math.min(motion,25)*0.12-Math.max(0,motion-45)*0.35-abrupt*15;
-        const marked=marks.some(mark=>mark.sourceTime>=sourceStart+start+0.1 && mark.sourceTime<=sourceStart+start+2.9);
+        const marked=marks.some(mark=>mark.sourceTime>=sourceStart+(start+0.1)*cutRate && mark.sourceTime<=sourceStart+(start+2.9)*cutRate);
         // 急な切り替わりの疑いがある窓は上で除外済み。全候補共通の条件を理由にしない。
         const traits=[];
         if(marked) traits.push('しおりの瞬間を含む');
@@ -15679,7 +15928,7 @@ const recomputeStarts=(arr)=>{
       }
       return {...stats,status:stats.verified===0?'limited':'ready',
         reason:stats.verified===0?'フレーム時刻を確認できない端末です。候補を試写してください':'取得したフレームから候補を選びました',
-        candidates:chosen.map(c=>({start:sourceStart+c.start,reason:c.reason,marked:c.marked,frames:c.frames,avg:c.avg,contrast:c.contrast}))};
+        candidates:chosen.map(c=>({start:sourceStart+c.start*cutRate,reason:c.reason,marked:c.marked,frames:c.frames,avg:c.avg,contrast:c.contrast}))};
     }finally{
       try{ video.pause(); video.muted=previousMuted; }catch{}
     }
@@ -15719,7 +15968,7 @@ const recomputeStarts=(arr)=>{
             result={status:'error',reason:error?.message || '映像の読み取りに失敗しました',candidates:[],attempted:0,valid:0,verified:0};
           }
         }
-        reviews.push({clipId:clip.id,name:clip.name,originalStart:clip.trimStart||0,originalDuration:clip.duration,
+        reviews.push({clipId:clip.id,name:clip.name,originalStart:clip.trimStart||0,originalDuration:clip.duration,sourceRate:clip._cutGroupId?(clip._playbackRate||1):1,
           url:clip.url,...result,selectedIndex:0,start:result.candidates[0]?.start??null});
         setAnalyzeProgress(Math.round((idx+1)/targetClips.length*100));
       }
@@ -15736,7 +15985,7 @@ const recomputeStarts=(arr)=>{
       const video=active && videoRefs.current.get(active.id);
       if(video){
         video.addEventListener('seeked',()=>drawFrameRef.current(timeRef.current),{once:true});
-        try{ video.currentTime=(active.trimStart||0)+originalTime-active.timelineStart; }catch{}
+        try{ video.currentTime=(active.trimStart||0)+(originalTime-active.timelineStart)*(active._cutGroupId?(active._playbackRate||1):1); }catch{}
       }
       drawFrameRef.current(originalTime);
       setIsAnalyzing(false);
@@ -15750,13 +15999,15 @@ const recomputeStarts=(arr)=>{
       setAnalyzeText('素材が変更されています。もう一度解析してください');
       return;
     }
-    const start=review.start;
-    if(!Number.isFinite(start) || start<review.originalStart-0.001 || start>review.originalStart+review.originalDuration-3+0.001) return;
+    const start=review.start,sourceRate=review.sourceRate||1;
+    if(current._cutGroupId && (current._playbackRate||1)!==sourceRate){setAnalyzeText('再生速度が変更されています。もう一度解析してください');return;}
+    if(!Number.isFinite(start) || start<review.originalStart-0.001 || start>review.originalStart+(review.originalDuration-3)*sourceRate+0.001) return;
     const before=editSnapshot();
     handleStop();
     const next=recomputeStarts(clipsRef.current.map(c=>c.id===review.clipId ?
       {...c,trimStart:start,duration:3,
-        _good3SourceRange:{start:review.originalStart,end:review.originalStart+review.originalDuration},
+        _good3SourceRange:{start:review.originalStart,end:review.originalStart+review.originalDuration*sourceRate},
+        ...(c._cutGroupId?{_sourceRangeDuration:3*sourceRate,_connectionBase:undefined,_connectionInCut:undefined,_connectionOutCut:undefined}:{}),
         _good3Candidates:review.candidates.map(candidate=>({start:candidate.start,reason:candidate.reason})),
         _analyzeReason:review.selectedIndex<0?'manual':review.candidates[review.selectedIndex]?.reason} : c));
     clipsRef.current=next;
@@ -15791,14 +16042,20 @@ const recomputeStarts=(arr)=>{
     const sourceDuration=Number.isFinite(loadedSourceDuration) && loadedSourceDuration>0 ? loadedSourceDuration
       : Number.isFinite(video?.duration) && video.duration>0 ? video.duration
       : Number.isFinite(clip._sourceDuration) && clip._sourceDuration>0 ? clip._sourceDuration
+      : clip._cutGroupId ? (clip._good3SourceRange?.end??((clip.trimStart||0)+(clip._sourceRangeDuration||clip.duration*(clip._playbackRate||1))))
       : (clip.trimStart||0)+clip.duration;
-    const sourceStart=Math.min(clip._good3SourceRange?.start??0,clip.trimStart||0);
-    const sourceEnd=Math.min(Math.max(clip._good3SourceRange?.end??sourceDuration,
-      (clip.trimStart||0)+clip.duration),sourceDuration);
+    const cutSegment=!!clip._cutGroupId,rate=Math.max(0.1,Number(clip._playbackRate)||1);
+    const sourceStart=cutSegment ? (clip._good3SourceRange?.start??(clip.trimStart||0))
+      : Math.min(clip._good3SourceRange?.start??0,clip.trimStart||0);
+    const sourceEnd=cutSegment ? Math.min(clip._good3SourceRange?.end??((clip.trimStart||0)+(clip._sourceRangeDuration||clip.duration*rate)),sourceDuration)
+      : Math.min(Math.max(clip._good3SourceRange?.end??sourceDuration,
+        (clip.trimStart||0)+clip.duration),sourceDuration);
     const inCut=clip._connectionInCut||0;
     const outCut=clip._connectionOutCut||0;
-    return {min:Math.max(sourceStart,inCut),max:Math.min(sourceEnd,sourceDuration-outCut),
-      minSpan};
+    const connectionBase=cutSegment?clip._connectionBase:null;
+    return {min:Math.max(sourceStart,connectionBase?connectionBase.trimStart+inCut*rate:inCut),
+      max:Math.min(sourceEnd,connectionBase?connectionBase.trimStart+(connectionBase.duration-outCut)*rate:sourceDuration-outCut),
+      minSpan:cutSegment?minSpan*rate:minSpan};
   };
   const openGood3Adjustment=(clipId)=>{
     const clip=clipsRef.current.find(c=>c.id===clipId);
@@ -15807,20 +16064,61 @@ const recomputeStarts=(arr)=>{
     if(bounds.max-bounds.min<bounds.minSpan-0.001){ setAnalyzeText('素材に使える範囲がありません'); return; }
     handleStop();
     closeQuickPeek(false);
-    setGood3Adjust({clipId,start:clip.type==='photo'?0:clip.trimStart||0,
-      end:(clip.type==='photo'?0:clip.trimStart||0)+clip.duration,overflowChoice:null});
+    const sourceSpan=clip._cutGroupId?(clip._sourceRangeDuration||clip.duration*(clip._playbackRate||1)):clip.duration;
+    setGood3Adjust({clipId,mode:'keep',start:clip.type==='photo'?0:clip.trimStart||0,
+      end:(clip.type==='photo'?0:clip.trimStart||0)+sourceSpan,overflowChoice:null});
     setGood3AdjustNotice('');
+  };
+  const getMiddleCutPlan=(clipId,start,end)=>{
+    const previewId=()=>`preview-${String(clipId)}-${Math.round(start*1000)}-${Math.round(end*1000)}`;
+    let call=0;
+    return vlogCutPlan(clipsRef.current,textsRef.current,clipId,start,end,()=>`${previewId()}-${call++}`);
+  };
+  const applyMiddleCut=()=>{
+    const clip=clipsRef.current.find(c=>c.id===good3Adjust?.clipId);
+    if(!clip || clip.type!=='video' || clip._splitScreen){setGood3AdjustNotice('単独の動画だけカットできます');return;}
+    const {start,end}=good3Adjust, makeId=()=>`${Date.now()}-${Math.random().toString(36).slice(2,9)}-${Math.random().toString(36).slice(2,6)}`;
+    const plan=vlogCutPlan(clipsRef.current,textsRef.current,clip.id,start,end,makeId);
+    if(plan.error){
+      setGood3AdjustNotice(plan.error==='transition-span'?'トランジションを保てる長さがありません':'カット位置を確認してください');
+      return;
+    }
+    const before=editSnapshot(true);
+    handleStop();
+    const back=plan.segments[1],backVideo=document.createElement('video');
+    backVideo.src=clip.url;backVideo.muted=true;backVideo.playsInline=true;backVideo.preload='metadata';
+    backVideo.setAttribute('playsinline','');backVideo.setAttribute('webkit-playsinline','');
+    videoRefs.current.set(back.id,backVideo);
+    const frontVideo=videoRefs.current.get(clip.id);
+    if(frontVideo){try{frontVideo.pause();frontVideo.currentTime=plan.segments[0].trimStart;}catch{}}
+    const leaks={...lightLeaksRef.current};
+    const leak=leaks[clip.id];delete leaks[clip.id];
+    if(leak) leaks[back.id]=leak;
+    lightLeaksRef.current=leaks;setLightLeaks(leaks);
+    clipsRef.current=plan.clips;setClips(plan.clips);
+    textsRef.current=plan.texts;setTexts(plan.texts);
+    recordEdit(before,{allowIdentityChange:true});
+    const total=plan.clips.length?Math.max(...plan.clips.map(c=>c.timelineStart+c.duration)):3;
+    durationRef.current=total;setDuration(total);
+    const front=plan.clips.find(c=>c.id===clip.id);
+    timeRef.current=front?.timelineStart||0;setCurrentTime(timeRef.current);
+    setGood3Adjust(null);setGood3AdjustNotice('');
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+    setAnalyzeText(`${clip.name} をカットしました。↶ 戻すで元に戻せます`);
   };
   const applyGood3Adjustment=()=>{
     if(!good3Adjust) return;
     const clip=clipsRef.current.find(c=>c.id===good3Adjust.clipId);
     if(!clip) return;
+    if(good3Adjust.mode==='cut'){applyMiddleCut();return;}
     const bounds=good3AdjustBounds(clip,good3Adjust.sourceDuration);
     const {start,end}=good3Adjust;
     const length=end-start;
+    const cutRate=clip._cutGroupId?Math.max(0.1,Number(clip._playbackRate)||1):1;
+    const outputLength=length/cutRate;
     if(!Number.isFinite(start) || !Number.isFinite(end) ||
        (clip.type==='photo' && Math.abs(start)>0.001) || start<bounds.min-0.001 ||
-       end>bounds.max+0.001 || length<bounds.minSpan-0.001){
+       end>bounds.max+0.001 || outputLength<bounds.minSpan/cutRate-0.001){
       setGood3AdjustNotice('使える範囲外です');
       return;
     }
@@ -15828,8 +16126,8 @@ const recomputeStarts=(arr)=>{
       setGood3Adjust(null);return;
     }
     const overflowing=textsRef.current.filter(t=>t._clipId===clip.id &&
-      (t._clipEnd??t.end-clip.timelineStart)>length+0.001);
-    const proposed=recomputeStarts(clipsRef.current.map(c=>c.id===clip.id?{...c,duration:length}:c));
+      (t._clipEnd??t.end-clip.timelineStart)>outputLength+0.001);
+    const proposed=recomputeStarts(clipsRef.current.map(c=>c.id===clip.id?{...c,duration:outputLength}:c));
     const proposedEnd=Math.max(...proposed.map(c=>c.timelineStart+c.duration));
     const globalFits=overflowing.every(t=>clip.timelineStart+(t._clipEnd??t.end-clip.timelineStart)<=proposedEnd+0.001);
     if(overflowing.length && !good3Adjust.overflowChoice){
@@ -15842,11 +16140,12 @@ const recomputeStarts=(arr)=>{
     handleStop();
     const next=recomputeStarts(clipsRef.current.map(c=>{
       if(c.id!==clip.id) return c;
-      if(c.type==='photo') return {...c,duration:length};
+      if(c.type==='photo') return {...c,duration:outputLength};
       const nextIn=c._connectionInCut||0, nextOut=c._connectionOutCut||0;
-      return {...c,trimStart:start,duration:length,_analyzeReason:'manual',
-        ...(Number.isFinite(good3Adjust.sourceDuration) ? {_sourceDuration:good3Adjust.sourceDuration} : {}),
-        ...(nextIn || nextOut ? {_connectionBase:{trimStart:start-nextIn,duration:length+nextIn+nextOut}} : {})};
+      return {...c,trimStart:start,duration:outputLength,_analyzeReason:'manual',
+        ...(c._cutGroupId?{_sourceRangeDuration:length,_good3SourceRange:{start,end}}:{}),
+        ...(!c._cutGroupId && Number.isFinite(good3Adjust.sourceDuration) ? {_sourceDuration:good3Adjust.sourceDuration} : {}),
+        ...(nextIn || nextOut ? {_connectionBase:{trimStart:start-nextIn*cutRate,duration:outputLength+nextIn+nextOut}} : {})};
     }));
     const newById=new Map(next.map(c=>[c.id,c]));
     const oldById=new Map(clipsRef.current.map(c=>[c.id,c]));
@@ -15856,13 +16155,13 @@ const recomputeStarts=(arr)=>{
       if(!old || !current) return t;
       const localStart=t._clipStart??t.start-old.timelineStart;
       const localEnd=t._clipEnd??t.end-old.timelineStart;
-      if(t._clipId===clip.id && localEnd>length+0.001){
+      if(t._clipId===clip.id && localEnd>outputLength+0.001){
         if(good3Adjust.overflowChoice==='global'){
           return {...t,_clipId:null,_clipStart:null,_clipEnd:null,
             start:old.timelineStart+localStart,end:old.timelineStart+localEnd};
         }
-        const adjustedStart=Math.max(0,Math.min(localStart,length-0.2));
-        const adjustedEnd=Math.max(adjustedStart+0.2,Math.min(localEnd,length));
+        const adjustedStart=Math.max(0,Math.min(localStart,outputLength-0.2));
+        const adjustedEnd=Math.max(adjustedStart+0.2,Math.min(localEnd,outputLength));
         return {...t,start:current.timelineStart+adjustedStart,end:current.timelineStart+adjustedEnd,
           _clipStart:adjustedStart,_clipEnd:adjustedEnd};
       }
@@ -17591,7 +17890,7 @@ const recomputeStarts=(arr)=>{
       source.connect(gain);gain.connect(context.destination);
       const rate=Math.max(0.25,target._playbackRate||1);
       const start=Math.max(0,target.trimStart||0);
-      const end=start+Math.max(0.3,target.duration||0.3)*(target._splitGroupId?rate:1);
+      const end=start+Math.max(0.3,target.duration||0.3)*((target._splitGroupId||target._cutGroupId)?rate:1);
       const entry={audio,context,source,gain,sceneId,childId:target.id,stopTimer:0,segmentReady:false};
       quickPeekAudioRef.current=entry;
       entry.stopTimer=setTimeout(()=>{
@@ -17608,7 +17907,7 @@ const recomputeStarts=(arr)=>{
           if(!currentTarget || currentTarget.id!==entry.childId){stopQuickPeekAudition();return;}
           try{gain.gain.setTargetAtTime(vlogClipSourceGain(currentTarget,sourceAudioVolumeRef.current),context.currentTime,0.01);}
           catch{gain.gain.value=vlogClipSourceGain(currentTarget,sourceAudioVolumeRef.current);}
-          const wallDuration=(target.duration||0.3)*(target._splitGroupId?1:1/rate);
+          const wallDuration=(target.duration||0.3)*((target._splitGroupId||target._cutGroupId)?1:1/rate);
           clearTimeout(entry.stopTimer);
           entry.stopTimer=setTimeout(()=>stopQuickPeekAudition(),Math.max(300,wallDuration*1000)+250);
         };
@@ -19259,7 +19558,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 review.selectedIndex<0 ? '開始位置を手動調整' : review.candidates[review.selectedIndex]?.reason,
                 ` ・開始 ${Number(review.start).toFixed(1)}秒`),
               React.createElement('input', {
-                type:'range',min:review.originalStart,max:review.originalStart+review.originalDuration-3,step:0.1,value:review.start,
+                type:'range',min:review.originalStart,max:review.originalStart+(review.originalDuration-3)*(review.sourceRate||1),step:0.1,value:review.start,
                 'aria-label':`${review.name}の3秒候補の開始位置`,className:'w-full accent-violet-500 mt-2',
                 onChange:e=>setAnalysisReview(prev=>prev.map(item=>item.clipId===review.clipId ?
                   {...item,start:Number(e.target.value),selectedIndex:-1} : item))
@@ -19273,9 +19572,9 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
               analysisPreviewId===review.clipId && React.createElement(VlogRotatedMedia, {as:'video',clip:clips.find(item=>item.id===review.clipId),
                 key:`${review.clipId}-${review.start}`,src:review.url,controls:true,muted:true,playsInline:true,preload:'metadata',
                 className:'w-full mt-2 rounded-lg bg-black',style:{maxHeight:'220px',objectFit:'contain'},
-                onLoadedMetadata:e=>{ try{ e.currentTarget.currentTime=review.start; }catch{} },
-                onPlay:e=>{ const v=e.currentTarget; if(v.currentTime<review.start-0.05 || v.currentTime>=review.start+3) v.currentTime=review.start; },
-                onTimeUpdate:e=>{ const v=e.currentTarget; if(v.currentTime>=review.start+3){ v.pause(); v.currentTime=review.start; } }
+                onLoadedMetadata:e=>{ try{ e.currentTarget.playbackRate=review.sourceRate||1;e.currentTarget.currentTime=review.start; }catch{} },
+                onPlay:e=>{ const v=e.currentTarget; if(v.currentTime<review.start-0.05 || v.currentTime>=review.start+3*(review.sourceRate||1)) v.currentTime=review.start; },
+                onTimeUpdate:e=>{ const v=e.currentTarget; if(v.currentTime>=review.start+3*(review.sourceRate||1)){ v.pause(); v.currentTime=review.start; } }
               })
             ),
             React.createElement('button', {onClick:()=>{
@@ -20046,26 +20345,56 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 const clip=c;
                 const bounds=good3AdjustBounds(clip,good3Adjust.sourceDuration);
                 const {start,end}=good3Adjust;
+                const cutMode=clip.type==='video' && good3Adjust.mode==='cut';
+                let middleCutPlan=null;
+                if(cutMode && typeof getMiddleCutPlan==='function'){
+                  try{middleCutPlan=getMiddleCutPlan(clip.id,start,end);}catch{middleCutPlan=null;}
+                }
                 const length=end-start;
-                const candidateClips=recomputeStarts(clipsRef.current.map(x=>x.id===clip.id?{...x,...(clip.type==='photo'?{}:{trimStart:start}),duration:length}:x));
+                const outputLength=length/(!cutMode && clip._cutGroupId?(clip._playbackRate||1):1);
+                const candidateClips=recomputeStarts(clipsRef.current.map(x=>x.id===clip.id?{...x,...(clip.type==='photo'?{}:{trimStart:start}),duration:outputLength}:x));
                 const originalIndex=clipsRef.current.findIndex(x=>x.id===clip.id);
                 const movedCount=candidateClips.slice(originalIndex+1).filter(x=> Math.abs(x.timelineStart-clipsRef.current.find(old=>old.id===x.id).timelineStart)>0.001).length;
-                const overflowing=texts.filter(t=>t._clipId===clip.id && (t._clipEnd??t.end-clip.timelineStart)>length+0.001);
+                const overflowing=texts.filter(t=>t._clipId===clip.id && (t._clipEnd??t.end-clip.timelineStart)>outputLength+0.001);
                 const nextTotal=candidateClips.length?Math.max(...candidateClips.map(x=>x.timelineStart+x.duration)):0;
                 const followingTextCount=texts.filter(t=>t._clipId && candidateClips.some(next=> next.id===t._clipId && Math.abs(next.timelineStart-(clipsRef.current.find(old=>old.id===next.id)?.timelineStart??next.timelineStart))>0.001)).length;
                 const canKeepGlobal=overflowing.every(t=>clip.timelineStart+(t._clipEnd??t.end-clip.timelineStart)<=nextTotal+0.001);
                 const setDraftRange=(nextStart,nextEnd)=>{
-                  setGood3Adjust(prev=>prev?{...prev,start:clip.type==='photo'?0:nextStart,end:nextEnd}:prev);
+                  setGood3Adjust(prev=>prev?{...prev,start:clip.type==='photo'?0:nextStart,end:nextEnd,
+                    ...(prev.mode==='cut'?{_cutRange:{start:nextStart,end:nextEnd}}:{_keepRange:{start:nextStart,end:nextEnd}})}:prev);
+                  setGood3AdjustNotice('');
+                };
+                const setMode=mode=>{
+                  if(mode==='cut' && clip.duration<0.7){setGood3AdjustNotice('前後に0.3秒ずつ残せる長さが必要です');return;}
+                  setGood3Adjust(prev=>{
+                    if(!prev || prev.mode===mode) return prev;
+                    if(mode==='cut'){
+                      const duration=clip.duration;
+                      let cutStart=prev._cutRange?.start??Math.max(0.3,duration/3);
+                      let cutEnd=prev._cutRange?.end??Math.min(duration-0.3,duration*2/3);
+                      if(cutEnd-cutStart<0.1 && duration>=0.7){cutStart=0.3;cutEnd=duration-0.3;}
+                      const keepRange=prev._keepRange||{start:prev.start,end:prev.end};
+                      return {...prev,mode,start:cutStart,end:cutEnd,_keepRange:keepRange,_cutRange:{start:cutStart,end:cutEnd},overflowChoice:null};
+                    }
+                    const keepRange=prev._keepRange||{start:prev.start,end:prev.end};
+                    return {...prev,mode,start:keepRange.start,end:keepRange.end,_keepRange:keepRange,overflowChoice:null};
+                  });
                   setGood3AdjustNotice('');
                 };
                 return React.createElement('div', {
                   className:'camera-trim-panel self-start ml-2 mt-2 w-full max-w-[360px] rounded-2xl border border-violet-400/30 bg-[#1a1a1c] p-3 shadow-xl',
                   onClick:e=>e.stopPropagation()
                 },
-                  React.createElement('div', {className:'text-[12px] font-bold'}, clip.type==='photo'?'写真の長さを調整':'使う範囲を調整'),
+                  React.createElement('div', {className:'text-[12px] font-bold'}, clip.type==='photo'?'写真の長さを調整':cutMode?'途中をカット':'使う範囲を調整'),
                   React.createElement('div', {className:'text-[10px] text-white/50 mt-1 truncate'}, clip.name),
-                  React.createElement('div', {className:'text-[10px] text-white/60 mt-1'},
-                    clip.type==='photo'?`表示時間 ${length.toFixed(1)}秒`:`開始 ${start.toFixed(1)}秒・長さ ${length.toFixed(1)}秒`),
+                  clip.type==='video' && React.createElement('div',{className:'flex gap-2 mt-2'},
+                    [['keep','残す範囲'],['cut','途中をカット']].map(([mode,label])=>React.createElement('button',{key:mode,type:'button',onClick:()=>setMode(mode),disabled:mode==='cut'&&clip.duration<0.7,
+                      'aria-pressed':(cutMode?'cut':'keep')===mode,
+                      className:`flex-1 min-h-9 rounded-full border text-[10px] ${(cutMode?'cut':'keep')===mode?'border-violet-300 bg-violet-500/25 text-white':'border-white/15 bg-white/5 text-white/65'}`},label))),
+                  React.createElement('div', {className:'text-[10px] text-white/60 mt-1'},clip.type==='photo'
+                    ?`表示時間 ${length.toFixed(1)}秒`
+                    :cutMode?`出力内 ${start.toFixed(1)}〜${end.toFixed(1)}秒をカット`
+                      :`開始 ${start.toFixed(1)}秒・長さ ${outputLength.toFixed(1)}秒`),
                   clip.type==='photo' ? 
                     React.createElement('div', {className:'mt-2'},
                       React.createElement(VlogRotatedMedia, {as:'img',clip,src:clip.url, alt:clip.name, className:'w-full rounded-xl bg-black object-contain', style:{maxHeight:'140px', aspectRatio:'16/9'}}),
@@ -20075,7 +20404,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                           onChange:e=>setDraftRange(0,Number(e.target.value)),
                           className:'block w-full mt-2 accent-violet-500'}))
                     ) :
-                    React.createElement('div',{className:'mt-2 flex flex-col gap-2'},
+                    cutMode ? React.createElement(VlogMiddleCutControls,{clip,start,end,onChange:setDraftRange,plan:middleCutPlan,sourceAudioVolume}) : React.createElement('div',{className:'mt-2 flex flex-col gap-2'},
                       React.createElement(VlogRotatedMedia, {as:'video',clip,
                         ref:good3AdjustVideoRef,src:clip.url,muted:true,playsInline:true,preload:'metadata',
                         className:'w-full rounded-xl bg-black object-contain',style:{maxHeight:'140px', aspectRatio:'16/9'},
@@ -20096,13 +20425,20 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                         label:'元動画から使う範囲',onChange:setDraftRange,
                         onDragEnd:()=>{const v=good3AdjustVideoRef.current;if(v){try{v.pause();v.currentTime=good3Adjust.start;}catch{}}}
                       })
-                    ),
-                  React.createElement('div',{className:'mt-2 rounded-lg bg-black/30 p-2 text-[10px] text-white/70'},
-                    `素材 ${length-clip.duration>=0?'+':''}${(length-clip.duration).toFixed(1)}秒・後続${movedCount}件移動・全体 ${nextTotal.toFixed(1)}秒`),
+                  ),
+                  cutMode
+                    ? React.createElement('div',{className:'mt-2 rounded-lg bg-rose-950/35 border border-rose-300/20 p-2 text-[10px] text-white/75'},
+                        middleCutPlan && !middleCutPlan.error
+                          ?`削除 ${Number(middleCutPlan.removedDuration||0).toFixed(1)}秒・残り ${(clip.duration-Number(middleCutPlan.removedDuration||0)).toFixed(1)}秒・影響する文字 ${Number(middleCutPlan.affectedTextCount||0)}件`
+                          :middleCutPlan?.error==='transition-span'?`前後に ${Number(middleCutPlan.minFront||0.3).toFixed(1)}秒・${Number(middleCutPlan.minBack||0.3).toFixed(1)}秒以上残してください`
+                            :middleCutPlan?.error==='source-range'?'元動画の使用できる範囲を超えています':'前後に0.3秒以上残る範囲を選んでください')
+                    : React.createElement('div',{className:'mt-2 rounded-lg bg-black/30 p-2 text-[10px] text-white/70'},
+                        `素材 ${outputLength-clip.duration>=0?'+':''}${(outputLength-clip.duration).toFixed(1)}秒・後続${movedCount}件移動・全体 ${nextTotal.toFixed(1)}秒`),
+                  cutMode && clip.duration<0.7 && React.createElement('div',{className:'text-[10px] text-amber-200 mt-2'},'前後に0.3秒ずつ残せる長さが必要です'),
                   good3AdjustNotice && React.createElement('div', {className:'text-[10px] text-amber-200 mt-2'},good3AdjustNotice),
                   React.createElement('div', {className:'flex gap-2 mt-2'},
                     React.createElement('button', {type:'button',onClick:()=>setGood3Adjust(null), className:'flex-1 min-h-9 rounded-full bg-white/10 text-[11px]'}, 'キャンセル'),
-                    React.createElement('button', {type:'button',onClick:applyGood3Adjustment, disabled:overflowing.length>0 && !good3Adjust.overflowChoice, className:'camera-key-primary flex-1 min-h-9 rounded-full bg-violet-600 text-white text-[11px] font-bold disabled:opacity-35'}, 'この範囲にする')
+                    React.createElement('button', {type:'button',onClick:applyGood3Adjustment, disabled:cutMode?(!middleCutPlan||!!middleCutPlan.error):(overflowing.length>0 && !good3Adjust.overflowChoice), className:'camera-key-primary flex-1 min-h-9 rounded-full bg-violet-600 text-white text-[11px] font-bold disabled:opacity-35'}, cutMode?'カットを適用':'この範囲にする')
                   )
                 );
               })(),
@@ -21867,7 +22203,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               },
                 clips.map((c)=>{
                   const left = c.timelineStart * timelineZoom;
-                  const width = Math.max(8,Math.min(c.duration*timelineZoom-2,Math.max(40,c.duration*timelineZoom*0.9)));
+                  const width = c.duration * timelineZoom;
                   const selected=selectedTimelineItem?.type==='clip' && selectedTimelineItem.id===c.id;
                   const focused=focusedClipId===c.id;
                   const showHandles=inlineTimelineExpanded && selected && width>=74;
@@ -22755,6 +23091,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
     filterSheetOpen && (()=> {
       const currentClip=clips.find(c=>c.id===filterSessionRef.current?.clipId);
       const draftFilter = FILTERS.find(f=>f.id===filterDraft.id) || FILTERS[0];
+      const draftIntensityMax=draftFilter.intensityMax || 200;
       const isBeforePreview=filterBeforeHold || filterPreviewFrame===1;
       const displayFilterCss=getClipPreviewFilter(setVlogClipFilter(currentClip,isBeforePreview?'none':filterDraft.id,
         isBeforePreview?0:filterDraft.intensity),activeFilter,filterIntensity);
@@ -22908,7 +23245,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                 React.createElement('input', {
                   type:'range',
                   min:0,
-                  max: (FILTERS.find(f=>f.id===filterDraft.id)?.intensityMax || 200),
+                  max:draftIntensityMax,
                   step:10,
                   value:filterDraft.intensity,
                   disabled: filterDraft.id==='none',
@@ -22921,9 +23258,9 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   className:'w-full accent-violet-500 h-1.5'
                 }),
                 React.createElement('div', {className:'flex justify-between text-[9px] text-white/30 mt-1.5 font-bold'},
-                  React.createElement('span', null, '弱い'),
-                  React.createElement('span', null, '100%'),
-                  React.createElement('span', null, '強い')
+                  React.createElement('span', null, '0%'),
+                  React.createElement('span', null, `${draftIntensityMax/2}%`),
+                  React.createElement('span', null, `${draftIntensityMax}%`)
                 )
               )
             ),
@@ -22959,9 +23296,10 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       const markedFrame=(markedClip?._finderMarks||[]).find(m=>m.id===connectionMarkPeek?.markId);
       const markedSide=markedClip?.id===left.id?'left':'right';
       const markedBase=markedSide==='left'?leftBase:rightBase;
+      const markedRate=markedClip?._cutGroupId?(markedClip._playbackRate||1):1;
       const markedCut=markedFrame && markedBase ? (markedSide==='left'
-        ? markedBase.trimStart+markedBase.duration-markedFrame.sourceTime
-        : markedFrame.sourceTime-markedBase.trimStart) : NaN;
+        ? markedBase.duration-(markedFrame.sourceTime-markedBase.trimStart)/markedRate
+        : (markedFrame.sourceTime-markedBase.trimStart)/markedRate) : NaN;
       const markedRange=connectionEditor.keepDuration && markedClip
         ? connectionFixedRange(markedClip,markedSide,
           markedSide==='left'?connectionEditor.initialOutCut:connectionEditor.initialInCut,
