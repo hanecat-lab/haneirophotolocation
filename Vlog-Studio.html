@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-04-prewarm';
+const VLOG_PREVIEW_BUILD='2026-10-04-muted-start';
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -12334,7 +12334,8 @@ function App(){
         const targetGain=vlogClipSourceGain(nextClip,sourceAudioVolumeRef.current) *
           Math.cos((1-audioCrossfadeProgress)*Math.PI/2);
         nextVideo.volume=targetGain;
-        nextVideo.muted=targetGain===0 || previewAutoplayMutedRef.current.has(nextVideo);
+        nextVideo.muted=targetGain===0 || previewAutoplayMutedRef.current.has(nextVideo) ||
+          (state.audioDefer?.id===nextClip.id && state.audioDefer.phase==='waiting');
         if(targetGain>0 && nextVideo.paused && nextVideo.readyState>=2 &&
            (state.heldTime===null || state.heldTime===undefined))
           requestPreviewPlay(nextVideo,nextClip,'crossfade-incoming');
@@ -12382,10 +12383,11 @@ function App(){
     }
     const inOverlap=!!next && t>=overlapStart;
     if(inOverlap && incoming){
-      if(state.prewarm?.id===next.id && !state.prewarm.unmuted){
-        state.prewarm.unmuted=true;
-        state.prewarm.phase='done';
-        if(!previewAutoplayMutedRef.current.has(incoming)) incoming.muted=false;
+      // 音ありの再生開始は音の準備待ちで0.1〜0.65秒進まない。音なしで始め、動き出してから音を戻す。
+      if(state.audioDefer?.id!==next.id){
+        if(state.prewarm?.id===next.id) state.prewarm.phase='done';
+        incoming.muted=true;
+        state.audioDefer={id:next.id,name:next.name,phase:'waiting',startAt:now,from:null};
       }
       // iOS は音の出る動画を同時に1本しか再生させず、もう片方を止める。
       // 重なり中は前の素材を消音し、2本が交互に止め合わないようにする。
@@ -12411,7 +12413,8 @@ function App(){
             previewAudioContextRef.current.currentTime,0.01);
       }else if(!incomingUsesCrossfade && !previewAudioGraphFailedRef.current.has(incoming)){
         incoming.volume=incomingGain;
-        incoming.muted=incomingGain===0 || previewAutoplayMutedRef.current.has(incoming);
+        incoming.muted=incomingGain===0 || previewAutoplayMutedRef.current.has(incoming) ||
+          (state.audioDefer?.id===next.id && state.audioDefer.phase==='waiting');
       }
       if(state.incomingId!==next.id){
         const clipRateNext = next._playbackRate || 1;
@@ -12436,6 +12439,24 @@ function App(){
         }
       }
       probePreviewAdvance(incoming,next,'incoming');
+    }
+    // 音なしで始めた次の素材が動き出したら音を戻し、0.3秒後に止まっていないかを記録する。
+    const audioDefer=state.audioDefer;
+    const deferVideo=audioDefer && audioDefer.phase!=='done' ? videoRefs.current.get(audioDefer.id) : null;
+    if(deferVideo){
+      if(audioDefer.phase==='waiting' && !deferVideo.paused && !deferVideo.seeking){
+        if(audioDefer.from===null) audioDefer.from=deferVideo.currentTime;
+        else if(deferVideo.currentTime-audioDefer.from>=0.02){
+          if(!previewAutoplayMutedRef.current.has(deferVideo)) deferVideo.muted=false;
+          audioDefer.phase='checking';audioDefer.unmutedAt=now;audioDefer.unmuteFrom=deferVideo.currentTime;
+          recordPreviewDiagnostic('incoming-unmute',{clip:audioDefer.name,ms:Math.round(now-audioDefer.startAt),
+            timelineTime:Number(t.toFixed(3))});
+        }
+      }else if(audioDefer.phase==='checking' && now-audioDefer.unmutedAt>=300){
+        audioDefer.phase='done';
+        recordPreviewDiagnostic('incoming-unmute-check',{clip:audioDefer.name,paused:deferVideo.paused,
+          muted:deferVideo.muted,movedIn300ms:Number((deferVideo.currentTime-audioDefer.unmuteFrom).toFixed(3))});
+      }
     }
     const liveIds=new Set();
     if(active?._splitScreen)active._splitScreen.clips.filter(child=>child.type==='video').forEach(child=>liveIds.add(child.id));
