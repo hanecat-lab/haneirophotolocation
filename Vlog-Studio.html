@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-bgm-trace';
+const VLOG_PREVIEW_BUILD='2026-10-06-bgm-lab';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -12784,8 +12784,19 @@ function App(){
     const video=videoClip ? videoRefs.current.get(videoClip.id) : null;
     if(video){ connectPreviewAudioClip(videoClip,video,context); video.muted=true; }
     const [a,b,c]=previewAudioSlots();
+    // BGM も本番と同じ経路（BGM 用の AudioContext と GainNode）で鳴らし、止まるかを同時に測る。
+    const bgmClip=customBgms.find(item=>item.id===bgmTrack) || customBgms[0] || null;
+    if(bgmClip && !bgmAudioRef.current){
+      bgmAudioRef.current=new Audio();bgmAudioRef.current.crossOrigin='anonymous';bgmAudioRef.current.preload='auto';
+    }
+    const bgm=bgmClip ? bgmAudioRef.current : null;
+    const bgmContext=bgm ? resumeBgmAudioContext() : null;
+    if(bgm){
+      try{ if(bgm.src!==bgmClip.url){ bgm.src=bgmClip.url; bgm.load(); } bgm.loop=true; bgm.currentTime=0; }catch{}
+      setBgmElementGain(bgm,0.3,0);
+    }
     const lab={running:true,graph:PREVIEW_AUDIO_PROBE.graph,contextState:context?.state||null,
-      main:main.name,other:other.name,video:videoClip?.name||null,
+      main:main.name,other:other.name,video:videoClip?.name||null,bgm:bgmClip?.name||null,bgmRouted:null,
       videoRouted:!!(videoClip && previewAudioGainsRef.current.get(videoClip.id)),loop:main.duration<17,
       startedAt:new Date().toISOString(),startMs:null,actions:[],errors:[],samples:[]};
     diag.lab=lab;
@@ -12804,6 +12815,7 @@ function App(){
       try{ const played=slot.audio.play(); if(played?.then) played.then(()=>slot.audio.pause()).catch(error=>note('unlock',error)); }catch(error){ note('unlock',error); }
     });
     if(video){ try{ const played=video.play(); if(played?.then) played.then(()=>video.pause()).catch(error=>note('video-unlock',error)); }catch{} }
+    if(bgm) tryPlay(bgm,'bgm');
     const actions=[
       ['none',()=>{}],
       ['slot-play',()=>tryPlay(b.audio,'slot-play')],
@@ -12812,8 +12824,16 @@ function App(){
       ['slot-reload',()=>{ c.audio.src=main.url; try{ c.audio.load(); }catch{} }],
       ['slot-seek-paused',()=>{ try{ b.audio.currentTime=Math.max(0,(b.audio.duration||other.duration)-0.4); }catch{} }],
       ['slot-play-to-end',()=>tryPlay(b.audio,'slot-play-to-end')],
+      ['video-seek-paused',()=>{ if(video) try{ video.currentTime=0.5; }catch{} }],
       ['video-play',()=>{ if(video) try{ const played=video.play(); if(played?.catch) played.catch(error=>note('video-play',error)); }catch{} }],
+      ['video-seek-playing',()=>{ if(video) try{ video.currentTime=0.2; }catch{} }],
       ['video-pause',()=>{ if(video) video.pause(); }],
+      // 繋ぎ目と同じ組み合わせ: 止まっている動画の位置合わせ・動画の再生・音のスロットの再生を同時に行う。
+      ['seam-combo',()=>{
+        if(video) try{ video.currentTime=0; const played=video.play(); if(played?.catch) played.catch(error=>note('seam-video',error)); }catch{}
+        try{ b.audio.pause(); b.audio.currentTime=0; }catch{}
+        tryPlay(b.audio,'seam-slot');
+      }],
       ['none',()=>{}],
     ];
     const t0=performance.now();
@@ -12833,18 +12853,26 @@ function App(){
         }
         return Math.round(best);
       };
-      lab.actions.forEach(action=>{ action.mainStallMs=longest(action.ms,action.ms+1200,'a'); action.clockStallMs=longest(action.ms,action.ms+1200,'ctx'); });
+      lab.actions.forEach(action=>{ action.mainStallMs=longest(action.ms,action.ms+1200,'a'); action.clockStallMs=longest(action.ms,action.ms+1200,'ctx');
+        if(bgm){ action.bgmStallMs=longest(action.ms,action.ms+1200,'g'); action.bgmClockStallMs=longest(action.ms,action.ms+1200,'bctx'); } });
+      if(bgm && lab.startMs!==null) lab.bgmStartStallMs=longest(0,lab.startMs+2000,'g');
+      if(bgm) try{ bgm.pause(); bgm.loop=false; setBgmElementGain(bgm,0,0); }catch{}
       lab.running=false;
       lab.samples=lab.samples.filter((_,index)=>index%2===0);
-      recordPreviewDiagnostic('audio-lab-done',{actions:lab.actions.map(action=>`${action.name}:${action.mainStallMs}/${action.clockStallMs}`).join(' ')});
+      recordPreviewDiagnostic('audio-lab-done',{actions:lab.actions.map(action=>
+        `${action.name}:${action.mainStallMs}/${action.clockStallMs}${bgm?` bgm ${action.bgmStallMs}/${action.bgmClockStallMs}`:''}`).join(' | ')});
       window.alert('音の実験が終わりました。診断をコピーして送ってください');
     };
     const timer=setInterval(()=>{
       const now=performance.now(),ms=Math.round(now-t0);
       lab.samples.push({ms,a:Number(a.audio.currentTime.toFixed(3)),ctx:context?Number(context.currentTime.toFixed(3)):0,
-        bPaused:b.audio.paused});
+        bPaused:b.audio.paused,
+        ...(bgm?{g:Number(bgm.currentTime.toFixed(3)),bctx:bgmContext?Number(bgmContext.currentTime.toFixed(3)):0}:{})});
       if(moving===null){
-        if(a.audio.currentTime>0.05){ moving=now; lab.startMs=ms; next=now+2000; }
+        if(a.audio.currentTime>0.05){
+          moving=now; lab.startMs=ms; next=now+2000;
+          if(bgm){ setBgmElementGain(bgm,0.3,0); lab.bgmRouted=!!exportAudioRef.current.bgmGains?.get(bgm); }
+        }
         else if(ms>5000){ lab.errors.push({phase:'main',error:'not-moving'}); finish(); }
         return;
       }
