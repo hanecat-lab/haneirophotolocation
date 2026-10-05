@@ -6658,11 +6658,11 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-05-seam-buffer2';
+const VLOG_PREVIEW_BUILD='2026-10-05-seam-element';
 // 実験: 繋ぎ目の音の戻し方。?seam=silent は音を戻さない、?seam=gain は動画の消音を切り替えず WebAudio の音量で絞る、
-// ?seam=buffer は動画を消音のまま、取り出した音を別に鳴らす。
+// ?seam=buffer は動画を消音のまま、取り出した音を別に鳴らす、?seam=element は動画を消音のまま音専用の audio 要素で鳴らす。
 const VLOG_SEAM_MODE=(()=>{try{const mode=new URLSearchParams(location.search).get('seam');
-  return mode==='silent'||mode==='gain'||mode==='buffer'?mode:'normal';}catch{return 'normal';}})();
+  return ['silent','gain','buffer','element'].includes(mode)?mode:'normal';}catch{return 'normal';}})();
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -10434,6 +10434,7 @@ function App(){
   const previewAudioGainsRef = useRef(new Map()); // clipId -> {source, gain}
   const previewSeamAudioRef = useRef(new Map());
   const previewSeamSourceRef = useRef(null);
+  const previewElementAudioRef = useRef({elements:new Map(),current:null});
   const previewAudioGraphFailedRef = useRef(new WeakSet());
 
   // バグ修正: クリップ削除時のAudioContextリーク防止ヘルパー
@@ -12217,7 +12218,59 @@ function App(){
         bytes:entry.bytes,error:String(error?.message||error?.name||error).slice(0,160)});
     });
   };
+  // 実験 ?seam=element: 映像の動画は消音のまま、素材ごとの見えない audio 要素で音を鳴らす。
+  const stopElementAudio=()=>{
+    const store=previewElementAudioRef.current,current=store.current;
+    store.current=null;
+    if(current) try{ current.audio.pause(); }catch{}
+  };
+  const ensureElementAudio=clip=>{
+    const store=previewElementAudioRef.current;
+    let audio=store.elements.get(clip.id);
+    if(!audio){
+      audio=document.createElement('audio');
+      audio.preload='auto';audio.src=clip.url;
+      audio.setAttribute('playsinline','');
+      store.elements.set(clip.id,audio);
+    }
+    return audio;
+  };
+  const syncElementAudio=(clip,t,rate,now)=>{
+    const store=previewElementAudioRef.current;
+    if(!clip || clip.type!=='video' || !clip.url){ stopElementAudio(); return; }
+    let current=store.current;
+    if(current?.clipId!==clip.id){
+      stopElementAudio();
+      const audio=ensureElementAudio(clip);
+      const offset=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart)*(clip._playbackRate||1);
+      try{ audio.currentTime=offset; }catch{}
+      audio.playbackRate=rate*(clip._playbackRate||1);
+      current={clipId:clip.id,name:clip.name,audio,startAt:now,from:null,advanced:false,pausedReported:false};
+      store.current=current;
+      const played=audio.play();
+      if(played?.catch) played.catch(error=>recordPreviewDiagnostic('element-audio-error',{clip:clip.name,
+        error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`}));
+      recordPreviewDiagnostic('element-audio-start',{clip:clip.name,offset:Number(offset.toFixed(3)),
+        readyState:audio.readyState,timelineTime:Number(t.toFixed(3))});
+      return;
+    }
+    const audio=current.audio;
+    if(!current.advanced && !audio.paused && !audio.seeking){
+      if(current.from===null) current.from=audio.currentTime;
+      else if(audio.currentTime-current.from>=0.02){
+        current.advanced=true;
+        recordPreviewDiagnostic('element-audio-first-advance',{clip:current.name,ms:Math.round(now-current.startAt),
+          timelineTime:Number(t.toFixed(3))});
+      }
+    }
+    if(current.advanced && audio.paused && !current.pausedReported){
+      current.pausedReported=true;
+      recordPreviewDiagnostic('element-audio-paused',{clip:current.name,audioTime:Number(audio.currentTime.toFixed(3)),
+        timelineTime:Number(t.toFixed(3))});
+    }
+  };
   const stopSeamAudio=()=>{
+    stopElementAudio();
     const playing=previewSeamSourceRef.current;
     if(!playing) return;
     previewSeamSourceRef.current=null;
@@ -12710,6 +12763,14 @@ function App(){
       }
       probePreviewAdvance(incoming,next,'incoming');
     }
+    if(VLOG_SEAM_MODE==='element'){
+      // 重なり中は次の素材、それ以外は今の素材の音を audio 要素で鳴らす。映像の動画は常に消音。
+      if(activeVideo && !activeVideo.muted) activeVideo.muted=true;
+      syncElementAudio(inOverlap ? next : active,t,rate,now);
+      // 次の素材の audio 要素は先に作って読み込ませ、繋ぎ目で位置を合わせられるようにする。
+      const upcoming=clipsNow[index+1];
+      if(upcoming?.type==='video' && upcoming.url) ensureElementAudio(upcoming);
+    }
     // 音なしで始めた次の素材が動き出したら音を戻し、0.3秒後に止まっていないかを記録する。
     const audioDefer=state.audioDefer;
     const deferVideo=audioDefer && audioDefer.phase!=='done' ? videoRefs.current.get(audioDefer.id) : null;
@@ -12724,7 +12785,7 @@ function App(){
         else if(deferVideo.currentTime-audioDefer.from>=0.02 &&
                 !(Number.isFinite(audioDefer.unmuteAfter) && t<audioDefer.unmuteAfter)){
           // silent の実験では音を戻さない。gain の実験では絞り直しをやめるだけで、音量は通常の処理が戻す。
-          if(VLOG_SEAM_MODE!=='silent' && VLOG_SEAM_MODE!=='buffer' && audioDefer.hold!=='gain' && !previewAutoplayMutedRef.current.has(deferVideo))
+          if(!['silent','buffer','element'].includes(VLOG_SEAM_MODE) && audioDefer.hold!=='gain' && !previewAutoplayMutedRef.current.has(deferVideo))
             deferVideo.muted=false;
           audioDefer.phase='checking';audioDefer.unmutedAt=now;audioDefer.unmuteFrom=deferVideo.currentTime;
           recordPreviewDiagnostic('incoming-unmute',{clip:audioDefer.name,ms:Math.round(now-audioDefer.startAt),
@@ -12742,8 +12803,10 @@ function App(){
       const elapsed=now-seamTrace.startAt;
       if(elapsed-seamTrace.last>=100){
         const inVideo=videoRefs.current.get(seamTrace.inId),outVideo=videoRefs.current.get(seamTrace.outId);
+        const elementAudio=previewElementAudioRef.current.current;
         seamTrace.samples.push({ms:Math.round(elapsed),t:Number(t.toFixed(3)),
-          in:inVideo?Number(inVideo.currentTime.toFixed(3)):null,out:outVideo?Number(outVideo.currentTime.toFixed(3)):null});
+          in:inVideo?Number(inVideo.currentTime.toFixed(3)):null,out:outVideo?Number(outVideo.currentTime.toFixed(3)):null,
+          ...(elementAudio?{aud:Number(elementAudio.audio.currentTime.toFixed(3)),audClip:elementAudio.name}:{})});
         seamTrace.last=elapsed;
       }
       if(elapsed>=1000){
