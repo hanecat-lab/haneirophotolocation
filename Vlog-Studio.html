@@ -6658,16 +6658,15 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-audio-norate';
+const VLOG_PREVIEW_BUILD='2026-10-06-audio-delay';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
   catch{return 'normal';}})();
 const PREVIEW_VIDEO_AUDIBLE=VLOG_SEAM_MODE==='legacy';
-// 再生中に音の速さを変えてずれを吸収すると、実機で音が出なくなるため、通常は速さの調整をしない（ずれは大きいときの位置合わせだけで直す）。
-// 切り分け用: ?audiorate=on は速さの調整を戻す、?audiograph=off は音を WebAudio に通さない（音量は効かず消音のみ）。
-const PREVIEW_AUDIO_PROBE=(()=>{try{const q=new URLSearchParams(location.search);
-  return {rate:q.get('audiorate')==='on',graph:q.get('audiograph')!=='off'};}catch{return {rate:false,graph:true};}})();
+// ?audiograph=off は音を WebAudio に通さない（音量は効かず消音のみ、ずれの合わせもしない）。
+const PREVIEW_AUDIO_PROBE=(()=>{try{return {graph:new URLSearchParams(location.search).get('audiograph')!=='off'};}
+  catch{return {graph:true};}})();
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -8969,7 +8968,7 @@ function nextPreviewAudioStart(clips,t,cutInfo){
     // 頭より前の位置になる区間（切れ目の前半）は鳴らせないので、頭の位置になる時刻から鳴らす。
     const at=item.position<0 ? startLimit-item.position/item.speed : startLimit;
     if(!(at>t)) continue;
-    return {key:item.source.id,url:item.source.url,name:item.source.name,at,
+    return {key:item.source.id,url:item.source.url,name:item.source.name,at,speed:item.speed,
       position:Math.max(0,item.position)};
   }
   return null;
@@ -12257,14 +12256,16 @@ function App(){
   };
   // ---- 音専用スロット（3本） ----
   // iOS は再生の許可を要素ごとに与えるため、3本とも再生ボタンのタップ中に許可を取る。
-  // 再生中の位置の飛ばしは要素が約0.5秒止まるため行わず、ずれは速さ（±5%）で吸収する。
-  const PREVIEW_AUDIO_PREWARM=1.2,PREVIEW_AUDIO_HARD_DRIFT=0.6;
+  // 再生中の audio 要素は、位置の飛ばしでも速さの変更でも約0.5秒止まる（設計書 F8・F11）。
+  // そのため要素は触らず、少し早めに鳴らし始めて、先行した分を WebAudio の DelayNode で遅らせて揃える。
+  const PREVIEW_AUDIO_PREWARM=1.2,PREVIEW_AUDIO_HARD_DRIFT=0.6,PREVIEW_AUDIO_MARGIN=0.15,PREVIEW_AUDIO_MAX_DELAY=1.5;
   const previewAudioSlots=()=>{
     const store=previewAudioSlotsRef.current;
     while(store.slots.length<3){
       const audio=document.createElement('audio');
       audio.preload='auto';audio.setAttribute('playsinline','');
-      store.slots.push({index:store.slots.length,audio,url:null,key:null,name:null,state:'idle',gain:null,routed:undefined});
+      store.slots.push({index:store.slots.length,audio,url:null,key:null,name:null,state:'idle',gain:null,delay:null,
+        delayValue:0,routed:undefined});
     }
     return store.slots;
   };
@@ -12274,9 +12275,10 @@ function App(){
     const context=previewAudioContextRef.current;
     if(!context){ slot.routed=false; recordPreviewDiagnostic('audio-graph',{slot:slot.index,ok:false,error:'no-audio-context'}); return; }
     try{
-      const source=context.createMediaElementSource(slot.audio),gain=context.createGain();
-      gain.gain.value=0;source.connect(gain);gain.connect(context.destination);
-      slot.gain=gain;slot.routed=true;
+      const source=context.createMediaElementSource(slot.audio),delay=context.createDelay(2),gain=context.createGain();
+      gain.gain.value=0;delay.delayTime.value=0;
+      source.connect(delay);delay.connect(gain);gain.connect(context.destination);
+      slot.gain=gain;slot.delay=delay;slot.routed=true;
       recordPreviewDiagnostic('audio-graph',{slot:slot.index,ok:true});
     }catch(error){
       slot.routed=false;
@@ -12288,6 +12290,16 @@ function App(){
       try{ slot.gain.gain.setTargetAtTime(value,previewAudioContextRef.current.currentTime,0.015); }catch{}
       if(slot.audio.muted) slot.audio.muted=false;
     }else slot.audio.muted=!(value>0.001);
+  };
+  const setPreviewAudioSlotDelay=(slot,value,smooth)=>{
+    slot.delayValue=value;
+    if(!slot.delay) return;
+    const context=previewAudioContextRef.current;
+    try{
+      slot.delay.delayTime.cancelScheduledValues(context.currentTime);
+      if(smooth) slot.delay.delayTime.setTargetAtTime(value,context.currentTime,smooth);
+      else slot.delay.delayTime.setValueAtTime(value,context.currentTime);
+    }catch{}
   };
   const loadPreviewAudioSlot=(slot,item)=>{
     if(slot.url!==item.url){ slot.url=item.url; slot.audio.src=item.url; }
@@ -12302,6 +12314,16 @@ function App(){
           error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`});
       });
     }catch{}
+  };
+  // 止まっている要素だけに、位置・速さ・遅延を設定して鳴らす（再生中の要素には触らない）。
+  const startPreviewAudioSlot=(slot,position,rate,speed,now,phase)=>{
+    try{ slot.audio.pause(); slot.audio.currentTime=Math.max(0,position); }catch{}
+    slot.audio.playbackRate=rate*speed;slot.baseRate=rate*speed;
+    setPreviewAudioSlotGain(slot,0);
+    setPreviewAudioSlotDelay(slot,0,0);
+    slot.state='playing';slot.startAt=now;slot.from=null;slot.advanced=false;slot.audibleAt=Infinity;
+    slot.lastTrackAt=now;slot.preemptReported=false;slot.realigned=false;
+    playPreviewAudioSlot(slot,phase);
   };
   const unlockPreviewAudio=()=>{
     const videos=vlogMediaClips(clipsRef.current).flatMap(clip=>vlogPreviewAudioSources(clip,clip.timelineStart).map(item=>item.source));
@@ -12324,31 +12346,39 @@ function App(){
     previewAudioSlotsRef.current.slots.forEach(slot=>{
       try{ slot.audio.pause(); }catch{}
       setPreviewAudioSlotGain(slot,0);
-      slot.state='idle';slot.audio.playbackRate=1;
+      slot.state='idle';
     });
   };
   const notePreviewAudioSample=(list,ms)=>{
     list.push(ms);
     if(list.length>5) list.shift();
   };
-  // 毎フレーム呼ぶ。計画した音にスロットを割り当て、予熱・鳴らし始め・音量・ずれの吸収を行う。
+  // 毎フレーム呼ぶ。計画した音にスロットを割り当て、予熱・鳴らし始め・音量・ずれの合わせを行う。
   const syncPreviewAudio=(clipsNow,t,rate,now,cutInfo)=>{
     const store=previewAudioSlotsRef.current,slots=previewAudioSlots();
     const plan=planPreviewAudio(clipsNow,t,cutInfo,sourceAudioVolumeRef.current);
     const upcoming=nextPreviewAudioStart(clipsNow,t,cutInfo);
     const planned=new Map(plan.map(item=>[item.key,item]));
     const keepKeys=new Set(planned.keys());
-    // 見込み時間（実時間）にタイムラインが進む量。再生速度を掛ける。
-    const leadSpan=store.lead*rate;
-    // 予熱済みの次の音は、見込み時間だけ早く頭から鳴らし始める。
+    // 鳴り始めまでの見込み時間に余裕を足した分だけ早く鳴らし、必ず先行させてから遅延で揃える。
+    const startLead=store.lead+PREVIEW_AUDIO_MARGIN,leadSpan=startLead*rate;
+    // 想定位置（計画にない次の音は、鳴り始める予定の時刻から逆算する。負の値もそのまま使う）。
+    const expectedFor=slot=>{
+      const item=planned.get(slot.key);
+      if(item) return {position:item.position,speed:item.speed};
+      if(upcoming && upcoming.key===slot.key) return {position:upcoming.position+(t-upcoming.at)*upcoming.speed,speed:upcoming.speed};
+      return null;
+    };
+    // 予熱済みの次の音は、見込み時間＋余裕だけ早く頭から鳴らし始める。
     if(upcoming && t>=upcoming.at-leadSpan){
       const warm=slots.find(slot=>slot.key===upcoming.key && slot.state==='warm');
       if(warm){
-        warm.state='playing';warm.startAt=now;warm.from=null;warm.advanced=false;warm.warmStart=true;
-        warm.audio.playbackRate=rate;
-        playPreviewAudioSlot(warm,'warm-start');
-        recordPreviewDiagnostic('audio-start',{clip:warm.name,slot:warm.index,warm:true,lead:Number(store.lead.toFixed(3)),
-          position:Number(warm.audio.currentTime.toFixed(3)),timelineTime:Number(t.toFixed(3))});
+        // 鳴らし始めが遅れたときは、遅れた分だけ先の位置から鳴らして先行を保つ。
+        const position=Math.max(upcoming.position,upcoming.position+(t-upcoming.at)*upcoming.speed+leadSpan*upcoming.speed);
+        startPreviewAudioSlot(warm,position,rate,upcoming.speed,now,'warm-start');
+        warm.warmStart=true;
+        recordPreviewDiagnostic('audio-start',{clip:warm.name,slot:warm.index,warm:true,lead:Number(startLead.toFixed(3)),
+          position:Number(position.toFixed(3)),timelineTime:Number(t.toFixed(3))});
       }
       if(slots.some(slot=>slot.key===upcoming.key && slot.state==='playing')) keepKeys.add(upcoming.key);
     }
@@ -12357,7 +12387,7 @@ function App(){
       if((slot.state==='playing' || slot.state==='priming') && !keepKeys.has(slot.key)){
         try{ slot.audio.pause(); }catch{}
         setPreviewAudioSlotGain(slot,0);
-        slot.state='idle';slot.audio.playbackRate=1;
+        slot.state='idle';
       }
     }
     // 計画した音で、まだ鳴っていないものを鳴らす。予熱済みならすぐ鳴らし、
@@ -12370,12 +12400,11 @@ function App(){
       loadPreviewAudioSlot(slot,item);
       routePreviewAudioSlot(slot);
       if(warmSlot){
-        try{ slot.audio.pause(); slot.audio.currentTime=item.position+leadSpan*item.speed; }catch{}
-        slot.audio.playbackRate=rate*item.speed;
-        slot.state='playing';slot.startAt=now;slot.from=null;slot.advanced=false;slot.warmStart=true;slot.rateAdjust=0;
-        playPreviewAudioSlot(slot,'start');
-        recordPreviewDiagnostic('audio-start',{clip:item.name,slot:slot.index,warm:true,lead:Number(store.lead.toFixed(3)),
-          position:Number((item.position+leadSpan*item.speed).toFixed(3)),timelineTime:Number(t.toFixed(3))});
+        const position=item.position+leadSpan*item.speed;
+        startPreviewAudioSlot(slot,position,rate,item.speed,now,'start');
+        slot.warmStart=true;
+        recordPreviewDiagnostic('audio-start',{clip:item.name,slot:slot.index,warm:true,lead:Number(startLead.toFixed(3)),
+          position:Number(position.toFixed(3)),timelineTime:Number(t.toFixed(3))});
       }else{
         setPreviewAudioSlotGain(slot,0);
         try{ slot.audio.pause(); slot.audio.currentTime=item.position; }catch{}
@@ -12386,7 +12415,6 @@ function App(){
           timelineTime:Number(t.toFixed(3))});
       }
     }
-    // 音量、動き出しの記録、ずれの吸収（速さは 0／±2%／±5% の段階で変え、毎フレーム変えない）。
     for(const slot of slots){
       if(slot.state==='priming'){
         // 冷えた要素を音量0で一度動かし、動き出したら止めて、今の想定位置＋見込み時間から鳴らし直す。
@@ -12394,15 +12422,15 @@ function App(){
         if(slot.from===null && !audio.paused && !audio.seeking) slot.from=audio.currentTime;
         const moved=slot.from===null ? 0 : audio.currentTime-slot.from;
         if(moved>=0.02 || now-slot.startAt>=1500){
+          const primedMs=Math.round(now-slot.startAt);
           try{ audio.pause(); }catch{}
-          notePreviewAudioSample(store.warmSamples,Math.round(now-slot.startAt));
+          notePreviewAudioSample(store.warmSamples,primedMs);
           if(!item){ slot.state='idle'; continue; }
-          try{ audio.currentTime=item.position+leadSpan*item.speed; }catch{}
-          audio.playbackRate=rate*item.speed;
-          recordPreviewDiagnostic('audio-start',{clip:slot.name,slot:slot.index,warm:true,primedMs:Math.round(now-slot.startAt),
-            lead:Number(store.lead.toFixed(3)),position:Number((item.position+leadSpan*item.speed).toFixed(3)),timelineTime:Number(t.toFixed(3))});
-          slot.state='playing';slot.startAt=now;slot.from=null;slot.advanced=false;slot.warmStart=true;slot.rateAdjust=0;
-          playPreviewAudioSlot(slot,'primed-start');
+          const position=item.position+leadSpan*item.speed;
+          startPreviewAudioSlot(slot,position,rate,item.speed,now,'primed-start');
+          slot.warmStart=true;
+          recordPreviewDiagnostic('audio-start',{clip:slot.name,slot:slot.index,warm:true,primedMs,
+            lead:Number(startLead.toFixed(3)),position:Number(position.toFixed(3)),timelineTime:Number(t.toFixed(3))});
         }
         continue;
       }
@@ -12420,8 +12448,9 @@ function App(){
         continue;
       }
       if(slot.state!=='playing') continue;
-      const item=planned.get(slot.key),audio=slot.audio;
-      setPreviewAudioSlotGain(slot,item ? item.gain : 0);
+      const item=planned.get(slot.key),audio=slot.audio,expected=expectedFor(slot);
+      // 揃うまでは音量0（遅延を設定する瞬間の音の乱れを聞かせない）。
+      setPreviewAudioSlotGain(slot,item && now>=slot.audibleAt ? item.gain : 0);
       if(!slot.advanced && !audio.paused && !audio.seeking){
         if(slot.from===null) slot.from=audio.currentTime;
         else if(audio.currentTime-slot.from>=0.02){
@@ -12432,37 +12461,61 @@ function App(){
             const average=store.startSamples.reduce((sum,value)=>sum+value,0)/store.startSamples.length;
             store.lead=Math.max(0.03,Math.min(0.4,average/1000));
           }
+          // 先行している分（実時間）だけ出力を遅らせて揃える。
+          const ahead=expected ? (audio.currentTime-expected.position)/(rate*expected.speed) : 0;
+          if(expected && slot.delay && ahead<-0.02 && !slot.realigned){
+            // 遅れて動き出したときは、まだ音量0のうちに1回だけ止めて、先の位置から鳴らし直す（止めている間の位置合わせ）。
+            startPreviewAudioSlot(slot,expected.position+leadSpan*expected.speed,rate,expected.speed,now,'realign');
+            slot.realigned=true;
+            recordPreviewDiagnostic('audio-realign',{clip:slot.name,slot:slot.index,ahead:Number(ahead.toFixed(3)),
+              timelineTime:Number(t.toFixed(3))});
+            continue;
+          }
+          const delay=slot.delay ? Math.max(0,Math.min(PREVIEW_AUDIO_MAX_DELAY,ahead)) : 0;
+          setPreviewAudioSlotDelay(slot,delay,0.03);
+          slot.audibleAt=slot.delay ? now+150 : now;
+          slot.lastTrackAt=now;
           recordPreviewDiagnostic('audio-first-advance',{clip:slot.name,slot:slot.index,ms,warm:!!slot.warmStart,
             lead:Number(store.lead.toFixed(3)),timelineTime:Number(t.toFixed(3))});
+          recordPreviewDiagnostic('audio-align',{clip:slot.name,slot:slot.index,ahead:Number(ahead.toFixed(3)),
+            delay:Number(delay.toFixed(3)),timelineTime:Number(t.toFixed(3))});
         }
       }
-      if(!item || !slot.advanced) continue;
+      if(!slot.advanced || !expected) continue;
+      // 利用者が再生速度を変えたときは、止めてから速さと位置を設定し直して鳴らす（再生中の要素の速さは変えない）。
+      if(Math.abs(slot.baseRate-rate*expected.speed)>0.001){
+        startPreviewAudioSlot(slot,Math.max(0,expected.position+leadSpan*expected.speed),rate,expected.speed,now,'rate-change');
+        recordPreviewDiagnostic('audio-rate-change',{clip:slot.name,slot:slot.index,rate:slot.baseRate});
+        continue;
+      }
+      if(!item) continue;
       if(audio.paused && !slot.preemptReported){
         slot.preemptReported=true;
         recordPreviewDiagnostic('audio-preempted',{clip:slot.name,slot:slot.index,timelineTime:Number(t.toFixed(3))});
       }
-      const drift=audio.currentTime-item.position;
-      if(Math.abs(drift)>PREVIEW_AUDIO_HARD_DRIFT){
+      // 聞こえている位置 = 要素の位置 − 遅延分。
+      const heardError=audio.currentTime-slot.delayValue*rate*item.speed-item.position;
+      const neededDelay=slot.delayValue+heardError/(rate*item.speed);
+      if(heardError<-PREVIEW_AUDIO_HARD_DRIFT || neededDelay>PREVIEW_AUDIO_MAX_DELAY+0.2){
         // 大きくずれたときだけ、止めて位置を合わせ直す（1回分の途切れを許す）。
         try{ audio.pause(); audio.currentTime=item.position; }catch{}
         setPreviewAudioSlotGain(slot,0);
-        slot.state='priming';slot.startAt=now;slot.from=null;slot.rateAdjust=0;
-        audio.playbackRate=rate*item.speed;
+        slot.state='priming';slot.startAt=now;slot.from=null;
         playPreviewAudioSlot(slot,'hard-resync');
-        recordPreviewDiagnostic('audio-hard-resync',{clip:slot.name,slot:slot.index,drift:Number(drift.toFixed(3)),
+        recordPreviewDiagnostic('audio-hard-resync',{clip:slot.name,slot:slot.index,drift:Number(heardError.toFixed(3)),
           timelineTime:Number(t.toFixed(3))});
         continue;
       }
-      let adjust=PREVIEW_AUDIO_PROBE.rate ? slot.rateAdjust||0 : 0;
-      if(Math.abs(drift)<=0.015) adjust=0;
-      else if(PREVIEW_AUDIO_PROBE.rate && Math.abs(drift)>0.04) adjust=-Math.sign(drift)*(Math.abs(drift)>0.12?0.05:0.02);
-      if(adjust!==(slot.rateAdjust||0)){
-        recordPreviewDiagnostic('audio-rate',{clip:slot.name,slot:slot.index,drift:Number(drift.toFixed(3)),
-          adjust:Number(adjust.toFixed(3)),timelineTime:Number(t.toFixed(3))});
-        slot.rateAdjust=adjust;
+      // 1秒ごとに、遅延を最大10msだけ動かして追従する（音程はほぼ変わらない）。
+      if(slot.delay && now-slot.lastTrackAt>=1000){
+        slot.lastTrackAt=now;
+        if(Math.abs(heardError)>0.04){
+          const next=Math.max(0,Math.min(PREVIEW_AUDIO_MAX_DELAY,slot.delayValue+Math.max(-0.01,Math.min(0.01,heardError/(rate*item.speed)))));
+          setPreviewAudioSlotDelay(slot,next,0.2);
+          recordPreviewDiagnostic('audio-delay-track',{clip:slot.name,slot:slot.index,error:Number(heardError.toFixed(3)),
+            delay:Number(next.toFixed(3))});
+        }
       }
-      const targetRate=rate*item.speed*(1+adjust);
-      if(Math.abs(audio.playbackRate-targetRate)>0.001) audio.playbackRate=targetRate;
     }
     // 次の繋ぎ目の1.2秒前に、空いている要素で次の音を音量0のまま一度動かし、頭に戻しておく。
     if(upcoming && t>=upcoming.at-PREVIEW_AUDIO_PREWARM*rate && t<upcoming.at-leadSpan &&
@@ -12474,7 +12527,7 @@ function App(){
         setPreviewAudioSlotGain(slot,0);
         slot.warmPosition=upcoming.position;
         try{ slot.audio.currentTime=upcoming.position; }catch{}
-        slot.audio.playbackRate=rate;
+        slot.audio.playbackRate=rate*upcoming.speed;
         slot.state='warming';slot.startAt=now;slot.from=null;
         playPreviewAudioSlot(slot,'prewarm');
       }
@@ -12514,7 +12567,7 @@ function App(){
       previewAudio:{probe:PREVIEW_AUDIO_PROBE,lead:Number(audioStore.lead.toFixed(3)),startSamples:audioStore.startSamples.slice(),
         warmSamples:audioStore.warmSamples.slice(),slots:audioStore.slots.map(slot=>({slot:slot.index,state:slot.state,
           clip:slot.name,routed:slot.routed,paused:slot.audio.paused,time:Number(slot.audio.currentTime.toFixed(3)),
-          rate:Number(slot.audio.playbackRate.toFixed(3))}))},run:previewTapRef.current.run,
+          rate:Number(slot.audio.playbackRate.toFixed(3)),delay:Number((slot.delayValue||0).toFixed(3))}))},run:previewTapRef.current.run,
       msSinceLastTap:previewTapRef.current.at===null?null:Math.round(performance.now()-previewTapRef.current.at),
       capturedAt:new Date().toISOString(),
       browser:navigator.userAgent,now:previewDiagnosticSnapshot('手動で状態を記録'),
@@ -12984,8 +13037,9 @@ function App(){
         const inSlot=inSource ? previewAudioSlotsRef.current.slots.find(slot=>slot.key===inSource.source.id && slot.state==='playing') : null;
         seamTrace.samples.push({ms:Math.round(elapsed),t:Number(t.toFixed(3)),
           in:inVideo?Number(inVideo.currentTime.toFixed(3)):null,out:outVideo?Number(outVideo.currentTime.toFixed(3)):null,
-          ...(inSlot?{aud:Number(inSlot.audio.currentTime.toFixed(3)),exp:Number(inSource.position.toFixed(3)),
-            rate:Number(inSlot.audio.playbackRate.toFixed(3))}:{})});
+          ...(inSlot?{aud:Number(inSlot.audio.currentTime.toFixed(3)),delay:Number(inSlot.delayValue.toFixed(3)),
+            heard:Number((inSlot.audio.currentTime-inSlot.delayValue*inSlot.audio.playbackRate).toFixed(3)),
+            exp:Number(inSource.position.toFixed(3))}:{})});
         seamTrace.last=elapsed;
       }
       if(elapsed>=1000){
