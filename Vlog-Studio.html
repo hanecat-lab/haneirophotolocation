@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-start-trace';
+const VLOG_PREVIEW_BUILD='2026-10-06-audio-begin';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -12325,12 +12325,40 @@ function App(){
     setPreviewAudioSlotGain(slot,0);
     setPreviewAudioSlotDelay(slot,0,0);
     slot.state='playing';slot.startAt=now;slot.from=null;slot.advanced=false;slot.audibleAt=Infinity;
-    slot.lastTrackAt=now;slot.preemptReported=false;slot.realigned=false;
+    slot.lastTrackAt=now;slot.preemptReported=false;slot.realigned=false;slot.begin=false;
     playPreviewAudioSlot(slot,phase);
   };
-  const unlockPreviewAudio=()=>{
+  // 再生ボタンのタップ中に、最初の音をそのまま鳴らし始める（止めて鳴らし直さない）。
+  // 呼んだ側は、この音が動き出すまで映像の開始を待つ。音がない位置では null を返す。
+  const beginPreviewAudio=(clipsNow,t,rate,now,cutInfo)=>{
+    const item=planPreviewAudio(clipsNow,t,cutInfo,sourceAudioVolumeRef.current)[0];
+    if(!item) return null;
+    const slots=previewAudioSlots();
+    const slot=slots.find(entry=>entry.url===item.url) || slots.find(entry=>!entry.url) || slots[0];
+    loadPreviewAudioSlot(slot,item);
+    routePreviewAudioSlot(slot);
+    startPreviewAudioSlot(slot,item.position,rate,item.speed,now,'begin');
+    slot.warmStart=false;slot.begin=true;slot.beginFrom=item.position;
+    recordPreviewDiagnostic('audio-begin',{clip:item.name,slot:slot.index,readyState:slot.audio.readyState,
+      position:Number(item.position.toFixed(3)),timelineTime:Number(t.toFixed(3))});
+    return slot;
+  };
+  // 再生していない間に、今の位置の素材と次の素材をスロットに読み込んでおく。
+  const preloadPreviewAudio=(clipsNow,t)=>{
+    const items=planPreviewAudio(clipsNow,t,null,sourceAudioVolumeRef.current);
+    const next=nextPreviewAudioStart(clipsNow,t,null);
+    const slots=previewAudioSlots();
+    [items[0],next].forEach((item,index)=>{
+      if(!item || slots.some(slot=>slot.url===item.url)) return;
+      const slot=slots[index];
+      if(slot.state!=='idle') return;
+      slot.url=item.url;slot.audio.src=item.url;slot.key=null;slot.name=item.name;
+    });
+  };
+  const unlockPreviewAudio=(begun=null)=>{
     const videos=vlogMediaClips(clipsRef.current).flatMap(clip=>vlogPreviewAudioSources(clip,clip.timelineStart).map(item=>item.source));
     previewAudioSlots().forEach((slot,index)=>{
+      if(slot===begun) return;
       routePreviewAudioSlot(slot);
       setPreviewAudioSlotGain(slot,0);
       const source=videos[index]||videos[0];
@@ -12456,7 +12484,8 @@ function App(){
       const item=planned.get(slot.key),audio=slot.audio,expected=expectedFor(slot);
       // 揃うまでは音量0（遅延を設定する瞬間の音の乱れを聞かせない）。
       setPreviewAudioSlotGain(slot,item && now>=slot.audibleAt ? item.gain : 0);
-      if(!slot.advanced && !audio.paused && !audio.seeking){
+      // 再生開始の音（begin）は、映像（タイムライン）が動き出してから揃える。
+      if(!slot.advanced && !audio.paused && !audio.seeking && !(slot.begin && expected && expected.position<=slot.beginFrom+0.001)){
         if(slot.from===null) slot.from=audio.currentTime;
         else if(audio.currentTime-slot.from>=0.02){
           slot.advanced=true;
@@ -12477,8 +12506,9 @@ function App(){
             continue;
           }
           const delay=slot.delay ? Math.max(0,Math.min(PREVIEW_AUDIO_MAX_DELAY,ahead)) : 0;
-          setPreviewAudioSlotDelay(slot,delay,0.03);
-          slot.audibleAt=slot.delay ? now+150 : now;
+          // 再生開始の音（begin）は、まだ音量0なので遅延をすぐ設定し、そのまま鳴らす。
+          setPreviewAudioSlotDelay(slot,delay,slot.begin ? 0 : 0.03);
+          slot.audibleAt=slot.delay && !slot.begin ? now+150 : now;
           slot.lastTrackAt=now;
           recordPreviewDiagnostic('audio-first-advance',{clip:slot.name,slot:slot.index,ms,warm:!!slot.warmStart,
             lead:Number(store.lead.toFixed(3)),timelineTime:Number(t.toFixed(3))});
@@ -13520,8 +13550,12 @@ function App(){
       requestPreviewPlay(firstVideo,activeAtStart,'tap-start');
     }
     previewDiagnosticRef.current.start={at:performance.now(),last:-Infinity,trace:[],events:[]};
-    if(!PREVIEW_VIDEO_AUDIBLE) unlockPreviewAudio();
-    if(bgmAudioRef.current && bgmTrack!=='none'){
+    // 最初の音をタップ中にそのまま鳴らし始め、動き出すまで映像の開始を待つ。
+    const begun=PREVIEW_VIDEO_AUDIBLE ? null :
+      beginPreviewAudio(clipsRef.current,timeRef.current,playbackRateRef.current,performance.now(),null);
+    if(!PREVIEW_VIDEO_AUDIBLE) unlockPreviewAudio(begun);
+    const bgmOn=!!bgmAudioRef.current && bgmTrack!=='none';
+    if(bgmOn){
       bgmAudioRef.current.loop=true;
       bgmAudioRef.current.playbackRate=playbackRateRef.current;
       try{
@@ -13530,9 +13564,14 @@ function App(){
       }catch{}
       requestPreviewPlay(bgmAudioRef.current,null,'bgm-start');
     }
+    // 待つ間、映像と BGM は許可だけ取って止めておく。
+    if(begun){
+      try{ firstVideo?.pause(); }catch{}
+      if(bgmOn) try{ bgmAudioRef.current.pause(); }catch{}
+    }
     // 少し待ってからtick開始（seek完了待ち）
     const startDelay = needsWait ? 120 : 30;
-    previewStartTimerRef.current=setTimeout(()=>{
+    const startPlayback=()=>{
       previewStartTimerRef.current=0;
       if(playingRef.current && previewSessionRef.current===previewSession){
         // 再生直前にアクティブクリップのvideoを確実にplay。ここでの再シークは不要。
@@ -13549,9 +13588,22 @@ function App(){
             requestPreviewPlay(v,active,'delayed-start');
           }
         }
+        if(begun && bgmOn) requestPreviewPlay(bgmAudioRef.current,null,'bgm-start');
+        if(begun){ tick._last=performance.now(); previewDiagnosticRef.current.lastProgressAt=tick._last; }
         rafTickRef.current=requestAnimationFrame(tick);
       }
-    }, startDelay);
+    };
+    const beginAt=performance.now();
+    const waitForAudio=()=>{
+      previewStartTimerRef.current=0;
+      if(!playingRef.current || previewSessionRef.current!==previewSession) return;
+      const waited=performance.now()-beginAt,moved=begun.audio.currentTime-begun.beginFrom>=0.02;
+      if(moved || waited>=1500){
+        recordPreviewDiagnostic('audio-begin-ready',{clip:begun.name,slot:begun.index,ms:Math.round(waited),timedOut:!moved});
+        startPlayback();
+      }else previewStartTimerRef.current=setTimeout(waitForAudio,30);
+    };
+    previewStartTimerRef.current=setTimeout(begun ? waitForAudio : startPlayback, startDelay);
   },[tick, bgmTrack, playbackRate]);
 
   const handleStop = useCallback((redraw=true)=>{
@@ -13583,6 +13635,11 @@ function App(){
     setCurrentTime(timeRef.current);
     if(redraw!==false) drawFrameRef.current(timeRef.current);
   },[playbackRate]);
+  // 再生していない間に、今の位置の音をスロットに読み込んでおく（再生開始の待ちを短くする）。
+  useEffect(()=>{
+    if(isPlaying || PREVIEW_VIDEO_AUDIBLE || !clipsRef.current?.length) return;
+    try{ preloadPreviewAudio(clipsRef.current,timeRef.current); }catch{}
+  },[clips,currentTime,isPlaying]);
   const handleRestartPreview=useCallback((e)=>{
     if(!clipsRef.current.length || analysisBusyRef.current) return;
     handleStop(false);
