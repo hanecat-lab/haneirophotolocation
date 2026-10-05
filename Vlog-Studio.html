@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-05-seam-element';
+const VLOG_PREVIEW_BUILD='2026-10-05-seam-element2';
 // 実験: 繋ぎ目の音の戻し方。?seam=silent は音を戻さない、?seam=gain は動画の消音を切り替えず WebAudio の音量で絞る、
 // ?seam=buffer は動画を消音のまま、取り出した音を別に鳴らす、?seam=element は動画を消音のまま音専用の audio 要素で鳴らす。
 const VLOG_SEAM_MODE=(()=>{try{const mode=new URLSearchParams(location.search).get('seam');
@@ -10434,7 +10434,7 @@ function App(){
   const previewAudioGainsRef = useRef(new Map()); // clipId -> {source, gain}
   const previewSeamAudioRef = useRef(new Map());
   const previewSeamSourceRef = useRef(null);
-  const previewElementAudioRef = useRef({elements:new Map(),current:null});
+  const previewElementAudioRef = useRef({slots:[],current:null,outgoing:null});
   const previewAudioGraphFailedRef = useRef(new WeakSet());
 
   // バグ修正: クリップ削除時のAudioContextリーク防止ヘルパー
@@ -12218,43 +12218,84 @@ function App(){
         bytes:entry.bytes,error:String(error?.message||error?.name||error).slice(0,160)});
     });
   };
-  // 実験 ?seam=element: 映像の動画は消音のまま、素材ごとの見えない audio 要素で音を鳴らす。
-  const stopElementAudio=()=>{
-    const store=previewElementAudioRef.current,current=store.current;
-    store.current=null;
-    if(current) try{ current.audio.pause(); }catch{}
-  };
-  const ensureElementAudio=clip=>{
+  // 実験 ?seam=element: 映像の動画は消音のまま、audio 要素2つを交互に使って音を鳴らす。
+  // iOS は再生の許可を要素ごとに与えるため、2つとも再生ボタンのタップ中に許可を取る。
+  // 鳴り始めまで約0.3秒かかるため、その分だけ先の位置から早めに鳴らし始める。
+  const ELEMENT_AUDIO_LEAD=0.3;
+  const elementAudioSlots=()=>{
     const store=previewElementAudioRef.current;
-    let audio=store.elements.get(clip.id);
-    if(!audio){
-      audio=document.createElement('audio');
-      audio.preload='auto';audio.src=clip.url;
-      audio.setAttribute('playsinline','');
-      store.elements.set(clip.id,audio);
+    while(store.slots.length<2){
+      const audio=document.createElement('audio');
+      audio.preload='auto';audio.setAttribute('playsinline','');
+      store.slots.push({audio,url:null,clipId:null});
     }
-    return audio;
+    return store.slots;
   };
-  const syncElementAudio=(clip,t,rate,now)=>{
+  const loadElementAudioSlot=(slot,clip)=>{
+    if(slot.url!==clip.url){ slot.url=clip.url; slot.audio.src=clip.url; }
+    slot.clipId=clip.id;
+  };
+  const unlockElementAudio=()=>{
+    const videos=clipsRef.current.filter(clip=>clip.type==='video' && clip.url);
+    elementAudioSlots().forEach((slot,index)=>{
+      const clip=videos[index]||videos[0];
+      if(!clip) return;
+      if(!slot.url) loadElementAudioSlot(slot,clip);
+      try{
+        const played=slot.audio.play();
+        if(played?.then) played.then(()=>{
+          const store=previewElementAudioRef.current;
+          if(store.current?.slot!==slot && store.outgoing?.slot!==slot) slot.audio.pause();
+        }).catch(error=>recordPreviewDiagnostic('element-audio-unlock-error',{slot:index,
+          error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`}));
+      }catch{}
+    });
+    recordPreviewDiagnostic('element-audio-unlock',{slots:2});
+  };
+  const stopElementAudio=()=>{
     const store=previewElementAudioRef.current;
-    if(!clip || clip.type!=='video' || !clip.url){ stopElementAudio(); return; }
+    store.current=null;store.outgoing=null;
+    store.slots.forEach(slot=>{ try{ slot.audio.pause(); }catch{} });
+  };
+  const syncElementAudio=(owner,upcoming,seamStart,t,rate,now)=>{
+    const store=previewElementAudioRef.current,slots=elementAudioSlots();
+    const outgoing=store.outgoing;
+    if(outgoing){
+      if(t>=outgoing.until){ try{ outgoing.slot.audio.pause(); }catch{} store.outgoing=null; }
+      else if(outgoing.slot.audio.paused && !outgoing.reported){
+        outgoing.reported=true;
+        recordPreviewDiagnostic('element-audio-preempted',{clip:outgoing.name,msBeforeSeam:Math.round((outgoing.until-t)*1000)});
+      }
+    }
     let current=store.current;
-    if(current?.clipId!==clip.id){
-      stopElementAudio();
-      const audio=ensureElementAudio(clip);
-      const offset=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart)*(clip._playbackRate||1);
-      try{ audio.currentTime=offset; }catch{}
-      audio.playbackRate=rate*(clip._playbackRate||1);
-      current={clipId:clip.id,name:clip.name,audio,startAt:now,from:null,advanced:false,pausedReported:false};
-      store.current=current;
-      const played=audio.play();
-      if(played?.catch) played.catch(error=>recordPreviewDiagnostic('element-audio-error',{clip:clip.name,
-        error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`}));
-      recordPreviewDiagnostic('element-audio-start',{clip:clip.name,offset:Number(offset.toFixed(3)),
-        readyState:audio.readyState,timelineTime:Number(t.toFixed(3))});
+    if(!owner || owner.type!=='video' || !owner.url){
+      if(current){ try{ current.slot.audio.pause(); }catch{} store.current=null; }
       return;
     }
-    const audio=current.audio;
+    if(current?.clipId!==owner.id){
+      const slot=slots.find(item=>item!==current?.slot && item!==store.outgoing?.slot) ||
+        slots.find(item=>item!==current?.slot) || slots[0];
+      if(store.outgoing && store.outgoing.slot===slot){ try{ slot.audio.pause(); }catch{} store.outgoing=null; }
+      const prepared=slot.clipId===owner.id && slot.url===owner.url;
+      if(current){
+        if(t<seamStart) store.outgoing={slot:current.slot,name:current.name,until:seamStart,reported:false};
+        else try{ current.slot.audio.pause(); }catch{}
+      }
+      loadElementAudioSlot(slot,owner);
+      const offset=(owner.trimStart||0)+Math.max(0,t+ELEMENT_AUDIO_LEAD-owner.timelineStart)*(owner._playbackRate||1);
+      try{ slot.audio.currentTime=offset; }catch{}
+      slot.audio.playbackRate=rate*(owner._playbackRate||1);
+      current={clipId:owner.id,name:owner.name,slot,startAt:now,from:null,advanced:false,pausedReported:false};
+      store.current=current;
+      const played=slot.audio.play();
+      if(played?.catch) played.catch(error=>recordPreviewDiagnostic('element-audio-error',{clip:owner.name,
+        error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`}));
+      recordPreviewDiagnostic('element-audio-start',{clip:owner.name,slot:slots.indexOf(slot),prepared,
+        offset:Number(offset.toFixed(3)),readyState:slot.audio.readyState,timelineTime:Number(t.toFixed(3)),
+        seamStart:Number.isFinite(seamStart)?Number(seamStart.toFixed(3)):null});
+      return;
+    }
+    const audio=current.slot.audio;
     if(!current.advanced && !audio.paused && !audio.seeking){
       if(current.from===null) current.from=audio.currentTime;
       else if(audio.currentTime-current.from>=0.02){
@@ -12267,6 +12308,15 @@ function App(){
       current.pausedReported=true;
       recordPreviewDiagnostic('element-audio-paused',{clip:current.name,audioTime:Number(audio.currentTime.toFixed(3)),
         timelineTime:Number(t.toFixed(3))});
+    }
+    // 空いている要素に次の素材を先に読み込ませ、頭の位置に合わせておく。
+    if(upcoming?.type==='video' && upcoming.url && !store.outgoing){
+      const idle=slots.find(item=>item!==current.slot);
+      if(idle && idle.clipId!==upcoming.id){
+        loadElementAudioSlot(idle,upcoming);
+        try{ idle.audio.pause(); idle.audio.currentTime=upcoming.trimStart||0; }catch{}
+        recordPreviewDiagnostic('element-audio-prepare',{clip:upcoming.name,slot:slots.indexOf(idle)});
+      }
     }
   };
   const stopSeamAudio=()=>{
@@ -12766,10 +12816,11 @@ function App(){
     if(VLOG_SEAM_MODE==='element'){
       // 重なり中は次の素材、それ以外は今の素材の音を audio 要素で鳴らす。映像の動画は常に消音。
       if(activeVideo && !activeVideo.muted) activeVideo.muted=true;
-      syncElementAudio(inOverlap ? next : active,t,rate,now);
-      // 次の素材の audio 要素は先に作って読み込ませ、繋ぎ目で位置を合わせられるようにする。
-      const upcoming=clipsNow[index+1];
-      if(upcoming?.type==='video' && upcoming.url) ensureElementAudio(upcoming);
+      // 繋ぎ目（トランジションは重なりの始まり、なしは切れ目）の0.3秒前から次の素材の音にする。
+      const upcoming=clipsNow[index+1]||null;
+      const seamStart=upcoming ? (next ? overlapStart : upcoming.timelineStart) : Infinity;
+      const owner=upcoming && t>=seamStart-ELEMENT_AUDIO_LEAD ? upcoming : active;
+      syncElementAudio(owner,owner===upcoming ? clipsNow[index+2]||null : upcoming,seamStart,t,rate,now);
     }
     // 音なしで始めた次の素材が動き出したら音を戻し、0.3秒後に止まっていないかを記録する。
     const audioDefer=state.audioDefer;
@@ -12806,7 +12857,7 @@ function App(){
         const elementAudio=previewElementAudioRef.current.current;
         seamTrace.samples.push({ms:Math.round(elapsed),t:Number(t.toFixed(3)),
           in:inVideo?Number(inVideo.currentTime.toFixed(3)):null,out:outVideo?Number(outVideo.currentTime.toFixed(3)):null,
-          ...(elementAudio?{aud:Number(elementAudio.audio.currentTime.toFixed(3)),audClip:elementAudio.name}:{})});
+          ...(elementAudio?{aud:Number(elementAudio.slot.audio.currentTime.toFixed(3)),audClip:elementAudio.name}:{})});
         seamTrace.last=elapsed;
       }
       if(elapsed>=1000){
@@ -13263,6 +13314,7 @@ function App(){
       }catch{}
       requestPreviewPlay(firstVideo,activeAtStart,'tap-start');
     }
+    if(VLOG_SEAM_MODE==='element') unlockElementAudio();
     if(bgmAudioRef.current && bgmTrack!=='none'){
       bgmAudioRef.current.loop=true;
       bgmAudioRef.current.playbackRate=playbackRateRef.current;
