@@ -6658,7 +6658,10 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-05-cut-muted';
+const VLOG_PREVIEW_BUILD='2026-10-05-seam-probe';
+// 実験: 繋ぎ目の音の戻し方。?seam=silent は音を戻さない、?seam=gain は動画の消音を切り替えず WebAudio の音量で絞る。
+const VLOG_SEAM_MODE=(()=>{try{const mode=new URLSearchParams(location.search).get('seam');
+  return mode==='silent'||mode==='gain'?mode:'normal';}catch{return 'normal';}})();
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -12171,6 +12174,17 @@ function App(){
     }
   };
   // プレビュー中の時刻指定は tick と再生開始だけが行う。再生済みの incoming は再シークしない。
+  // 繋ぎ目で次の素材の音を一時的に止める。gain の実験では動画の消音は切り替えない。
+  const holdSeamAudio=(video,clipId)=>{
+    const entry=previewAudioGainsRef.current.get(clipId),context=previewAudioContextRef.current;
+    if(VLOG_SEAM_MODE==='gain' && entry?.gain && context){
+      try{ entry.gain.gain.cancelScheduledValues(context.currentTime); entry.gain.gain.setValueAtTime(0,context.currentTime); }catch{}
+      if(!previewAutoplayMutedRef.current.has(video)) video.muted=false;
+      return 'gain';
+    }
+    video.muted=true;
+    return 'muted';
+  };
   const positionPreviewVideo=(video,clip,target,phase,tolerance=0.08)=>{
     if(!video || video.readyState<1 || video.seeking || !Number.isFinite(target)) return false;
     if(Math.abs(video.currentTime-target)<=tolerance) return true;
@@ -12200,7 +12214,7 @@ function App(){
   };
   const formatPreviewDiagnostic=()=>{
     const diag=previewDiagnosticRef.current;
-    return JSON.stringify({report:'Vlog Studio 再生診断',build:VLOG_PREVIEW_BUILD,run:previewTapRef.current.run,
+    return JSON.stringify({report:'Vlog Studio 再生診断',build:VLOG_PREVIEW_BUILD,seamMode:VLOG_SEAM_MODE,run:previewTapRef.current.run,
       msSinceLastTap:previewTapRef.current.at===null?null:Math.round(performance.now()-previewTapRef.current.at),
       capturedAt:new Date().toISOString(),
       browser:navigator.userAgent,now:previewDiagnosticSnapshot('手動で状態を記録'),
@@ -12496,9 +12510,10 @@ function App(){
       // iOS は音の出る動画を同時に1本しか鳴らさず、前の素材を止める。
       // 切れ目までは次の素材を音なしで動かし、切れ目を過ぎて動いてから音を戻す。
       if(nextVideo && !transDur && t<nextClip.timelineStart && state.audioDefer?.id!==nextClip.id){
-        nextVideo.muted=true;
+        const hold=holdSeamAudio(nextVideo,nextClip.id);
         state.audioDefer={id:nextClip.id,name:nextClip.name,phase:'waiting',startAt:now,from:null,
-          unmuteAfter:nextClip.timelineStart};
+          unmuteAfter:nextClip.timelineStart,hold};
+        state.seamTrace={clip:nextClip.name,inId:nextClip.id,outId:active?.id,hold,startAt:now,last:-Infinity,samples:[]};
         recordPreviewDiagnostic('cut-incoming-muted',{clip:nextClip.name,from:active?.name,
           timelineTime:Number(t.toFixed(3))});
       }
@@ -12572,8 +12587,9 @@ function App(){
       // 音ありの再生開始は音の準備待ちで0.1〜0.65秒進まない。音なしで始め、動き出してから音を戻す。
       if(state.audioDefer?.id!==next.id){
         if(state.prewarm?.id===next.id) state.prewarm.phase='done';
-        incoming.muted=true;
-        state.audioDefer={id:next.id,name:next.name,phase:'waiting',startAt:now,from:null};
+        const hold=holdSeamAudio(incoming,next.id);
+        state.audioDefer={id:next.id,name:next.name,phase:'waiting',startAt:now,from:null,hold};
+        state.seamTrace={clip:next.name,inId:next.id,outId:active?.id,hold,startAt:now,last:-Infinity,samples:[]};
       }
       // iOS は音の出る動画を同時に1本しか再生させず、もう片方を止める。
       // 重なり中は前の素材を消音し、2本が交互に止め合わないようにする。
@@ -12630,19 +12646,48 @@ function App(){
     const audioDefer=state.audioDefer;
     const deferVideo=audioDefer && audioDefer.phase!=='done' ? videoRefs.current.get(audioDefer.id) : null;
     if(deferVideo){
+      if(audioDefer.phase==='waiting' && audioDefer.hold==='gain'){
+        // 他の処理が毎フレーム音量を戻すため、音を戻すまでは最後に0へ絞り直す。
+        const entry=previewAudioGainsRef.current.get(audioDefer.id),context=previewAudioContextRef.current;
+        if(entry?.gain && context) try{ entry.gain.gain.setTargetAtTime(0,context.currentTime,0.005); }catch{}
+      }
       if(audioDefer.phase==='waiting' && !deferVideo.paused && !deferVideo.seeking){
         if(audioDefer.from===null) audioDefer.from=deferVideo.currentTime;
         else if(deferVideo.currentTime-audioDefer.from>=0.02 &&
                 !(Number.isFinite(audioDefer.unmuteAfter) && t<audioDefer.unmuteAfter)){
-          if(!previewAutoplayMutedRef.current.has(deferVideo)) deferVideo.muted=false;
+          // silent の実験では音を戻さない。gain の実験では絞り直しをやめるだけで、音量は通常の処理が戻す。
+          if(VLOG_SEAM_MODE!=='silent' && audioDefer.hold!=='gain' && !previewAutoplayMutedRef.current.has(deferVideo))
+            deferVideo.muted=false;
           audioDefer.phase='checking';audioDefer.unmutedAt=now;audioDefer.unmuteFrom=deferVideo.currentTime;
           recordPreviewDiagnostic('incoming-unmute',{clip:audioDefer.name,ms:Math.round(now-audioDefer.startAt),
-            timelineTime:Number(t.toFixed(3))});
+            timelineTime:Number(t.toFixed(3)),seamMode:VLOG_SEAM_MODE,hold:audioDefer.hold||'muted'});
         }
       }else if(audioDefer.phase==='checking' && now-audioDefer.unmutedAt>=300){
         audioDefer.phase='done';
         recordPreviewDiagnostic('incoming-unmute-check',{clip:audioDefer.name,paused:deferVideo.paused,
           muted:deferVideo.muted,movedIn300ms:Number((deferVideo.currentTime-audioDefer.unmuteFrom).toFixed(3))});
+      }
+    }
+    // 繋ぎ目から1秒間、0.1秒ごとにタイムラインと2本の動画の位置を残し、止まっていた時間を数える。
+    const seamTrace=state.seamTrace;
+    if(seamTrace){
+      const elapsed=now-seamTrace.startAt;
+      if(elapsed-seamTrace.last>=100){
+        const inVideo=videoRefs.current.get(seamTrace.inId),outVideo=videoRefs.current.get(seamTrace.outId);
+        seamTrace.samples.push({ms:Math.round(elapsed),t:Number(t.toFixed(3)),
+          in:inVideo?Number(inVideo.currentTime.toFixed(3)):null,out:outVideo?Number(outVideo.currentTime.toFixed(3)):null});
+        seamTrace.last=elapsed;
+      }
+      if(elapsed>=1000){
+        let stuckMs=0;
+        for(let i=1;i<seamTrace.samples.length;i++){
+          const a=seamTrace.samples[i-1],b=seamTrace.samples[i],dt=b.ms-a.ms;
+          const moved=Math.max(b.t-a.t,(b.in??0)-(a.in??0),(b.out??0)-(a.out??0));
+          if(moved<dt/1000*0.2) stuckMs+=dt;
+        }
+        recordPreviewDiagnostic('seam-trace',{clip:seamTrace.clip,seamMode:VLOG_SEAM_MODE,hold:seamTrace.hold,
+          stuckMs,samples:seamTrace.samples});
+        state.seamTrace=null;
       }
     }
     const liveIds=new Set();
