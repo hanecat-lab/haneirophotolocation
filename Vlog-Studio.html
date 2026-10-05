@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-audio-end';
+const VLOG_PREVIEW_BUILD='2026-10-06-cut-prewarm';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -13158,6 +13158,48 @@ function App(){
         }
       }
     }
+    // 切れ目（トランジションなし）でも、次の素材を音なしで一度動かして止め、頭へ戻しておく。
+    // そのうえで、動き出しまでの見込み時間だけ切れ目より前に再生し始める（切れ目の直後に絵が止まらないように）。
+    if(cutNext && cutNextVideo && state.cutPreparedId===cutNext.id && t<cutNext.timelineStart &&
+       (state.heldTime===null || state.heldTime===undefined)){
+      const warm=state.cutPrewarm;
+      if(!warm || warm.id!==cutNext.id){
+        if(!cutNextVideo.seeking && cutNextVideo.readyState>=2 && cutNextVideo.paused){
+          cutNextVideo.muted=true;
+          state.cutPrewarm={id:cutNext.id,phase:'playing',startAt:now,from:cutNextVideo.currentTime};
+          requestPreviewPlay(cutNextVideo,cutNext,'incoming-prewarm');
+        }
+      }else if(warm.phase==='playing'){
+        const moved=cutNextVideo.currentTime-warm.from;
+        if(moved>=0.02 || now-warm.startAt>=900){
+          try{ cutNextVideo.pause(); }catch{}
+          warm.phase='done';
+          recordPreviewDiagnostic('incoming-prewarm',{clip:cutNext.name,ms:Math.round(now-warm.startAt),cut:true,
+            moved:Number(moved.toFixed(3)),timelineTime:Number(t.toFixed(3))});
+          positionPreviewVideo(cutNextVideo,cutNext,cutNext.trimStart||0,'incoming-prewarm-rewind',0.02);
+        }
+      }else if(warm.phase==='done' && cutNextVideo.paused && !cutNextVideo.seeking){
+        const samples=state.cutStartSamples||[];
+        const lead=Math.max(0.03,Math.min(0.25,(samples.length ? samples.reduce((sum,value)=>sum+value,0)/samples.length : 80)/1000));
+        if(t>=cutNext.timelineStart-lead*rate){
+          warm.phase='started';warm.startAt=now;warm.from=cutNextVideo.currentTime;
+          requestPreviewPlay(cutNextVideo,cutNext,'cut-incoming-play');
+          recordPreviewDiagnostic('cut-incoming-play',{clip:cutNext.name,lead:Number(lead.toFixed(3)),
+            position:Number(cutNextVideo.currentTime.toFixed(3)),timelineTime:Number(t.toFixed(3))});
+        }
+      }
+    }
+    // 早めに再生した次の素材が動き出すまでの時間を、次の切れ目の見込み時間にする。
+    if(state.cutPrewarm?.phase==='started'){
+      const warm=state.cutPrewarm,video=videoRefs.current.get(warm.id);
+      if(!video || video.paused) warm.phase='measured';
+      else if(video.currentTime-warm.from>=0.02){
+        const samples=state.cutStartSamples||(state.cutStartSamples=[]);
+        samples.push(Math.round(now-warm.startAt));
+        if(samples.length>5) samples.shift();
+        warm.phase='measured';
+      }
+    }
     const inOverlap=!!next && t>=overlapStart;
     if(inOverlap && incoming){
       // 音ありの再生開始は音の準備待ちで0.1〜0.65秒進まない。音なしで始め、動き出してから音を戻す。
@@ -13385,6 +13427,7 @@ function App(){
     if(active?.type==='video') liveIds.add(active.id);
     if(inOverlap && incoming) liveIds.add(next.id);
     if(state.prewarm?.phase==='playing') liveIds.add(state.prewarm.id);
+    if(state.cutPrewarm?.phase==='playing' || state.cutPrewarm?.phase==='started') liveIds.add(state.cutPrewarm.id);
     if(audioCrossfadeActive?.to?.type==='video')liveIds.add(audioCrossfadeActive.to.id);
     livePreviewIdsRef.current=liveIds;
     if(waiting){
