@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-audio-lab';
+const VLOG_PREVIEW_BUILD='2026-10-06-audio-pass';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -12265,7 +12265,10 @@ function App(){
   // iOS は再生の許可を要素ごとに与えるため、3本とも再生ボタンのタップ中に許可を取る。
   // 再生中の audio 要素は、位置の飛ばしでも速さの変更でも約0.5秒止まる（設計書 F8・F11）。
   // そのため要素は触らず、少し早めに鳴らし始めて、先行した分を WebAudio の DelayNode で遅らせて揃える。
-  const PREVIEW_AUDIO_PREWARM=1.2,PREVIEW_AUDIO_HARD_DRIFT=0.6,PREVIEW_AUDIO_MARGIN=0.15,PREVIEW_AUDIO_MAX_DELAY=1.5;
+  const PREVIEW_AUDIO_PREWARM=1.0,PREVIEW_AUDIO_HARD_DRIFT=0.6,PREVIEW_AUDIO_MARGIN=0.15,PREVIEW_AUDIO_MAX_DELAY=1.5;
+  // audio 要素は鳴らし始めて約0.3秒後に1回だけ約0.26秒止まる（設計書 F12）。音量0のまま0.55秒分進めて
+  // この止まりを通り過ぎてから揃えるため、その実時間（約0.85秒）だけ早く鳴らし始める。
+  const PREVIEW_AUDIO_PASS_MEDIA=0.55,PREVIEW_AUDIO_PASS_TIME=0.85;
   // 鳴っている要素が途中で止まって遅れたままになったとき、空いている要素へ引き継ぐ基準。
   const PREVIEW_AUDIO_HANDOFF_LAG=0.08,PREVIEW_AUDIO_HANDOFF_HOLD=300,PREVIEW_AUDIO_HANDOFF_GAP=2000;
   const previewAudioSlots=()=>{
@@ -12337,7 +12340,7 @@ function App(){
     setPreviewAudioSlotDelay(slot,0,0);
     slot.state='playing';slot.startAt=now;slot.from=null;slot.advanced=false;slot.audibleAt=Infinity;
     slot.lastTrackAt=now;slot.preemptReported=false;slot.realigned=false;slot.begin=false;
-    slot.lagSince=null;slot.moveAt=null;slot.movePos=null;slot.stall=null;slot.handoffTo=null;
+    slot.lagSince=null;slot.moveAt=null;slot.movePos=null;slot.stall=null;slot.handoffTo=null;slot.firstMoveAt=null;
     playPreviewAudioSlot(slot,phase);
   };
   // 再生ボタンのタップ中に、最初の音をそのまま鳴らし始める（止めて鳴らし直さない）。
@@ -12350,7 +12353,7 @@ function App(){
     loadPreviewAudioSlot(slot,item);
     routePreviewAudioSlot(slot);
     startPreviewAudioSlot(slot,item.position,rate,item.speed,now,'begin');
-    slot.warmStart=false;slot.begin=true;slot.beginFrom=item.position;
+    slot.warmStart=false;slot.begin=true;slot.beginFrom=item.position;slot.from=item.position;
     recordPreviewDiagnostic('audio-begin',{clip:item.name,slot:slot.index,readyState:slot.audio.readyState,
       position:Number(item.position.toFixed(3)),timelineTime:Number(t.toFixed(3))});
     return slot;
@@ -12414,20 +12417,28 @@ function App(){
   const syncPreviewAudio=(clipsNow,t,rate,now,cutInfo)=>{
     const store=previewAudioSlotsRef.current,slots=previewAudioSlots();
     const plan=planPreviewAudio(clipsNow,t,cutInfo,sourceAudioVolumeRef.current);
-    const upcoming=nextPreviewAudioStart(clipsNow,t,cutInfo);
+    // 次に鳴り始める音。次の音がもう鳴り始めていれば、その次の音も準備する（短い素材が続くとき）。
+    const upcomings=[];
+    for(let next=nextPreviewAudioStart(clipsNow,t,cutInfo);next && upcomings.length<2;
+        next=nextPreviewAudioStart(clipsNow,next.at+0.001,cutInfo)){
+      upcomings.push(next);
+      if(!previewAudioSlots().some(slot=>slot.key===next.key && slot.state==='playing')) break;
+    }
     const planned=new Map(plan.map(item=>[item.key,item]));
     const keepKeys=new Set(planned.keys());
     // 鳴り始めまでの見込み時間に余裕を足した分だけ早く鳴らし、必ず先行させてから遅延で揃える。
-    const startLead=store.lead+PREVIEW_AUDIO_MARGIN,leadSpan=startLead*rate;
+    const startLead=store.lead+PREVIEW_AUDIO_MARGIN+PREVIEW_AUDIO_PASS_TIME,leadSpan=startLead*rate;
     // 想定位置（計画にない次の音は、鳴り始める予定の時刻から逆算する。負の値もそのまま使う）。
     const expectedFor=slot=>{
       const item=planned.get(slot.key);
       if(item) return {position:item.position,speed:item.speed};
-      if(upcoming && upcoming.key===slot.key) return {position:upcoming.position+(t-upcoming.at)*upcoming.speed,speed:upcoming.speed};
+      const upcoming=upcomings.find(entry=>entry.key===slot.key);
+      if(upcoming) return {position:upcoming.position+(t-upcoming.at)*upcoming.speed,speed:upcoming.speed};
       return null;
     };
     // 予熱済みの次の音は、見込み時間＋余裕だけ早く頭から鳴らし始める。
-    if(upcoming && t>=upcoming.at-leadSpan){
+    for(const upcoming of upcomings){
+      if(t<upcoming.at-leadSpan) continue;
       const warm=slots.find(slot=>slot.key===upcoming.key && slot.state==='warm');
       if(warm){
         // 鳴らし始めが遅れたときは、遅れた分だけ先の位置から鳴らして先行を保つ。
@@ -12526,16 +12537,21 @@ function App(){
       // 揃うまでは音量0（遅延を設定する瞬間の音の乱れを聞かせない）。
       setPreviewAudioSlotGain(slot,item && now>=slot.audibleAt ? item.gain : 0);
       // 再生開始の音（begin）は、映像（タイムライン）が動き出してから揃える。
+      if(!slot.advanced && !audio.paused && !audio.seeking && slot.from===null) slot.from=audio.currentTime;
+      // 動き出した時刻（0.02秒進んだ時点）は、鳴り始めまでの見込み時間の学習にだけ使う。
+      if(!slot.advanced && !slot.firstMoveAt && slot.from!==null && audio.currentTime-slot.from>=0.02){
+        slot.firstMoveAt=now;
+        if(slot.warmStart){
+          notePreviewAudioSample(store.startSamples,Math.round(now-slot.startAt));
+          const average=store.startSamples.reduce((sum,value)=>sum+value,0)/store.startSamples.length;
+          store.lead=Math.max(0.03,Math.min(0.4,average/1000));
+        }
+      }
+      // 揃えるのは、鳴らし始めの止まりを通り過ぎてから（0.55秒分進んでから）。
       if(!slot.advanced && !audio.paused && !audio.seeking && !(slot.begin && expected && expected.position<=slot.beginFrom+0.001)){
-        if(slot.from===null) slot.from=audio.currentTime;
-        else if(audio.currentTime-slot.from>=0.02){
+        if(slot.from!==null && audio.currentTime-slot.from>=PREVIEW_AUDIO_PASS_MEDIA*(expected?.speed||1)){
           slot.advanced=true;
-          const ms=Math.round(now-slot.startAt);
-          if(slot.warmStart){
-            notePreviewAudioSample(store.startSamples,ms);
-            const average=store.startSamples.reduce((sum,value)=>sum+value,0)/store.startSamples.length;
-            store.lead=Math.max(0.03,Math.min(0.4,average/1000));
-          }
+          const ms=Math.round((slot.firstMoveAt??now)-slot.startAt);
           // 先行している分（実時間）だけ出力を遅らせて揃える。
           const ahead=expected ? (audio.currentTime-expected.position)/(rate*expected.speed) : 0;
           if(expected && slot.delay && ahead<-0.02 && !slot.realigned){
@@ -12547,9 +12563,9 @@ function App(){
             continue;
           }
           const delay=slot.delay ? Math.max(0,Math.min(PREVIEW_AUDIO_MAX_DELAY,ahead)) : 0;
-          // 再生開始の音（begin）は、まだ音量0なので遅延をすぐ設定し、そのまま鳴らす。
-          setPreviewAudioSlotDelay(slot,delay,slot.begin ? 0 : 0.03);
-          slot.audibleAt=slot.delay && !slot.begin ? now+150 : now;
+          // まだ音量0なので、遅延をすぐ設定してそのまま鳴らす。
+          setPreviewAudioSlotDelay(slot,delay,0);
+          slot.audibleAt=now;
           slot.lastTrackAt=now;
           recordPreviewDiagnostic('audio-first-advance',{clip:slot.name,slot:slot.index,ms,warm:!!slot.warmStart,
             lead:Number(store.lead.toFixed(3)),timelineTime:Number(t.toFixed(3))});
@@ -12619,9 +12635,10 @@ function App(){
         }
       }
     }
-    // 次の繋ぎ目の1.2秒前に、空いている要素で次の音を音量0のまま一度動かし、頭に戻しておく。
-    if(upcoming && t>=upcoming.at-PREVIEW_AUDIO_PREWARM*rate && t<upcoming.at-leadSpan &&
-       !slots.some(slot=>slot.key===upcoming.key && slot.state!=='idle')){
+    // 鳴らし始める1.0秒前に、空いている要素で次の音を音量0のまま一度動かし、頭に戻しておく。
+    for(const upcoming of upcomings){
+      if(!(t>=upcoming.at-leadSpan-PREVIEW_AUDIO_PREWARM*rate && t<upcoming.at-leadSpan &&
+         !slots.some(slot=>slot.key===upcoming.key && slot.state!=='idle'))) continue;
       const slot=slots.find(entry=>entry.state==='idle');
       if(slot){
         loadPreviewAudioSlot(slot,upcoming);
@@ -13760,8 +13777,9 @@ function App(){
     const waitForAudio=()=>{
       previewStartTimerRef.current=0;
       if(!playingRef.current || previewSessionRef.current!==previewSession) return;
-      const waited=performance.now()-beginAt,moved=begun.audio.currentTime-begun.beginFrom>=0.02;
-      if(moved || waited>=1500){
+      // 鳴らし始めの止まり（F12）を通り過ぎるまで待つ。
+      const waited=performance.now()-beginAt,moved=begun.audio.currentTime-begun.beginFrom>=PREVIEW_AUDIO_PASS_MEDIA+0.02;
+      if(moved || waited>=2500){
         recordPreviewDiagnostic('audio-begin-ready',{clip:begun.name,slot:begun.index,ms:Math.round(waited),timedOut:!moved});
         startPlayback();
       }else previewStartTimerRef.current=setTimeout(waitForAudio,30);
