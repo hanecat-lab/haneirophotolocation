@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-04-muted-start';
+const VLOG_PREVIEW_BUILD='2026-10-05-cut-muted';
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -12472,10 +12472,36 @@ function App(){
     const transDur=trans?.type && trans.type!=='none' && index<clipsNow.length-1 ? trans.duration||0.5 : 0;
     const overlapStart=active ? active.timelineStart+active.duration-transDur : Infinity;
     const next=transDur ? clipsNow[index+1] : null;
+    // トランジションなしの切れ目: 次の素材を切れ目の1.2秒前に、止めたまま頭へ合わせておく。
+    const cutNext=!transDur && index<clipsNow.length-1 ? clipsNow[index+1] : null;
+    const cutNextVideo=cutNext?.type==='video' ? videoRefs.current.get(cutNext.id) : null;
+    if(cutNextVideo && cutNextVideo.paused && t>=cutNext.timelineStart-1.2 && t<cutNext.timelineStart &&
+       state.cutPreparedId!==cutNext.id){
+      if(positionPreviewVideo(cutNextVideo,cutNext,cutNext.trimStart||0,'cut-prepare'))
+        state.cutPreparedId=cutNext.id;
+    }
     // Crossfade時の次のクリップのGain制御
+    let crossfadeIncomingReady=true;
     if(audioCrossfadeActive && audioCrossfadeActive.to){
       const nextClip = audioCrossfadeActive.to;
       const nextVideo = videoRefs.current.get(nextClip.id);
+      if(nextVideo && nextVideo.paused){
+        // 前回の再生位置のまま鳴らさない。ずれていれば合わせ直し、このフレームは鳴らさない。
+        const expected=(nextClip.trimStart||0)+Math.max(0,t-nextClip.timelineStart);
+        if(Math.abs(nextVideo.currentTime-expected)>0.1){
+          positionPreviewVideo(nextVideo,nextClip,expected,'crossfade-prepare',0.1);
+          crossfadeIncomingReady=false;
+        }
+      }
+      // iOS は音の出る動画を同時に1本しか鳴らさず、前の素材を止める。
+      // 切れ目までは次の素材を音なしで動かし、切れ目を過ぎて動いてから音を戻す。
+      if(nextVideo && !transDur && t<nextClip.timelineStart && state.audioDefer?.id!==nextClip.id){
+        nextVideo.muted=true;
+        state.audioDefer={id:nextClip.id,name:nextClip.name,phase:'waiting',startAt:now,from:null,
+          unmuteAfter:nextClip.timelineStart};
+        recordPreviewDiagnostic('cut-incoming-muted',{clip:nextClip.name,from:active?.name,
+          timelineTime:Number(t.toFixed(3))});
+      }
       if(nextVideo && previewAudioGainsRef.current.has(nextClip.id)){
         try{
           const gainEntry = previewAudioGainsRef.current.get(nextClip.id);
@@ -12485,7 +12511,7 @@ function App(){
             gainEntry.gain.gain.setTargetAtTime(targetGain, previewAudioContextRef.current.currentTime, 0.01);
           }
           // 裏で再生しておく（同期ズレ防止）
-          if(nextVideo.paused && nextVideo.readyState >= 2 &&
+          if(crossfadeIncomingReady && nextVideo.paused && nextVideo.readyState >= 2 &&
              (state.heldTime===null || state.heldTime===undefined)){
             try{ nextVideo.play().catch(()=>{}); }catch{}
           }
@@ -12496,7 +12522,7 @@ function App(){
         nextVideo.volume=targetGain;
         nextVideo.muted=targetGain===0 || previewAutoplayMutedRef.current.has(nextVideo) ||
           (state.audioDefer?.id===nextClip.id && state.audioDefer.phase==='waiting');
-        if(targetGain>0 && nextVideo.paused && nextVideo.readyState>=2 &&
+        if(crossfadeIncomingReady && targetGain>0 && nextVideo.paused && nextVideo.readyState>=2 &&
            (state.heldTime===null || state.heldTime===undefined))
           requestPreviewPlay(nextVideo,nextClip,'crossfade-incoming');
       }
@@ -12606,7 +12632,8 @@ function App(){
     if(deferVideo){
       if(audioDefer.phase==='waiting' && !deferVideo.paused && !deferVideo.seeking){
         if(audioDefer.from===null) audioDefer.from=deferVideo.currentTime;
-        else if(deferVideo.currentTime-audioDefer.from>=0.02){
+        else if(deferVideo.currentTime-audioDefer.from>=0.02 &&
+                !(Number.isFinite(audioDefer.unmuteAfter) && t<audioDefer.unmuteAfter)){
           if(!previewAutoplayMutedRef.current.has(deferVideo)) deferVideo.muted=false;
           audioDefer.phase='checking';audioDefer.unmutedAt=now;audioDefer.unmuteFrom=deferVideo.currentTime;
           recordPreviewDiagnostic('incoming-unmute',{clip:audioDefer.name,ms:Math.round(now-audioDefer.startAt),
