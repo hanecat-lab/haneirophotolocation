@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-audio-delay';
+const VLOG_PREVIEW_BUILD='2026-10-06-start-trace';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -9300,7 +9300,7 @@ function App(){
   const previewDiagnosticRef = useRef({events:[],lastTime:null,lastClipId:null,lastProgressAt:0,
     stallReported:false,waitReason:'',lastErrorKey:'',lastErrorAt:0,mediaEventAt:{},
     hitches:[],hitchCount:0,hitchSummary:new Map(),drawMs:[],drawCount:0,drawMaxMs:0,drawSlow:0,drawProfiler:null,
-    mediaActivity:new Map()});
+    mediaActivity:new Map(),start:null});
   const previewDiagnosticWatchedRef = useRef(new WeakSet());
   const previewPlayPendingRef = useRef(new WeakMap());
   const previewPlayAttemptAtRef = useRef(new WeakMap());
@@ -12060,6 +12060,9 @@ function App(){
     const diag=previewDiagnosticRef.current;
     diag.events.push({at:new Date().toISOString(),type,...detail});
     if(diag.events.length>80) diag.events.splice(0,diag.events.length-80);
+    // 再生開始から3秒以内の音のイベントは、押し出されないよう別に残す。
+    if(diag.start && type.startsWith('audio-') && performance.now()-diag.start.at<=3000 && diag.start.events.length<30)
+      diag.start.events.push({ms:Math.round(performance.now()-diag.start.at),type,...detail});
     if(type==='stall' || type==='play-error' || type==='media-error')
       setPreviewDiagnosticCount(count=>count+1);
   };
@@ -12340,7 +12343,9 @@ function App(){
             error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`}));
       }catch{}
     });
-    recordPreviewDiagnostic('audio-unlock',{slots:previewAudioSlotsRef.current.slots.length});
+    const firstClip=vlogMediaClips(clipsRef.current).find(clip=>timeRef.current>=clip.timelineStart && timeRef.current<clip.timelineStart+clip.duration);
+    recordPreviewDiagnostic('audio-unlock',{slots:previewAudioSlotsRef.current.slots.length,
+      loaded:previewAudioSlotsRef.current.slots.map(slot=>slot.name),first:firstClip?.name??null});
   };
   const stopPreviewAudio=()=>{
     previewAudioSlotsRef.current.slots.forEach(slot=>{
@@ -12582,6 +12587,7 @@ function App(){
           p50Ms:pick(.5),p95Ms:pick(.95),maxMs:Number(diag.drawMaxMs.toFixed(1)),over33Ms:diag.drawSlow,
           profiler:diag.drawProfiler?.summary()||null};
       })(),
+      startTrace:diag.start?.trace||null,startEvents:diag.start?.events||null,
       recentEvents:diag.events.slice(-40)},null,2);
   };
   const capturePreviewDiagnostic=()=>{
@@ -13004,6 +13010,21 @@ function App(){
       };
       syncPreviewAudio(clipsNow,t,rate,now,cutInfo);
       videoRefs.current.forEach(video=>{ if(!video.muted) video.muted=true; });
+      // 再生開始から2秒間、0.1秒ごとに最初の素材の音のスロットと映像の位置を残す。
+      const start=previewDiagnosticRef.current.start,startElapsed=start ? performance.now()-start.at : Infinity;
+      if(startElapsed<=2000 && startElapsed-start.last>=100){
+        start.last=startElapsed;
+        const item=planPreviewAudio(clipsNow,t,cutInfo,sourceAudioVolumeRef.current)[0];
+        const slot=item ? previewAudioSlotsRef.current.slots.find(entry=>entry.key===item.key && entry.state!=='idle') : null;
+        const video=active ? videoRefs.current.get(active.id) : null;
+        start.trace.push({ms:Math.round(startElapsed),t:Number(t.toFixed(3)),
+          video:video?Number(video.currentTime.toFixed(3)):null,
+          ...(slot?{state:slot.state,paused:slot.audio.paused,readyState:slot.audio.readyState,
+            aud:Number(slot.audio.currentTime.toFixed(3)),delay:Number((slot.delayValue||0).toFixed(3)),
+            gain:slot.gain?Number(slot.gain.gain.value.toFixed(3)):null,
+            heard:Number((slot.audio.currentTime-(slot.delayValue||0)*slot.audio.playbackRate).toFixed(3)),
+            exp:Number(item.position.toFixed(3))}:{slot:null})});
+      }
     }
     // 音なしで始めた次の素材が動き出したら音を戻し、0.3秒後に止まっていないかを記録する。
     const audioDefer=state.audioDefer;
@@ -13498,6 +13519,7 @@ function App(){
       }catch{}
       requestPreviewPlay(firstVideo,activeAtStart,'tap-start');
     }
+    previewDiagnosticRef.current.start={at:performance.now(),last:-Infinity,trace:[],events:[]};
     if(!PREVIEW_VIDEO_AUDIBLE) unlockPreviewAudio();
     if(bgmAudioRef.current && bgmTrack!=='none'){
       bgmAudioRef.current.loop=true;
