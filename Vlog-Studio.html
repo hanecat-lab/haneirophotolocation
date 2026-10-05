@@ -8343,6 +8343,23 @@ function TextStylePreview({item,backdrop,onFontReady}){
 
 // The bar always shows the whole range, so only the edge the user touches ever moves.
 // Values remain a draft until the owning editor explicitly applies them.
+// 5ショットの派生素材を、記録しておいた元の素材へ戻す。5ショット後に足した素材はそのまま残す。
+function vlogFiveShotRevertPlan(current,before){
+  const parents=new Map((before||[]).map(c=>[c.id,c]));
+  const clips=[],removed=[],restored=[],seen=new Set();
+  for(const clip of current){
+    const parent=clip._fromFiveShot ? parents.get(clip._parentId) : null;
+    if(!parent){ clips.push(clip); continue; }
+    removed.push(clip);
+    if(seen.has(parent.id)) continue;
+    seen.add(parent.id);
+    const back={...parent,_transitionToNext:parent._transitionToNext?{...parent._transitionToNext}:undefined};
+    if(!back._transitionToNext) delete back._transitionToNext;
+    clips.push(back); restored.push(back);
+  }
+  return {clips,removed,restored};
+}
+
 function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragStart,onDragEnd,onSelectEdge,onFocusChange,getCurrentTime,label,removed=false,segments=null,snapPoints=null}){
   const [focus,setFocus]=useState('start');
   const [notice,setNotice]=useState('');
@@ -10018,6 +10035,7 @@ function App(){
   const [swipeMediaError,setSwipeMediaError]=useState('');
   const swipeVideoRef=useRef(null);
   const [fiveShotMode, setFiveShotMode] = useState(false);
+  const fiveShotBeforeRef = useRef(null);
   const [fiveShotType, setFiveShotType] = useState('smart'); // smart or filter
   // Level 1: Random tilt -1.2deg to 0.8deg
   useEffect(()=>{
@@ -16698,6 +16716,7 @@ const recomputeStarts=(arr)=>{
     const targetIds = (selectedClipIds.length>0 ? selectedClipIds : [clipsRef.current[0].id]).filter(id=>!clipsRef.current.find(c=>c.id===id)?._splitScreen);
     const targetClips = clipsRef.current.filter(c=> targetIds.includes(c.id));
     if(targetClips.length===0) return;
+    fiveShotBeforeRef.current=clipsRef.current.map(c=>({...c,_transitionToNext:c._transitionToNext?{...c._transitionToNext}:undefined}));
     setIsFiveShotAnalyzing(true);
     setAnalyzeText('スマート5ショット解析中...');
     setAnalyzeProgress(0);
@@ -16780,6 +16799,7 @@ const recomputeStarts=(arr)=>{
     const targetIds = (selectedClipIds.length>0 ? selectedClipIds : [clipsRef.current[0].id]).filter(id=>!clipsRef.current.find(c=>c.id===id)?._splitScreen);
     const targetClips = clipsRef.current.filter(c=> targetIds.includes(c.id));
     if(targetClips.length===0) return;
+    fiveShotBeforeRef.current=clipsRef.current.map(c=>({...c,_transitionToNext:c._transitionToNext?{...c._transitionToNext}:undefined}));
     setIsFiveShotAnalyzing(true);
     setAnalyzeText('フィルター物語5ショット作成中...');
     setAnalyzeProgress(0);
@@ -16931,7 +16951,48 @@ const recomputeStarts=(arr)=>{
 
   const handleFiveShot = useCallback(async ()=>{
     if(fiveShotMode){
+      const before=fiveShotBeforeRef.current;
+      const plan=before ? vlogFiveShotRevertPlan(clipsRef.current,before) : null;
+      if(!plan || plan.restored.length===0){
+        setFiveShotMode(false);
+        fiveShotBeforeRef.current=null;
+        setAnalyzeText('元の素材の記録がないため、素材は戻せません');
+        return;
+      }
+      if(!confirm('5ショット前の素材に戻しますか？5ショットで作った素材への編集は消えます。')) return;
+      handleStop();
+      for(const clip of plan.removed){
+        const video=videoRefs.current.get(clip.id);
+        if(video){
+          try{ video.pause(); video.src=''; video.load(); }catch{}
+          try{ cleanupClipAudioResources(clip.id); }catch{}
+          videoRefs.current.delete(clip.id);
+        }
+        photoRefs.current.delete(clip.id);
+      }
+      for(const clip of plan.restored){
+        if(clip.type==='photo'){
+          const image=new Image();image.src=clip.url;photoRefs.current.set(clip.id,image);
+          image.onload=()=>requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+        }else{
+          const video=document.createElement('video');video.src=clip.url;video.muted=true;
+          video.playsInline=true;video.preload='metadata';
+          video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');
+          videoRefs.current.set(clip.id,video);
+          video.addEventListener('loadeddata',()=>requestAnimationFrame(()=>drawFrameRef.current(timeRef.current)),{once:true});
+        }
+      }
+      const recomputed=recomputeStarts(plan.clips);
+      clipsRef.current=recomputed;
+      setClips(recomputed);
+      const maxEnd=recomputed.length ? Math.max(...recomputed.map(c=>c.timelineStart+c.duration)) : 3;
+      setDuration(maxEnd); durationRef.current=maxEnd;
+      setSelectedClipIds(plan.restored.map(c=>c.id));
+      timeRef.current=0; setCurrentTime(0); lastFrameHasVideoRef.current=false;
       setFiveShotMode(false);
+      fiveShotBeforeRef.current=null;
+      setAnalyzeText('5ショット前の素材に戻しました');
+      setTimeout(()=>{ syncCanvasSize(true); drawFrameRef.current(0); },60);
       return;
     }
     // デフォルトはタイプに応じて
@@ -16940,7 +17001,7 @@ const recomputeStarts=(arr)=>{
     } else {
       await handleFiveShotSmart();
     }
-  },[fiveShotMode, fiveShotType, handleFiveShotFilter, handleFiveShotSmart]);
+  },[fiveShotMode, fiveShotType, handleFiveShotFilter, handleFiveShotSmart, handleStop, cleanupClipAudioResources, syncCanvasSize]);
 
   const handleOmakaseEdit = useCallback(async ()=>{
     if(clipsRef.current.length===0){
