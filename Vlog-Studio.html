@@ -6658,15 +6658,16 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-audio-begin';
+const VLOG_PREVIEW_BUILD='2026-10-06-audio-handoff';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
   catch{return 'normal';}})();
 const PREVIEW_VIDEO_AUDIBLE=VLOG_SEAM_MODE==='legacy';
 // ?audiograph=off は音を WebAudio に通さない（音量は効かず消音のみ、ずれの合わせもしない）。
-const PREVIEW_AUDIO_PROBE=(()=>{try{return {graph:new URLSearchParams(location.search).get('audiograph')!=='off'};}
-  catch{return {graph:true};}})();
+const PREVIEW_AUDIO_PROBE=(()=>{try{const params=new URLSearchParams(location.search);
+  return {graph:params.get('audiograph')!=='off',handoff:params.get('audiohandoff')!=='off'};}
+  catch{return {graph:true,handoff:true};}})();
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -12262,13 +12263,20 @@ function App(){
   // 再生中の audio 要素は、位置の飛ばしでも速さの変更でも約0.5秒止まる（設計書 F8・F11）。
   // そのため要素は触らず、少し早めに鳴らし始めて、先行した分を WebAudio の DelayNode で遅らせて揃える。
   const PREVIEW_AUDIO_PREWARM=1.2,PREVIEW_AUDIO_HARD_DRIFT=0.6,PREVIEW_AUDIO_MARGIN=0.15,PREVIEW_AUDIO_MAX_DELAY=1.5;
+  // 鳴っている要素が途中で止まって遅れたままになったとき、空いている要素へ引き継ぐ基準。
+  const PREVIEW_AUDIO_HANDOFF_LAG=0.08,PREVIEW_AUDIO_HANDOFF_HOLD=300,PREVIEW_AUDIO_HANDOFF_GAP=2000;
   const previewAudioSlots=()=>{
     const store=previewAudioSlotsRef.current;
     while(store.slots.length<3){
       const audio=document.createElement('audio');
       audio.preload='auto';audio.setAttribute('playsinline','');
-      store.slots.push({index:store.slots.length,audio,url:null,key:null,name:null,state:'idle',gain:null,delay:null,
-        delayValue:0,routed:undefined});
+      const slot={index:store.slots.length,audio,url:null,key:null,name:null,state:'idle',gain:null,delay:null,
+        delayValue:0,routed:undefined,events:{}};
+      // 止まりの原因を探るため、要素ごとに最後の再生・停止の時刻を残す。
+      ['play','pause','playing','waiting'].forEach(type=>{
+        try{ audio.addEventListener(type,()=>{ slot.events[type]=performance.now(); }); }catch{}
+      });
+      store.slots.push(slot);
     }
     return store.slots;
   };
@@ -12326,6 +12334,7 @@ function App(){
     setPreviewAudioSlotDelay(slot,0,0);
     slot.state='playing';slot.startAt=now;slot.from=null;slot.advanced=false;slot.audibleAt=Infinity;
     slot.lastTrackAt=now;slot.preemptReported=false;slot.realigned=false;slot.begin=false;
+    slot.lagSince=null;slot.moveAt=null;slot.movePos=null;slot.stall=null;slot.handoffTo=null;
     playPreviewAudioSlot(slot,phase);
   };
   // 再生ボタンのタップ中に、最初の音をそのまま鳴らし始める（止めて鳴らし直さない）。
@@ -12385,6 +12394,18 @@ function App(){
   const notePreviewAudioSample=(list,ms)=>{
     list.push(ms);
     if(list.length>5) list.shift();
+  };
+  // 止まった瞬間の前後500msに、他の要素（音のスロット・映像の動画）が再生・停止したかを集める。
+  const previewAudioStallContext=slot=>{
+    const at=performance.now(),recent=value=>value!=null && at-value<=500 ? Math.round(at-value) : undefined;
+    const others=previewAudioSlotsRef.current.slots.filter(entry=>entry!==slot).map(entry=>({slot:entry.index,clip:entry.name,
+      state:entry.state,play:recent(entry.events.play),pause:recent(entry.events.pause),
+      playing:recent(entry.events.playing),waiting:recent(entry.events.waiting)}))
+      .filter(entry=>entry.play!==undefined || entry.pause!==undefined || entry.playing!==undefined || entry.waiting!==undefined);
+    const videos=[...(previewDiagnosticRef.current.mediaActivity?.values()||[])].map(entry=>({clip:entry.name,
+      play:recent(entry.lastPlayAt),pause:recent(entry.lastPauseAt)}))
+      .filter(entry=>entry.play!==undefined || entry.pause!==undefined);
+    return {self:{waiting:recent(slot.events.waiting),pause:recent(slot.events.pause)},others,videos};
   };
   // 毎フレーム呼ぶ。計画した音にスロットを割り当て、予熱・鳴らし始め・音量・ずれの合わせを行う。
   const syncPreviewAudio=(clipsNow,t,rate,now,cutInfo)=>{
@@ -12480,6 +12501,23 @@ function App(){
         }
         continue;
       }
+      if(slot.state==='retiring'){
+        // 引き継いだ古い要素。新しい要素が鳴り始めたら音量を0にし、200ms後に止めて空きに戻す。
+        const next=slot.handoffTo,item=planned.get(slot.key);
+        const nextAudible=next && next.state==='playing' && next.key===slot.key && now>=next.audibleAt;
+        if(!slot.retireAt && (nextAudible || !item || !next || next.state!=='playing' || now-slot.startAt>=2000)){
+          slot.retireAt=now;
+          setPreviewAudioSlotGain(slot,0);
+          if(nextAudible && item) recordPreviewDiagnostic('audio-handoff-done',{clip:slot.name,from:slot.index,to:next.index,
+            error:Number((next.audio.currentTime-next.delayValue*rate*item.speed-item.position).toFixed(3)),
+            timelineTime:Number(t.toFixed(3))});
+        }else if(!slot.retireAt) setPreviewAudioSlotGain(slot,item.gain);
+        if(slot.retireAt && now-slot.retireAt>=200){
+          try{ slot.audio.pause(); }catch{}
+          slot.state='idle';slot.retireAt=null;slot.handoffTo=null;
+        }
+        continue;
+      }
       if(slot.state!=='playing') continue;
       const item=planned.get(slot.key),audio=slot.audio,expected=expectedFor(slot);
       // 揃うまでは音量0（遅延を設定する瞬間の音の乱れを聞かせない）。
@@ -12528,8 +12566,34 @@ function App(){
         slot.preemptReported=true;
         recordPreviewDiagnostic('audio-preempted',{clip:slot.name,slot:slot.index,timelineTime:Number(t.toFixed(3))});
       }
+      // 要素が150ms以上進まなかったら止まりとして、動き出したときに長さと前後の様子を記録する。
+      if(slot.movePos===null || audio.currentTime!==slot.movePos){
+        if(slot.stall) recordPreviewDiagnostic('audio-stall',{clip:slot.name,slot:slot.index,ms:Math.round(now-slot.stall.at),
+          timelineTime:Number(slot.stall.t.toFixed(3)),context:slot.stall.context});
+        slot.stall=null;slot.movePos=audio.currentTime;slot.moveAt=now;
+      }else if(!slot.stall && !audio.paused && now-slot.moveAt>=150){
+        slot.stall={at:slot.moveAt,t,context:previewAudioStallContext(slot)};
+      }
       // 聞こえている位置 = 要素の位置 − 遅延分。
       const heardError=audio.currentTime-slot.delayValue*rate*item.speed-item.position;
+      // 遅れたままが続いたら、空いている要素で同じ音を正しい位置から鳴らし、揃ったら音量を入れ替える。
+      slot.lagSince=heardError<-PREVIEW_AUDIO_HANDOFF_LAG ? (slot.lagSince??now) : null;
+      if(PREVIEW_AUDIO_PROBE.handoff && slot.lagSince!==null && now-slot.lagSince>=PREVIEW_AUDIO_HANDOFF_HOLD &&
+         item.gain>0.2 && now-(slot.handoffAt??-Infinity)>=PREVIEW_AUDIO_HANDOFF_GAP && heardError>=-PREVIEW_AUDIO_HARD_DRIFT){
+        const spare=slots.find(entry=>entry.state==='idle');
+        if(spare){
+          // 空いている要素は鳴り始めが遅いことがある（読み込み直しなら約1.2秒）ので、多めに先行させ、先行分は遅延で吸収する。
+          const loaded=spare.url===item.url && spare.audio.readyState>=3;
+          loadPreviewAudioSlot(spare,item);
+          routePreviewAudioSlot(spare);
+          startPreviewAudioSlot(spare,item.position+Math.max(leadSpan,(loaded?0.6:1.2)*rate)*item.speed,rate,item.speed,now,'handoff');
+          spare.warmStart=false;spare.handoffAt=now;
+          slot.state='retiring';slot.handoffTo=spare;slot.retireAt=null;slot.startAt=now;
+          recordPreviewDiagnostic('audio-handoff',{clip:slot.name,from:slot.index,to:spare.index,loaded,
+            lag:Number(heardError.toFixed(3)),timelineTime:Number(t.toFixed(3))});
+          continue;
+        }
+      }
       const neededDelay=slot.delayValue+heardError/(rate*item.speed);
       if(heardError<-PREVIEW_AUDIO_HARD_DRIFT || neededDelay>PREVIEW_AUDIO_MAX_DELAY+0.2){
         // 大きくずれたときだけ、止めて位置を合わせ直す（1回分の途切れを許す）。
