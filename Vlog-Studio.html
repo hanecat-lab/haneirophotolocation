@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-cut-prewarm';
+const VLOG_PREVIEW_BUILD='2026-10-06-bgm-gain';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -8909,6 +8909,37 @@ const vlogMediaClips=list=>list.flatMap(clip=>clip._splitScreen
 const vlogClipSourceGain=(clip,master=1)=>Math.max(0,Math.min(1,master)) *
   Math.max(0,Math.min(1,Number.isFinite(clip?._sourceAudioGain)?clip._sourceAudioGain:1)) *
   (clip?._sourceAudioMuted || clip?._splitMuted ? 0 : 1);
+// BGM のクリップの音量 = 全体の音量 × クリップごとの音量（0〜150%） × フェード。プレビューと書き出しで共通。
+const vlogBgmFadeFactor=(clip,t)=>{
+  const start=clip.timelineStart,end=start+clip.duration;
+  if(!(t>=start && t<end)) return 0;
+  const fadeIn=Math.max(0,Number(clip.fadeIn)||0),fadeOut=Math.max(0,Number(clip.fadeOut)||0);
+  return Math.max(0,Math.min(1,fadeIn?(t-start)/fadeIn:1,fadeOut?(end-t)/fadeOut:1));
+};
+const vlogBgmClipGain=(clip,master,t)=>Math.max(0,Math.min(1,Number(master)||0)) *
+  Math.max(0,Math.min(1.5,Number.isFinite(clip?.gain)?clip.gain:1))*vlogBgmFadeFactor(clip,t);
+// 声が鳴っている間だけ BGM を下げる（ダッキング）。素材の音の大きさ（dBFS）から、BGM に掛ける係数を求める。
+const VLOG_BGM_DUCK={thresholdDb:-38,attack:0.08,hold:0.4,release:0.5};
+const vlogBgmDuckStep=(state,levelDb,dt,amount)=>{
+  const depth=Math.max(0,Math.min(1,Number(amount)||0));
+  if(depth<=0) return {factor:1,holdLeft:0,voice:false};
+  const target=1-depth,previous=state||{factor:1,holdLeft:0};
+  const voice=levelDb>VLOG_BGM_DUCK.thresholdDb;
+  const holdLeft=voice?VLOG_BGM_DUCK.hold:Math.max(0,previous.holdLeft-dt);
+  const factor=voice || holdLeft>0
+    ? Math.max(target,Math.min(previous.factor,1)-depth*dt/VLOG_BGM_DUCK.attack)
+    : Math.min(1,Math.max(previous.factor,target)+depth*dt/VLOG_BGM_DUCK.release);
+  return {factor,holdLeft,voice};
+};
+// AnalyserNode の音の大きさ（RMS、dBFS）。
+const vlogAnalyserLevelDb=(analyser,buffer)=>{
+  if(!analyser || !buffer) return -Infinity;
+  try{ analyser.getFloatTimeDomainData(buffer); }catch{ return -Infinity; }
+  let sum=0;
+  for(let i=0;i<buffer.length;i++) sum+=buffer[i]*buffer[i];
+  const rms=Math.sqrt(sum/buffer.length);
+  return rms>0 ? 20*Math.log10(rms) : -Infinity;
+};
 // プレビューの音の計画。素材が音を出す元（分割画面は音を担当する子）と、時刻 t での再生位置を返す。
 const vlogPreviewAudioSources=(clip,t)=>{
   if(!clip) return [];
@@ -10493,6 +10524,12 @@ function App(){
   const [bgmTrack, setBgmTrack] = useState('none');
   const [bgmOffset, setBgmOffset] = useState(0);
   const [bgmVolume, setBgmVolume] = useState(0.5);
+  // 声のとき BGM を下げる量（0〜1）。再生中の tick から最新の値を読むため ref にも置く。
+  const [bgmDuckAmount, setBgmDuckAmount] = useState(0.5);
+  const bgmVolumeRef = useRef(0.5);
+  const bgmDuckAmountRef = useRef(0.5);
+  bgmVolumeRef.current = bgmVolume;
+  bgmDuckAmountRef.current = bgmDuckAmount;
   // Ambient Bed for cafe
   const [ambientBedVolume, setAmbientBedVolume] = useState(0.15);
   const [sourceAudioVolume, setSourceAudioVolume] = useState(1);
@@ -10740,7 +10777,8 @@ function App(){
   const [exportDiagnosticText, setExportDiagnosticText] = useState('');
   const [exportDiagnosticVisible, setExportDiagnosticVisible] = useState(false);
   const exportJobRef = useRef(null);
-  const exportAudioRef = useRef({context:null, sources:new WeakMap()});
+  const exportAudioRef = useRef({context:null, sources:new WeakMap(), bgmGains:new WeakMap()});
+  const previewDuckRef = useRef({context:null, analyser:null, buffer:null});
   const [photoDuration, setPhotoDuration] = useState(2.5);
   const [bulkPhotoDuration, setBulkPhotoDuration] = useState(2.5);
   const [selectedTransition, setSelectedTransition] = useState(null);
@@ -12261,6 +12299,71 @@ function App(){
     video.muted=true;
     return 'muted';
   };
+  // ---- BGM の音量（GainNode） ----
+  // iOS は audio 要素の volume を無視するため、BGM の要素は書き出し用の AudioContext に一度だけつなぎ、
+  // 試聴・プレビュー用の GainNode で音量・フェード・ダッキングをかける。書き出しも同じ要素の source を使う。
+  // 止まっている AudioContext につなぐと音が出なくなるため、動いているときだけつなぐ（それ以外は volume で代わりにする）。
+  const resumeBgmAudioContext=()=>{
+    const audio=exportAudioRef.current;
+    try{
+      if(!audio.context || audio.context.state==='closed'){
+        const Context=window.AudioContext || window.webkitAudioContext;
+        if(!Context) return null;
+        audio.context=new Context();
+        audio.sources=new WeakMap();
+        audio.bgmGains=new WeakMap();
+      }
+      const resumed=audio.context.resume();
+      if(resumed?.catch) resumed.catch(()=>{});
+    }catch{}
+    return audio.context;
+  };
+  const routeBgmElement=element=>{
+    const audio=exportAudioRef.current;
+    if(!element || !audio.context || audio.context.state!=='running') return audio.bgmGains?.get(element)||null;
+    if(!audio.bgmGains) audio.bgmGains=new WeakMap();
+    const existing=audio.bgmGains.get(element);
+    if(existing) return existing;
+    try{
+      let source=audio.sources.get(element);
+      if(!source){ source=audio.context.createMediaElementSource(element); audio.sources.set(element,source); }
+      else{ try{ source.disconnect(); }catch{} }
+      const gain=audio.context.createGain();
+      gain.gain.value=0;
+      source.connect(gain);gain.connect(audio.context.destination);
+      audio.bgmGains.set(element,gain);
+      element.volume=1;
+      recordPreviewDiagnostic('bgm-graph',{ok:true});
+      return gain;
+    }catch(error){
+      recordPreviewDiagnostic('bgm-graph',{ok:false,error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`});
+      return null;
+    }
+  };
+  const setBgmElementGain=(element,value,smooth=0.03)=>{
+    if(!element) return null;
+    const gain=routeBgmElement(element);
+    if(gain){
+      try{
+        if(smooth) gain.gain.setTargetAtTime(value,gain.context.currentTime,smooth);
+        else{ gain.gain.cancelScheduledValues(gain.context.currentTime); gain.gain.setValueAtTime(value,gain.context.currentTime); }
+      }catch{ gain.gain.value=value; }
+      return gain;
+    }
+    try{ const volume=Math.max(0,Math.min(1,value)); if(Math.abs(element.volume-volume)>0.02) element.volume=volume; }catch{}
+    return null;
+  };
+  // プレビューで実際に聞こえている素材の音（音のスロットの出力）の大きさを測る。BGM はつながない。
+  const previewDuckAnalyser=context=>{
+    const duck=previewDuckRef.current;
+    if(duck.context!==context){
+      try{
+        duck.analyser=context.createAnalyser();duck.analyser.fftSize=1024;
+        duck.buffer=new Float32Array(duck.analyser.fftSize);duck.context=context;
+      }catch{ duck.analyser=null;duck.buffer=null;duck.context=context; }
+    }
+    return duck.analyser;
+  };
   // ---- 音専用スロット（3本） ----
   // iOS は再生の許可を要素ごとに与えるため、3本とも再生ボタンのタップ中に許可を取る。
   // 再生中の audio 要素は、位置の飛ばしでも速さの変更でも約0.5秒止まる（設計書 F8・F11）。
@@ -12295,6 +12398,8 @@ function App(){
       const source=context.createMediaElementSource(slot.audio),delay=context.createDelay(2),gain=context.createGain();
       gain.gain.value=0;delay.delayTime.value=0;
       source.connect(delay);delay.connect(gain);gain.connect(context.destination);
+      const analyser=previewDuckAnalyser(context);
+      if(analyser) gain.connect(analyser);
       slot.gain=gain;slot.delay=delay;slot.routed=true;
       recordPreviewDiagnostic('audio-graph',{slot:slot.index,ok:true});
     }catch(error){
@@ -12788,7 +12893,16 @@ function App(){
       previewAudio:{probe:PREVIEW_AUDIO_PROBE,lead:Number(audioStore.lead.toFixed(3)),startSamples:audioStore.startSamples.slice(),
         warmSamples:audioStore.warmSamples.slice(),slots:audioStore.slots.map(slot=>({slot:slot.index,state:slot.state,
           clip:slot.name,routed:slot.routed,paused:slot.audio.paused,time:Number(slot.audio.currentTime.toFixed(3)),
-          rate:Number(slot.audio.playbackRate.toFixed(3)),delay:Number((slot.delayValue||0).toFixed(3))}))},run:previewTapRef.current.run,
+          rate:Number(slot.audio.playbackRate.toFixed(3)),delay:Number((slot.delayValue||0).toFixed(3))})),
+        bgm:(()=>{
+          const playback=previewPlaybackRef.current,diagBgm=playback?.bgmDiag;
+          const round=value=>Array.isArray(value)?value.map(round):Number.isFinite(value)?Number(value.toFixed(3)):value;
+          return {duckAmount:bgmDuckAmountRef.current,master:bgmVolumeRef.current,
+            voiceLevelDb:Number.isFinite(playback?.bgmDuckLevel)?Number(playback.bgmDuckLevel.toFixed(1)):null,
+            duckFactor:round(playback?.bgmDuck?.factor??1),routed:!!(bgmAudioRef.current && exportAudioRef.current.bgmGains?.get(bgmAudioRef.current)),
+            contextState:exportAudioRef.current.context?.state||null,
+            ...(diagBgm?Object.fromEntries(Object.entries(diagBgm).map(([key,value])=>[key,round(value)])):{})};
+        })()},run:previewTapRef.current.run,
       msSinceLastTap:previewTapRef.current.at===null?null:Math.round(performance.now()-previewTapRef.current.at),
       capturedAt:new Date().toISOString(),
       browser:navigator.userAgent,now:previewDiagnosticSnapshot('手動で状態を記録'),
@@ -13575,11 +13689,19 @@ function App(){
       state.releasedThrough=i;
     }
     if(retired) watchPreviewMedia();
+    // 声が鳴っている間だけ BGM を下げる係数（素材の音のスロットの出力を測る）。
+    {
+      const duck=previewDuckRef.current,level=vlogAnalyserLevelDb(duck.analyser,duck.buffer);
+      const dt=Math.max(0,Math.min(0.1,(now-(state.bgmDuckAt??now))/1000));
+      state.bgmDuck=vlogBgmDuckStep(state.bgmDuck,level,dt,bgmDuckAmountRef.current);
+      state.bgmDuckAt=now;state.bgmDuckLevel=level;
+    }
+    const bgmDuckFactor=state.bgmDuck?.factor??1;
     if(bgmTrack!=='none'){
       try{
         const activeClips = (bgmClipsRef.current && bgmClipsRef.current.length>0) 
           ? bgmClipsRef.current.filter(c=> t >= c.timelineStart && t < c.timelineStart + c.duration).sort((a,b)=>a.timelineStart-b.timelineStart)
-          : [{id:'single', trackId: bgmTrack, timelineStart: (bgmTimelineStartRef.current||0), duration: (bgmTimelineDurationRef.current||10), offset: (bgmOffsetRef.current||0), fadeIn: (bgmFadeInRef.current||1), fadeOut: (bgmFadeOutRef.current||1), volume: bgmVolume, url: null}];
+          : [{id:'single', trackId: bgmTrack, timelineStart: (bgmTimelineStartRef.current||0), duration: (bgmTimelineDurationRef.current||10), offset: (bgmOffsetRef.current||0), fadeIn: (bgmFadeInRef.current||1), fadeOut: (bgmFadeOutRef.current||1), gain: 1, url: null}];
         const ensureAudio = (ref)=>{
           if(!ref.current){
             ref.current = new Audio();
@@ -13590,8 +13712,8 @@ function App(){
           return ref.current;
         };
         if(activeClips.length===0){
-          if(bgmAudioRef.current){ try{ bgmAudioRef.current.pause(); bgmAudioRef.current.volume=0; }catch{} }
-          try{ if(bgmAudioRef2.current){ try{ bgmAudioRef2.current.pause(); bgmAudioRef2.current.volume=0; }catch{} } }catch{}
+          if(bgmAudioRef.current){ try{ bgmAudioRef.current.pause(); setBgmElementGain(bgmAudioRef.current,0); }catch{} }
+          try{ if(bgmAudioRef2.current){ try{ bgmAudioRef2.current.pause(); setBgmElementGain(bgmAudioRef2.current,0); }catch{} } }catch{}
         } else if(activeClips.length===1){
           const clip = activeClips[0];
           const bgm = ensureAudio(bgmAudioRef);
@@ -13614,14 +13736,11 @@ function App(){
           } else {
             state.bgmDriftSince=0;
           }
-          const fIn = Math.max(0, clip.fadeIn);
-          const fOut = Math.max(0, clip.fadeOut);
-          const bStart = clip.timelineStart;
-          const bEnd = bStart + clip.duration;
-          const factor = t < bStart || t >= bEnd ? 0 : Math.min(1, fIn ? (t - bStart)/fIn : 1, fOut ? (bEnd - t)/fOut : 1);
-          const targetVol = (clip.volume ?? bgmVolume) * Math.max(0, factor);
-          try{ if(Math.abs(bgm.volume - targetVol) > 0.02) bgm.volume = targetVol; }catch{}
-          try{ if(bgmAudioRef2.current){ try{ bgmAudioRef2.current.pause(); bgmAudioRef2.current.volume=0; }catch{} } }catch{}
+          const targetVol = vlogBgmClipGain(clip, bgmVolumeRef.current, t) * bgmDuckFactor;
+          setBgmElementGain(bgm,targetVol);
+          state.bgmDiag={clip:clip.name||clip.trackId,master:bgmVolumeRef.current,clipGain:Number.isFinite(clip.gain)?clip.gain:1,
+            fade:vlogBgmFadeFactor(clip,t),duck:bgmDuckFactor,gain:targetVol,time:bgm.currentTime,expected:bgmTarget};
+          try{ if(bgmAudioRef2.current){ try{ bgmAudioRef2.current.pause(); setBgmElementGain(bgmAudioRef2.current,0); }catch{} } }catch{}
         } else {
           const clipA = activeClips[0];
           const clipB = activeClips[1];
@@ -13640,16 +13759,12 @@ function App(){
           if(bgmB.paused){ try{ requestPreviewPlay(bgmB,null,'bgm-tick-B'); }catch{} }
           if(Math.abs(bgmA.currentTime-targetA)>0.6){ try{ bgmA.currentTime=Math.max(0,targetA); }catch{} }
           if(Math.abs(bgmB.currentTime-targetB)>0.6){ try{ bgmB.currentTime=Math.max(0,targetB); }catch{} }
-          const fInA = Math.max(0, clipA.fadeIn);
-          const fOutA = Math.max(0, clipA.fadeOut);
-          const fInB = Math.max(0, clipB.fadeIn);
-          const fOutB = Math.max(0, clipB.fadeOut);
-          const factorA = t < clipA.timelineStart || t >= clipA.timelineStart+clipA.duration ? 0 : Math.min(1, fInA ? (t - clipA.timelineStart)/fInA : 1, fOutA ? (clipA.timelineStart+clipA.duration - t)/fOutA : 1);
-          const factorB = t < clipB.timelineStart || t >= clipB.timelineStart+clipB.duration ? 0 : Math.min(1, fInB ? (t - clipB.timelineStart)/fInB : 1, fOutB ? (clipB.timelineStart+clipB.duration - t)/fOutB : 1);
-          const volA = (clipA.volume ?? bgmVolume) * Math.max(0, factorA);
-          const volB = (clipB.volume ?? bgmVolume) * Math.max(0, factorB);
-          try{ if(Math.abs(bgmA.volume - volA) > 0.02) bgmA.volume = volA; }catch{}
-          try{ if(Math.abs(bgmB.volume - volB) > 0.02) bgmB.volume = volB; }catch{}
+          const volA = vlogBgmClipGain(clipA, bgmVolumeRef.current, t) * bgmDuckFactor;
+          const volB = vlogBgmClipGain(clipB, bgmVolumeRef.current, t) * bgmDuckFactor;
+          setBgmElementGain(bgmA,volA);
+          setBgmElementGain(bgmB,volB);
+          state.bgmDiag={clip:`${clipA.name||clipA.trackId} + ${clipB.name||clipB.trackId}`,master:bgmVolumeRef.current,
+            duck:bgmDuckFactor,gain:[volA,volB],time:bgmA.currentTime,expected:targetA};
         }
       }catch(e){ console.log('BGM tick error', e); }
     }
@@ -13785,6 +13900,8 @@ function App(){
     const begun=PREVIEW_VIDEO_AUDIBLE ? null :
       beginPreviewAudio(clipsRef.current,timeRef.current,playbackRateRef.current,performance.now(),null);
     if(!PREVIEW_VIDEO_AUDIBLE) unlockPreviewAudio(begun);
+    // BGM の音量を GainNode でかけるため、タップ中に AudioContext を動かしておく（iOS）。
+    if(bgmTrack!=='none') resumeBgmAudioContext();
     const bgmOn=!!bgmAudioRef.current && bgmTrack!=='none';
     if(bgmOn){
       bgmAudioRef.current.loop=true;
@@ -14073,11 +14190,17 @@ function App(){
         if(!audio.context || audio.context.state==='closed'){
           audio.context=new Context();
           audio.sources=new WeakMap();
+          audio.bgmGains=new WeakMap();
         }
         audioContext=audio.context;
         const resume=audioContext.resume();
         if(resume?.then) await resume;
         destination=audioContext.createMediaStreamDestination();
+        // 声が鳴っている間だけ BGM を下げるため、素材の音の大きさを測る（BGM はつながない）。
+        try{
+          job.duckAnalyser=audioContext.createAnalyser();job.duckAnalyser.fftSize=1024;
+          job.duckBuffer=new Float32Array(job.duckAnalyser.fftSize);
+        }catch{ job.duckAnalyser=null;job.duckBuffer=null; }
         const connect=(element, volume, monitor=false)=>{
           let source=audio.sources.get(element);
           if(!source){
@@ -14100,12 +14223,15 @@ function App(){
           job.videos.set(clip.id,entry);
           video.muted=vlogClipSourceGain(clip,sourceAudioVolume)===0;
           entry.gain=connect(video,0);
+          if(job.duckAnalyser) try{ entry.gain.connect(job.duckAnalyser); }catch{}
         }
         if(bgm){
           if(bgm.readyState<2 || !bgm.currentSrc) throw new Error('BGMを読み込めません。BGMを確認してから再度お試しください。');
           bgmVolumeBefore=bgm.volume;
           bgm.volume=1;
-          job.bgmGain=connect(bgm,0,true);
+          // 試聴・プレビュー用の GainNode を先につないでおく（書き出し中に聞こえる音も同じ音量にする）。
+          job.bgmMonitor=routeBgmElement(bgm);
+          job.bgmGain=connect(bgm,0,!job.bgmMonitor);
         }
       }
       const exportVideoItems=mediaItems.filter(clip=>clip.type==='video');
@@ -14448,29 +14574,29 @@ function App(){
           }
           let totalBgmGain = 0;
           try{
+            const duckLevel=vlogAnalyserLevelDb(job.duckAnalyser,job.duckBuffer),duckNow=performance.now();
+            job.bgmDuck=vlogBgmDuckStep(job.bgmDuck,duckLevel,Math.max(0,Math.min(0.1,(duckNow-(job.bgmDuckAt??duckNow))/1000)),bgmDuckAmountRef.current);
+            job.bgmDuckAt=duckNow;
+            const duckFactor=job.bgmDuck.factor;
             if(job.bgmClips && job.bgmClips.length>0){
               for(const bClip of job.bgmClips){
                 const bStart = bClip.timelineStart;
                 const bEnd = bStart + bClip.duration;
                 if(t >= bStart && t < bEnd){
-                  const fIn = Math.max(0, bClip.fadeIn);
-                  const fOut = Math.max(0, bClip.fadeOut);
-                  const bFactor = Math.min(1, fIn ? (t - bStart)/fIn : 1, fOut ? (bEnd - t)/fOut : 1);
-                  totalBgmGain += (bClip.volume ?? bgmVolume) * Math.max(0, bFactor);
+                  totalBgmGain += vlogBgmClipGain(bClip, bgmVolumeRef.current, t);
                   if(job.bgmClipId !== bClip.id){
                     job.bgmClipId = bClip.id;
                     job.bgmOffset = bClip.offset;
                   }
                 }
               }
-              job.bgmGain.gain.value = bgmReady && !bgm.seeking ? Math.min(1, totalBgmGain) : 0;
+              job.bgmGain.gain.value = bgmReady && !bgm.seeking ? Math.min(1.5, totalBgmGain)*duckFactor : 0;
             } else {
-              const start=bgmTimelineStartRef.current;
-              const end=start+bgmTimelineDurationRef.current;
-              const fadeIn=Math.max(0,bgmFadeInRef.current), fadeOut=Math.max(0,bgmFadeOutRef.current);
-              const factor=t<start || t>=end ? 0 : Math.min(1,fadeIn? (t-start)/fadeIn : 1,fadeOut? (end-t)/fadeOut : 1);
-              job.bgmGain.gain.value=bgmReady && !bgm.seeking ? bgmVolume*Math.max(0,factor) : 0;
+              const single={timelineStart:bgmTimelineStartRef.current,duration:bgmTimelineDurationRef.current,
+                fadeIn:bgmFadeInRef.current,fadeOut:bgmFadeOutRef.current,gain:1};
+              job.bgmGain.gain.value=bgmReady && !bgm.seeking ? vlogBgmClipGain(single,bgmVolumeRef.current,t)*duckFactor : 0;
             }
+            if(job.bgmMonitor) job.bgmMonitor.gain.value=job.bgmGain.gain.value;
           }catch(e){ console.log('export fade error', e); }
         }
         const visibleVideos=mediaItems.filter(clip=>clip.type==='video' &&
@@ -15669,7 +15795,7 @@ const recomputeStarts=(arr)=>{
       settings:{aspectMode,fitMode,verticalPriority,autoVerticalDetect,activeFilter,filterIntensity,
         photoDuration,bulkPhotoDuration,defaultTransition,fiveShotMode,fiveShotType,selectedClipIds,
         exportSizeMode,
-        bgmTrack,bgmOffset,bgmVolume,sourceAudioVolume,bgmTimelineStart,bgmTimelineDuration,bgmFadeIn,bgmFadeOut,
+        bgmTrack,bgmOffset,bgmVolume,bgmDuckAmount,sourceAudioVolume,bgmTimelineStart,bgmTimelineDuration,bgmFadeIn,bgmFadeOut,
         showSafeArea,autoLayoutEnabled,cafeStoreName,playhead:timeRef.current}};
   };
   const saveCurrentProject=async()=>{
@@ -15734,7 +15860,7 @@ const recomputeStarts=(arr)=>{
     clips,texts,customBgms,materialThumbnails,selectedClipIds,aspectMode,fitMode,verticalPriority,autoVerticalDetect,
     activeFilter,filterIntensity,photoDuration,bulkPhotoDuration,defaultTransition,fiveShotMode,fiveShotType,
     exportSizeMode,
-    bgmTrack,bgmOffset,bgmVolume,sourceAudioVolume,bgmTimelineStart,bgmTimelineDuration,bgmFadeIn,bgmFadeOut,
+    bgmTrack,bgmOffset,bgmVolume,bgmDuckAmount,sourceAudioVolume,bgmTimelineStart,bgmTimelineDuration,bgmFadeIn,bgmFadeOut,
     showSafeArea,autoLayoutEnabled,cafeStoreName
   ]);
   useEffect(()=>{
@@ -15892,6 +16018,7 @@ const recomputeStarts=(arr)=>{
       setExportSizeMode(VLOG_EXPORT_PROFILES[settings.exportSizeMode]?settings.exportSizeMode:'compact');
       setBgmTrack(bgms.some(b=>b.id===settings.bgmTrack)||!String(settings.bgmTrack||'').startsWith('custom_')?settings.bgmTrack||'none':'none');
       setBgmOffset(settings.bgmOffset||0);setBgmVolume(settings.bgmVolume??0.5);
+      setBgmDuckAmount(Number.isFinite(settings.bgmDuckAmount)?Math.max(0,Math.min(1,settings.bgmDuckAmount)):0.5);
       setSourceAudioVolume(Number.isFinite(settings.sourceAudioVolume)
         ?Math.max(0,Math.min(1,settings.sourceAudioVolume)):1);
       setBgmTimelineStart(settings.bgmTimelineStart||0);setBgmTimelineDuration(settings.bgmTimelineDuration||10);
@@ -18160,7 +18287,7 @@ const recomputeStarts=(arr)=>{
         offset: 0,
         fadeIn: 0.8,
         fadeOut: 0.8,
-        volume: bgmVolume,
+        gain: 1,
         _fullDuration: fullDuration
       };
       const newClips = [...(bgmClipsRef.current||[]), newClip].sort((a,b)=>a.timelineStart - b.timelineStart);
@@ -18189,7 +18316,7 @@ const recomputeStarts=(arr)=>{
         offset: bgmOffset,
         fadeIn: bgmFadeIn,
         fadeOut: bgmFadeOut,
-        volume: bgmVolume,
+        gain: 1,
         _fullDuration: bgmFullDuration || bgmTimelineDuration
       };
       bgmClipsRef.current = [clip];
@@ -18313,7 +18440,7 @@ const recomputeStarts=(arr)=>{
     };
     audio.oncanplay=canplay;audio.onerror=error;
     audio.loop=!!(playingRef.current || bgmAuditionRef.current);
-    audio.volume=bgmVolume;
+    if(!playingRef.current) setBgmElementGain(audio,bgmVolume,0);
     const currentSrc=audio.src||'';
     const fileName=src.split('/').pop().split('?')[0];
     if(customBgm?currentSrc!==src:!currentSrc.includes(fileName)){
@@ -21913,7 +22040,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                         offset: 0,
                         fadeIn: 0.8,
                         fadeOut: 0.8,
-                        volume: bgmVolume,
+                        gain: 1,
                         _fullDuration: fullDur || 15
                       };
                       const newClips = [...bgmClipsRef.current, newClip].sort((a,b)=>a.timelineStart - b.timelineStart);
@@ -21932,6 +22059,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                           bgmAudioRef.current.volume=bgmVolume;
                           bgmAudioRef.current.crossOrigin='anonymous';
                         }
+                        resumeBgmAudioContext();setBgmElementGain(bgmAudioRef.current,bgmVolume,0);
                         try{
                           bgmAudioRef.current.pause();
                           bgmAudioRef.current.src = b.url;
@@ -21999,6 +22127,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   try{
                     if(bgmAudioRef.current.paused){
                       ++bgmPlaybackSessionRef.current;bgmAuditionRef.current=true;
+                      resumeBgmAudioContext();setBgmElementGain(bgmAudioRef.current,bgmVolume,0);
                       bgmAudioRef.current.loop=true;
                       const p = bgmAudioRef.current.play();
                       if(p&&p.then) p.catch(()=>{});
@@ -22208,6 +22337,22 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 )
               )
             ),
+            selectedBgmClipId && (()=>{
+              const selectedGain=bgmClips.find(c=>c.id===selectedBgmClipId)?.gain;
+              const clipGain=Number.isFinite(selectedGain)?selectedGain:1;
+              return React.createElement('div', {className:'space-y-1'},
+                React.createElement('div', {className:'flex items-center justify-between'},
+                  React.createElement('div', {className:'text-[10px] text-white/60'}, 'このBGMの音量'),
+                  React.createElement('span', {className:'text-[9px] font-mono text-white/50'}, `${Math.round(clipGain*100)}%`)
+                ),
+                React.createElement('input', {
+                  type:'range', min:0, max:1.5, step:0.05, value:clipGain,
+                  'aria-label':'このBGMの音量',
+                  onChange:e=>{ const v=parseFloat(e.target.value); if(Number.isFinite(v)) updateBgmClip(selectedBgmClipId,{gain:v}); },
+                  className:'w-full accent-violet-500 h-1'
+                })
+              );
+            })(),
             React.createElement('div', {className:'flex gap-2'},
               React.createElement('button', {
                 onClick:()=>{
@@ -22258,9 +22403,22 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
           ),
           React.createElement('input', {
             type:'range', min:0, max:1, step:0.05, value:bgmVolume,
-            onChange:e=>{ const v=parseFloat(e.target.value); setBgmVolume(v); if(bgmAudioRef.current) bgmAudioRef.current.volume=v; },
+            onChange:e=>{ const v=parseFloat(e.target.value); setBgmVolume(v); bgmVolumeRef.current=v;
+              if(!playingRef.current && bgmAudioRef.current) setBgmElementGain(bgmAudioRef.current,v,0); },
             className:'w-full accent-violet-500'
-          })
+          }),
+          React.createElement('div', {className:'flex items-center justify-between mt-3 mb-1'},
+            React.createElement('div', {className:'text-[11px] text-white/60'}, '声のときBGMを下げる'),
+            React.createElement('div', {className:'text-[11px] font-mono bg-black/50 px-2 py-1 rounded'}, bgmDuckAmount>0 ? `${Math.round(bgmDuckAmount*100)}%` : 'オフ')
+          ),
+          React.createElement('input', {
+            type:'range', min:0, max:1, step:0.05, value:bgmDuckAmount,
+            'aria-label':'声のときBGMを下げる量',
+            onChange:e=>{ const v=parseFloat(e.target.value); setBgmDuckAmount(v); bgmDuckAmountRef.current=v; },
+            className:'w-full accent-violet-500'
+          }),
+          React.createElement('div',{className:'text-[10px] text-white/45 mt-1'},
+            '素材の音（声など）が鳴っている間だけ、BGMをこの割合だけ下げます。0%でオフ。')
         )
       ),
             activeTab==='preset' && React.createElement('section', {className:'p-3 rounded-xl border border-white/10 bg-[#111113]', 'aria-label':'物語テンプレート'},
