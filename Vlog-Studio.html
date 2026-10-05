@@ -7676,6 +7676,32 @@ const vlogTextFont=key=>VLOG_TEXT_FONTS.find(font=>font.key===key)?.family ||
 const vlogTextFontWeight=txt=>txt.bold?(VLOG_TEXT_FONTS.find(font=>font.key===txt.fontFamily)?.boldWeight||700):400;
 const vlogTextFontSpec=(txt,size)=>`${vlogTextFontWeight(txt)} ${size}px ${vlogTextFont(txt.fontFamily)}`;
 
+const VLOG_TEXT_LAYER_CACHE=new Map();
+// 文字の濃さが100%未満のとき、縁取り・影・文字を裏のcanvasにまとめて描き、1枚として透かして重ねる。
+function paintVlogCaptionGlyphs(ctx,paint,opacity,box,key,fontSize){
+  if(opacity>=0.999){ paint(ctx); return; }
+  const m=Math.ceil(Math.max(2,fontSize*0.12)+Math.max(2,fontSize*0.1)*2+fontSize*0.5);
+  const left=Math.floor(box.left-m),top=Math.floor(box.top-m);
+  const w=Math.max(1,Math.ceil(box.width+m*2)),h=Math.max(1,Math.ceil(box.height+m*2));
+  const cacheKey=`${key}|${left}|${top}|${w}|${h}`;
+  let layer=VLOG_TEXT_LAYER_CACHE.get(cacheKey);
+  if(layer){
+    VLOG_TEXT_LAYER_CACHE.delete(cacheKey);
+  }else{
+    layer=document.createElement('canvas');layer.width=w;layer.height=h;
+    const g=layer.getContext('2d');
+    g.translate(-left,-top);
+    paint(g);
+  }
+  VLOG_TEXT_LAYER_CACHE.set(cacheKey,layer);
+  while(VLOG_TEXT_LAYER_CACHE.size>8) VLOG_TEXT_LAYER_CACHE.delete(VLOG_TEXT_LAYER_CACHE.keys().next().value);
+  ctx.save();
+  ctx.globalAlpha*=opacity;
+  ctx.shadowColor='transparent';ctx.shadowBlur=0;
+  ctx.drawImage(layer,left,top);
+  ctx.restore();
+}
+
 function drawVlogCaption(ctx,txt,width,height,options={}){
   const content=options.sampleText??txt.text??'';
   const x=options.x??(txt.x??50)/100*width;
@@ -7732,11 +7758,16 @@ function drawVlogCaption(ctx,txt,width,height,options={}){
   }
 
   const isVertical = !!txt.vertical;
+  // 文字の濃さ（縁取り・影ごと均一に透かす）。値のない古いデータは100%。
+  const rawOpacity=Number(txt.textOpacity);
+  const textOpacity=Number.isFinite(rawOpacity)&&rawOpacity>0 ? Math.max(0.2,Math.min(1,rawOpacity)) : 1;
   const vSpacing = Number.isFinite(txt.verticalSpacing) ? txt.verticalSpacing : 0.15;
   const hSpacing = Number.isFinite(txt.letterSpacing) ? txt.letterSpacing : 0;
   const chars = isVertical ? Array.from(content) : null;
   const charsH = !isVertical ? Array.from(content) : null;
   const rotateSet = new Set(['ー','-','–','—','~','～','…','‥','ｰ','-','ｰ','ー','—']);
+  const glyphKey=[content,txt.fontFamily,txt.bold,fontSize,txt.color,txt.outline,txt.strokeColor,
+    vSpacing,hSpacing,isVertical,fullBand,width].join('|');
 
   // 縦書きの全体サイズ計算
   let totalVHeight = 0;
@@ -7807,24 +7838,29 @@ function drawVlogCaption(ctx,txt,width,height,options={}){
       ctx.fillRect(textX-bandW/2, textY-bandH/2, bandW, bandH);
     }
 
-    ctx.lineJoin='round';
-    ctx.shadowColor='rgba(0,0,0,0.8)';ctx.shadowBlur=Math.max(2,fontSize*0.1);
-    for(let i=0;i<chars.length;i++){
-      const ch = chars[i];
-      const cy = startY + i*charStep;
-      const needRotate = rotateSet.has(ch);
-      ctx.save();
-      ctx.translate(textX, cy);
-      if(needRotate) ctx.rotate(Math.PI/2);
-      if(txt.outline){
-        ctx.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
-        ctx.lineWidth=Math.max(2,fontSize*0.12);
-        ctx.strokeText(ch, 0, 0);
+    const paintGlyphs=g=>{
+      g.font=vlogTextFontSpec(txt,fontSize);g.textAlign='center';g.textBaseline='middle';
+      g.lineJoin='round';
+      g.shadowColor='rgba(0,0,0,0.8)';g.shadowBlur=Math.max(2,fontSize*0.1);
+      for(let i=0;i<chars.length;i++){
+        const ch = chars[i];
+        const cy = startY + i*charStep;
+        const needRotate = rotateSet.has(ch);
+        g.save();
+        g.translate(textX, cy);
+        if(needRotate) g.rotate(Math.PI/2);
+        if(txt.outline){
+          g.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
+          g.lineWidth=Math.max(2,fontSize*0.12);
+          g.strokeText(ch, 0, 0);
+        }
+        g.fillStyle=txt.color||'#fff';
+        g.fillText(ch, 0, 0);
+        g.restore();
       }
-      ctx.fillStyle=txt.color||'#fff';
-      ctx.fillText(ch, 0, 0);
-      ctx.restore();
-    }
+    };
+    paintVlogCaptionGlyphs(ctx,paintGlyphs,textOpacity,
+      {left:textX-fontSize/2,top:textY-totalVHeight/2,width:fontSize,height:totalVHeight},glyphKey,fontSize);
     ctx.restore();
     return bandW;
   } else {
@@ -7851,37 +7887,44 @@ function drawVlogCaption(ctx,txt,width,height,options={}){
       ctx.fillStyle=txt.bgColor;
       ctx.fillRect(x-measured/2-pad,textY-fontSize/2-pad,measured+pad*2,fontSize+pad*2);
     }
-    ctx.lineJoin='round';
-    ctx.shadowColor='rgba(0,0,0,0.8)';ctx.shadowBlur=Math.max(2,fontSize*0.1);
+    const paintGlyphs=g=>{
+      g.font=vlogTextFontSpec(txt,fontSize);g.textAlign='center';g.textBaseline='middle';
+      g.lineJoin='round';
+      g.shadowColor='rgba(0,0,0,0.8)';g.shadowBlur=Math.max(2,fontSize*0.1);
 
-    if(hSpacing>0){
-      let curX = x - measured/2;
-      for(let i=0;i<charsH.length;i++){
-        const ch = charsH[i];
-        const cw = ctx.measureText(ch).width;
-        const drawX = curX + cw/2;
-        if(txt.outline){
-          ctx.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
-          ctx.lineWidth=Math.max(2,fontSize*0.12);
-          if(fullBand) ctx.strokeText(ch, drawX, textY, width*0.84);
-          else ctx.strokeText(ch, drawX, textY);
+      if(hSpacing>0){
+        let curX = x - measured/2;
+        for(let i=0;i<charsH.length;i++){
+          const ch = charsH[i];
+          const cw = g.measureText(ch).width;
+          const drawX = curX + cw/2;
+          if(txt.outline){
+            g.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
+            g.lineWidth=Math.max(2,fontSize*0.12);
+            if(fullBand) g.strokeText(ch, drawX, textY, width*0.84);
+            else g.strokeText(ch, drawX, textY);
+          }
+          g.fillStyle=txt.color||'#fff';
+          if(fullBand) g.fillText(ch, drawX, textY, width*0.84);
+          else g.fillText(ch, drawX, textY);
+          curX += cw + (i < charsH.length-1 ? fontSize*hSpacing : 0);
         }
-        ctx.fillStyle=txt.color||'#fff';
-        if(fullBand) ctx.fillText(ch, drawX, textY, width*0.84);
-        else ctx.fillText(ch, drawX, textY);
-        curX += cw + (i < charsH.length-1 ? fontSize*hSpacing : 0);
+      } else {
+        if(txt.outline){
+          g.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
+          g.lineWidth=Math.max(2,fontSize*0.12);
+          if(fullBand) g.strokeText(content,textX,textY,width*0.84);
+          else g.strokeText(content,x,textY);
+        }
+        g.fillStyle=txt.color||'#fff';
+        if(fullBand) g.fillText(content,textX,textY,width*0.84);
+        else g.fillText(content,x,textY);
       }
-    } else {
-      if(txt.outline){
-        ctx.strokeStyle=txt.strokeColor||'rgba(0,0,0,0.8)';
-        ctx.lineWidth=Math.max(2,fontSize*0.12);
-        if(fullBand) ctx.strokeText(content,textX,textY,width*0.84);
-        else ctx.strokeText(content,x,textY);
-      }
-      ctx.fillStyle=txt.color||'#fff';
-      if(fullBand) ctx.fillText(content,textX,textY,width*0.84);
-      else ctx.fillText(content,x,textY);
-    }
+    };
+    const bandSqueezed=fullBand && !(hSpacing>0);
+    const glyphWidth=bandSqueezed?Math.min(measured,width*0.84):measured;
+    paintVlogCaptionGlyphs(ctx,paintGlyphs,textOpacity,
+      {left:(bandSqueezed?textX:x)-glyphWidth/2,top:textY-fontSize/2,width:glyphWidth,height:fontSize},glyphKey,fontSize);
     ctx.restore();
     return measured;
   }
@@ -18021,8 +18064,8 @@ const recomputeStarts=(arr)=>{
   // A move changes only the source caption's timing. Its composed draft at the
   // same target is already correct, so do not discard all three decoded frames.
   const textMoveVisualKey=JSON.stringify(texts.map(t=>t.id===textMoveReview?.textId
-    ? [t.id,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor,t.backgroundMode,t.bandColor,t.bandOpacity]
-    : [t.id,t.start,t.end,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor,t.backgroundMode,t.bandColor,t.bandOpacity]));
+    ? [t.id,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor,t.backgroundMode,t.bandColor,t.bandOpacity,t.textOpacity]
+    : [t.id,t.start,t.end,t.text,t.x,t.y,t.fontSize,t.fontFamily,t.bold,t.outline,t.strokeColor,t.color,t.bgColor,t.backgroundMode,t.bandColor,t.bandOpacity,t.textOpacity]));
   // Compose a draft only after the slider settles; keep the playback videos untouched.
   useEffect(()=>{
     if(!textMoveReview || activeTab!=='text'){setTextMoveFrames(null);return;}
@@ -21795,7 +21838,21 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   className:`w-8 h-8 rounded-full border-2 ${texts.find(t=>t.id===selectedTextId)?.color===c ? 'border-yellow-500 scale-110' : 'border-white/20'}`
                 })
               )
-            )
+            ),
+            (()=>{
+              const current=texts.find(t=>t.id===selectedTextId)?.textOpacity??1;
+              const setOpacity=value=>setTexts(prev=>prev.map(t=>t.id===selectedTextId?{...t,textOpacity:value}:t));
+              return React.createElement('div',{className:'mt-3'},
+                React.createElement('div',{className:'text-[10px] text-white/50 mb-2'},`文字の濃さ ${Math.round(current*100)}%`),
+                React.createElement('div',{className:'grid grid-cols-3 gap-2'},
+                  [{v:1,label:'はっきり 100%'},{v:0.7,label:'やわらか 70%'},{v:0.4,label:'すける 40%'}].map(option=>
+                    React.createElement('button',{key:option.v,type:'button',onClick:()=>setOpacity(option.v),
+                      className:`min-h-10 rounded-lg border px-1 text-[10px] ${Math.abs(current-option.v)<0.001?'bg-yellow-500/30 border-yellow-500':'bg-white/10 border-white/10'}`},option.label))
+                ),
+                React.createElement('input',{type:'range',min:0.2,max:1,step:0.05,value:current,
+                  'aria-label':'文字の濃さ',onChange:e=>setOpacity(Number(e.target.value)),className:'w-full mt-2'})
+              );
+            })()
           ),
           React.createElement('div', {className:'mb-3'},
             React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '文字の背景'),
