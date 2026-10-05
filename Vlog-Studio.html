@@ -6658,16 +6658,19 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-audio-handoff';
+const VLOG_PREVIEW_BUILD='2026-10-06-audio-lab';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
   catch{return 'normal';}})();
 const PREVIEW_VIDEO_AUDIBLE=VLOG_SEAM_MODE==='legacy';
 // ?audiograph=off は音を WebAudio に通さない（音量は効かず消音のみ、ずれの合わせもしない）。
+// 引き継ぎ（handoff）は古い要素を止めるたびに止まりをくり返したため、?audiohandoff=on のときだけ働く。
 const PREVIEW_AUDIO_PROBE=(()=>{try{const params=new URLSearchParams(location.search);
-  return {graph:params.get('audiograph')!=='off',handoff:params.get('audiohandoff')!=='off'};}
-  catch{return {graph:true,handoff:true};}})();
+  return {graph:params.get('audiograph')!=='off',handoff:params.get('audiohandoff')==='on'};}
+  catch{return {graph:true,handoff:false};}})();
+// ?audiolab=1 は再生ボタンで音の実験を行う（他の要素への操作ごとに、鳴っている音が止まるかを測る）。
+const PREVIEW_AUDIO_LAB=(()=>{try{return new URLSearchParams(location.search).get('audiolab')==='1';}catch{return false;}})();
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
   if(!profiler)return run();
@@ -12632,6 +12635,100 @@ function App(){
       }
     }
   };
+  // ---- 音の実験（?audiolab=1） ----
+  // スロット0で1本の音を鳴らし続け、1.5秒ごとに他の要素へ操作を1つずつ行い、
+  // スロット0の位置と WebAudio の時計が操作の後に止まったかを50msごとに測る。
+  const runPreviewAudioLab=()=>{
+    const diag=previewDiagnosticRef.current;
+    if(diag.lab?.running) return;
+    const videoClips=vlogMediaClips(clipsRef.current).filter(clip=>clip.type==='video' && clip.url);
+    if(!videoClips.length){ window.alert('動画の素材を1つ以上入れてください'); return; }
+    const main=videoClips.reduce((best,clip)=>clip.duration>best.duration ? clip : best,videoClips[0]);
+    const other=videoClips.find(clip=>clip!==main) || main;
+    let context=previewAudioContextRef.current;
+    try{
+      if(!context){ const Ctx=window.AudioContext || window.webkitAudioContext; if(Ctx) context=previewAudioContextRef.current=new Ctx(); }
+      if(context){ const resumed=context.resume(); if(resumed?.catch) resumed.catch(()=>{}); }
+    }catch{}
+    const videoClip=videoClips.find(clip=>videoRefs.current.get(clip.id)) || null;
+    const video=videoClip ? videoRefs.current.get(videoClip.id) : null;
+    if(video){ connectPreviewAudioClip(videoClip,video,context); video.muted=true; }
+    const [a,b,c]=previewAudioSlots();
+    const lab={running:true,graph:PREVIEW_AUDIO_PROBE.graph,contextState:context?.state||null,
+      main:main.name,other:other.name,video:videoClip?.name||null,
+      videoRouted:!!(videoClip && previewAudioGainsRef.current.get(videoClip.id)),loop:main.duration<17,
+      startedAt:new Date().toISOString(),startMs:null,actions:[],errors:[],samples:[]};
+    diag.lab=lab;
+    const note=(phase,error)=>lab.errors.push({phase,error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,80)}`});
+    const tryPlay=(audio,phase)=>{ try{ const played=audio.play(); if(played?.catch) played.catch(error=>note(phase,error)); }catch(error){ note(phase,error); } };
+    [a,b,c].forEach(slot=>{ routePreviewAudioSlot(slot); setPreviewAudioSlotDelay(slot,0,0); slot.state='lab'; });
+    loadPreviewAudioSlot(a,{url:main.url,key:null,name:main.name});
+    loadPreviewAudioSlot(b,{url:other.url,key:null,name:other.name});
+    loadPreviewAudioSlot(c,{url:other.url,key:null,name:other.name});
+    a.audio.loop=lab.loop;
+    try{ a.audio.currentTime=0; }catch{}
+    setPreviewAudioSlotGain(a,1);setPreviewAudioSlotGain(b,0);setPreviewAudioSlotGain(c,0);
+    // タップ中に3本とも許可を取る。b と c は動き出したら止める（測る前の準備）。
+    tryPlay(a.audio,'main');
+    [b,c].forEach(slot=>{
+      try{ const played=slot.audio.play(); if(played?.then) played.then(()=>slot.audio.pause()).catch(error=>note('unlock',error)); }catch(error){ note('unlock',error); }
+    });
+    if(video){ try{ const played=video.play(); if(played?.then) played.then(()=>video.pause()).catch(error=>note('video-unlock',error)); }catch{} }
+    const actions=[
+      ['none',()=>{}],
+      ['slot-play',()=>tryPlay(b.audio,'slot-play')],
+      ['slot-muted',()=>{ b.audio.muted=true; }],
+      ['slot-pause',()=>{ b.audio.pause(); b.audio.muted=false; }],
+      ['slot-reload',()=>{ c.audio.src=main.url; try{ c.audio.load(); }catch{} }],
+      ['slot-seek-paused',()=>{ try{ b.audio.currentTime=Math.max(0,(b.audio.duration||other.duration)-0.4); }catch{} }],
+      ['slot-play-to-end',()=>tryPlay(b.audio,'slot-play-to-end')],
+      ['video-play',()=>{ if(video) try{ const played=video.play(); if(played?.catch) played.catch(error=>note('video-play',error)); }catch{} }],
+      ['video-pause',()=>{ if(video) video.pause(); }],
+      ['none',()=>{}],
+    ];
+    const t0=performance.now();
+    let moving=null,next=0;
+    const finish=()=>{
+      clearInterval(timer);
+      [a,b,c].forEach(slot=>{ try{ slot.audio.pause(); }catch{} slot.audio.loop=false; setPreviewAudioSlotGain(slot,0); slot.state='idle'; });
+      if(video) try{ video.pause(); }catch{}
+      // 操作ごとに、操作から1.2秒の間で最も長く止まった時間を求める（進みが実時間の2割未満の区間を止まりとする）。
+      const longest=(from,to,key)=>{
+        let best=0,run=0;
+        for(let i=1;i<lab.samples.length;i++){
+          const p=lab.samples[i-1],q=lab.samples[i];
+          if(q.ms<from || p.ms>to) continue;
+          const dt=q.ms-p.ms,moved=q[key]-p[key];
+          if(moved>=0 && moved<dt/1000*0.2){ run+=dt; best=Math.max(best,run); } else run=0;
+        }
+        return Math.round(best);
+      };
+      lab.actions.forEach(action=>{ action.mainStallMs=longest(action.ms,action.ms+1200,'a'); action.clockStallMs=longest(action.ms,action.ms+1200,'ctx'); });
+      lab.running=false;
+      lab.samples=lab.samples.filter((_,index)=>index%2===0);
+      recordPreviewDiagnostic('audio-lab-done',{actions:lab.actions.map(action=>`${action.name}:${action.mainStallMs}/${action.clockStallMs}`).join(' ')});
+      window.alert('音の実験が終わりました。診断をコピーして送ってください');
+    };
+    const timer=setInterval(()=>{
+      const now=performance.now(),ms=Math.round(now-t0);
+      lab.samples.push({ms,a:Number(a.audio.currentTime.toFixed(3)),ctx:context?Number(context.currentTime.toFixed(3)):0,
+        bPaused:b.audio.paused});
+      if(moving===null){
+        if(a.audio.currentTime>0.05){ moving=now; lab.startMs=ms; next=now+2000; }
+        else if(ms>5000){ lab.errors.push({phase:'main',error:'not-moving'}); finish(); }
+        return;
+      }
+      if(now>=next){
+        const index=lab.actions.length;
+        if(index>=actions.length){ finish(); return; }
+        const [name,act]=actions[index];
+        lab.actions.push({name,ms,bReady:b.audio.readyState,cReady:c.audio.readyState});
+        try{ act(); }catch(error){ note(name,error); }
+        next=now+1500;
+      }
+    },50);
+    recordPreviewDiagnostic('audio-lab-start',{main:main.name,other:other.name,video:lab.video,graph:lab.graph});
+  };
   const positionPreviewVideo=(video,clip,target,phase,tolerance=0.08)=>{
     if(!video || video.readyState<1 || video.seeking || !Number.isFinite(target)) return false;
     if(Math.abs(video.currentTime-target)<=tolerance) return true;
@@ -12681,6 +12778,7 @@ function App(){
           p50Ms:pick(.5),p95Ms:pick(.95),maxMs:Number(diag.drawMaxMs.toFixed(1)),over33Ms:diag.drawSlow,
           profiler:diag.drawProfiler?.summary()||null};
       })(),
+      ...(diag.lab?{audioLab:diag.lab}:{}),
       startTrace:diag.start?.trace||null,startEvents:diag.start?.events||null,
       recentEvents:diag.events.slice(-40)},null,2);
   };
@@ -13522,6 +13620,7 @@ function App(){
     setTimeout(()=> setShowFlash(false), 200);
     
     if(playingRef.current) return;
+    if(PREVIEW_AUDIO_LAB && !PREVIEW_VIDEO_AUDIBLE){ runPreviewAudioLab(); return; }
     clearTimeout(previewStartTimerRef.current);
     previewTapRef.current={at:performance.now(),run:previewTapRef.current.run+1};
     const previewSession=++previewSessionRef.current;
