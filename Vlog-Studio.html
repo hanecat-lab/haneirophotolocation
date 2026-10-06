@@ -4419,7 +4419,8 @@ body.text-editing-active .desk-stack{
 /* 拡大プレビューでは気分ダイヤルを表示しない */
 body.is-finder-expanded #moodSelector,
 body.is-hikariyomi-expanded #moodSelector,
-body:has(.polaroid-wrapper.hikariyomi-mode) #moodSelector{
+body:has(.polaroid-wrapper.hikariyomi-mode) #moodSelector,
+body:has([data-range-fullscreen]) #moodSelector{
   display: none !important;
 }
 .polaroid-wrapper.finder-mode .safe-area-label.top-label,
@@ -6331,10 +6332,6 @@ body.is-hikariyomi-expanded .bottom-timeline-scroll {
   border-color:var(--camera-rim) !important;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.055),inset 0 -1px 0 rgba(0,0,0,.24);
 }
-/* 範囲調整のプレビューが特大のとき、横向きの端末では左に映像・右に操作の2列にする。 */
-@media (orientation:landscape) and (max-height:500px){
-  .camera-trim-panel.range-preview-xl [data-range-layout]{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start;--range-controls-h:0px !important}
-}
 .camera-shell .camera-key{
   background-color:var(--camera-card) !important;
   background-image:none;
@@ -6662,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-range-xl-fit';
+const VLOG_PREVIEW_BUILD='2026-10-06-range-fullscreen';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -8543,38 +8540,99 @@ function TimeRangeBand({scopeKey,start,end,min,max,minSpan=0.2,onChange,onDragSt
   );
 }
 
-// 範囲調整のプレビューの大きさ（小 → 大 → 特大）。特大は大の2倍。
-// 特大は、貼りついたプレビューの下に帯・つまみ・±ボタンが隠れないよう、測った操作部分の高さ（--range-controls-h）を引いた高さで止める。
-const VLOG_RANGE_PREVIEW_HEIGHT={small:'140px',large:'min(280px, 45dvh)',
-  xl:'min(560px, 85dvh, max(200px, calc(100dvh - 3.5rem - var(--range-controls-h, 16rem) - 1.5rem)))'};
-// 範囲調整の入れ物の ref。プレビュー（最初の子）以外の高さを測り、CSS 変数 --range-controls-h に入れる。
-const vlogFitRangeLayout=node=>{
-  if(!node || node._rangeFitObserver || typeof ResizeObserver==='undefined') return;
-  const measure=()=>{
-    if(!node.isConnected){ node._rangeFitObserver?.disconnect(); return; }
-    const preview=node.firstElementChild;
-    const controls=Math.max(0,node.getBoundingClientRect().height-(preview?preview.getBoundingClientRect().height:0));
-    const value=`${Math.round(controls)}px`;
-    if(node.style.getPropertyValue('--range-controls-h')!==value) node.style.setProperty('--range-controls-h',value);
-  };
-  node._rangeFitObserver=new ResizeObserver(measure);
-  node._rangeFitObserver.observe(node);
-  measure();
-};
-const VLOG_RANGE_PREVIEW_NEXT={small:'large',large:'xl',xl:'small'};
-const VLOG_RANGE_PREVIEW_BUTTON={small:'大きく',large:'特大',xl:'小さく'};
-const VLOG_RANGE_PREVIEW_NAME={small:'小',large:'大',xl:'特大'};
+// 範囲調整のプレビューの大きさ（小 ⇄ 大）。大きく見たいときは全画面（VlogRangeFullscreen）を使う。
+const VLOG_RANGE_PREVIEW_HEIGHT={small:'140px',large:'min(280px, 45dvh)'};
 const vlogRangePreviewSize=size=>VLOG_RANGE_PREVIEW_HEIGHT[size]?size:'large';
-function VlogRangePreviewSizeButton({size,onChange}){
+function VlogRangePreviewSizeButton({size,onChange,onFullscreen}){
   const current=vlogRangePreviewSize(size);
-  return React.createElement('button',{type:'button',onClick:()=>onChange?.(VLOG_RANGE_PREVIEW_NEXT[current]),
-    className:'absolute right-2 top-2 z-10 rounded-full border border-white/25 bg-black/70 px-2 py-1 text-[10px] text-white',
-    'aria-label':`プレビューの大きさ: ${VLOG_RANGE_PREVIEW_NAME[current]}`},VLOG_RANGE_PREVIEW_BUTTON[current]);
+  const chip='rounded-full border border-white/25 bg-black/70 px-2 py-1 text-[10px] text-white';
+  return React.createElement('div',{className:'absolute right-2 top-2 z-10 flex gap-1'},
+    onFullscreen && React.createElement('button',{type:'button',onClick:onFullscreen,className:chip,'aria-label':'プレビューを全画面で調整'},'⛶ 全画面'),
+    React.createElement('button',{type:'button',onClick:()=>onChange?.(current==='large'?'small':'large'),className:chip,
+      'aria-label':`プレビューの大きさ: ${current==='large'?'大':'小'}`},current==='large'?'小さく':'大きく'));
+}
+
+// 範囲調整の全画面。映像を画面いっぱいに出し、下部の ±10・1・0.1秒で選んだ端を動かす。
+// 範囲の変更は呼び出し元の onChange(start,end,kind) をそのまま使う。toSource は範囲の時刻を元動画の時刻に直す。
+const VLOG_RANGE_FULLSCREEN_STEPS=[-10,-1,-0.1,0.1,1,10];
+function VlogRangeFullscreen({clip,start,end,min,max,minSpan,onChange,onClose,mode='keep',toSource=t=>t}){
+  const videoRef=useRef(null);
+  const playRef=useRef(null);
+  const [edge,setEdge]=useState('start');
+  const [playing,setPlaying]=useState(false);
+  const seekTo=time=>{
+    const video=videoRef.current;
+    if(!video) return;
+    try{
+      if(!video.paused) video.pause();
+      playRef.current=null;setPlaying(false);
+      if(video.readyState>=1) video.currentTime=Math.min(Math.max(0,(video.duration||Infinity)-0.001),Math.max(0,toSource(time)));
+    }catch{}
+  };
+  useEffect(()=>{
+    const onKey=e=>{ if(e.key==='Escape') onClose?.(); };
+    window.addEventListener('keydown',onKey);
+    return()=>window.removeEventListener('keydown',onKey);
+  },[onClose]);
+  const step=delta=>{
+    let nextStart=start,nextEnd=end;
+    if(edge==='start') nextStart=Math.min(Math.max(min,start+delta),end-minSpan);
+    else nextEnd=Math.max(Math.min(max,end+delta),start+minSpan);
+    nextStart=Math.round(nextStart*1000)/1000;nextEnd=Math.round(nextEnd*1000)/1000;
+    if(nextStart===start && nextEnd===end){ seekTo(edge==='start'?start:end); return; }
+    onChange(nextStart,nextEnd,edge);
+    seekTo(edge==='start'?nextStart:nextEnd);
+  };
+  const selectEdge=next=>{ setEdge(next); seekTo(next==='start'?start:end); };
+  const togglePlay=()=>{
+    const video=videoRef.current;
+    if(!video) return;
+    if(!video.paused){ seekTo(edge==='start'?start:end); return; }
+    const center=edge==='start'?start:end;
+    const from=mode==='cut'?Math.max(min,center-1):start;
+    const to=mode==='cut'?Math.min(max,center+1):end;
+    try{
+      video.currentTime=Math.max(0,toSource(from));
+      playRef.current={until:toSource(to),back:center};
+      setPlaying(true);
+      video.play()?.catch?.(()=>{ playRef.current=null;setPlaying(false); });
+    }catch{ playRef.current=null;setPlaying(false); }
+  };
+  const onTimeUpdate=e=>{
+    const run=playRef.current,video=e.currentTarget;
+    if(run && !video.paused && video.currentTime>=run.until-0.04) seekTo(run.back);
+  };
+  const button='min-h-10 rounded-full border text-[12px] font-bold';
+  const edgeLabel=mode==='cut'?{start:'カット開始',end:'カット終了'}:{start:'開始',end:'終了'};
+  return createPortal(React.createElement('div',{className:'fixed inset-0 z-[1000] flex flex-col bg-black text-white',
+      role:'dialog','aria-modal':true,'aria-label':'範囲を全画面で調整','data-range-fullscreen':true,onClick:e=>e.stopPropagation()},
+    React.createElement('div',{className:'flex items-center gap-2 px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 text-[12px]'},
+      React.createElement('div',{className:'flex-1 min-w-0 truncate text-white/85'},
+        `${edgeLabel.start} ${start.toFixed(1)}秒 ／ ${edgeLabel.end} ${end.toFixed(1)}秒 ／ ${mode==='cut'?'カットする長さ':'長さ'} ${(end-start).toFixed(1)}秒`),
+      React.createElement('button',{type:'button',onClick:onClose,className:'shrink-0 min-h-9 rounded-full bg-white text-black px-4 text-[12px] font-bold'},'完了')),
+    React.createElement('div',{className:'relative flex-1 min-h-0'},
+      React.createElement(VlogRotatedMedia,{as:'video',clip,ref:videoRef,src:clip.url,muted:true,playsInline:true,preload:'auto',
+        className:'w-full h-full bg-black object-contain',style:{width:'100%',height:'100%',maxHeight:'100%'},
+        onLoadedMetadata:()=>seekTo(edge==='start'?start:end),onTimeUpdate,
+        onPause:()=>{ if(playRef.current){ playRef.current=null;setPlaying(false); } }})),
+    React.createElement('div',{className:'flex flex-col gap-2 bg-black/80 px-3 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]'},
+      React.createElement('div',{className:'flex items-center justify-center gap-2'},
+        ['start','end'].map(kind=>React.createElement('button',{key:kind,type:'button',onClick:()=>selectEdge(kind),'aria-pressed':edge===kind,
+          className:`${button} px-4 ${edge===kind?'border-violet-300 bg-violet-500/40 text-white':'border-white/25 bg-white/10 text-white/70'}`},
+          `${edgeLabel[kind]}を動かす`)),
+        React.createElement('button',{type:'button',onClick:togglePlay,className:`${button} px-4 border-white/25 bg-white/10`},
+          playing?'■ 止める':mode==='cut'?'▶ 端の前後':'▶ 範囲を再生')),
+      React.createElement('div',{className:'grid grid-cols-6 gap-1.5 max-w-[560px] w-full mx-auto'},
+        VLOG_RANGE_FULLSCREEN_STEPS.map(delta=>React.createElement('button',{key:delta,type:'button',onClick:()=>step(delta),
+          className:`${button} border-white/25 bg-white/10 active:bg-white/25`,'aria-label':`${edgeLabel[edge]}を${Math.abs(delta)}秒${delta<0?'戻す':'進める'}`},
+          `${delta<0?'−':'+'}${Math.abs(delta)}`)))
+    )),document.body);
 }
 
 function VlogMiddleCutControls({clip,start,end,onChange,plan,sourceAudioVolume,previewSize='large',onPreviewSizeChange}){
   const videoRef=useRef(null);
   const previewHeight=VLOG_RANGE_PREVIEW_HEIGHT[vlogRangePreviewSize(previewSize)];
+  const [fullscreen,setFullscreen]=useState(false);
   const auditionRef=useRef(null);
   const auditionTokenRef=useRef(0);
   const audioContextRef=useRef(null);
@@ -8671,9 +8729,12 @@ function VlogMiddleCutControls({clip,start,end,onChange,plan,sourceAudioVolume,p
     run.phase='after';
   };
   const planOk=!!plan && !plan.error;
-  return React.createElement('div',{className:'mt-2 flex flex-col gap-2','data-range-layout':true,ref:vlogFitRangeLayout},
+  return React.createElement('div',{className:'mt-2 flex flex-col gap-2'},
+    fullscreen && React.createElement(VlogRangeFullscreen,{clip,start,end,min:0,max:clip.duration,minSpan:0.1,mode:'cut',
+      toSource:t=>(clip.trimStart||0)+t*rate,onChange:(a,b)=>onChange(a,b),onClose:()=>setFullscreen(false)}),
     React.createElement('div',{className:'sticky top-14 z-20 flex flex-col gap-2 bg-[#1a1a1c] py-1'},
-      React.createElement(VlogRangePreviewSizeButton,{size:previewSize,onChange:onPreviewSizeChange}),
+      React.createElement(VlogRangePreviewSizeButton,{size:previewSize,onChange:onPreviewSizeChange,
+        onFullscreen:clip.duration>=0.2?()=>{stopPreview();setFullscreen(true);}:null}),
       React.createElement(VlogRotatedMedia,{as:'video',clip,ref:videoRef,src:clip.url,muted:true,playsInline:true,preload:'metadata','data-range-preview':true,
       className:'w-full rounded-xl bg-black object-contain',style:{maxHeight:previewHeight,height:previewHeight,aspectRatio:'16/9'},onTimeUpdate:tick,onSeeked,
       onLoadedMetadata:setSelectedFrame}),
@@ -10580,6 +10641,7 @@ function App(){
   const [good3Adjust, setGood3Adjust] = useState(null);
   const [good3AdjustNotice, setGood3AdjustNotice] = useState('');
   const [rangePreviewSize,setRangePreviewSize] = useState('large');
+  const [rangeFullscreen,setRangeFullscreen] = useState(false);
   const good3AdjustVideoRef = useRef(null);
   const [rangePreviewPlaying,setRangePreviewPlaying] = useState(false);
   const analysisBusyRef = useRef(false);
@@ -17546,6 +17608,7 @@ const recomputeStarts=(arr)=>{
     handleStop();
     closeQuickPeek(false);
     setRangePreviewSize('large');
+    setRangeFullscreen(false);
     setRangePreviewPlaying(false);
     const sourceSpan=clip._cutGroupId?(clip._sourceRangeDuration||clip.duration*(clip._playbackRate||1)):clip.duration;
     setGood3Adjust({clipId,mode:'keep',start:clip.type==='photo'?0:clip.trimStart||0,
@@ -21917,7 +21980,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   setGood3AdjustNotice('');
                 };
                 return React.createElement('div', {
-                  className:`camera-trim-panel self-start ml-2 mt-2 rounded-2xl border border-violet-400/30 bg-[#1a1a1c] p-3 shadow-xl ${clip.type!=='photo'&&rangePreviewSize==='xl'?'range-preview-xl w-[calc(100%-1rem)] max-w-none':'w-full max-w-[360px]'}`,
+                  className:'camera-trim-panel self-start ml-2 mt-2 w-full max-w-[360px] rounded-2xl border border-violet-400/30 bg-[#1a1a1c] p-3 shadow-xl',
                   onClick:e=>e.stopPropagation()
                 },
                   React.createElement('div', {className:'text-[12px] font-bold'}, clip.type==='photo'?'写真の長さを調整':cutMode?'途中をカット':'使う範囲を調整'),
@@ -21940,9 +22003,12 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                           className:'block w-full mt-2 accent-violet-500'}))
                     ) :
                     cutMode ? React.createElement(VlogMiddleCutControls,{clip,start,end,onChange:setDraftRange,plan:middleCutPlan,sourceAudioVolume,
-                      previewSize:rangePreviewSize,onPreviewSizeChange:setRangePreviewSize}) : React.createElement('div',{className:'mt-2 flex flex-col gap-2','data-range-layout':true,ref:vlogFitRangeLayout},
+                      previewSize:rangePreviewSize,onPreviewSizeChange:setRangePreviewSize}) : React.createElement('div',{className:'mt-2 flex flex-col gap-2'},
+                      rangeFullscreen && React.createElement(VlogRangeFullscreen,{clip,start,end,min:bounds.min,max:bounds.max,minSpan:bounds.minSpan,mode:'keep',
+                        onChange:(a,b)=>setDraftRange(a,b),onClose:()=>setRangeFullscreen(false)}),
                       React.createElement('div',{className:'sticky top-14 z-20 flex flex-col gap-2 bg-[#1a1a1c] py-1'},
-                      React.createElement(VlogRangePreviewSizeButton,{size:rangePreviewSize,onChange:setRangePreviewSize}),
+                      React.createElement(VlogRangePreviewSizeButton,{size:rangePreviewSize,onChange:setRangePreviewSize,
+                        onFullscreen:()=>{const v=good3AdjustVideoRef.current;if(v&&!v.paused)try{v.pause();}catch{} setRangeFullscreen(true);}}),
                       React.createElement(VlogRotatedMedia, {as:'video',clip,
                         ref:good3AdjustVideoRef,src:clip.url,muted:true,playsInline:true,preload:'metadata','data-range-preview':true,
                         className:'w-full rounded-xl bg-black object-contain',style:{maxHeight:VLOG_RANGE_PREVIEW_HEIGHT[vlogRangePreviewSize(rangePreviewSize)],height:VLOG_RANGE_PREVIEW_HEIGHT[vlogRangePreviewSize(rangePreviewSize)], aspectRatio:'16/9'},
