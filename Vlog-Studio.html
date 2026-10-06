@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-bgm-lab';
+const VLOG_PREVIEW_BUILD='2026-10-06-bgm-lab2';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -12169,6 +12169,7 @@ function App(){
         if(videoRefs.current.get(clip.id)===old && !playingRef.current && !exportJobRef.current)
           drawFrameRef.current(timeRef.current);
       },{once:true});
+      previewDiagnosticRef.current.lastMediaRefresh={at:performance.now(),clip:clip.name};
       if(phase!=='end-of-preview') recordPreviewDiagnostic('media-refresh',{clip:clip.name,phase,reused:true,
         previousError,timelineTime:Number(timeRef.current.toFixed(3))});
       return old;
@@ -12518,6 +12519,18 @@ function App(){
       .filter(entry=>entry.play!==undefined || entry.pause!==undefined);
     return {self:{waiting:recent(slot.events.waiting),pause:recent(slot.events.pause)},others,videos};
   };
+  // BGM が止まった瞬間の前後500msに起きたこと（動画の付け直し、動画・音のスロットの再生と停止）。
+  const previewBgmStallContext=()=>{
+    const at=performance.now(),recent=value=>value!=null && at-value<=500 ? Math.round(at-value) : undefined;
+    const refresh=previewDiagnosticRef.current.lastMediaRefresh;
+    const slots=previewAudioSlotsRef.current.slots.map(entry=>({slot:entry.index,clip:entry.name,state:entry.state,
+      play:recent(entry.events.play),pause:recent(entry.events.pause),playing:recent(entry.events.playing),waiting:recent(entry.events.waiting)}))
+      .filter(entry=>entry.play!==undefined || entry.pause!==undefined || entry.playing!==undefined || entry.waiting!==undefined);
+    const videos=[...(previewDiagnosticRef.current.mediaActivity?.values()||[])].map(entry=>({clip:entry.name,
+      play:recent(entry.lastPlayAt),pause:recent(entry.lastPauseAt)}))
+      .filter(entry=>entry.play!==undefined || entry.pause!==undefined);
+    return {mediaRefresh:refresh && recent(refresh.at)!==undefined ? {ms:recent(refresh.at),clip:refresh.clip} : null,slots,videos};
+  };
   // 毎フレーム呼ぶ。計画した音にスロットを割り当て、予熱・鳴らし始め・音量・ずれの合わせを行う。
   const syncPreviewAudio=(clipsNow,t,rate,now,cutInfo)=>{
     const store=previewAudioSlotsRef.current,slots=previewAudioSlots();
@@ -12828,6 +12841,12 @@ function App(){
       ['video-play',()=>{ if(video) try{ const played=video.play(); if(played?.catch) played.catch(error=>note('video-play',error)); }catch{} }],
       ['video-seek-playing',()=>{ if(video) try{ video.currentTime=0.2; }catch{} }],
       ['video-pause',()=>{ if(video) video.pause(); }],
+      ['video-play-to-end',()=>{ if(video) try{
+        video.currentTime=Math.max(0,(video.duration||videoClip.duration)-0.4);
+        const played=video.play(); if(played?.catch) played.catch(error=>note('video-play-to-end',error));
+      }catch{} }],
+      // 本番の繋ぎ目と同じく、通り過ぎた素材の動画から映像を外して付け直す（WebAudio にはつないだまま）。
+      ['video-refresh',()=>{ if(videoClip) refreshPreviewVideo(videoClip,'played-clip','none'); }],
       // 繋ぎ目と同じ組み合わせ: 止まっている動画の位置合わせ・動画の再生・音のスロットの再生を同時に行う。
       ['seam-combo',()=>{
         if(video) try{ video.currentTime=0; const played=video.play(); if(played?.catch) played.catch(error=>note('seam-video',error)); }catch{}
@@ -13804,6 +13823,18 @@ function App(){
           setBgmElementGain(bgmB,volB);
           state.bgmDiag={clip:`${clipA.name||clipA.trackId} + ${clipB.name||clipB.trackId}`,master:bgmVolumeRef.current,
             duck:bgmDuckFactor,gain:[volA,volB],time:bgmA.currentTime,expected:targetA};
+        }
+        // BGM の要素が150ms以上進まなかったら、動き出したときに長さと前後の様子を記録する。
+        const watched=bgmAudioRef.current;
+        if(watched && !watched.paused){
+          const watch=state.bgmWatch||(state.bgmWatch={pos:null,at:now,stall:null});
+          if(watch.pos===null || watched.currentTime!==watch.pos){
+            if(watch.stall) recordPreviewDiagnostic('bgm-stall',{ms:Math.round(now-watch.stall.at),
+              timelineTime:Number(watch.stall.t.toFixed(3)),position:Number(watch.stall.position.toFixed(3)),context:watch.stall.context});
+            watch.stall=null;watch.pos=watched.currentTime;watch.at=now;
+          }else if(!watch.stall && now-watch.at>=150){
+            watch.stall={at:watch.at,t,position:watched.currentTime,context:previewBgmStallContext()};
+          }
         }
       }catch(e){ console.log('BGM tick error', e); }
     }
