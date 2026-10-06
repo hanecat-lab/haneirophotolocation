@@ -434,6 +434,16 @@ function ynBlurNoFilter(src,w,h,sigma,out,sn,refA,refB){
  while(cw<w||ch<h){const tw=Math.min(w,cw*2),th=Math.min(h,ch*2);if(tw>=w&&th>=h)break;cur=step(cur,cw,ch,tw,th,flip?refB:refA);if(!cur)return null;cw=tw;ch=th;flip^=1}
  oc.imageSmoothingEnabled=true;oc.imageSmoothingQuality='high';oc.drawImage(cur,0,0,cw,ch,0,0,w,h);return out;
 }
+// Auto-detected ID overlay: boxes at the current time, and duplicate detections of one face merged into a single badge.
+function ynTrackBoxAt(tr,time,tol){let best=null,bd=Infinity;for(const h of tr.history||[]){const d=Math.abs((h.time||0)-time);if(d<bd){bd=d;best=h}}return best&&bd<=tol?{x:best.x,y:best.y,w:best.w,h:best.h}:null}
+function ynSameFace(a,b){const x1=Math.max(a.x,b.x),y1=Math.max(a.y,b.y),x2=Math.min(a.x+a.w,b.x+b.w),y2=Math.min(a.y+a.h,b.y+b.h),inter=Math.max(0,x2-x1)*Math.max(0,y2-y1),aa=a.w*a.h,bb=b.w*b.h;if(inter<=0||aa<=0||bb<=0)return false;return inter/(aa+bb-inter)>.35||inter/Math.min(aa,bb)>.7}
+function ynGroupTracksAt(tracks,time){
+ const items=[];for(const tr of tracks){const b=ynTrackBoxAt(tr,time,.25);if(b)items.push({tr,b})}
+ const parent=items.map((_,i)=>i),find=i=>{while(parent[i]!==i){parent[i]=parent[parent[i]];i=parent[i]}return i};
+ for(let i=0;i<items.length;i++)for(let j=i+1;j<items.length;j++)if(ynSameFace(items[i].b,items[j].b))parent[find(j)]=find(i);
+ const map=new Map();items.forEach((it,i)=>{const r=find(i);if(!map.has(r))map.set(r,[]);map.get(r).push(it)});
+ return [...map.values()].map(list=>{let big=list[0];for(const it of list)if(it.b.w*it.b.h>big.b.w*big.b.h)big=it;const ids=list.map(it=>it.tr.id).sort((a,b)=>a-b);return {ids,id:ids[0],box:big.b}});
+}
 function ynFrameExtraPadding(frame){return frame?.estimated?Math.max(.04,Math.min(.2,Number(frame.uncertainty)||.08)):0}
 function ynProject(H,p){const d=H[6]*p.x+H[7]*p.y+H[8];return {x:(H[0]*p.x+H[1]*p.y+H[2])/d,y:(H[3]*p.x+H[4]*p.y+H[5])/d}}
 function ynInverse(H){const [a,b,c,d,e,f,g,h,i]=H,det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);if(Math.abs(det)<1e-12)return null;return [(e*i-f*h)/det,(c*h-b*i)/det,(b*f-c*e)/det,(f*g-d*i)/det,(a*i-c*g)/det,(c*d-a*f)/det,(d*h-e*g)/det,(b*g-a*h)/det,(a*e-b*d)/det]}
@@ -1132,7 +1142,7 @@ const ynToggleAutoSelect=E.useCallback((id)=>{
     return next;
   });
 },[]);
-const ynDeleteSingleAutoDirect=E.useCallback((id)=>{
+const ynToggleAutoGroup=E.useCallback((ids)=>{ynSetSelectedAutoIds(prev=>{const next=new Set(prev),all=ids.every(i=>next.has(i));ids.forEach(i=>all?next.delete(i):next.add(i));return next})},[]); const ynDeleteAutoIds=E.useCallback((ids)=>{const set=new Set(ids),cleaned=Ut.filter(t=>!set.has(t.id));try{ynSaveUndo&&ynSaveUndo();}catch{}je(cleaned);Be(cleaned.length);b(v=>v+1);ynSetSelectedAutoIds(prev=>{const n=new Set(prev);ids.forEach(i=>n.delete(i));return n})},[Ut]); const ynDeleteSingleAutoDirect=E.useCallback((id)=>{
   const cleaned=Ut.filter(t=>t.id!==id);
   try{ynSaveUndo&&ynSaveUndo();}catch{}
   je(cleaned);Be(cleaned.length);
@@ -1151,13 +1161,9 @@ const ynActiveAtCurrent=E.useMemo(()=>{
 },[Ut,an]);
 const ynPickAutoAtVideoCoords=E.useCallback((vx,vy)=>{
   let best=null,bestDist=Infinity;
-  for(let i=0;i<ynActiveAtCurrent.length;i++){
-    const tr=ynActiveAtCurrent[i];
-    const x=tr.union.x,y=tr.union.y,x2=tr.union.x2,y2=tr.union.y2;
-    if(vx>=x&&vx<=x2&&vy>=y&&vy<=y2){
-      const cx=(x+x2)/2,cy=(y+y2)/2,dist=Math.hypot(vx-cx,vy-cy);
-      if(dist<bestDist){bestDist=dist;best=tr;}
-    }
+  for(const grp of ynGroupTracksAt(ynActiveAtCurrent,ynCurrentFrameTime())){
+    const bx=grp.box;
+    if(vx>=bx.x&&vx<=bx.x+bx.w&&vy>=bx.y&&vy<=bx.y+bx.h){const dist=Math.hypot(vx-(bx.x+bx.w/2),vy-(bx.y+bx.h/2));if(dist<bestDist){bestDist=dist;best=grp}}
   }
   return best;
 },[ynActiveAtCurrent]);
@@ -1172,11 +1178,11 @@ E.useEffect(()=>{
     const pos=nl(cx,cy,ev.currentTarget===e.current);
     if(!pos) return;
     const picked=ynPickAutoAtVideoCoords(pos.x,pos.y);
-    if(picked){ev.preventDefault();ev.stopPropagation();ynToggleAutoSelect(picked.id);}
+    if(picked){ev.preventDefault();ev.stopPropagation();ynToggleAutoGroup(picked.ids);}
   };
   canvases.forEach(c=>{c.addEventListener('click',handler);c.addEventListener('touchend',handler,{passive:false});});
   return()=>{canvases.forEach(c=>{c.removeEventListener('click',handler);c.removeEventListener('touchend',handler);});};
-},[ynAutoSelectMode,ynActiveAtCurrent,nl,ynPickAutoAtVideoCoords,ynToggleAutoSelect,t,e,Ot]);
+},[ynAutoSelectMode,ynActiveAtCurrent,nl,ynPickAutoAtVideoCoords,ynToggleAutoGroup,t,e,Ot]);
 E.useEffect(()=>{
   let rafId=null,lastDraw=0;
   const draw=()=>{
@@ -1191,7 +1197,7 @@ E.useEffect(()=>{
     if(!ynActiveAtCurrent.length){rafId=requestAnimationFrame(draw);return;}
     if(!ynAutoSelectMode){rafId=requestAnimationFrame(draw);return;}
     const baseTracks=ynSelectedAutoIds.size?Ut.filter(t=>ynSelectedAutoIds.has(t.id)):ynActiveAtCurrent;
-    const visibleTracks=baseTracks.slice(0,12);
+    const visibleGroups=ynGroupTracksAt(baseTracks,ynCurrentFrameTime()).slice(0,12);
     const rect=target.getBoundingClientRect();
     const N=video.videoWidth,H=video.videoHeight;
     const v=N/H,a=rect.width/rect.height;
@@ -1200,16 +1206,16 @@ E.useEffect(()=>{
     const I=N/z,L=H/A;
     const offset=Ot?Ce:Me,zoom=Ot?ut:qn;
     const Yx=offset.x,Yy=offset.y,F=1/(zoom||1);
-    for(let i=0;i<visibleTracks.length;i++){
-      const tr=visibleTracks[i];
-      const x=tr.union.x,y=tr.union.y,w=tr.union.x2-tr.union.x,h=tr.union.y2-tr.union.y;
+    for(let i=0;i<visibleGroups.length;i++){
+      const grp=visibleGroups[i];
+      const x=grp.box.x,y=grp.box.y,w=grp.box.w,h=grp.box.h;
       const cw=w*(1+ynPadding*2),ch=h*(1+ynPadding*2);
       const vx=x-(cw-w)/2,vy=y-(ch-h)/2;
       const clientLeft=(vx/F + Yx)/I + rect.left + O;
       const clientTop=(vy/F + Yy)/L + rect.top + W;
       const clientW=cw/(F*I),clientH=ch/(F*L);
       if(clientLeft+clientW<rect.left||clientTop+clientH<rect.top||clientLeft>rect.right||clientTop>rect.bottom) continue;
-      const isSelected=ynSelectedAutoIds.has(tr.id);
+      const isSelected=grp.ids.every(i=>ynSelectedAutoIds.has(i));
       const el=document.createElement('div');
       el.style.position='absolute';
       el.style.left=clientLeft+'px';
@@ -1225,7 +1231,7 @@ E.useEffect(()=>{
       el.style.justifyContent='center';
       el.style.pointerEvents='auto';
       const label=document.createElement('div');
-      label.textContent='ID:'+tr.id;
+      label.textContent='ID:'+grp.id+(grp.ids.length>1?' 他'+(grp.ids.length-1):'');
       label.style.fontSize='10px';
       label.style.fontWeight='700';
       label.style.background=isSelected?'rgba(0,0,0,0.75)':'rgba(0,0,0,0.55)';
@@ -1246,16 +1252,16 @@ E.useEffect(()=>{
       delBtn.style.color='white';
       delBtn.style.fontSize='12px';
       delBtn.style.pointerEvents='auto';
-      delBtn.addEventListener('click',function(ev){ev.preventDefault();ev.stopPropagation();ynDeleteSingleAutoDirect(tr.id);});
+      delBtn.addEventListener('click',function(ev){ev.preventDefault();ev.stopPropagation();ynDeleteAutoIds(grp.ids);});
       el.appendChild(delBtn);
-      el.addEventListener('click',function(ev){if(ev.target===delBtn) return; ev.preventDefault();ev.stopPropagation();ynToggleAutoSelect(tr.id);});
+      el.addEventListener('click',function(ev){if(ev.target===delBtn) return; ev.preventDefault();ev.stopPropagation();ynToggleAutoGroup(grp.ids);});
       overlay.appendChild(el);
     }
     rafId=requestAnimationFrame(draw);
   };
   rafId=requestAnimationFrame(draw);
   return function(){if(rafId) cancelAnimationFrame(rafId);};
-},[ynActiveAtCurrent,Ut,ynSelectedAutoIds,ynPadding,Me,Ce,qn,ut,Ot,J,an,ynAutoSelectMode]);
+},[ynActiveAtCurrent,Ut,ynSelectedAutoIds,ynPadding,Me,Ce,qn,ut,Ot,J,an,ynAutoSelectMode,ynDeleteAutoIds,ynToggleAutoGroup]);
 const ynMergeOnePerFace=E.useCallback(()=>{
   if(ynActiveAtCurrent.length<=1) return;
   const sorted=ynActiveAtCurrent.slice().sort(function(a,b){return (b.history?.length||0)-(a.history?.length||0);});
