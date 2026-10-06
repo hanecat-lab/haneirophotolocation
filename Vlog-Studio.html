@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-export-frame-audio';
+const VLOG_PREVIEW_BUILD='2026-10-06-export-listen';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -14903,6 +14903,7 @@ function App(){
             buffer.copyToChannel(left,0);buffer.copyToChannel(right,1);
             return {buffer,method:'demux',codec:demuxed.codec,sampleRate:rate,channels:demuxed.channels,seconds:Number(seconds.toFixed(2))};
           };
+          job.frameDecodeByDemux=decodeByDemux;
           const decodeByAudioData=arrayBuffer=>new Promise(resolve=>{
             const ok=buffer=>resolve({buffer,method:'decodeAudioData',sampleRate:buffer.sampleRate,channels:buffer.numberOfChannels,seconds:Number(buffer.duration.toFixed(2))});
             const fail=error=>resolve({reason:'decodeAudioData-error',detail:String(error?.message||error?.name||error).slice(0,80)});
@@ -15049,7 +15050,35 @@ function App(){
         if(mixed){
           setExportMessage('なめらか書き出し中（音をまとめています）');
           audioReport.audioChunks=0;
-          const audioEncoder=new AudioEncoder({output:(chunk,meta)=>{ audioReport.audioChunks++; muxer.addAudioChunk(chunk,meta); },
+          // AAC-LC の AudioSpecificConfig（種類2・サンプルレートの番号・チャンネル数）。エンコーダが description を付けないときに使う。
+          const sampleRateIndex=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000].indexOf(sampleRate);
+          const fallbackConfig=new Uint8Array([(2<<3)|(sampleRateIndex>>1),((sampleRateIndex&1)<<7)|(2<<3)]);
+          const hex=bytes=>Array.from(bytes||[],value=>value.toString(16).padStart(2,'0')).join('');
+          let firstAudioChunk=true;
+          const addEncodedAudio=(chunk,meta)=>{
+            audioReport.audioChunks++;
+            const bytes=new Uint8Array(chunk.byteLength);chunk.copyTo(bytes);
+            // ADTS のヘッダー付き（0xFFF で始まる）なら、MP4 には生の AAC を入れるためヘッダーを外す。
+            const adts=bytes.length>7 && bytes[0]===0xff && (bytes[1]&0xf0)===0xf0;
+            const payload=adts?bytes.subarray((bytes[1]&1)?7:9):bytes;
+            if(firstAudioChunk){
+              const description=meta?.decoderConfig?.description;
+              const descriptionBytes=description?new Uint8Array(description.buffer||description,description.byteOffset||0,description.byteLength):null;
+              audioReport.encoderMeta={hasDecoderConfig:!!meta?.decoderConfig,codec:meta?.decoderConfig?.codec||null,
+                sampleRate:meta?.decoderConfig?.sampleRate||null,channels:meta?.decoderConfig?.numberOfChannels||null,
+                description:descriptionBytes?hex(descriptionBytes):null,firstBytes:hex(bytes.subarray(0,8)),firstSize:bytes.length,adts,
+                fallbackDescription:hex(fallbackConfig)};
+            }
+            const output=adts?new EncodedAudioChunk({type:chunk.type,timestamp:chunk.timestamp,duration:chunk.duration??undefined,data:payload}):chunk;
+            const hasDescription=!!meta?.decoderConfig?.description;
+            const fixedMeta=firstAudioChunk && !hasDescription
+              ? {...(meta||{}),decoderConfig:{...(meta?.decoderConfig||{}),codec:'mp4a.40.2',sampleRate,numberOfChannels:2,description:fallbackConfig}}
+              : meta;
+            if(firstAudioChunk && !hasDescription) audioReport.usedFallbackDescription=true;
+            firstAudioChunk=false;
+            muxer.addAudioChunk(output,fixedMeta);
+          };
+          const audioEncoder=new AudioEncoder({output:addEncodedAudio,
             error:error=>{encoderError=error;job.failure=`音のエンコードに失敗しました（${error?.message||error?.name||'不明'}）。`;job.cancelled=true;}});
           audioEncoder.configure({codec:'mp4a.40.2',sampleRate,numberOfChannels:2,bitrate:128000});
           const left=mixed.getChannelData(0),right=mixed.numberOfChannels>1?mixed.getChannelData(1):left;
@@ -15086,6 +15115,12 @@ function App(){
           audioReport.outputAudioTrack=!output.reason;
           audioReport.outputAudioSamples=output.samples?.length??0;
           audioReport.outputAudioCodec=output.codec||null;
+          audioReport.outputDescription=output.description?Array.from(output.description,value=>value.toString(16).padStart(2,'0')).join(''):null;
+          // 書き出した MP4 の音を、もう一度デコードして聞こえる音があるかを確かめる（再生側で読めるかの代わり）。
+          if(output.samples?.length && job.frameDecodeByDemux){
+            const check=await job.frameDecodeByDemux(await blob.arrayBuffer());
+            audioReport.outputDecoded=check.buffer?{...audioLevel(check.buffer),seconds:check.seconds}:{reason:check.reason,detail:check.detail||null};
+          }
         }catch(error){ audioReport.outputAudioTrack=null;audioReport.outputCheckError=String(error?.message||error).slice(0,80); }
         job.stats.recordedVideoSamples=inspection?.samples??null;
         job.stats.recordedVideoLastTime=inspection?.lastVideoTime??null;
@@ -15102,7 +15137,8 @@ function App(){
           'decodeAudioData-error':'読み込みに失敗','demux-error':'ファイルを解析できない','not-mp4':'形式を判別できない'};
         const failures=audioReport.decodeFailures.length
           ? `次の素材の音を入れられませんでした: ${audioReport.decodeFailures.map(item=>`${item.clip}（${reasonLabel[item.reason]||item.reason}）`).join('、')}。` : '';
-        const nearSilent=mixed && (audioReport.mixLevel?.peak??0)<0.001 ? '書き出しの音がほぼ無音です。' : '';
+        const nearSilent=mixed && ((audioReport.mixLevel?.peak??0)<0.001 || (audioReport.outputDecoded && !(audioReport.outputDecoded.peak>=0.001)))
+          ? '書き出した動画の音を確認できませんでした（無音の可能性があります）。' : '';
         setExportMessage([verification==='passed'?'':'書き出した映像のコマ数が想定より少ない可能性があります。保存後に確認してください。',failures,
           nearSilent,!canAudio?'この端末では音を含められませんでした。':''].filter(Boolean).join(' '));
         setExportDiagnosticText(job.exportSnapshot('なめらか書き出しの完了時の状態を記録しました。'));
@@ -20775,6 +20811,9 @@ const recomputeStarts=(arr)=>{
         ),
         exportStatus==='done' && React.createElement(React.Fragment,null,
           React.createElement('div', {className:'text-sm text-white/70 mb-2'}, `${exportFile?.name || '動画'} を作成しました。`),
+          // 出来上がった動画をその場で再生して、映像と音を確かめる（なめらか書き出しは書き出し中に音が鳴らないため）。
+          exportFile?.url && React.createElement('video', {key:exportFile.url,src:exportFile.url,controls:true,playsInline:true,preload:'metadata',
+            'aria-label':'書き出した動画の試聴',className:'w-full rounded-xl bg-black mb-3',style:{maxHeight:'min(320px, 40dvh)'}}),
           React.createElement('div', {className:'text-xs text-white/55 mb-4'},
             `${exportFile?.size ? (exportFile.size/1048576).toFixed(1)+' MiB' : ''} · ${exportFile?.profileLabel||'標準'} · 実測合計 ${exportFile?.actualTotalBitrate ? (exportFile.actualTotalBitrate/1000000).toFixed(1)+'Mbps' : '不明'}${exportFile?.bitrateFallback?' · 端末の録画方式により指定値と異なります。':''}`),
           exportFile?.verification==='passed' && React.createElement('div',{className:'text-xs text-emerald-200 mb-3'},
