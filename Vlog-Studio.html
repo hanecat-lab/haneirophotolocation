@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-export-frame';
+const VLOG_PREVIEW_BUILD='2026-10-06-export-frame-audio';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -9156,6 +9156,77 @@ const vlogAnalyserLevelDb=(analyser,buffer)=>{
   const rms=Math.sqrt(sum/buffer.length);
   return rms>0 ? 20*Math.log10(rms) : -Infinity;
 };
+// esds の中の AudioSpecificConfig（タグ5）を、ファイルの生のバイト列から探す。
+// QuickTime の .mov は esds が wave の中にあり、mp4box が解釈しないことがあるため自前で読む。
+const vlogFindAudioSpecificConfig=bytes=>{
+  for(let i=4;i+8<bytes.length;i++){
+    if(bytes[i]!==0x65||bytes[i+1]!==0x73||bytes[i+2]!==0x64||bytes[i+3]!==0x73) continue; // 'esds'
+    let at=i+8; // 種別の後ろの version と flags を飛ばす
+    const readDescriptor=()=>{
+      const tag=bytes[at++];let size=0;
+      for(let k=0;k<4;k++){ const value=bytes[at++]; size=(size<<7)|(value&0x7f); if(!(value&0x80)) break; }
+      return {tag,size,start:at};
+    };
+    try{
+      const es=readDescriptor();
+      if(es.tag!==3) continue;
+      at+=2;const flags=bytes[at++];
+      if(flags&0x80) at+=2;
+      if(flags&0x40) at+=1+bytes[at];
+      if(flags&0x20) at+=2;
+      const config=readDescriptor();
+      if(config.tag!==4) continue;
+      at+=13;
+      const specific=readDescriptor();
+      if(specific.tag!==5 || specific.size<2 || at+specific.size>bytes.length) continue;
+      return bytes.slice(at,at+specific.size);
+    }catch{ continue; }
+  }
+  return null;
+};
+// 動画ファイル（.mov/.mp4）から音のトラックのサンプルと設定を取り出す。音のトラックがない・読めないときは reason を返す。
+const vlogDemuxAudio=(MP4Box,arrayBuffer)=>new Promise(resolve=>{
+  let settled=false;
+  const done=value=>{ if(!settled){ settled=true; resolve(value); } };
+  try{
+    const file=MP4Box.createFile();
+    const samples=[];
+    let meta=null;
+    file.onError=error=>done({reason:'demux-error',detail:String(error).slice(0,80)});
+    file.onReady=info=>{
+      const track=info.audioTracks?.[0];
+      if(!track){ done({reason:'no-audio-track'}); return; }
+      const trak=file.getTrackById(track.id);
+      const entry=trak?.mdia?.minf?.stbl?.stsd?.entries?.[0];
+      const findSpecific=node=>{
+        if(!node) return null;
+        if(node.tag===5 && node.data) return node.data;
+        for(const child of node.descs||[]){ const found=findSpecific(child); if(found) return found; }
+        return null;
+      };
+      const specific=findSpecific(entry?.esds?.esd)||vlogFindAudioSpecificConfig(new Uint8Array(arrayBuffer));
+      const timescale=trak?.mdia?.mdhd?.timescale||track.timescale;
+      const edit=trak?.edts?.elst?.entries?.find(item=>item.media_time>=0);
+      // 'mp4a' だけのときは AudioSpecificConfig の先頭5ビット（オブジェクトの種類）から mp4a.40.x を作る。
+      const objectType=specific&&specific.length?(new Uint8Array(specific)[0]>>3):2;
+      const codec=/^mp4a\.40\.\d+$/.test(track.codec)?track.codec:track.codec&&track.codec.startsWith('mp4a')?`mp4a.40.${objectType||2}`:track.codec;
+      meta={codec,sampleRate:track.audio?.sample_rate,channels:track.audio?.channel_count,
+        timescale,mediaTime:edit?edit.media_time/timescale:null,
+        description:specific?new Uint8Array(specific):null,count:track.nb_samples};
+      file.setExtractionOptions(track.id,null,{nbSamples:Infinity});
+      file.start();
+    };
+    file.onSamples=(id,user,list)=>{
+      for(const sample of list) samples.push({data:sample.data,timestamp:Math.round(sample.cts*1e6/sample.timescale),
+        duration:Math.round(sample.duration*1e6/sample.timescale)});
+      if(meta && samples.length>=meta.count) done({...meta,samples});
+    };
+    const buffer=arrayBuffer.slice(0);buffer.fileStart=0;
+    file.appendBuffer(buffer);
+    file.flush();
+    setTimeout(()=>done(meta?(samples.length?{...meta,samples}:{reason:'no-samples'}):{reason:'not-mp4'}),0);
+  }catch(error){ done({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}); }
+});
 // なめらか書き出しの音の段取り（一括合成用の純粋関数）。音量は実時間の書き出しと同じ計算にそろえる。
 // 素材の音量: トランジションの重なりで、入る側はフェードイン、出る側はフェードアウト。
 const vlogExportClipVolume=(items,clip,t)=>{
@@ -14762,25 +14833,96 @@ function App(){
         const {Muxer,ArrayBufferTarget}=await import('https://esm.sh/mp4-muxer@5.1.3');
         const sampleRate=48000;
         // 音: 素材の音を一括合成し、その大きさから BGM を下げる係数を出してから、BGM を重ねてもう一度合成する。
-        const audioReport={decodeFailures:[],clips:0,bgm:0};
+        const audioReport={sources:[],decodeFailures:[],clips:0,bgm:0};
+        const mp4boxModule=await import('https://esm.sh/mp4box@0.5.2');
+        const MP4Box=mp4boxModule.default||mp4boxModule;
+        // 合成した音の最大値と平均（dBFS）。無音かどうかを診断で見分ける。
+        const audioLevel=buffer=>{
+          let peak=0,sum=0,count=0;
+          for(let c=0;c<buffer.numberOfChannels;c++){
+            const data=buffer.getChannelData(c);
+            for(let i=0;i<data.length;i+=4){ const v=Math.abs(data[i]); if(v>peak) peak=v; sum+=v*v; count++; }
+          }
+          const rms=count?Math.sqrt(sum/count):0;
+          return {peak:Number(peak.toFixed(4)),rmsDb:rms>0?Number((20*Math.log10(rms)).toFixed(1)):null};
+        };
         let mixed=null;
         const Offline=window.OfflineAudioContext||window.webkitOfflineAudioContext;
         const canAudio=typeof AudioEncoder==='function' && typeof AudioData==='function' && !!Offline;
         if(!canAudio) recordExportEvent('frame-audio-unavailable',null,{});
         if(canAudio){
+          // 動画ファイルの音: mp4box で取り出して AudioDecoder でデコードする（iPhone の decodeAudioData は .mov を読めない）。
+          const helperCtx=new Offline(2,sampleRate,sampleRate);
+          const copyChannel=(data,channel)=>{
+            const frames=data.numberOfFrames,out=new Float32Array(frames);
+            if(String(data.format).endsWith('-planar')){
+              if(data.format==='f32-planar'){ data.copyTo(out,{planeIndex:channel}); return out; }
+              data.copyTo(out,{planeIndex:channel,format:'f32-planar'}); return out;
+            }
+            if(data.format==='f32'){
+              const all=new Float32Array(frames*data.numberOfChannels);data.copyTo(all,{planeIndex:0});
+              for(let i=0;i<frames;i++) out[i]=all[i*data.numberOfChannels+channel];
+              return out;
+            }
+            data.copyTo(out,{planeIndex:channel,format:'f32-planar'});
+            return out;
+          };
+          const decodeByDemux=async arrayBuffer=>{
+            const demuxed=await vlogDemuxAudio(MP4Box,arrayBuffer);
+            if(demuxed.reason) return demuxed;
+            if(typeof AudioDecoder!=='function') return {reason:'no-audio-decoder'};
+            const config={codec:demuxed.codec,sampleRate:demuxed.sampleRate,numberOfChannels:demuxed.channels,
+              ...(demuxed.description?{description:demuxed.description}:{})};
+            const support=await AudioDecoder.isConfigSupported(config).catch(()=>({supported:false}));
+            if(!support?.supported) return {reason:'unsupported-codec',codec:demuxed.codec};
+            const start=Number.isFinite(demuxed.mediaTime)?demuxed.mediaTime:demuxed.samples[0].timestamp/1e6;
+            const lastSample=demuxed.samples[demuxed.samples.length-1];
+            const seconds=Math.max(0.01,(lastSample.timestamp+lastSample.duration)/1e6-start);
+            const rate=demuxed.sampleRate,length=Math.max(1,Math.ceil(seconds*rate));
+            const left=new Float32Array(length),right=new Float32Array(length);
+            const write=(target,source,at)=>{ for(let i=0;i<source.length;i++){ const index=at+i; if(index>=0 && index<length) target[index]=source[i]; } };
+            let decodeError=null;
+            const decoder=new AudioDecoder({output:data=>{
+              try{
+                const at=Math.round((data.timestamp/1e6-start)*rate);
+                const first=copyChannel(data,0);
+                write(left,first,at);
+                write(right,data.numberOfChannels>1?copyChannel(data,1):first,at);
+              }catch(error){ decodeError=decodeError||error; }
+              finally{ data.close(); }
+            },error:error=>{ decodeError=decodeError||error; }});
+            decoder.configure(config);
+            for(const sample of demuxed.samples)
+              decoder.decode(new EncodedAudioChunk({type:'key',timestamp:sample.timestamp,duration:sample.duration,data:sample.data}));
+            let timer=0;
+            await Promise.race([decoder.flush(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('timeout')),10000);})])
+              .catch(error=>{ decodeError=decodeError||error; }).finally(()=>clearTimeout(timer));
+            try{ decoder.close(); }catch{}
+            if(decodeError) return {reason:'decoder-error',codec:demuxed.codec,detail:String(decodeError?.message||decodeError?.name||decodeError).slice(0,80)};
+            const buffer=helperCtx.createBuffer(2,length,rate);
+            buffer.copyToChannel(left,0);buffer.copyToChannel(right,1);
+            return {buffer,method:'demux',codec:demuxed.codec,sampleRate:rate,channels:demuxed.channels,seconds:Number(seconds.toFixed(2))};
+          };
+          const decodeByAudioData=arrayBuffer=>new Promise(resolve=>{
+            const ok=buffer=>resolve({buffer,method:'decodeAudioData',sampleRate:buffer.sampleRate,channels:buffer.numberOfChannels,seconds:Number(buffer.duration.toFixed(2))});
+            const fail=error=>resolve({reason:'decodeAudioData-error',detail:String(error?.message||error?.name||error).slice(0,80)});
+            try{ const result=helperCtx.decodeAudioData(arrayBuffer,ok,fail); if(result?.then) result.then(ok,fail); }catch(error){ fail(error); }
+          });
           const decoded=new Map();
-          const decodeUrl=async url=>{
-            if(decoded.has(url)) return decoded.get(url);
-            const task=(async()=>{
-              const data=await (await fetch(url)).arrayBuffer();
-              const ctx=new Offline(2,sampleRate,sampleRate);
-              return await new Promise((resolve,reject)=>{
-                const result=ctx.decodeAudioData(data,resolve,reject);
-                if(result?.then) result.then(resolve,reject);
-              });
-            })();
-            decoded.set(url,task);
-            return task;
+          const decodeUrl=async (url,label)=>{
+            if(!decoded.has(url)) decoded.set(url,(async()=>{
+              let data;
+              try{ data=await (await fetch(url)).arrayBuffer(); }catch(error){ return {reason:'fetch-error',detail:String(error?.message||error).slice(0,80)}; }
+              const first=await decodeByDemux(data.slice(0)).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
+              if(first.buffer || first.reason==='no-audio-track') return first;
+              const second=await decodeByAudioData(data.slice(0));
+              return second.buffer?second:{...second,demux:first.reason,codec:first.codec};
+            })());
+            const result=await decoded.get(url);
+            audioReport.sources.push({clip:label,method:result.method||'none',codec:result.codec||null,sampleRate:result.sampleRate||null,
+              channels:result.channels||null,seconds:result.seconds||null,reason:result.reason||null,detail:result.detail||null,demux:result.demux||null});
+            if(!result.buffer && result.reason!=='no-audio-track') audioReport.decodeFailures.push({clip:label,reason:result.reason});
+            return result.buffer||null;
           };
           const length=Math.max(1,Math.ceil(total*sampleRate));
           const clipPlan=vlogFrameClipAudioPlan({items,mediaItems,sourceAudioVolume,total});
@@ -14798,9 +14940,7 @@ function App(){
           const renderClips=async ctx=>{
             for(const item of clipPlan){
               if(job.cancelled) throw new Error('書き出しを中止しました。');
-              let buffer=null;
-              try{ buffer=await decodeUrl(item.url); }
-              catch(error){ audioReport.decodeFailures.push({clip:item.name,error:String(error?.name||error?.message||error).slice(0,80)}); continue; }
+              const buffer=await decodeUrl(item.url,item.name);
               if(!buffer || item.offset>=buffer.duration) continue;
               schedule(ctx,buffer,item,ctx.destination,{offset:item.offset,rate:item.rate});
               audioReport.clips++;
@@ -14810,14 +14950,13 @@ function App(){
           const voiceCtx=new Offline(2,length,sampleRate);
           await renderClips(voiceCtx);
           const voice=await voiceCtx.startRendering();
+          audioReport.voiceLevel=audioLevel(voice);
           const bgmUrl=bgm?.currentSrc||bgm?.src||'';
           const bgmPlan=bgmUrl ? vlogFrameBgmPlan({bgmClips:job.bgmClips,master:bgmVolumeRef.current,total,
             single:{timelineStart:bgmTimelineStartRef.current,duration:bgmTimelineDurationRef.current,
               fadeIn:bgmFadeInRef.current,fadeOut:bgmFadeOutRef.current,gain:1,offset:bgmOffsetRef.current}}) : [];
           if(bgmPlan.length){
-            let bgmBuffer=null;
-            try{ bgmBuffer=await decodeUrl(bgmUrl); }
-            catch(error){ audioReport.decodeFailures.push({clip:'BGM',error:String(error?.name||error?.message||error).slice(0,80)}); }
+            const bgmBuffer=await decodeUrl(bgmUrl,'BGM');
             if(bgmBuffer){
               const mixCtx=new Offline(2,length,sampleRate);
               const voiceSource=mixCtx.createBufferSource();voiceSource.buffer=voice;voiceSource.connect(mixCtx.destination);voiceSource.start(0);
@@ -14832,6 +14971,7 @@ function App(){
             }
           }
           if(!mixed) mixed=voice;
+          audioReport.mixLevel=audioLevel(mixed);
         }
         job.stats.frameAudio=audioReport;
         // 映像と音をまとめる。
@@ -14908,7 +15048,8 @@ function App(){
         if(encoderError || job.cancelled) throw new Error(job.failure||'書き出しを中止しました。');
         if(mixed){
           setExportMessage('なめらか書き出し中（音をまとめています）');
-          const audioEncoder=new AudioEncoder({output:(chunk,meta)=>muxer.addAudioChunk(chunk,meta),
+          audioReport.audioChunks=0;
+          const audioEncoder=new AudioEncoder({output:(chunk,meta)=>{ audioReport.audioChunks++; muxer.addAudioChunk(chunk,meta); },
             error:error=>{encoderError=error;job.failure=`音のエンコードに失敗しました（${error?.message||error?.name||'不明'}）。`;job.cancelled=true;}});
           audioEncoder.configure({codec:'mp4a.40.2',sampleRate,numberOfChannels:2,bitrate:128000});
           const left=mixed.getChannelData(0),right=mixed.numberOfChannels>1?mixed.getChannelData(1):left;
@@ -14939,6 +15080,13 @@ function App(){
         job.stats.recordedBytes=blob.size;
         job.stats.actualTotalBitrate=Math.round(blob.size*8/total);
         const inspection=await inspectMp4Video(blob,items).catch(()=>null);
+        // 書き出した MP4 に音のトラックが入ったかを確かめる。
+        try{
+          const output=await vlogDemuxAudio(MP4Box,await blob.arrayBuffer());
+          audioReport.outputAudioTrack=!output.reason;
+          audioReport.outputAudioSamples=output.samples?.length??0;
+          audioReport.outputAudioCodec=output.codec||null;
+        }catch(error){ audioReport.outputAudioTrack=null;audioReport.outputCheckError=String(error?.message||error).slice(0,80); }
         job.stats.recordedVideoSamples=inspection?.samples??null;
         job.stats.recordedVideoLastTime=inspection?.lastVideoTime??null;
         job.stats.recordingContainer=inspection?.container??null;
@@ -14950,10 +15098,13 @@ function App(){
         const name=`Vlog-Studio-${new Date().toISOString().replace(/[:.]/g,'-')}.mp4`;
         setExportFile({url:URL.createObjectURL(blob),name,size:blob.size,bitrateFallback:false,verification,
           videoSamples:job.stats.recordedVideoSamples,profileLabel:exportProfile.label,actualTotalBitrate:job.stats.actualTotalBitrate});
+        const reasonLabel={'unsupported-codec':'この形式は未対応','decoder-error':'デコードに失敗','fetch-error':'読み込みに失敗',
+          'decodeAudioData-error':'読み込みに失敗','demux-error':'ファイルを解析できない','not-mp4':'形式を判別できない'};
         const failures=audioReport.decodeFailures.length
-          ? `次の素材の音を読み込めず、無音になりました: ${audioReport.decodeFailures.map(item=>item.clip).join('、')}。` : '';
+          ? `次の素材の音を入れられませんでした: ${audioReport.decodeFailures.map(item=>`${item.clip}（${reasonLabel[item.reason]||item.reason}）`).join('、')}。` : '';
+        const nearSilent=mixed && (audioReport.mixLevel?.peak??0)<0.001 ? '書き出しの音がほぼ無音です。' : '';
         setExportMessage([verification==='passed'?'':'書き出した映像のコマ数が想定より少ない可能性があります。保存後に確認してください。',failures,
-          !canAudio?'この端末では音を含められませんでした。':''].filter(Boolean).join(' '));
+          nearSilent,!canAudio?'この端末では音を含められませんでした。':''].filter(Boolean).join(' '));
         setExportDiagnosticText(job.exportSnapshot('なめらか書き出しの完了時の状態を記録しました。'));
         setExportProgress(100);
         setExportStatus('done');
