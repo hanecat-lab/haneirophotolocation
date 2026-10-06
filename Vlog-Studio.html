@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-export-frame-text';
+const VLOG_PREVIEW_BUILD='2026-10-06-cover-date';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -7723,6 +7723,178 @@ const vlogTextFont=key=>VLOG_TEXT_FONTS.find(font=>font.key===key)?.family ||
   (key && key!=='sans' ? key : VLOG_TEXT_FONTS[0].family);
 const vlogTextFontWeight=txt=>txt.bold?(VLOG_TEXT_FONTS.find(font=>font.key===txt.fontFamily)?.boldWeight||700):400;
 const vlogTextFontSpec=(txt,size)=>`${vlogTextFontWeight(txt)} ${size}px ${vlogTextFont(txt.fontFamily)}`;
+
+// 撮影日スタンプ。日付は「撮影した場所の暦日」を 'YYYY-MM-DD' で持ち、曜日もそこから出す。
+const VLOG_DATE_STAMP_FORMATS=[
+  {key:'dot',label:'2026.10.06 TUE',font:'cormorant'},
+  {key:'ja',label:'2026年10月6日（火）',font:'rounded'},
+  {key:'en',label:'OCT 6, 2026',font:'cormorant'}
+];
+const vlogFormatCaptureDate=(ymd,format)=>{
+  const m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd||'');
+  if(!m) return '';
+  const [y,mo,d]=[Number(m[1]),Number(m[2]),Number(m[3])];
+  const wd=new Date(Date.UTC(y,mo-1,d)).getUTCDay();
+  if(format==='ja') return `${y}年${mo}月${d}日（${'日月火水木金土'[wd]}）`;
+  if(format==='en') return `${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][mo-1]} ${d}, ${y}`;
+  return `${m[1]}.${m[2]}.${m[3]} ${['SUN','MON','TUE','WED','THU','FRI','SAT'][wd]}`;
+};
+const vlogValidYmd=(y,mo,d)=>y>=1990 && y<=2100 && mo>=1 && mo<=12 && d>=1 && d<=31
+  ? `${String(y).padStart(4,'0')}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}` : null;
+// JPEG の EXIF から DateTimeOriginal（なければ DateTime）を読む。
+const vlogJpegCaptureDate=bytes=>{
+  const v=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+  if(v.byteLength<4 || v.getUint16(0)!==0xFFD8) return null;
+  let p=2;
+  while(p+4<=v.byteLength){
+    if(v.getUint8(p)!==0xFF) return null;
+    const marker=v.getUint8(p+1);
+    if(marker===0xDA || marker===0xD9) return null;
+    const len=v.getUint16(p+2);
+    if(marker===0xE1 && p+10<=v.byteLength && v.getUint32(p+4)===0x45786966 && v.getUint16(p+8)===0){
+      const t=p+10;
+      if(t+8>v.byteLength) return null;
+      const le=v.getUint16(t)===0x4949;
+      const u16=o=>v.getUint16(t+o,le), u32=o=>v.getUint32(t+o,le);
+      const inRange=o=>t+o>=t && t+o<v.byteLength;
+      const readIfd=(off,want)=>{
+        const found={};
+        if(!inRange(off+2)) return found;
+        const n=u16(off);
+        for(let i=0;i<n;i++){
+          const e=off+2+i*12;
+          if(!inRange(e+12)) break;
+          const tag=u16(e);
+          if(!want.includes(tag)) continue;
+          if(tag===0x8769) found[tag]=u32(e+8);
+          else {
+            const count=u32(e+4), at=count>4?u32(e+8):e+8;
+            if(!inRange(at+Math.min(count,19))) continue;
+            let str='';
+            for(let k=0;k<Math.min(count,19);k++) str+=String.fromCharCode(v.getUint8(t+at+k));
+            found[tag]=str;
+          }
+        }
+        return found;
+      };
+      const ifd0=readIfd(u32(4),[0x8769,0x0132]);
+      const exif=ifd0[0x8769]!=null ? readIfd(ifd0[0x8769],[0x9003,0x9004]) : {};
+      for(const str of [exif[0x9003],exif[0x9004],ifd0[0x0132]]){
+        const m=/^(\d{4}):(\d{2}):(\d{2})/.exec(str||'');
+        const ymd=m && vlogValidYmd(Number(m[1]),Number(m[2]),Number(m[3]));
+        if(ymd) return ymd;
+      }
+      return null;
+    }
+    p+=2+len;
+  }
+  return null;
+};
+// 動画（mov/mp4）の moov から撮影日を読む。Apple の creationdate（撮影地の時刻帯つき文字列）を優先し、
+// なければ mvhd の作成日時（UTC 秒）を端末の時刻帯で暦日にする。
+const vlogMoovCaptureDate=bytes=>{
+  const v=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+  let text='';
+  for(let i=0;i<bytes.length;i++) text+=String.fromCharCode(bytes[i]);
+  // meta の keys で creationdate の番号を探し、ilst の同じ番号の data から文字列を取る。
+  const keysAt=text.indexOf('keys'), ilstAt=text.indexOf('ilst');
+  if(keysAt>=4 && ilstAt>=4 && keysAt+12<=bytes.length){
+    let index=0;
+    const count=v.getUint32(keysAt+8);
+    for(let i=0,e=keysAt+12;i<count && e+8<=bytes.length;i++){
+      const size=v.getUint32(e);
+      if(size<8) break;
+      if(text.slice(e+8,e+size)==='com.apple.quicktime.creationdate'){ index=i+1; break; }
+      e+=size;
+    }
+    const ilstEnd=Math.min(bytes.length,ilstAt-4+v.getUint32(ilstAt-4));
+    for(let e=ilstAt+4;index && e+8<=ilstEnd;){
+      const size=v.getUint32(e);
+      if(size<8) break;
+      if(v.getUint32(e+4)===index && text.slice(e+12,e+16)==='data'){
+        const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(text.slice(e+24,e+size));
+        const ymd=m && vlogValidYmd(Number(m[1]),Number(m[2]),Number(m[3]));
+        if(ymd) return ymd;
+      }
+      e+=size;
+    }
+  }
+  const at=text.indexOf('mvhd');
+  if(at>=4 && at+16<=bytes.length){
+    const version=v.getUint8(at+4);
+    const secs=version===1 ? (at+20<=bytes.length ? v.getUint32(at+8)*4294967296+v.getUint32(at+12) : 0) : v.getUint32(at+8);
+    if(secs>0){
+      const date=new Date((secs-2082844800)*1000);
+      return vlogValidYmd(date.getFullYear(),date.getMonth()+1,date.getDate());
+    }
+  }
+  return null;
+};
+const vlogFindMoov=async blob=>{
+  let pos=0;
+  while(pos+8<=blob.size){
+    const head=new DataView(await blob.slice(pos,pos+16).arrayBuffer());
+    let size=head.getUint32(0);
+    const type=String.fromCharCode(head.getUint8(4),head.getUint8(5),head.getUint8(6),head.getUint8(7));
+    if(size===1 && head.byteLength>=16) size=head.getUint32(8)*4294967296+head.getUint32(12);
+    else if(size===0) size=blob.size-pos;
+    if(size<8) return null;
+    if(type==='moov') return new Uint8Array(await blob.slice(pos,Math.min(blob.size,pos+size,pos+32*1024*1024)).arrayBuffer());
+    pos+=size;
+  }
+  return null;
+};
+const vlogReadCaptureDate=async clip=>{
+  if(!clip?.url) return null;
+  const blob=await (await fetch(clip.url)).blob();
+  if(clip.type==='photo') return vlogJpegCaptureDate(new Uint8Array(await blob.slice(0,256*1024).arrayBuffer()));
+  const moov=await vlogFindMoov(blob);
+  return moov ? vlogMoovCaptureDate(moov) : null;
+};
+
+// 表紙のタイトル。frame=白フチ文字、band=帯、hand=手書き風。改行で最大3行、幅に合わせて縮める。
+const VLOG_COVER_STYLES=[
+  {key:'frame',label:'白フチ',font:'rounded'},
+  {key:'band',label:'帯',font:'shippori'},
+  {key:'hand',label:'手書き風',font:'klee'}
+];
+const vlogCoverTitleFont=(style,size)=>{
+  const def=VLOG_COVER_STYLES.find(s=>s.key===style)||VLOG_COVER_STYLES[0];
+  return `${style==='hand'?600:700} ${Math.round(size)}px ${vlogTextFont(def.font)}`;
+};
+const paintVlogCoverTitle=(ctx,W,H,title,style)=>{
+  const lines=String(title||'').split('\n').map(l=>l.trim()).filter(Boolean).slice(0,3);
+  if(!lines.length) return;
+  let size=Math.round(Math.min(W,H)*(style==='band'?0.085:0.11));
+  ctx.save();
+  ctx.textAlign='center';ctx.textBaseline='middle';ctx.lineJoin='round';
+  for(;size>12;size-=2){
+    ctx.font=vlogCoverTitleFont(style,size);
+    if(Math.max(...lines.map(l=>ctx.measureText(l).width))<=W*0.86) break;
+  }
+  const lineH=size*1.3, cx=W/2, cy=H*(H>W?0.72:0.68);
+  const top=cy-lineH*(lines.length-1)/2;
+  if(style==='band'){
+    const bandH=lineH*lines.length+size*0.9;
+    ctx.fillStyle='rgba(245,239,228,0.92)';
+    ctx.fillRect(0,cy-bandH/2,W,bandH);
+    ctx.fillStyle='#2b2420';
+    lines.forEach((l,i)=>ctx.fillText(l,cx,top+i*lineH));
+  }else if(style==='hand'){
+    ctx.translate(cx,cy);ctx.rotate(-0.06);ctx.translate(-cx,-cy);
+    ctx.shadowColor='rgba(0,0,0,0.55)';ctx.shadowBlur=size*0.25;ctx.shadowOffsetY=size*0.05;
+    ctx.fillStyle='#ffffff';
+    lines.forEach((l,i)=>ctx.fillText(l,cx,top+i*lineH));
+  }else{
+    ctx.shadowColor='rgba(0,0,0,0.35)';ctx.shadowBlur=size*0.2;
+    ctx.strokeStyle='#ffffff';ctx.lineWidth=size*0.24;
+    lines.forEach((l,i)=>ctx.strokeText(l,cx,top+i*lineH));
+    ctx.shadowColor='transparent';
+    ctx.fillStyle='#2a2a2a';
+    lines.forEach((l,i)=>ctx.fillText(l,cx,top+i*lineH));
+  }
+  ctx.restore();
+};
 
 const VLOG_TEXT_LAYER_CACHE=new Map();
 // 文字の濃さが100%未満のとき、縁取り・影・文字を裏のcanvasにまとめて描き、1枚として透かして重ねる。
@@ -9787,6 +9959,9 @@ function App(){
   const projectImportBusyRef=useRef(false);
   const projectFailedAssetsRef=useRef(new Map());
   const [cafeStoreName, setCafeStoreName] = useState('BLUE BOTTLE');
+  const [dateStampFormat, setDateStampFormat] = useState(()=>{ try{ return localStorage.getItem('vlogDateStampFormat')||'dot'; }catch{ return 'dot'; } });
+  const [dateStampBusy, setDateStampBusy] = useState(false);
+  const [dateStampNote, setDateStampNote] = useState('');
   const [showSafeArea, setShowSafeArea] = useState(true);
   const [autoLayoutEnabled, setAutoLayoutEnabled] = useState(true);
   // ひかりよみシアター用
@@ -11085,6 +11260,11 @@ function App(){
   const [reorderOpen, setReorderOpen] = useState(false);
   const [reorderInitialId, setReorderInitialId] = useState(null);
   const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
+  const [coverOpen, setCoverOpen] = useState(false);
+  const [coverTitle, setCoverTitle] = useState('');
+  const [coverStyle, setCoverStyle] = useState('frame');
+  const [coverImage, setCoverImage] = useState(null);
+  const [coverError, setCoverError] = useState('');
   const [exportChoiceScope, setExportChoiceScope] = useState('all');
   const [exportSizeMode, setExportSizeMode] = useState('compact');
   const [connectionEditor, setConnectionEditor] = useState(null);
@@ -15966,6 +16146,60 @@ function App(){
   },[cafeStoreName, findSafePosition]);
 
 
+  // 撮影日スタンプ。mode='one' は再生位置の素材に、'change' は撮影日が前の素材と変わる素材にだけ入れる。
+  const addCaptureDateStamps=async(mode)=>{
+    if(dateStampBusy) return;
+    const sorted=[...clipsRef.current].sort((a,b)=>a.timelineStart-b.timelineStart);
+    const targets=mode==='one'
+      ? sorted.filter(c=>timeRef.current>=c.timelineStart && timeRef.current<c.timelineStart+c.duration).slice(0,1)
+      : sorted;
+    if(!targets.length){ setDateStampNote('再生位置に素材がありません。'); return; }
+    setDateStampBusy(true);
+    setDateStampNote('撮影日を読んでいます…');
+    try{
+      const dates=new Map(), unknown=[];
+      for(const clip of targets){
+        let ymd=clip._capturedAt||null;
+        if(!ymd){ try{ ymd=await vlogReadCaptureDate(clip._splitScreen?.clips?.[0]||clip); }catch{ ymd=null; } }
+        if(ymd) dates.set(clip.id,ymd); else unknown.push(clip.name||'素材');
+      }
+      if([...dates].some(([id,ymd])=>targets.find(c=>c.id===id)?._capturedAt!==ymd))
+        setClips(prev=>prev.map(c=>dates.has(c.id)&&c._capturedAt!==dates.get(c.id)?{...c,_capturedAt:dates.get(c.id)}:c));
+      const stampClips=[];
+      let prevYmd=null;
+      for(const clip of targets){
+        const ymd=dates.get(clip.id);
+        if(!ymd) continue;
+        if(mode==='one' || ymd!==prevYmd) stampClips.push(clip);
+        prevYmd=ymd;
+      }
+      const format=VLOG_DATE_STAMP_FORMATS.find(f=>f.key===dateStampFormat)||VLOG_DATE_STAMP_FORMATS[0];
+      const canvas=canvasRef.current;
+      const W=canvas?.width||1080, H=canvas?.height||1920;
+      const measure=document.createElement('canvas').getContext('2d');
+      const items=stampClips.map((clip,i)=>{
+        const end=Math.min(2,clip.duration);
+        const item={id:`${Date.now()}-${i}-${Math.random().toString(36).slice(2,7)}`,
+          text:vlogFormatCaptureDate(dates.get(clip.id),format.key),
+          start:clip.timelineStart,end:clip.timelineStart+end,x:30,y:88,font:0,anim:'fade',
+          fontSize:0.03,color:'#ffffff',bgColor:'transparent',fontFamily:format.font,bold:false,outline:false,
+          strokeColor:'rgba(0,0,0,0.8)',align:'center',vertical:false,verticalSpacing:0.15,letterSpacing:0,
+          _dateStamp:true,_clipId:clip.id,_clipStart:0,_clipEnd:end};
+        // 文字の中心で位置が決まるので、左端が画面の左6%にそろうように中心を出す。
+        measure.font=vlogTextFontSpec(item,item.fontSize*H);
+        item.x=Math.round((W*0.06+measure.measureText(item.text).width/2)/W*1000)/10;
+        return item;
+      });
+      const stamped=new Set(stampClips.map(c=>c.id));
+      if(items.length) setTexts(prev=>[...prev.filter(t=>!(t._dateStamp && stamped.has(t._clipId))),...items]);
+      setDateStampNote([
+        items.length?`日付を${items.length}件入れました。`:'日付を入れられる素材がありませんでした。',
+        unknown.length?`撮影日が分からなかった素材: ${unknown.join('、')}`:''
+      ].filter(Boolean).join('\n'));
+      setTimeout(()=>{ try{ drawFrameRef.current(timeRef.current); }catch{} },30);
+    }finally{ setDateStampBusy(false); }
+  };
+
   const addText = useCallback(()=>{
     const id=`${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
     const t = timeRef.current;
@@ -16542,6 +16776,70 @@ function App(){
       setCameraStatus('saving');
       try{ recorder.stop(); }catch{ setCameraStatus('error'); setCameraError('録画を停止できませんでした。'); }
     }
+  };
+  // 表紙: 再生位置のコマを書き出しと同じ寸法で描き、タイトルを重ねて JPEG にする。キャンバスはすぐ元に戻す。
+  const renderCoverImage=async(title,style)=>{
+    const canvas=canvasRef.current;
+    if(!canvas) throw new Error('プレビューが見つかりません。');
+    try{ await document.fonts?.load?.(vlogCoverTitleFont(style,64),title||'あ'); }catch{}
+    const wide=aspectModeRef.current==='16:9';
+    const W=wide?1920:1080, H=wide?1080:1920;
+    const out=document.createElement('canvas');
+    out.width=W;out.height=H;
+    const w0=canvas.width,h0=canvas.height,t=timeRef.current;
+    try{
+      canvas.width=W;canvas.height=H;
+      drawFrameRef.current._forceNext=true;
+      drawFrameRef.current(t);
+      out.getContext('2d').drawImage(canvas,0,0);
+    }finally{
+      canvas.width=w0;canvas.height=h0;
+      drawFrameRef.current._forceNext=true;
+      drawFrameRef.current(t);
+    }
+    paintVlogCoverTitle(out.getContext('2d'),W,H,title,style);
+    const blob=await new Promise(res=>out.toBlob(res,'image/jpeg',0.92));
+    if(!blob) throw new Error('表紙の画像を作れませんでした。');
+    return blob;
+  };
+  const openCover=()=>{
+    if(playingRef.current) handleStop();
+    setExportChoiceOpen(false);
+    setCoverError('');
+    setCoverOpen(true);
+  };
+  useEffect(()=>{
+    if(!coverOpen) return;
+    let cancelled=false;
+    const timer=setTimeout(async()=>{
+      try{
+        const blob=await renderCoverImage(coverTitle,coverStyle);
+        if(cancelled) return;
+        const d=new Date(), pad=n=>String(n).padStart(2,'0');
+        const name=`Vlog-cover-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.jpg`;
+        setCoverImage(prev=>{ if(prev?.url) URL.revokeObjectURL(prev.url); return {url:URL.createObjectURL(blob),file:new File([blob],name,{type:'image/jpeg'})}; });
+        setCoverError('');
+      }catch(e){ if(!cancelled) setCoverError(e?.message||'表紙を作れませんでした。'); }
+    },250);
+    return ()=>{ cancelled=true; clearTimeout(timer); };
+  },[coverOpen,coverTitle,coverStyle]);
+  const closeCover=()=>{
+    setCoverOpen(false);
+    setCoverImage(prev=>{ if(prev?.url) URL.revokeObjectURL(prev.url); return null; });
+  };
+  const shareCover=async()=>{
+    const file=coverImage?.file;
+    if(!file) return;
+    try{
+      if(navigator.share && navigator.canShare?.({files:[file]})){
+        await navigator.share({files:[file],title:'Vlogの表紙'});
+      }else{
+        const url=URL.createObjectURL(file);
+        const link=document.createElement('a');link.href=url;link.download=file.name;
+        document.body.appendChild(link);link.click();link.remove();
+        setTimeout(()=>{try{URL.revokeObjectURL(url);}catch{}},2000);
+      }
+    }catch(error){ if(error?.name!=='AbortError') setCoverError(error?.message||'保存できませんでした。'); }
   };
   const exportCameraFile=async(file)=>{
     if(!file) return;
@@ -20828,9 +21126,32 @@ const recomputeStarts=(arr)=>{
             : '素材がありません'),
         React.createElement('button', {onClick:()=>startExport(exportChoiceScope), disabled:!clips.length || exportChoiceScope==='selected' && !clips.some(c=>selectedClipIds.includes(c.id)),
           className:'camera-key-primary w-full h-11 rounded-full bg-white text-black font-bold disabled:opacity-40 mb-3'}, 'この範囲を書き出す'),
+        React.createElement('button', {onClick:openCover, disabled:!clips.length,
+          className:'w-full h-10 rounded-full bg-white/10 text-xs font-bold disabled:opacity-40 mb-3'}, '🖼 表紙を作る（再生位置のコマ）'),
         React.createElement('div', {className:'flex gap-2'},
           React.createElement('button', {onClick:()=>{setExportChoiceOpen(false); if(!window.__userScrollingY){ try{ materialListRef.current?.scrollIntoView({behavior:'auto',block:'nearest',inline:'nearest'}); }catch{} }}, className:'flex-1 h-10 rounded-full bg-white/10 text-xs'}, '素材を選び直す'),
           React.createElement('button', {onClick:()=>setExportChoiceOpen(false), className:'flex-1 h-10 rounded-full bg-white/10 text-xs'}, '閉じる'))
+      )
+    ),
+    coverOpen && React.createElement('div', {className:'camera-export-dialog fixed inset-0 z-[1000] bg-black/75 flex items-center justify-center p-5', role:'dialog', 'aria-modal':'true', 'aria-label':'表紙を作る'},
+      React.createElement('div', {className:'camera-export-panel w-full max-w-sm max-h-[88dvh] overflow-y-auto rounded-2xl bg-[#17171a] border border-white/20 p-5 shadow-2xl'},
+        React.createElement('div', {className:'text-base font-bold mb-2'}, '🖼 表紙を作る'),
+        React.createElement('div', {className:'text-xs text-white/60 mb-3'}, '再生位置のコマを表紙にします。別のコマにするときは、閉じて再生位置を動かしてください。'),
+        React.createElement('div', {className:'flex justify-center mb-3'},
+          coverImage?.url
+            ? React.createElement('img', {src:coverImage.url, alt:'表紙のプレビュー', className:'rounded-xl bg-black', style:{maxHeight:'min(360px, 42dvh)', maxWidth:'100%'}})
+            : React.createElement('div', {className:'h-40 flex items-center text-xs text-white/50'}, '表紙を作っています…')),
+        React.createElement('textarea', {value:coverTitle, rows:2, onChange:e=>setCoverTitle(e.target.value),
+          placeholder:'タイトル（任意・改行で2〜3行）',
+          className:'w-full rounded-xl bg-black border border-white/15 px-3 py-2 text-[13px] mb-2 outline-none focus:border-violet-400'}),
+        React.createElement('div', {className:'flex gap-1.5 mb-3'},
+          VLOG_COVER_STYLES.map(st=>React.createElement('button', {key:st.key, type:'button', onClick:()=>setCoverStyle(st.key),
+            'aria-pressed':coverStyle===st.key,
+            className:`flex-1 h-9 rounded-full text-[12px] ${coverStyle===st.key?'bg-white text-black font-bold':'bg-white/10 text-white/70'}`}, st.label))),
+        coverError && React.createElement('div', {className:'text-xs text-rose-300 mb-2'}, coverError),
+        React.createElement('button', {onClick:shareCover, disabled:!coverImage?.file,
+          className:'camera-key-primary w-full h-11 rounded-full bg-white text-black font-bold disabled:opacity-40 mb-3'}, '保存・共有'),
+        React.createElement('button', {onClick:closeCover, className:'w-full h-10 rounded-full bg-white/10 text-xs'}, '閉じる')
       )
     ),
     exportStatus!=='idle' && React.createElement('div', {className:'camera-export-dialog fixed inset-0 z-[1000] bg-black/75 flex items-center justify-center p-5', role:'dialog', 'aria-modal':'true', 'aria-label':'動画の書き出し'},
@@ -23411,6 +23732,22 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
               React.createElement('div', {className:'text-[10px] text-white/50'}, p.text)
             )
           )
+        ),
+        React.createElement('div', {className:'mb-4 p-3 rounded-[18px] bg-[#111113] border border-white/10'},
+          React.createElement('div', {className:'text-[11px] font-bold mb-2'}, '📅 撮影日を入れる'),
+          React.createElement('div', {className:'flex gap-1.5 mb-2 overflow-x-auto'},
+            VLOG_DATE_STAMP_FORMATS.map(f=>React.createElement('button', {key:f.key,
+              onClick:()=>{ setDateStampFormat(f.key); try{ localStorage.setItem('vlogDateStampFormat',f.key); }catch{} },
+              className:`shrink-0 px-3 h-8 rounded-full text-[11px] ${dateStampFormat===f.key?'bg-white text-black font-bold':'bg-white/10 text-white/70'}`,
+              style:{fontFamily:vlogTextFont(f.font)}}, f.label))
+          ),
+          React.createElement('div', {className:'flex gap-2'},
+            React.createElement('button', {disabled:dateStampBusy, onClick:()=>addCaptureDateStamps('one'),
+              className:'flex-1 h-9 rounded-full bg-white/10 text-[12px] font-bold disabled:opacity-40'}, 'この素材に'),
+            React.createElement('button', {disabled:dateStampBusy, onClick:()=>addCaptureDateStamps('change'),
+              className:'flex-1 h-9 rounded-full bg-white/10 text-[12px] font-bold disabled:opacity-40'}, '日付が変わる素材ごとに')
+          ),
+          dateStampNote && React.createElement('div', {className:'mt-2 text-[10px] text-white/60 whitespace-pre-wrap break-all'}, dateStampNote)
         ),
                 React.createElement('div', {className:'mb-4 p-3 rounded-[18px] bg-[#1a1410] border border-amber-500/20'},
           React.createElement('div', {className:'flex items-center justify-between mb-2'},
