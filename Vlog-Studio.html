@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-export-prewarm-off';
+const VLOG_PREVIEW_BUILD='2026-10-06-export-observe';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -6676,6 +6676,31 @@ const PREVIEW_FAST_WARM=(()=>{try{return new URLSearchParams(location.search).ge
 // 書き出しの予熱（素材に入る前に音なしで一度動かして止め、頭へ戻す）。実機 A/B では録画中の予熱が動き出さず（moved 0）、
 // 映像のコマ数が 82%→72%、最大の止まりが 265→453ms と悪化したため既定では使わない。?exportwarm=on で試せる。
 const EXPORT_PREWARM=(()=>{try{return new URLSearchParams(location.search).get('exportwarm')==='on';}catch{return false;}})();
+// 書き出しの新方式（WebCodecs で1コマずつエンコード）の可否を実機で決めるため、使える機能を調べて診断に出す。
+const VLOG_CODEC_PROBE={done:false};
+(async()=>{
+  const probe=VLOG_CODEC_PROBE;
+  const check=async(name,run)=>{try{probe[name]=await run();}catch(error){probe[name]=`error: ${String(error?.name||error).slice(0,60)}`;}};
+  probe.videoEncoder=typeof VideoEncoder==='function';
+  probe.videoDecoder=typeof VideoDecoder==='function';
+  probe.audioEncoder=typeof AudioEncoder==='function';
+  probe.audioDecoder=typeof AudioDecoder==='function';
+  probe.videoFrame=typeof VideoFrame==='function';
+  probe.offlineAudioContext=typeof OfflineAudioContext==='function';
+  if(probe.videoEncoder){
+    await check('encodeAvcBaseline720',async()=>(await VideoEncoder.isConfigSupported({codec:'avc1.42001f',width:720,height:1280,framerate:24,bitrate:2800000})).supported);
+    await check('encodeAvcHigh1080',async()=>(await VideoEncoder.isConfigSupported({codec:'avc1.640028',width:1080,height:1920,framerate:30,bitrate:8000000})).supported);
+  }
+  if(probe.videoDecoder){
+    await check('decodeAvc',async()=>(await VideoDecoder.isConfigSupported({codec:'avc1.640028'})).supported);
+    await check('decodeHevc',async()=>(await VideoDecoder.isConfigSupported({codec:'hvc1.1.6.L120.B0'})).supported);
+  }
+  if(probe.audioEncoder){
+    await check('encodeAac',async()=>(await AudioEncoder.isConfigSupported({codec:'mp4a.40.2',sampleRate:48000,numberOfChannels:2,bitrate:128000})).supported);
+    await check('encodeOpus',async()=>(await AudioEncoder.isConfigSupported({codec:'opus',sampleRate:48000,numberOfChannels:2,bitrate:128000})).supported);
+  }
+  probe.done=true;
+})();
 // ?audiolab=1 は再生ボタンで音の実験を行う（他の要素への操作ごとに、鳴っている音が止まるかを測る）。
 const PREVIEW_AUDIO_LAB=(()=>{try{return new URLSearchParams(location.search).get('audiolab')==='1';}catch{return false;}})();
 const vlogExportProfileMeasure=(name,run)=>{
@@ -13165,6 +13190,7 @@ function App(){
     const diag=previewDiagnosticRef.current;
     const audioStore=previewAudioSlotsRef.current;
     return JSON.stringify({report:'Vlog Studio 再生診断',build:VLOG_PREVIEW_BUILD,seamMode:VLOG_SEAM_MODE,fastwarm:PREVIEW_FAST_WARM,
+      codecs:VLOG_CODEC_PROBE,
       clips:(clipsRef.current||[]).map(clip=>({name:clip.name,start:Number((clip.timelineStart||0).toFixed(3)),
         duration:Number((clip.duration||0).toFixed(3)),speed:vlogClipSourceRate(clip)})),
       previewAudio:{probe:PREVIEW_AUDIO_PROBE,lead:Number(audioStore.lead.toFixed(3)),startSamples:audioStore.startSamples.slice(),
@@ -14400,7 +14426,7 @@ function App(){
       canvasWidth:canvas.width, canvasHeight:canvas.height, videos:new Map(), videoPlayPending:new WeakSet(),
       preparedIds:new Set(),preparePromises:new Map(),releasedIds:new Set(),startedIds:new Set(),warmStartedIds:new Set(),
       driftSince:new Map(),lastSeekAt:new Map(),prepareCursor:0,prepareInFlight:0,
-      releaseCursor:0,soundCursor:0,liveSoundIds:new Set(),waitingByClip:new Map(),waitSummary:new Map(),gapSummary:new Map(),
+      releaseCursor:0,soundCursor:0,liveSoundIds:new Set(),waitingByClip:new Map(),waitSummary:new Map(),gapSummary:new Map(),gapLog:[],
       frameProgress:new Map(),frameCallbacks:new Map(),events:[],recorderChunks:[],lastDrawAt:-Infinity,drawTick:-1,
       wakeLock:null,stopWaiting:null,phase:'preparing',
       drawProfiler:createVlogExportDrawProfiler(),
@@ -14443,6 +14469,7 @@ function App(){
         profiler:job.drawProfiler.summary()},
       waits:[...job.waitSummary.values()].sort((a,b)=>b.frames-a.frames).slice(0,12),
       gaps:[...job.gapSummary.values()].sort((a,b)=>b.count-a.count).slice(0,12),
+      gapLog:job.gapLog,codecs:VLOG_CODEC_PROBE,
       recorderChunks:job.recorderChunks,recentEvents:job.events},null,2);
     exportJobRef.current=job;
     // MediaRecorder は実時間で canvas を録画する。画面消灯を防げる端末では
@@ -14696,6 +14723,7 @@ function App(){
           chunks.push(e.data);
           job.stats.recordedChunks++;
           job.stats.recordedBytes+=e.data.size;
+          job.lastChunkAt=performance.now();
           job.recorderChunks.push({timelineTime:Number(timeRef.current.toFixed(3)),bytes:e.data.size});
         };
         recorder.onerror=e=>{ job.failure=e.error?.message || '動画の録画に失敗しました。'; job.cancelled=true; };
@@ -14731,6 +14759,24 @@ function App(){
           const gap=job.gapSummary.get(key)||{name:clip?.name||'素材の切り替え',count:0,maxMs:0};
           gap.count++;gap.maxMs=Math.max(gap.maxMs,Math.round(frameGap));
           job.gapSummary.set(key,gap);
+          // 描画が飛んだ瞬間に、何が止まっていたかを残す（直前の描画処理の重さ、進み具合の画面更新、録画の取り出し、映像と音の進み）。
+          const gapVideo=clip?.type==='video'?job.videos.get(clip.id)?.video:null;
+          const gapFrame=clip?job.frameProgress.get(clip.id):null;
+          const audioNow=audioContext?audioContext.currentTime:null;
+          job.gapLog.push({t:Number(t.toFixed(3)),gapMs:Math.round(frameGap),clip:clip?.name||null,
+            prevWorkMs:Number.isFinite(job.lastWorkMs)?Math.round(job.lastWorkMs):null,
+            sinceProgressMs:Number.isFinite(job.lastProgressAt)?Math.round(now-job.lastProgressAt):null,
+            sinceChunkMs:Number.isFinite(job.lastChunkAt)?Math.round(now-job.lastChunkAt):null,
+            videoMovedMs:gapVideo&&Number.isFinite(job.lastVideoTime)?Math.round((gapVideo.currentTime-job.lastVideoTime)*1000):null,
+            presentedAgoMs:Number.isFinite(gapFrame?.presentedAt)?Math.round(now-gapFrame.presentedAt):null,
+            audioMovedMs:Number.isFinite(audioNow)&&Number.isFinite(job.lastAudioTime)?Math.round((audioNow-job.lastAudioTime)*1000):null});
+          if(job.gapLog.length>40) job.gapLog.shift();
+        }
+        {
+          const nowClip=items.find(item=>item.timelineStart<=t && t<item.timelineStart+item.duration);
+          const nowVideo=nowClip?.type==='video'?job.videos.get(nowClip.id)?.video:null;
+          job.lastVideoTime=nowVideo?nowVideo.currentTime:null;
+          job.lastAudioTime=audioContext?audioContext.currentTime:null;
         }
         pumpExportPrepare(t);
         while(job.releaseCursor<exportVideoItems.length &&
@@ -15049,7 +15095,8 @@ function App(){
           job.stats.maxDrawMs=Math.max(job.stats.maxDrawMs,drawMs);
           if(drawMs>1000/exportFps) job.stats.slowFrames++;
         }
-        if(now-lastProgress>500){ lastProgress=now; setExportProgress(Math.min(100,Math.round(t/total*100))); }
+        if(now-lastProgress>500){ lastProgress=now; job.lastProgressAt=performance.now(); setExportProgress(Math.min(100,Math.round(t/total*100))); }
+        job.lastWorkMs=performance.now()-now;
         job.frame=requestAnimationFrame(render);
       };
       job.frame=requestAnimationFrame(render);
