@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-bgm-hold';
+const VLOG_PREVIEW_BUILD='2026-10-06-bgm-first';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -18447,6 +18447,52 @@ const recomputeStarts=(arr)=>{
     }catch(e){ console.log('addBgmClip error', e); }
   },[bgmFullDuration, bgmVolume]);
 
+  // BGM が未追加のときの最初の1本: 0秒から動画の最後まで（曲が短ければ曲の長さまで）。
+  // 選んだ直後に呼ばれるため、state（bgmTrack など）ではなく引数と ref だけで作る。
+  const addFirstBgmClip = useCallback(bgm=>{
+    try{
+      if(!bgm || !bgm.id || bgm.id==='none') return;
+      if(bgmClipsRef.current && bgmClipsRef.current.length>0) return;
+      const videoDuration=(clipsRef.current||[]).length>0 ? Number(durationRef.current)||0 : 0;
+      const useDuration=videoDuration>0 ? videoDuration : 10;
+      const clip = {
+        id: 'bgmclip_' + Math.random().toString(36).slice(2,9),
+        trackId: bgm.id,
+        url: bgm.url || null,
+        name: bgm.name || bgm.id,
+        timelineStart: 0,
+        duration: useDuration,
+        offset: 0,
+        fadeIn: 0.8,
+        fadeOut: 0.8,
+        gain: 1,
+        _fullDuration: useDuration
+      };
+      bgmClipsRef.current = [clip];
+      setBgmClips([clip]);
+      setSelectedBgmClipId(clip.id);
+      setBgmTimelineStart(0);
+      setBgmTimelineDuration(useDuration);
+      setBgmOffset(0);
+      if(!bgm.url) return;
+      const probe=new Audio();
+      probe.preload='metadata';
+      probe.addEventListener('loadedmetadata',()=>{
+        const full=probe.duration;
+        try{ probe.removeAttribute('src');probe.load(); }catch{}
+        if(!Number.isFinite(full) || full<=0) return;
+        const current=(bgmClipsRef.current||[]).find(c=>c.id===clip.id);
+        if(!current) return;
+        const duration=Math.min(current.duration,full);
+        const newClips=(bgmClipsRef.current||[]).map(c=>c.id===clip.id ? {...c,duration,_fullDuration:full} : c);
+        bgmClipsRef.current=newClips;
+        setBgmClips(newClips);
+        if(duration!==current.duration) setBgmTimelineDuration(duration);
+      },{once:true});
+      probe.src=bgm.url;
+    }catch(e){ console.log('addFirstBgmClip error', e); }
+  },[]);
+
   const migrateSingleBgmToClips = useCallback(()=>{
     try{
       if(bgmClipsRef.current && bgmClipsRef.current.length>0) return;
@@ -22146,6 +22192,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   ++bgmPlaybackSessionRef.current;bgmAuditionRef.current=true;
                   bgmTrackRef.current=newBgms[0].id;
                   setBgmTrack(newBgms[0].id);
+                  addFirstBgmClip(newBgms[0]);
                 }
                 }finally{projectImportBusyRef.current=false;e.target.value='';}
               }
@@ -22223,7 +22270,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                         }catch{}
                         if(b.url) generateBgmWaveform(b.url);
                       }
-                      setTimeout(()=> { try{ migrateSingleBgmToClips(); }catch{} }, 200);
+                      addFirstBgmClip({id:b.id,url:b.url||customData?.url||null,name:b.name});
                     }
                   }catch(e){ console.log('bgm select error', e); }
                 },
@@ -22504,7 +22551,9 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 onClick:()=>{
                   try{
                     const customBgm = customBgms.find(c=>c.id===bgmTrack);
-                    if(customBgm) addBgmClipAtPlayhead(bgmTrack, customBgm);
+                    if(!customBgm) return;
+                    if(!bgmClipsRef.current || bgmClipsRef.current.length===0) addFirstBgmClip(customBgm);
+                    else addBgmClipAtPlayhead(bgmTrack, customBgm);
                   }catch{}
                 },
                 className:'camera-key-primary flex-1 h-7 rounded-full bg-violet-600/50 text-white text-[10px] hover:bg-violet-600'
@@ -23934,9 +23983,10 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               React.createElement('button', {
                 onClick:()=>{
                   try{
-                    if(bgmClips.length===0 && bgmTrack!=='none') migrateSingleBgmToClips();
                     const customBgm = customBgms.find(c=>c.id===bgmTrack);
-                    if(customBgm || bgmTrack!=='none'){ addBgmClipAtPlayhead(bgmTrack, customBgm); } else { alert('BGMタブでBGMを追加'); }
+                    if(bgmTrack==='none'){ alert('BGMタブでBGMを追加'); return; }
+                    if(!bgmClipsRef.current || bgmClipsRef.current.length===0){ addFirstBgmClip(customBgm||{id:bgmTrack,name:bgmTrack}); return; }
+                    addBgmClipAtPlayhead(bgmTrack, customBgm);
                   }catch{}
                 },
                 className:'mt-1 px-1.5 py-0.5 rounded-full bg-violet-600 text-white text-[8px]'
