@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-export-asc';
+const VLOG_PREVIEW_BUILD='2026-10-06-export-frame-default';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -6676,8 +6676,9 @@ const PREVIEW_FAST_WARM=(()=>{try{return new URLSearchParams(location.search).ge
 // 書き出しの予熱（素材に入る前に音なしで一度動かして止め、頭へ戻す）。実機 A/B では録画中の予熱が動き出さず（moved 0）、
 // 映像のコマ数が 82%→72%、最大の止まりが 265→453ms と悪化したため既定では使わない。?exportwarm=on で試せる。
 const EXPORT_PREWARM=(()=>{try{return new URLSearchParams(location.search).get('exportwarm')==='on';}catch{return false;}})();
-// ?exportengine=frame: なめらか書き出し（実時間で録画せず、1コマずつ描いて時刻付きでエンコードする）。
-const EXPORT_FRAME_ENGINE=(()=>{try{return new URLSearchParams(location.search).get('exportengine')==='frame';}catch{return false;}})();
+// なめらか書き出し（実時間で録画せず、1コマずつ描いて時刻付きでエンコードする）を標準にする。
+// WebCodecs が使えない端末では自動で実時間の録画に切り替える。?exportengine=realtime で実時間の録画を選べる。
+const EXPORT_FRAME_ENGINE=(()=>{try{return new URLSearchParams(location.search).get('exportengine')!=='realtime';}catch{return true;}})();
 // 書き出しの新方式（WebCodecs で1コマずつエンコード）の可否を実機で決めるため、使える機能を調べて診断に出す。
 const VLOG_CODEC_PROBE={done:false};
 (async()=>{
@@ -14843,21 +14844,24 @@ function App(){
       // 30fpsを要求し続けるより、24fpsを一定に保つ方を優先する。
       const exportFps=exportSizeMode==='smaller'?24:30;
       job.stats.exportFps=exportFps;
-      if(EXPORT_FRAME_ENGINE){
+      if(EXPORT_FRAME_ENGINE && typeof VideoEncoder==='function' && typeof VideoFrame==='function'){
         // なめらか書き出し: 1コマずつ素材の位置を合わせて描き、時刻付きでエンコードする（実時間の録画を使わない）。
         job.stats.engine='frame';
         const frameStartedAt=performance.now();
         if(bgm){ try{ bgm.pause(); }catch{} }
         for(const {video} of job.videos.values()){ try{ video.pause(); }catch{} }
-        if(typeof VideoEncoder!=='function' || typeof VideoFrame!=='function')
-          throw new Error('この端末ではなめらか書き出しを使えません。URLの ?exportengine=frame を外して書き出してください。');
         setExportStatus('recording');
         setExportMessage('なめらか書き出し中（少し時間がかかります）');
-        const {Muxer,ArrayBufferTarget}=await import('https://esm.sh/mp4-muxer@5.1.3');
+        let muxerModule;
+        try{ muxerModule=await import('https://esm.sh/mp4-muxer@5.1.3'); }
+        catch{ throw new Error('書き出しの部品を読み込めませんでした。通信を確認して、もう一度書き出してください（URLに ?exportengine=realtime を付けると従来の書き出しを使えます）。'); }
+        const {Muxer,ArrayBufferTarget}=muxerModule;
         const sampleRate=48000;
         // 音: 素材の音を一括合成し、その大きさから BGM を下げる係数を出してから、BGM を重ねてもう一度合成する。
         const audioReport={sources:[],decodeFailures:[],clips:0,bgm:0};
-        const mp4boxModule=await import('https://esm.sh/mp4box@0.5.2');
+        let mp4boxModule;
+        try{ mp4boxModule=await import('https://esm.sh/mp4box@0.5.2'); }
+        catch{ throw new Error('書き出しの部品を読み込めませんでした。通信を確認して、もう一度書き出してください（URLに ?exportengine=realtime を付けると従来の書き出しを使えます）。'); }
         const MP4Box=mp4boxModule.default||mp4boxModule;
         // 合成した音の最大値と平均（dBFS）。無音かどうかを診断で見分ける。
         const audioLevel=buffer=>{
@@ -15174,6 +15178,7 @@ function App(){
         setExportStatus('done');
         return;
       }
+      job.stats.engine='realtime';
       const canvasStream=canvas.captureStream(exportFps);
       const canvasVideoTrack=canvasStream.getVideoTracks()[0];
       if(!canvasVideoTrack) throw new Error('書き出し用の映像トラックを作成できませんでした。');
