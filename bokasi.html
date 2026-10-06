@@ -453,30 +453,20 @@ function ynBoxAtSorted(h,time,tol){
  let best=null,bd=Infinity;for(const k of [lo-1,lo]){if(k<0||k>=h.length)continue;const d=Math.abs((h[k].time||0)-time);if(d<bd){bd=d;best=h[k]}}
  return best&&bd<=tol?{x:best.x,y:best.y,w:best.w,h:best.h}:null;
 }
-function ynObsEdge(h,t,dir){
- let lo=0,hi=h.length;while(lo<hi){const mid=(lo+hi)>>1;if((h[mid].time||0)<t-1e-6)lo=mid+1;else hi=mid}
- if(dir>0)return lo<h.length?h[lo].time:null;
- if(lo<h.length&&Math.abs((h[lo].time||0)-t)<1e-6)return h[lo].time;
- return lo>0?h[lo-1].time:null;
-}
-function ynComputeIdEvents(tracks){
- const prep=tracks.map(tr=>({tr,h:(tr.history||[]).slice().sort((a,b)=>(a.time||0)-(b.time||0))})).filter(p=>p.h.length);
- const byId=new Map(prep.map(p=>[p.tr.id,p])),times=[...new Set(prep.flatMap(p=>p.h.map(x=>x.time||0)))].sort((a,b)=>a-b);
- const share=(a,b)=>a.some(i=>b.includes(i)),raw=[];let prev=[],prevT=0;
- // Event times are snapped to real observations: first detection for "appear", last detection for "disappear".
- const firstSeen=(ids,t)=>{const v=ids.map(id=>ynObsEdge(byId.get(id).h,t,1)).filter(x=>x!=null&&x-t<=.2501);return v.length?Math.min(...v):t};
- const lastSeen=(ids,t)=>{const v=ids.map(id=>ynObsEdge(byId.get(id).h,t,-1)).filter(x=>x!=null&&t-x<=.2501);return v.length?Math.max(...v):t};
- times.forEach((t,ti)=>{
-  const items=[];for(const p of prep){const b=ynBoxAtSorted(p.h,t,.25);if(b)items.push({tr:p.tr,b})}
+// ID change stops, based on the faces that are really masked (facesAt = ynFacesAt result). A merged badge appears / disappears.
+// Appear = first frame the badge is masked, disappear = last frame it is masked. Changes within 0.3s become one stop.
+function ynComputeIdEvents(facesAt,t0,t1,step){
+ step=step||.05;const share=(a,b)=>a.some(i=>b.includes(i)),raw=[];let prev=[],prevT=t0;
+ for(let t=Math.max(0,t0),n=0;t<=t1+1e-9;t=+(Math.max(0,t0)+(++n)*step).toFixed(4)){
+  const items=[];for(const f of facesAt(t))if(f.trackId!=null)items.push({tr:{id:f.trackId},b:{x:f.x,y:f.y,w:f.w,h:f.h}});
   const cur=ynClusterItems(items);
-  for(const g of cur)if(!prev.some(h=>share(g.ids,h.ids)))raw.push({time:firstSeen(g.ids,t),type:'appear',id:g.id,ids:g.ids});
-  if(ti>0)for(const h of prev)if(!cur.some(g=>share(g.ids,h.ids)))raw.push({time:lastSeen(h.ids,prevT),type:'disappear',id:h.id,ids:h.ids});
+  for(const g of cur)if(!prev.some(h=>share(g.ids,h.ids)))raw.push({time:t,type:'appear',id:g.id,ids:g.ids});
+  if(t>t0)for(const h of prev)if(!cur.some(g=>share(g.ids,h.ids)))raw.push({time:prevT,type:'disappear',id:h.id,ids:h.ids});
   prev=cur;prevT=t;
- });
+ }
  raw.sort((a,b)=>a.time-b.time);
  const stops=[];let cur=null;
  for(const ev of raw){if(cur&&ev.time-cur.start<=.3)cur.items.push(ev);else{cur={start:ev.time,items:[ev]};stops.push(cur)}}
- // Land where everything that appears is already visible; otherwise on the earliest last-visible frame.
  return stops.map(st=>{const ap=st.items.filter(it=>it.type==='appear');return {time:ap.length?Math.max(...ap.map(it=>it.time)):Math.min(...st.items.map(it=>it.time)),items:st.items}}).sort((a,b)=>a.time-b.time);
 }
 // Evidence that an auto-detected ID is a real face (from the detector's own scores/landmarks) and whether other boxes already cover it.
@@ -1230,7 +1220,7 @@ const ynActiveAtCurrent=E.useMemo(()=>{
     return Math.abs(ls-ct)<1.2;
   });
 },[Ut,an]);
-const ynIdEvents=E.useMemo(()=>{try{return ynComputeIdEvents(Ut)}catch{return []}},[Ut]);
+const ynIdEvents=E.useMemo(()=>{try{let t0=Infinity,t1=-Infinity;for(const tr of Ut)for(const h of tr.history||[]){const tm=h.time||0;if(tm<t0)t0=tm;if(tm>t1)t1=tm}if(!isFinite(t0))return [];return ynComputeIdEvents(tm=>nc(tm).faces||[],Math.max(0,t0-.4),t1+.4)}catch{return []}},[Ut,nc]);
 const ynIdInfo=ids=>{
   const rev=ynGroups.current.map(g=>g.id+':'+(g.revision||0)+':'+((g.frames&&g.frames.length)||0)).join(','),c=ynIdInfoCache.current;
   if(c.ut!==Ut||c.rev!==rev){c.ut=Ut;c.rev=rev;c.map=new Map()}
@@ -1256,20 +1246,21 @@ const ynJumpIdChange=dir=>{
   ynSetIdToast({time:ev.time,text:`${label} · ${ev.time.toFixed(2)}秒 · ${k+1}/${ynIdEvents.length}`});
   bn.current?.();
 };
+const ynVisibleGroups=(time,selected)=>{const items=[];for(const f of nc(time).faces||[]){if(f.trackId==null)continue;if(selected&&selected.size&&!selected.has(f.trackId))continue;items.push({tr:{id:f.trackId},b:{x:f.x,y:f.y,w:f.w,h:f.h}})}return ynClusterItems(items)};
 const ynPickAutoAtVideoCoords=E.useCallback((vx,vy)=>{
   let best=null,bestDist=Infinity;
-  for(const grp of ynGroupTracksAt(ynActiveAtCurrent,ynCurrentFrameTime())){
+  for(const grp of ynVisibleGroups(ynCurrentFrameTime(),null)){
     const bx=grp.box;
     if(vx>=bx.x&&vx<=bx.x+bx.w&&vy>=bx.y&&vy<=bx.y+bx.h){const dist=Math.hypot(vx-(bx.x+bx.w/2),vy-(bx.y+bx.h/2));if(dist<bestDist){bestDist=dist;best=grp}}
   }
   return best;
-},[ynActiveAtCurrent]);
+},[ynActiveAtCurrent,nc]);
 E.useEffect(()=>{
   const canvases=[t.current,e.current].filter(Boolean);
   if(!canvases.length) return;
   const handler=(ev)=>{
     if(!ynAutoSelectMode) return;
-    if(!ynActiveAtCurrent.length) return;
+    
     const cx=ev.touches?ev.touches[0].clientX:ev.clientX;
     const cy=ev.touches?ev.touches[0].clientY:ev.clientY;
     const pos=nl(cx,cy,ev.currentTarget===e.current);
@@ -1291,10 +1282,9 @@ E.useEffect(()=>{
     const target=Ot?e.current:t.current;
     if(!overlay||!video||!target||!video.videoWidth){rafId=requestAnimationFrame(draw);return;}
     overlay.innerHTML='';
-    if(!ynActiveAtCurrent.length){rafId=requestAnimationFrame(draw);return;}
+    
     if(!ynAutoSelectMode){rafId=requestAnimationFrame(draw);return;}
-    const baseTracks=ynSelectedAutoIds.size?Ut.filter(t=>ynSelectedAutoIds.has(t.id)):ynActiveAtCurrent;
-    const visibleGroups=ynGroupTracksAt(baseTracks,ynCurrentFrameTime()).slice(0,12);
+    const visibleGroups=ynVisibleGroups(ynCurrentFrameTime(),ynSelectedAutoIds).slice(0,12);
     const rect=target.getBoundingClientRect();overlay.style.clipPath=Ot?`inset(${Math.max(0,rect.top)}px ${Math.max(0,innerWidth-rect.right)}px ${Math.max(0,innerHeight-rect.bottom)}px ${Math.max(0,rect.left)}px)`:'';
     const N=video.videoWidth,H=video.videoHeight;
     const v=N/H,a=rect.width/rect.height;
@@ -1358,7 +1348,7 @@ E.useEffect(()=>{
   };
   rafId=requestAnimationFrame(draw);
   return function(){if(rafId) cancelAnimationFrame(rafId);};
-},[ynActiveAtCurrent,Ut,ynSelectedAutoIds,ynPadding,Me,Ce,qn,ut,Ot,J,an,ynAutoSelectMode,ynDeleteAutoIds,ynToggleAutoGroup]);
+},[ynActiveAtCurrent,Ut,ynSelectedAutoIds,ynPadding,Me,Ce,qn,ut,Ot,J,an,ynAutoSelectMode,ynDeleteAutoIds,ynToggleAutoGroup,nc]);
 const ynMergeOnePerFace=E.useCallback(()=>{
   if(ynActiveAtCurrent.length<=1) return;
   const sorted=ynActiveAtCurrent.slice().sort(function(a,b){return (b.history?.length||0)-(a.history?.length||0);});
