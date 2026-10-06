@@ -6658,7 +6658,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-bgm-lab2';
+const VLOG_PREVIEW_BUILD='2026-10-06-bgm-delay';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -8930,6 +8930,36 @@ const vlogBgmDuckStep=(state,levelDb,dt,amount)=>{
     ? Math.max(target,Math.min(previous.factor,1)-depth*dt/VLOG_BGM_DUCK.attack)
     : Math.min(1,Math.max(previous.factor,target)+depth*dt/VLOG_BGM_DUCK.release);
   return {factor,holdLeft,voice};
+};
+// プレビューの BGM の揃え方（素材の音と同じく、再生中は位置を飛ばさず DelayNode で揃える。設計書 F8・F12）。
+// 揃える前: 音量0のまま 0.55秒分進めて鳴らし始めの止まりをやり過ごし、先行分を遅延にする。
+// 揃えた後: 1秒ごとに遅延を最大10msずつ動かして追従する。ずれが2秒を超えたときだけ位置を飛ばしてやり直す。
+const VLOG_BGM_ALIGN={pass:0.55,lead:0.85,maxDelay:1.5,jump:2,trackEvery:1000,trackStep:0.01,tolerance:0.04,lag:0.5};
+const vlogBgmAlignStep=(state,{position,target,now,rate=1,canDelay=true})=>{
+  const st=state ? {...state} : {phase:'pending',from:null,delay:0,lastTrackAt:now,lastLagAt:-Infinity};
+  const maxDelay=canDelay ? VLOG_BGM_ALIGN.maxDelay : 0;
+  const ahead=(position-target)/Math.max(0.1,rate);
+  const residual=ahead-st.delay;
+  if(Math.abs(residual)>VLOG_BGM_ALIGN.jump){
+    return {state:{phase:'pending',from:null,delay:0,lastTrackAt:now,lastLagAt:st.lastLagAt},audible:false,
+      seekTo:Math.max(0,target+VLOG_BGM_ALIGN.lead*rate),event:{type:'bgm-resync',ahead}};
+  }
+  if(st.phase==='pending'){
+    if(st.from===null || position<st.from) st.from=position;
+    if(position-st.from<VLOG_BGM_ALIGN.pass) return {state:st,audible:false};
+    st.phase='aligned';st.delay=Math.max(0,Math.min(maxDelay,ahead));st.lastTrackAt=now;
+    return {state:st,audible:true,delayChanged:true,event:{type:'bgm-align',ahead,delay:st.delay}};
+  }
+  let delayChanged=false,event=null;
+  if(now-st.lastTrackAt>=VLOG_BGM_ALIGN.trackEvery){
+    st.lastTrackAt=now;
+    if(Math.abs(residual)>VLOG_BGM_ALIGN.tolerance){
+      const next=Math.max(0,Math.min(maxDelay,st.delay+Math.max(-VLOG_BGM_ALIGN.trackStep,Math.min(VLOG_BGM_ALIGN.trackStep,residual))));
+      if(next!==st.delay){ st.delay=next;delayChanged=true; }
+    }
+    if(residual<-VLOG_BGM_ALIGN.lag && now-st.lastLagAt>=1000){ st.lastLagAt=now;event={type:'bgm-lag',ahead,delay:st.delay}; }
+  }
+  return {state:st,audible:true,delayChanged,event};
 };
 // AnalyserNode の音の大きさ（RMS、dBFS）。
 const vlogAnalyserLevelDb=(analyser,buffer)=>{
@@ -12329,10 +12359,12 @@ function App(){
       let source=audio.sources.get(element);
       if(!source){ source=audio.context.createMediaElementSource(element); audio.sources.set(element,source); }
       else{ try{ source.disconnect(); }catch{} }
-      const gain=audio.context.createGain();
-      gain.gain.value=0;
-      source.connect(gain);gain.connect(audio.context.destination);
+      const gain=audio.context.createGain(),delay=audio.context.createDelay(2);
+      gain.gain.value=0;delay.delayTime.value=0;
+      source.connect(delay);delay.connect(gain);gain.connect(audio.context.destination);
       audio.bgmGains.set(element,gain);
+      if(!audio.bgmDelays) audio.bgmDelays=new WeakMap();
+      audio.bgmDelays.set(element,delay);
       element.volume=1;
       recordPreviewDiagnostic('bgm-graph',{ok:true});
       return gain;
@@ -12353,6 +12385,42 @@ function App(){
     }
     try{ const volume=Math.max(0,Math.min(1,value)); if(Math.abs(element.volume-volume)>0.02) element.volume=volume; }catch{}
     return null;
+  };
+  const setBgmElementDelay=(element,value)=>{
+    const delay=exportAudioRef.current.bgmDelays?.get(element);
+    if(!delay) return false;
+    try{ delay.delayTime.cancelScheduledValues(delay.context.currentTime); delay.delayTime.setValueAtTime(value,delay.context.currentTime); }
+    catch{ delay.delayTime.value=value; }
+    return true;
+  };
+  // BGM の要素1本ぶんの揃え。音量（揃うまでは0）と遅延を反映し、記録を残す。
+  const alignPreviewBgm=(state,key,element,clip,target,vol,now,rate,t)=>{
+    if(!state.bgmAlign) state.bgmAlign={};
+    let current=state.bgmAlign[key];
+    if(current && current.clipId!==clip.id) current=null;
+    // 止まっている間（鳴らし始める前）に、目標より早めの位置へ合わせておく（止まっている要素の位置合わせは止まりを起こさない）。
+    if(element.paused){
+      if(!current?.seeded){
+        try{ element.currentTime=Math.max(0,target+VLOG_BGM_ALIGN.lead*rate); }catch{}
+        current={...(current||{}),clipId:clip.id,seeded:true,align:null};
+      }
+      setBgmElementGain(element,0);
+      state.bgmAlign[key]=current;
+      return {delay:0,audible:false};
+    }
+    const canDelay=!!exportAudioRef.current.bgmDelays?.get(element);
+    const step=vlogBgmAlignStep(current?.align,{position:element.currentTime,target,now,rate,canDelay});
+    state.bgmAlign[key]={clipId:clip.id,seeded:true,align:step.state};
+    if(step.seekTo!==undefined){
+      setBgmElementGain(element,0,0);
+      try{ element.currentTime=step.seekTo; }catch{}
+    }
+    if(step.delayChanged) setBgmElementDelay(element,step.state.delay);
+    if(step.event) recordPreviewDiagnostic(step.event.type,{element:key,clip:clip.name||clip.trackId,
+      ahead:Number(step.event.ahead.toFixed(3)),...(step.event.delay!==undefined?{delay:Number(step.event.delay.toFixed(3))}:{}),
+      timelineTime:Number(t.toFixed(3))});
+    setBgmElementGain(element,step.audible ? vol : 0);
+    return {delay:step.state.delay,audible:step.audible};
   };
   // プレビューで実際に聞こえている素材の音（音のスロットの出力）の大きさを測る。BGM はつながない。
   const previewDuckAnalyser=context=>{
@@ -13226,6 +13294,12 @@ function App(){
     // トランジションなしの切れ目: 次の素材を切れ目の1.2秒前に、止めたまま頭へ合わせておく。
     const cutNext=!transDur && index<clipsNow.length-1 ? clipsNow[index+1] : null;
     const cutNextVideo=cutNext?.type==='video' ? videoRefs.current.get(cutNext.id) : null;
+    // 前の再生の終わりに読み込みを外した動画もあるので、トランジションと同じく読み込み直してから合わせる。
+    if(cutNextVideo && cutNextVideo.paused && t>=cutNext.timelineStart-1.2 && t<cutNext.timelineStart &&
+       state.cutPreparedId!==cutNext.id && cutNextVideo.preload!=='auto'){
+      cutNextVideo.preload='auto';
+      if(cutNextVideo.readyState<1) try{ cutNextVideo.load(); }catch{}
+    }
     if(cutNextVideo && cutNextVideo.paused && t>=cutNext.timelineStart-1.2 && t<cutNext.timelineStart &&
        state.cutPreparedId!==cutNext.id){
       if(positionPreviewVideo(cutNextVideo,cutNext,cutNext.trimStart||0,'cut-prepare'))
@@ -13778,22 +13852,12 @@ function App(){
           }
           const clipOffset = clip.offset || 0;
           const bgmTarget = clipOffset + (t - clip.timelineStart);
-          if(bgm.paused){ try{ requestPreviewPlay(bgm,null,'bgm-tick'); }catch{} }
-          if(Math.abs(bgm.currentTime-bgmTarget)>0.5){
-            if(!state.bgmDriftSince) state.bgmDriftSince=now;
-            if(now-state.bgmDriftSince>400){
-              recordPreviewDiagnostic('bgm-resync',{from:Number(bgm.currentTime.toFixed(3)),to:Number(bgmTarget.toFixed(3)),
-                timelineTime:Number(t.toFixed(3))});
-              try{ bgm.currentTime=Math.max(0,bgmTarget); }catch{}
-              state.bgmDriftSince=0;
-            }
-          } else {
-            state.bgmDriftSince=0;
-          }
           const targetVol = vlogBgmClipGain(clip, bgmVolumeRef.current, t) * bgmDuckFactor;
-          setBgmElementGain(bgm,targetVol);
+          const aligned=alignPreviewBgm(state,'A',bgm,clip,bgmTarget,targetVol,now,rate,t);
+          if(bgm.paused){ try{ requestPreviewPlay(bgm,null,'bgm-tick'); }catch{} }
           state.bgmDiag={clip:clip.name||clip.trackId,master:bgmVolumeRef.current,clipGain:Number.isFinite(clip.gain)?clip.gain:1,
-            fade:vlogBgmFadeFactor(clip,t),duck:bgmDuckFactor,gain:targetVol,time:bgm.currentTime,expected:bgmTarget};
+            fade:vlogBgmFadeFactor(clip,t),duck:bgmDuckFactor,gain:aligned.audible?targetVol:0,time:bgm.currentTime,expected:bgmTarget,
+            delay:aligned.delay};
           try{ if(bgmAudioRef2.current){ try{ bgmAudioRef2.current.pause(); setBgmElementGain(bgmAudioRef2.current,0); }catch{} } }catch{}
         } else {
           const clipA = activeClips[0];
@@ -13809,20 +13873,15 @@ function App(){
           if(srcB && bgmB.src !== srcB){ try{ bgmB.src = srcB; bgmB.load(); }catch{} }
           const targetA = (clipA.offset||0) + (t - clipA.timelineStart);
           const targetB = (clipB.offset||0) + (t - clipB.timelineStart);
-          if(bgmA.paused){ try{ requestPreviewPlay(bgmA,null,'bgm-tick-A'); }catch{} }
-          if(bgmB.paused){ try{ requestPreviewPlay(bgmB,null,'bgm-tick-B'); }catch{} }
-          if(Math.abs(bgmA.currentTime-targetA)>0.6){
-            recordPreviewDiagnostic('bgm-resync',{from:Number(bgmA.currentTime.toFixed(3)),to:Number(targetA.toFixed(3)),
-              timelineTime:Number(t.toFixed(3)),element:'A'});
-            try{ bgmA.currentTime=Math.max(0,targetA); }catch{}
-          }
-          if(Math.abs(bgmB.currentTime-targetB)>0.6){ try{ bgmB.currentTime=Math.max(0,targetB); }catch{} }
           const volA = vlogBgmClipGain(clipA, bgmVolumeRef.current, t) * bgmDuckFactor;
           const volB = vlogBgmClipGain(clipB, bgmVolumeRef.current, t) * bgmDuckFactor;
-          setBgmElementGain(bgmA,volA);
-          setBgmElementGain(bgmB,volB);
+          const alignedA=alignPreviewBgm(state,'A',bgmA,clipA,targetA,volA,now,rate,t);
+          const alignedB=alignPreviewBgm(state,'B',bgmB,clipB,targetB,volB,now,rate,t);
+          if(bgmA.paused){ try{ requestPreviewPlay(bgmA,null,'bgm-tick-A'); }catch{} }
+          if(bgmB.paused){ try{ requestPreviewPlay(bgmB,null,'bgm-tick-B'); }catch{} }
           state.bgmDiag={clip:`${clipA.name||clipA.trackId} + ${clipB.name||clipB.trackId}`,master:bgmVolumeRef.current,
-            duck:bgmDuckFactor,gain:[volA,volB],time:bgmA.currentTime,expected:targetA};
+            duck:bgmDuckFactor,gain:[alignedA.audible?volA:0,alignedB.audible?volB:0],time:bgmA.currentTime,expected:targetA,
+            delay:alignedA.delay};
         }
         // BGM の要素が150ms以上進まなかったら、動き出したときに長さと前後の様子を記録する。
         const watched=bgmAudioRef.current;
@@ -13977,7 +14036,10 @@ function App(){
       bgmAudioRef.current.loop=true;
       bgmAudioRef.current.playbackRate=playbackRateRef.current;
       try{
-        const target=Math.max(0,timeRef.current+bgmOffsetRef.current);
+        // 鳴らし始めの止まり（F12）を音量0のうちにやり過ごすため、目標より早めの位置から鳴らす（tick が遅延で揃える）。
+        const startClip=(bgmClipsRef.current||[]).find(clip=>timeRef.current>=clip.timelineStart && timeRef.current<clip.timelineStart+clip.duration);
+        const base=startClip ? (startClip.offset||0)+(timeRef.current-startClip.timelineStart) : timeRef.current+bgmOffsetRef.current;
+        const target=Math.max(0,base+VLOG_BGM_ALIGN.lead*playbackRateRef.current);
         if(Math.abs(bgmAudioRef.current.currentTime-target)>0.05) bgmAudioRef.current.currentTime=target;
       }catch{}
       requestPreviewPlay(bgmAudioRef.current,null,'bgm-start');
