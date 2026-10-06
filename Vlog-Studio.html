@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-clip-fast';
+const VLOG_PREVIEW_BUILD='2026-10-06-clip-rate';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -8292,7 +8292,7 @@ async function captureMaterialEdge(clip,edge,signal,localTime=null,filter='none'
     if(video.readyState<2 || !video.videoWidth || !video.videoHeight) throw new Error('frame-unavailable');
     const raw=(clip.trimStart||0)+(Number.isFinite(localTime)
       ? Math.max(0,Math.min(clip.duration-0.04,localTime))
-      : edge==='last'?Math.max(0,clip.duration-0.08):Math.min(0.08,clip.duration/2))*(clip._cutGroupId?(clip._playbackRate||1):1);
+      : edge==='last'?Math.max(0,clip.duration-0.08):Math.min(0.08,clip.duration/2))*vlogClipSourceRate(clip);
     const target=Math.max(0,Math.min(raw,Number.isFinite(video.duration)?Math.max(0,video.duration-0.04):raw));
     if(Math.abs(video.currentTime-target)>0.04){
       const seeked=wait(['seeked'],2500);
@@ -9057,6 +9057,8 @@ const vlogMediaClips=list=>list.flatMap(clip=>clip._splitScreen
       trimStart:(child.trimStart||0)+(clip.trimStart||0)*(child._playbackRate||1),
       _splitGroupId:clip.id,_splitMuted:clip._splitScreen.audioId!==child.id,
       _transitionToNext:clip._transitionToNext})) : [clip]);
+// 素材の速度。タイムラインの時刻 ↔ 元動画の時刻は、どの素材も「trimStart + 経過 × 速度」で対応させる。
+const vlogClipSourceRate=clip=>Math.max(0.1,Number(clip?._playbackRate)||1);
 const vlogClipSourceGain=(clip,master=1)=>Math.max(0,Math.min(1,master)) *
   Math.max(0,Math.min(1,Number.isFinite(clip?._sourceAudioGain)?clip._sourceAudioGain:1)) *
   (clip?._sourceAudioMuted || clip?._splitMuted ? 0 : 1);
@@ -9132,7 +9134,7 @@ const vlogPreviewAudioSources=(clip,t)=>{
     return [{source:child,position:(child.trimStart||0)+((clip.trimStart||0)+elapsed)*childRate,speed:childRate}];
   }
   if(clip.type!=='video' || !clip.url) return [];
-  const speed=clip._cutGroupId?(clip._playbackRate||1):1;
+  const speed=vlogClipSourceRate(clip);
   return [{source:clip,position:(clip.trimStart||0)+elapsed*speed,speed}];
 };
 // 隣り合う素材 k と k+1 の繋ぎ目で、音を入れ替える区間。トランジションは重なり、なしは音のクロスフェードの区間。
@@ -12167,7 +12169,7 @@ function App(){
   const previewMediaState=(clip)=>{
     if(!clip) return null;
     const base={id:clip.id,name:clip.name,type:clip.type,
-      timelineStart:clip.timelineStart,duration:clip.duration,trimStart:clip.trimStart||0};
+      timelineStart:clip.timelineStart,duration:clip.duration,trimStart:clip.trimStart||0,speed:vlogClipSourceRate(clip)};
     if(clip.type==='photo') return base;
     const video=videoRefs.current.get(clip.id);
     if(!video) return {...base,missing:true};
@@ -12226,7 +12228,7 @@ function App(){
       untilClipEnd:active?Number((active.timelineStart+active.duration-t).toFixed(3)):null,
       waitReason:diag.waitReason||null,
       video:video?{readyState:video.readyState,paused:video.paused,seeking:video.seeking,
-        currentTime:Number(video.currentTime.toFixed(3))}:null,
+        currentTime:Number(video.currentTime.toFixed(3)),playbackRate:video.playbackRate}:null,
       incomingVideo:nextVideo?{readyState:nextVideo.readyState,paused:nextVideo.paused,seeking:nextVideo.seeking,
         currentTime:Number(nextVideo.currentTime.toFixed(3))}:null,
       activity:{clip:previewActivitySince(active,now),next:previewActivitySince(next,now)}});
@@ -13157,6 +13159,8 @@ function App(){
     const diag=previewDiagnosticRef.current;
     const audioStore=previewAudioSlotsRef.current;
     return JSON.stringify({report:'Vlog Studio 再生診断',build:VLOG_PREVIEW_BUILD,seamMode:VLOG_SEAM_MODE,
+      clips:(clipsRef.current||[]).map(clip=>({name:clip.name,start:Number((clip.timelineStart||0).toFixed(3)),
+        duration:Number((clip.duration||0).toFixed(3)),speed:vlogClipSourceRate(clip)})),
       previewAudio:{probe:PREVIEW_AUDIO_PROBE,lead:Number(audioStore.lead.toFixed(3)),startSamples:audioStore.startSamples.slice(),
         warmSamples:audioStore.warmSamples.slice(),slots:audioStore.slots.map(slot=>({slot:slot.index,state:slot.state,
           clip:slot.name,routed:slot.routed,paused:slot.audio.paused,time:Number(slot.audio.currentTime.toFixed(3)),
@@ -13342,7 +13346,7 @@ function App(){
         try{activeVideo.load();}catch{}
       }
       if(state.activeId!==active.id){
-        const target=(active.trimStart||0)+(t-active.timelineStart)*(active._cutGroupId?(active._playbackRate||1):1);
+        const target=(active.trimStart||0)+(t-active.timelineStart)*vlogClipSourceRate(active);
         // フェード中に再生を始めた次素材は、そのまま主素材へ引き継ぐ。
         if((state.incomingId===active.id && activeVideo.readyState>=2) ||
            positionPreviewVideo(activeVideo,active,target,'active-entry',0.08))
@@ -13378,7 +13382,7 @@ function App(){
         }
         else{
           const mediaTime=Math.max(active.timelineStart,Math.min(active.timelineStart+active.duration,
-            active.timelineStart+(activeVideo.currentTime-(active.trimStart||0))/(active._cutGroupId?clipRateActive:1)));
+            active.timelineStart+(activeVideo.currentTime-(active.trimStart||0))/vlogClipSourceRate(active)));
           if(mediaTime<t-0.12){
             // 数フレームの遅れは動画の時計が自然に追いつくまで待つ。
             waiting=true;
@@ -13794,7 +13798,7 @@ function App(){
       };
       if(active?.type==='video' && state.frozenOutgoingId!==active.id){
         const local=Math.max(0,state.heldTime-active.timelineStart);
-        syncHeldVideo(active,activeVideo,(active.trimStart||0)+local*(active._cutGroupId?(active._playbackRate||1):1),'resume-sync','active');
+        syncHeldVideo(active,activeVideo,(active.trimStart||0)+local*vlogClipSourceRate(active),'resume-sync','active');
       }
       if(inOverlap && incoming){
         const local=Math.max(0,state.heldTime-overlapStart)*(next._playbackRate||1);
@@ -14785,8 +14789,8 @@ function App(){
               progress.advancedAt=now;
             }
             job.frameProgress.set(clip.id,progress);
-            const target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart)*((clip._splitGroupId||clip._cutGroupId)?(clip._playbackRate||1):1);
-            if(clip._splitGroupId||clip._cutGroupId)video.playbackRate=clip._playbackRate||1;
+            const target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart)*vlogClipSourceRate(clip);
+            video.playbackRate=vlogClipSourceRate(clip);
             if(job.preparedIds.has(clip.id) && !job.startedIds.has(clip.id)){
               // クリップへの入場時だけ位置合わせする。再生中は短い遅れでシークしない。
               if(!video.seeking && Math.abs(video.currentTime-target)>
@@ -14923,7 +14927,7 @@ function App(){
           }
           if(progress && t>clip.timelineStart+0.25 &&
              now-progress.advancedAt>750 &&
-             video.currentTime<(clip.trimStart||0)+clip.duration*(clip._cutGroupId?(clip._playbackRate||1):1)-0.12)
+             video.currentTime<(clip.trimStart||0)+clip.duration*vlogClipSourceRate(clip)-0.12)
             return 'time-stalled';
           return null;
         };
@@ -16593,7 +16597,7 @@ const recomputeStarts=(arr)=>{
     }
     const video=clip && videoRefs.current.get(clip.id);
     if(video){
-      const target=(clip.trimStart||0)+(t-clip.timelineStart)*(clip._cutGroupId?(clip._playbackRate||1):1);
+      const target=(clip.trimStart||0)+(t-clip.timelineStart)*vlogClipSourceRate(clip);
       const position=()=>{
         if(videoRefs.current.get(clip.id)!==video || playingRef.current ||
            Math.abs(timeRef.current-t)>0.02) return;
