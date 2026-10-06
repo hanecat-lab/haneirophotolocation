@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-clip-fastwarm';
+const VLOG_PREVIEW_BUILD='2026-10-06-export-prewarm';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -6673,6 +6673,9 @@ const PREVIEW_AUDIO_PROBE=(()=>{try{const params=new URLSearchParams(location.se
 // 次の素材の予熱を、その素材の速度（倍速・スロー）で行う。1倍で予熱すると、2倍速の素材は繋ぎ目で動き出した直後に止まった
 // （実機 A/B: 止まり 106ms→0ms、動き出し後300msの進み 0.11→0.62秒）。?fastwarm=off で従来の予熱に戻せる。
 const PREVIEW_FAST_WARM=(()=>{try{return new URLSearchParams(location.search).get('fastwarm')!=='off';}catch{return true;}})();
+// 書き出しでも、素材に入る前に音なしで一度動かして止め、頭へ戻しておく（iPhone は最初の play() から動き出すまで 0.3〜1秒かかる）。
+// ?exportwarm=off で従来の書き出しに戻せる。
+const EXPORT_PREWARM=(()=>{try{return new URLSearchParams(location.search).get('exportwarm')!=='off';}catch{return true;}})();
 // ?audiolab=1 は再生ボタンで音の実験を行う（他の要素への操作ごとに、鳴っている音が止まるかを測る）。
 const PREVIEW_AUDIO_LAB=(()=>{try{return new URLSearchParams(location.search).get('audiolab')==='1';}catch{return false;}})();
 const vlogExportProfileMeasure=(name,run)=>{
@@ -14425,7 +14428,7 @@ function App(){
         timelineTime:Number(timeRef.current.toFixed(3)),...detail});
       if(job.events.length>60) job.events.shift();
     };
-    job.exportSnapshot=(reason,focus)=>JSON.stringify({report:'Vlog Studio 書き出し診断',
+    job.exportSnapshot=(reason,focus)=>JSON.stringify({report:'Vlog Studio 書き出し診断',build:VLOG_PREVIEW_BUILD,exportwarm:EXPORT_PREWARM,
       capturedAt:new Date().toISOString(),browser:navigator.userAgent,reason,
       timelineTime:Number(timeRef.current.toFixed(3)),totalTime:total,
       focus:exportVideoState(focus||job.lastIssue?.clip),
@@ -14754,6 +14757,50 @@ function App(){
               t>=clip.timelineStart &&
               t<clip.timelineStart+clip.duration)
           : null;
+        // 予熱: 開始の1.2秒前に音量0・素材の速度で一度動かして止め、頭へ戻す。入る0.08秒前に再生を始める。
+        if(EXPORT_PREWARM){
+          const warm=job.prewarm;
+          if(warm && warm.phase==='playing'){
+            const entry=job.videos.get(warm.clip.id), video=entry?.video;
+            const moved=video?video.currentTime-warm.from:0;
+            if(!video || moved>=0.02 || now-warm.startAt>=900){
+              try{ video?.pause(); }catch{}
+              if(entry) entry.gain.gain.value=0;
+              warm.phase='done';
+              recordExportEvent('export-prewarm',warm.clip,{ms:Math.round(now-warm.startAt),moved:Number(moved.toFixed(3))});
+              try{ if(video) video.currentTime=warm.clip.trimStart||0; }catch{}
+            }
+          }
+          if(!job.prewarm || job.prewarm.phase==='done'){
+            const next=exportVideoItems.find(clip=>clip.timelineStart>t && clip.timelineStart-t<=1.2 &&
+              clip.timelineStart-t>0.3 && job.preparedIds.has(clip.id) && !job.startedIds.has(clip.id) &&
+              !job.warmStartedIds.has(clip.id) && job.prewarm?.clip.id!==clip.id);
+            const entry=next&&job.videos.get(next.id), video=entry?.video;
+            if(video && video.paused && !video.seeking && video.readyState>=2 && !job.videoPlayPending.has(video)){
+              entry.gain.gain.value=0;
+              const speed=vlogClipSourceRate(next);
+              if(video.playbackRate!==speed) try{ video.playbackRate=speed; }catch{}
+              job.prewarm={clip:next,phase:'playing',startAt:now,from:video.currentTime};
+              try{ Promise.resolve(video.play()).catch(()=>{ if(job.prewarm?.clip===next) job.prewarm.phase='done'; }); }
+              catch{ job.prewarm.phase='done'; }
+            }
+          }
+          const done=job.prewarm;
+          if(done && done.phase==='done' && !job.warmStartedIds.has(done.clip.id) &&
+             t>=done.clip.timelineStart-0.08 && t<done.clip.timelineStart){
+            const entry=job.videos.get(done.clip.id), video=entry?.video;
+            if(video && video.paused && !video.seeking && !job.videoPlayPending.has(video)){
+              job.warmStartedIds.add(done.clip.id);
+              entry.gain.gain.value=0;
+              try{
+                job.videoPlayPending.add(video);
+                Promise.resolve(video.play()).then(()=>recordExportEvent('warm-playing',done.clip)).catch(()=>{
+                  job.warmStartedIds.delete(done.clip.id);
+                }).finally(()=>job.videoPlayPending.delete(video));
+              }catch{ job.videoPlayPending.delete(video); job.warmStartedIds.delete(done.clip.id); }
+            }
+          }
+        }
         // paused のまま切り替え点で play() するより、音量 0 で少し早くデコードを始める。
         // 素材の音声は実際の開始時刻になるまで録画へ流さない。
         for(const clip of exportVideoItems){
@@ -14796,7 +14843,7 @@ function App(){
             }
             job.frameProgress.set(clip.id,progress);
             const target=(clip.trimStart||0)+Math.max(0,t-clip.timelineStart)*vlogClipSourceRate(clip);
-            video.playbackRate=vlogClipSourceRate(clip);
+            if(video.playbackRate!==vlogClipSourceRate(clip)) video.playbackRate=vlogClipSourceRate(clip);
             if(job.preparedIds.has(clip.id) && !job.startedIds.has(clip.id)){
               // クリップへの入場時だけ位置合わせする。再生中は短い遅れでシークしない。
               if(!video.seeking && Math.abs(video.currentTime-target)>
