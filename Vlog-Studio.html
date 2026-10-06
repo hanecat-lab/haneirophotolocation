@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-cover-position';
+const VLOG_PREVIEW_BUILD='2026-10-06-photo-motion';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -7115,6 +7115,39 @@ const drawVlogMedia=(ctx,media,clip,...args)=>{
     if(cropped)ctx.drawImage(media,...source,-w/2,-h/2,w,h);
     else ctx.drawImage(media,-w/2,-h/2,w,h);
   }finally{ctx.restore();}
+};
+
+// 写真の動き。_photoPan で種類、_photoFocus {x,y}（写真全体に対する0〜1）で寄る先を持つ。
+const VLOG_PHOTO_MOTIONS=[
+  {key:'center',label:'なし'},{key:'kenburns-in',label:'寄る'},{key:'kenburns-out',label:'引く'},
+  {key:'pan-lr',label:'左→右'},{key:'pan-rl',label:'右→左'}
+];
+const vlogEase=p=>0.5-0.5*Math.cos(Math.PI*Math.max(0,Math.min(1,Number(p)||0)));
+// rect: 動く前の写真の描画先、win: 見える枠、imageRect: 写真全体の矩形（寄る先の計算用）。すべて {x,y,w,h}。
+const vlogPhotoMotionRect=(rect,win,clip,progress,imageRect=rect)=>{
+  let motion=clip?._photoPan||'center';
+  if(motion==='center' || !rect || !win) return rect;
+  const e=vlogEase(progress);
+  const isPan=motion==='pan-lr' || motion==='pan-rl';
+  // 枠を覆っていない写真（黒帯・ブラー表示）を横に流すと端が見えるので、寄る動きにする。
+  if(isPan && !(rect.w>=win.w-1 && rect.h>=win.h-1)) motion='kenburns-in';
+  if(motion==='kenburns-in' || motion==='kenburns-out'){
+    const z=motion==='kenburns-in' ? 1+0.1*e : 1.1-0.1*e;
+    const f=clip._photoFocus;
+    const fx=imageRect.x+imageRect.w*(Number.isFinite(f?.x)?f.x:0.5);
+    const fy=imageRect.y+imageRect.h*(Number.isFinite(f?.y)?f.y:0.5);
+    return {x:fx-(fx-rect.x)*z,y:fy-(fy-rect.y)*z,w:rect.w*z,h:rect.h*z};
+  }
+  if(isPan){
+    let r=rect;
+    if(r.w-win.w<win.w*0.08){
+      const z=win.w*1.1/r.w, cx=r.x+r.w/2, cy=r.y+r.h/2;
+      r={x:cx-r.w*z/2,y:cy-r.h*z/2,w:r.w*z,h:r.h*z};
+    }
+    const t=motion==='pan-lr' ? e : 1-e;
+    return {...r,x:win.x-(r.w-win.w)*t};
+  }
+  return rect;
 };
 
 const drawVlogDarkCinemaMaterial=(ctx,source,x,y,width,height,css,clip=null)=>{
@@ -8763,6 +8796,45 @@ function VlogRangePreviewSizeButton({size,onChange,onFullscreen}){
 // 範囲調整の全画面。映像を画面いっぱいに出し、下部の ±10・1・0.1秒で選んだ端を動かす。
 // 範囲の変更は呼び出し元の onChange(start,end,kind) をそのまま使う。toSource は範囲の時刻を元動画の時刻に直す。
 const VLOG_RANGE_FULLSCREEN_STEPS=[-10,-1,-0.1,0.1,1,10];
+// 写真の「寄る先」をタップで選ぶ全画面。座標は回転後の写真全体に対する0〜1。
+function VlogPhotoFocusPicker({clip,img,onChange,onClose}){
+  const canvasRef=useRef(null);
+  const focus={x:Number.isFinite(clip?._photoFocus?.x)?clip._photoFocus.x:0.5,
+    y:Number.isFinite(clip?._photoFocus?.y)?clip._photoFocus.y:0.5};
+  const dims=img?vlogMediaDimensions(img,clip):{width:1,height:1};
+  useEffect(()=>{
+    const canvas=canvasRef.current;
+    if(!canvas || !img) return;
+    const k=Math.min(1,1200/Math.max(dims.width,dims.height));
+    canvas.width=Math.max(1,Math.round(dims.width*k));
+    canvas.height=Math.max(1,Math.round(dims.height*k));
+    try{ drawVlogMedia(canvas.getContext('2d'),img,clip,0,0,canvas.width,canvas.height); }catch{}
+  },[img,clip?.id,dims.width,dims.height]);
+  const clamp=v=>Math.round(Math.max(0,Math.min(1,v))*1000)/1000;
+  const pick=e=>{
+    const r=e.currentTarget.getBoundingClientRect();
+    if(!r.width || !r.height) return;
+    onChange({x:clamp((e.clientX-r.left)/r.width),y:clamp((e.clientY-r.top)/r.height)});
+  };
+  const button='flex-1 min-h-11 rounded-full border border-white/25 text-[13px] font-bold';
+  return createPortal(React.createElement('div',{className:'fixed inset-0 z-[1000] flex flex-col bg-black text-white',
+      role:'dialog','aria-modal':true,'aria-label':'寄る先を選ぶ','data-range-fullscreen':true,onClick:e=>e.stopPropagation()},
+    React.createElement('div',{className:'px-4 pt-[max(0.75rem,env(safe-area-inset-top))] pb-2'},
+      React.createElement('div',{className:'text-[14px] font-bold'},'🎯 寄る先をタップ'),
+      React.createElement('div',{className:'text-[11px] text-white/65 mt-0.5'},'「寄る」「引く」の動きは、この点を中心に大きさが変わります。')),
+    React.createElement('div',{className:'flex-1 min-h-0 flex items-center justify-center p-3'},
+      img ? React.createElement('div',{className:'relative inline-block'},
+        React.createElement('canvas',{ref:canvasRef,onClick:pick,'aria-label':'写真（タップで寄る先を決める）',
+          style:{display:'block',maxWidth:'100%',maxHeight:'calc(100dvh - 200px)',width:'auto',height:'auto',touchAction:'manipulation'}}),
+        React.createElement('div',{'aria-hidden':true,className:'absolute w-12 h-12 rounded-full border-[3px] border-white pointer-events-none',
+          style:{left:`${focus.x*100}%`,top:`${focus.y*100}%`,transform:'translate(-50%,-50%)',boxShadow:'0 0 0 2px rgba(0,0,0,.45), inset 0 0 0 2px rgba(0,0,0,.45)'}}))
+      : React.createElement('div',{className:'text-[12px] text-white/60'},'写真を読み込めませんでした。')),
+    React.createElement('div',{className:'flex gap-2 px-4 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]'},
+      React.createElement('button',{type:'button',className:button,onClick:()=>onChange({x:0.5,y:0.5})},'真ん中に戻す'),
+      React.createElement('button',{type:'button',className:`${button} bg-white text-black border-white`,onClick:onClose},'完了'))
+  ),document.body);
+}
+
 function VlogRangeFullscreen({clip,start,end,min,max,minSpan,onChange,onClose,mode='keep',toSource=t=>t}){
   const videoRef=useRef(null);
   const playRef=useRef(null);
@@ -10471,16 +10543,7 @@ function App(){
         const w=canvas.width, h=canvas.height, frameRatio=w/h;
         const verticalMode=active._verticalMode || 'contain-black';
         let scale=1;
-        let panOffsetX=0, panOffsetY=0;
-        if(photo){
-          scale=active._photoZoom || 1;
-          const progress=Math.max(0,Math.min(1,(t-active.timelineStart)/Math.max(0.1,active.duration)));
-          if(active._photoPan==='kenburns-in' || active._photoPan==='kenburns-out'){
-            scale=active._photoPan==='kenburns-in' ? 1+progress*0.15 : 1.15-progress*0.15;
-            panOffsetX=(progress-0.5)*w*0.05;
-            panOffsetY=(progress-0.5)*h*0.05;
-          }
-        }
+        if(photo) scale=active._photoZoom || 1;
         let pictureW=w, pictureH=h;
         if(ratio>=1 && verticalMode==='contain-black'){
           pictureW=w*scale;
@@ -10492,10 +10555,12 @@ function App(){
           if(ratio>frameRatio){ pictureW=w*scale; pictureH=pictureW/ratio; }
           else { pictureH=h*scale; pictureW=pictureH*ratio; }
         }
-        const x=Math.max(0,Math.floor((w-pictureW)/2+panOffsetX)+1);
-        const y=Math.max(0,Math.floor((h-pictureH)/2+panOffsetY)+1);
-        const width=Math.min(w-x,Math.ceil(pictureW)-2);
-        const height=Math.min(h-y,Math.ceil(pictureH)-2);
+        let picture={x:(w-pictureW)/2,y:(h-pictureH)/2,w:pictureW,h:pictureH};
+        if(photo) picture=vlogPhotoMotionRect(picture,{x:0,y:0,w,h},active,(t-active.timelineStart)/Math.max(0.1,active.duration));
+        const x=Math.max(0,Math.floor(picture.x)+1);
+        const y=Math.max(0,Math.floor(picture.y)+1);
+        const width=Math.min(w-x,Math.ceil(picture.x+picture.w)-1-x);
+        const height=Math.min(h-y,Math.ceil(picture.y+picture.h)-1-y);
         if(width<10 || height<10){ setLumaHistogram(null); return; }
         const data=canvas.getContext('2d',{willReadFrequently:true}).getImageData(x,y,width,height).data;
         const bins=new Array(24).fill(0);
@@ -11262,6 +11327,7 @@ function App(){
   const [reorderOpen, setReorderOpen] = useState(false);
   const [reorderInitialId, setReorderInitialId] = useState(null);
   const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
+  const [photoFocusClipId, setPhotoFocusClipId] = useState(null);
   const [coverOpen, setCoverOpen] = useState(false);
   const [coverTitle, setCoverTitle] = useState('');
   const [coverStyle, setCoverStyle] = useState('frame');
@@ -11621,11 +11687,10 @@ function App(){
           const img=photoRefs.current.get(clip.id);
           if(!img || !img.complete || !img.naturalWidth || img.naturalWidth<2){ try{ outputCtx.fillStyle=paperColor; outputCtx.fillRect(0,0,cw,ch); }catch{} return true; }
           let zoom = clip._photoZoom||1.0;
-          let pan = clip._photoPan||'center';
+          const pan = clip._photoPan||'center';
           const progress = lTime / Math.max(0.1, clip.duration);
-          if(pan==='kenburns-in') zoom = 1.0 + progress*0.15;
-          else if(pan==='kenburns-out') zoom = 1.15 - progress*0.15;
           zoom *= scale;
+          const motionWin={x:(cw-cw*scale)/2+offsetX,y:(ch-ch*scale)/2+offsetY,w:cw*scale,h:ch*scale};
           const {width:iw,height:ih}=vlogMediaDimensions(img,clip);
           const ir=iw/ih;
           const cr=cw/ch;
@@ -11680,6 +11745,16 @@ function App(){
               if(ir > targetAspect){ sh = ih; sw = ih * targetAspect; sx = (iw - sw)/2; sy = 0; }
               else { sw = iw; sh = iw / targetAspect; sx = 0; sy = (ih - sh)/2; }
               dw=cw*zoom; dh=ch*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY;
+              if(pan!=='center'){
+                // 動きがあるときは写真全体を動かし、元の9:16の枠で切り抜く（横長写真を左右に流せる）。
+                const full={x:dx-sx*dw/sw,y:dy-sy*dh/sh,w:iw*dw/sw,h:ih*dh/sh};
+                const moved=vlogPhotoMotionRect(full,{x:dx,y:dy,w:dw,h:dh},clip,progress);
+                ctx.save();
+                ctx.beginPath();ctx.rect(dx,dy,dw,dh);ctx.clip();
+                vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(ctx,img,clip,moved.x,moved.y,moved.w,moved.h));
+                ctx.restore();
+                return finishClip();
+              }
               vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(ctx,img,clip,sx,sy,sw,sh,dx,dy,dw,dh));
               return finishClip();
             } else {
@@ -11695,9 +11770,9 @@ function App(){
               else{ dh=ch*zoom; dw=ch*ir*zoom; dx=(cw-dw)/2 + offsetX; dy=(ch-dh)/2 + offsetY; }
             }
           }
-          if(pan==='kenburns-in'){
-            dx += (progress-0.5)*cw*0.05;
-            dy += (progress-0.5)*ch*0.05;
+          if(pan!=='center'){
+            const moved=vlogPhotoMotionRect({x:dx,y:dy,w:dw,h:dh},motionWin,clip,progress);
+            dx=moved.x; dy=moved.y; dw=moved.w; dh=moved.h;
           }
           if(isVerticalFrame && isHorizontalContent && typeof effectiveMode!=='undefined' && effectiveMode==='blur-bg'){
             ctx.save();
@@ -16844,6 +16919,13 @@ function App(){
       }
     }catch(error){ if(error?.name!=='AbortError') setCoverError(error?.message||'保存できませんでした。'); }
   };
+  // 写真の動き・寄る先を変える。patchFn は素材ごとの変更（null なら変えない）。
+  const updatePhotoMotion=patchFn=>{
+    const next=clipsRef.current.map(x=>{ const patch=x.type==='photo'?patchFn(x):null; return patch?{...x,...patch}:x; });
+    setClips(next);
+    clipsRef.current=next;
+    setTimeout(()=>{ try{ drawFrameRef.current._forceNext=true; drawFrameRef.current(timeRef.current); }catch{} },10);
+  };
   const exportCameraFile=async(file)=>{
     if(!file) return;
     try{
@@ -20819,11 +20901,8 @@ const recomputeStarts=(arr)=>{
     // used by drawSingleClip so a tap on the image itself never closes the mode.
     if(sourceRatio>=1 && verticalMode!=='contain-black') return false;
     const isPhoto=previewClip.type==='photo';
-    let zoom=isPhoto ? (previewClip._photoZoom||1) : 1;
-    const pan=previewClip._photoPan||'center';
+    const zoom=isPhoto ? (previewClip._photoZoom||1) : 1;
     const progress=(timeRef.current-previewClip.timelineStart)/Math.max(0.1,previewClip.duration);
-    if(isPhoto && pan==='kenburns-in') zoom=1+progress*0.15;
-    else if(isPhoto && pan==='kenburns-out') zoom=1.15-progress*0.15;
     let width,height;
     if(sourceRatio>=1 || (fitMode!=='cover' && sourceRatio>frameRatio)){
       width=canvas.width*zoom;
@@ -20834,9 +20913,9 @@ const recomputeStarts=(arr)=>{
     }else return false;
     let left=(canvas.width-width)/2;
     let top=(canvas.height-height)/2;
-    if(isPhoto && pan.startsWith('kenburns-')){
-      left+=(progress-0.5)*canvas.width*0.05;
-      top+=(progress-0.5)*canvas.height*0.05;
+    if(isPhoto){
+      const moved=vlogPhotoMotionRect({x:left,y:top,w:width,h:height},{x:0,y:0,w:canvas.width,h:canvas.height},previewClip,progress);
+      left=moved.x; top=moved.y; width=moved.w; height=moved.h;
     }
     const x=(event.clientX-rect.left)*canvas.width/rect.width;
     const y=(event.clientY-rect.top)*canvas.height/rect.height;
@@ -21091,6 +21170,12 @@ const recomputeStarts=(arr)=>{
         )
       )
     ),
+    photoFocusClipId && (()=>{
+      const fc=clips.find(c=>c.id===photoFocusClipId);
+      return fc ? React.createElement(VlogPhotoFocusPicker,{clip:fc,img:photoRefs.current.get(fc.id),
+        onChange:f=>updatePhotoMotion(x=>x.id===fc.id?{_photoFocus:f,...((x._photoPan||'center')==='center'?{_photoPan:'kenburns-in'}:{})}:null),
+        onClose:()=>setPhotoFocusClipId(null)}) : null;
+    })(),
     reorderOpen && React.createElement(ReorderMaterials,{
       clips,initialSourceId:reorderInitialId,
       onClose:()=>{setReorderOpen(false);setReorderInitialId(null);},
@@ -22337,6 +22422,19 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
             React.createElement('input',{type:'range',min:0.5,max:10,step:0.1,value:photoDuration,'aria-label':'追加する写真の長さ',onChange:e=>{const v=parseFloat(e.target.value);setPhotoDuration(v);photoDurationRef.current=v;},className:'w-full accent-violet-500'})
           )
         ),
+        clips.some(c=>c.type==='photo') && React.createElement('section', {className:'camera-detail-panel mb-3 p-3 rounded-xl border', 'aria-label':'写真の動き'},
+          React.createElement('div', {className:'text-[12px] font-bold mb-1'}, '写真の動き'),
+          React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '写真ごとの動きと寄る先は、素材の行で変えられます。'),
+          React.createElement('div', {className:'flex gap-2'},
+            React.createElement('button', {type:'button',
+              onClick:()=>{
+                const order=[...clipsRef.current].filter(c=>c.type==='photo').sort((a,b)=>a.timelineStart-b.timelineStart).map(c=>c.id);
+                updatePhotoMotion(x=>({_photoPan:order.indexOf(x.id)%2===0?'kenburns-in':'kenburns-out'}));
+              },
+              className:'flex-1 px-3 py-1.5 rounded-full border border-white/20 text-[11px] font-bold'}, '全部に付ける（寄る・引くを交互）'),
+            React.createElement('button', {type:'button', onClick:()=>updatePhotoMotion(()=>({_photoPan:'center'})),
+              className:'px-3 py-1.5 rounded-full border border-white/20 text-[11px]'}, '全部外す'))
+        ),
         isAnalyzing && React.createElement('div', {className:'mb-3 p-3 rounded-xl bg-violet-600/20 border border-violet-500/30'},
           React.createElement('div', {className:'flex items-center justify-between mb-2'},
             React.createElement('div', {className:'text-[11px] font-bold text-violet-200'}, '🔍 映像フレーム解析中'),
@@ -22662,7 +22760,17 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                           title: vm.id==='contain-black' ? '黒帯で横全体表示' : vm.id==='blur-bg' ? 'ブラー背景で縦埋め' : '縦比率にクロップ'
                         }, vm.label))
                       ) : null; 
-                    })()
+                    })(),
+                    React.createElement('div', {className:'flex flex-wrap gap-0.5 mt-0.5', onClick:e=>e.stopPropagation(), onKeyDown:e=>e.stopPropagation()},
+                      VLOG_PHOTO_MOTIONS.map(m=>React.createElement('button', {key:m.key, type:'button',
+                        'aria-pressed':(c._photoPan||'center')===m.key,
+                        onClick:()=>updatePhotoMotion(x=>x.id===c.id?{_photoPan:m.key}:null),
+                        className:`px-1.5 py-0.5 rounded text-[8px] ${(c._photoPan||'center')===m.key ? 'bg-violet-600 text-white' : 'bg-white/10 text-white/60'}`,
+                        title:m.key.startsWith('pan-')?'画面いっぱいに写る写真で横に流します（黒帯・ブラー表示では寄る動きになります）':undefined
+                      }, m.label)),
+                      React.createElement('button', {type:'button', onClick:()=>setPhotoFocusClipId(c.id),
+                        className:'px-1.5 py-0.5 rounded text-[8px] bg-white/10 text-white/60'}, '🎯 寄る先')
+                    )
                   )
                 ),
                 (c._finderMarks||[]).length>0 && React.createElement('button', {
