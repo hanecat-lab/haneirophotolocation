@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-range-fullscreen';
+const VLOG_PREVIEW_BUILD='2026-10-06-range-zoom';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -8560,6 +8560,53 @@ function VlogRangeFullscreen({clip,start,end,min,max,minSpan,onChange,onClose,mo
   const playRef=useRef(null);
   const [edge,setEdge]=useState('start');
   const [playing,setPlaying]=useState(false);
+  // 映像の拡大（100〜300%）。拡大中はドラッグで見る場所を動かし、2本指で拡大・縮小、ダブルタップで100%⇄200%。
+  const stageRef=useRef(null);
+  const gestureRef=useRef({pointers:new Map(),pinch:null,drag:null,lastTap:0,moved:false});
+  const [view,setView]=useState({zoom:1,x:0,y:0});
+  const clampView=(zoom,x,y)=>{
+    const z=Math.min(3,Math.max(1,Math.round(zoom*100)/100));
+    const rect=stageRef.current?.getBoundingClientRect();
+    const maxX=rect?(z-1)*rect.width/2:0,maxY=rect?(z-1)*rect.height/2:0;
+    return {zoom:z,x:Math.min(maxX,Math.max(-maxX,x)),y:Math.min(maxY,Math.max(-maxY,y))};
+  };
+  const zoomTo=zoom=>setView(old=>clampView(zoom,old.x,old.y));
+  const onStagePointerDown=e=>{
+    const g=gestureRef.current;
+    try{ e.currentTarget.setPointerCapture(e.pointerId); }catch{}
+    g.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    g.moved=false;
+    if(g.pointers.size===2){
+      const [a,b]=[...g.pointers.values()];
+      g.pinch={dist:Math.hypot(a.x-b.x,a.y-b.y)||1,zoom:view.zoom};g.drag=null;
+    }else if(g.pointers.size===1) g.drag={x:e.clientX,y:e.clientY,vx:view.x,vy:view.y};
+  };
+  const onStagePointerMove=e=>{
+    const g=gestureRef.current;
+    if(!g.pointers.has(e.pointerId)) return;
+    g.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if(g.pinch && g.pointers.size>=2){
+      const [a,b]=[...g.pointers.values()];
+      g.moved=true;
+      zoomTo(g.pinch.zoom*(Math.hypot(a.x-b.x,a.y-b.y)||1)/g.pinch.dist);
+    }else if(g.drag){
+      const dx=e.clientX-g.drag.x,dy=e.clientY-g.drag.y;
+      if(Math.abs(dx)+Math.abs(dy)>6) g.moved=true;
+      if(g.moved) setView(old=>clampView(old.zoom,g.drag.vx+dx,g.drag.vy+dy));
+    }
+  };
+  const onStagePointerUp=e=>{
+    const g=gestureRef.current;
+    if(!g.pointers.has(e.pointerId)) return;
+    g.pointers.delete(e.pointerId);
+    if(g.pointers.size<2) g.pinch=null;
+    if(g.pointers.size===1){ const [p]=[...g.pointers.values()]; g.drag={x:p.x,y:p.y,vx:view.x,vy:view.y}; return; }
+    g.drag=null;
+    if(e.type!=='pointerup' || g.moved) return;
+    const now=Date.now();
+    if(now-g.lastTap<320){ g.lastTap=0; setView(old=>old.zoom>1?{zoom:1,x:0,y:0}:clampView(2,0,0)); }
+    else g.lastTap=now;
+  };
   const seekTo=time=>{
     const video=videoRef.current;
     if(!video) return;
@@ -8609,12 +8656,23 @@ function VlogRangeFullscreen({clip,start,end,min,max,minSpan,onChange,onClose,mo
     React.createElement('div',{className:'flex items-center gap-2 px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 text-[12px]'},
       React.createElement('div',{className:'flex-1 min-w-0 truncate text-white/85'},
         `${edgeLabel.start} ${start.toFixed(1)}秒 ／ ${edgeLabel.end} ${end.toFixed(1)}秒 ／ ${mode==='cut'?'カットする長さ':'長さ'} ${(end-start).toFixed(1)}秒`),
+      React.createElement('div',{className:'shrink-0 flex items-center gap-1'},
+        React.createElement('button',{type:'button',onClick:()=>zoomTo(view.zoom-0.5),disabled:view.zoom<=1,
+          className:'min-h-9 min-w-9 rounded-full border border-white/25 bg-white/10 text-[14px] font-bold disabled:opacity-35','aria-label':'映像を縮小'},'−'),
+        React.createElement('button',{type:'button',onClick:()=>setView({zoom:1,x:0,y:0}),
+          className:'min-h-9 min-w-[3.5rem] rounded-full border border-white/25 bg-white/10 px-2 text-[11px] tabular-nums','aria-label':'映像の倍率を100%に戻す'},
+          `${Math.round(view.zoom*100)}%`),
+        React.createElement('button',{type:'button',onClick:()=>zoomTo(view.zoom+0.5),disabled:view.zoom>=3,
+          className:'min-h-9 min-w-9 rounded-full border border-white/25 bg-white/10 text-[14px] font-bold disabled:opacity-35','aria-label':'映像を拡大'},'＋')),
       React.createElement('button',{type:'button',onClick:onClose,className:'shrink-0 min-h-9 rounded-full bg-white text-black px-4 text-[12px] font-bold'},'完了')),
-    React.createElement('div',{className:'relative flex-1 min-h-0'},
+    React.createElement('div',{ref:stageRef,className:'relative flex-1 min-h-0 overflow-hidden',style:{touchAction:'none'},
+        onPointerDown:onStagePointerDown,onPointerMove:onStagePointerMove,onPointerUp:onStagePointerUp,onPointerCancel:onStagePointerUp},
+      React.createElement('div',{'data-range-zoom-layer':true,className:'absolute inset-0',
+        style:{transform:`translate(${view.x}px, ${view.y}px) scale(${view.zoom})`,transformOrigin:'50% 50%'}},
       React.createElement(VlogRotatedMedia,{as:'video',clip,ref:videoRef,src:clip.url,muted:true,playsInline:true,preload:'auto',
         className:'w-full h-full bg-black object-contain',style:{width:'100%',height:'100%',maxHeight:'100%'},
         onLoadedMetadata:()=>seekTo(edge==='start'?start:end),onTimeUpdate,
-        onPause:()=>{ if(playRef.current){ playRef.current=null;setPlaying(false); } }})),
+        onPause:()=>{ if(playRef.current){ playRef.current=null;setPlaying(false); } }}))),
     React.createElement('div',{className:'flex flex-col gap-2 bg-black/80 px-3 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]'},
       React.createElement('div',{className:'flex items-center justify-center gap-2'},
         ['start','end'].map(kind=>React.createElement('button',{key:kind,type:'button',onClick:()=>selectEdge(kind),'aria-pressed':edge===kind,
