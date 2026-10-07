@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-07-snapshot-stack';
+const VLOG_PREVIEW_BUILD='2026-10-07-page-curl';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -9865,6 +9865,60 @@ const paintVlogSnapshotPop=(ctx,cw,ch,img,label,st)=>{
   }
   ctx.restore();
 };
+// 切り替え効果「めくる」。右下の角が左上（やや上）へめくれ、裏は生成りの紙になる。
+// 角 C を方向 d へ L·p 動かし、C とその移動先の垂直二等分線を折り線にする（d 方向に s=L·p/2）。
+const vlogClipPolygonHalf=(poly,C,d,s,keepFar)=>{
+  const side=pt=>(pt.x-C.x)*d.x+(pt.y-C.y)*d.y-s;
+  const out=[];
+  for(let i=0;i<poly.length;i++){
+    const a=poly[i],b=poly[(i+1)%poly.length],sa=side(a),sb=side(b);
+    const inA=keepFar?sa>=0:sa<0,inB=keepFar?sb>=0:sb<0;
+    if(inA) out.push(a);
+    if(inA!==inB){ const k=sa/(sa-sb); out.push({x:a.x+(b.x-a.x)*k,y:a.y+(b.y-a.y)*k}); }
+  }
+  return out;
+};
+const vlogPageCurlGeometry=(cw,ch,prog)=>{
+  const len=Math.hypot(1,0.6),d={x:-1/len,y:-0.6/len},C={x:cw,y:ch};
+  const L=2.04*(cw*Math.abs(d.x)+ch*Math.abs(d.y));
+  const s=L*vlogEase(prog)/2;
+  const rect=[{x:0,y:0},{x:cw,y:0},{x:cw,y:ch},{x:0,y:ch}];
+  const remain=vlogClipPolygonHalf(rect,C,d,s,true);
+  const curled=vlogClipPolygonHalf(rect,C,d,s,false);
+  // 折り線で鏡写しにした「めくれた紙の裏」。
+  const flap=curled.map(pt=>{ const k=2*((pt.x-C.x)*d.x+(pt.y-C.y)*d.y-s); return {x:pt.x-k*d.x,y:pt.y-k*d.y}; });
+  return {C,d,s,remain,curled,flap};
+};
+const vlogPolygonArea=poly=>Math.abs(poly.reduce((sum,a,i)=>{const b=poly[(i+1)%poly.length];return sum+a.x*b.y-b.x*a.y;},0))/2;
+const paintVlogPageCurl=(ctx,cw,ch,prog,drawFrom,drawTo)=>{
+  const g=vlogPageCurlGeometry(cw,ch,prog);
+  const path=poly=>{ ctx.beginPath(); poly.forEach((pt,i)=>i?ctx.lineTo(pt.x,pt.y):ctx.moveTo(pt.x,pt.y)); ctx.closePath(); };
+  if(g.curled.length>=3) drawTo();
+  if(g.remain.length>=3){
+    ctx.save(); path(g.remain); ctx.clip(); drawFrom(); ctx.restore();
+  }
+  if(g.curled.length<3 || g.remain.length<3) return;
+  ctx.save();ctx.filter='none';ctx.globalAlpha=1;
+  // 折り線に沿って、次の素材の上に落ちる影。
+  const width=Math.hypot(cw,ch)*0.06;
+  const fx=g.C.x+g.d.x*g.s,fy=g.C.y+g.d.y*g.s;
+  ctx.save(); path(g.curled); ctx.clip();
+  const shade=ctx.createLinearGradient(fx,fy,fx-g.d.x*width,fy-g.d.y*width);
+  shade.addColorStop(0,'rgba(0,0,0,0.28)'); shade.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=shade; ctx.fillRect(0,0,cw,ch); ctx.restore();
+  // めくれた紙の裏。
+  ctx.save();
+  ctx.shadowColor='rgba(0,0,0,0.3)';ctx.shadowBlur=18;
+  path(g.flap); ctx.fillStyle='#FBF6EC'; ctx.fill();
+  ctx.shadowColor='transparent';ctx.shadowBlur=0;
+  const tip=g.flap.reduce((far,pt)=>{ const v=(pt.x-g.C.x)*g.d.x+(pt.y-g.C.y)*g.d.y; return v>far.v?{v,pt}:far; },{v:-Infinity,pt:null});
+  const depth=Math.max(1,tip.v-g.s);
+  const light=ctx.createLinearGradient(fx,fy,fx+g.d.x*depth,fy+g.d.y*depth);
+  light.addColorStop(0,'rgba(60,45,30,0.16)'); light.addColorStop(0.6,'rgba(255,255,255,0)'); light.addColorStop(1,'rgba(255,255,255,0.22)');
+  path(g.flap); ctx.fillStyle=light; ctx.fill();
+  ctx.restore();
+  ctx.restore();
+};
 // 時刻 t に映っている素材（切り替えの途中は、後から始まる入ってくる側）。
 const vlogClipAtTime=(clips,t)=>(clips||[]).filter(c=>t>=c.timelineStart && t<c.timelineStart+c.duration)
   .sort((a,b)=>b.timelineStart-a.timelineStart)[0]||null;
@@ -12179,6 +12233,9 @@ function App(){
           ctx.fillRect(edge-12, 0, 24, ch);
           ctx.restore();
         }
+      } else if(transitionType==='page'){
+        paintVlogPageCurl(ctx,cw,ch,prog,()=>drawSingleClip(fromClip,fromLocal,1),()=>{ if(toClip) drawSingleClip(toClip,toLocal,1); });
+        ctx.filter='none';
       } else if(transitionType==='slide-up'){
         const slideOffset = ch * prog;
         drawSingleClip(fromClip, fromLocal, 1, 0, -slideOffset, 1);
@@ -22755,13 +22812,14 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
               {id:'black', name:'ブラック', icon:'●'},
               {id:'iris', name:'丸く開く', icon:'○'},
               {id:'wipe', name:'ワイプ', icon:'⇥'},
-              {id:'slide-up', name:'上へ', icon:'↑'}
+              {id:'slide-up', name:'上へ', icon:'↑'},
+              {id:'page', name:'めくる', icon:'📄'}
             ].map(t=>
               React.createElement('button', {
                 key:t.id,
                 onClick:()=> {
                   setDefaultTransition(prev=> {
-                    const next = {...prev, type:t.id};
+                    const next = {...prev, type:t.id, ...(t.id==='page'?{duration:0.7}:{})};
                     defaultTransitionRef.current = next;
                     return next;
                   });
@@ -22773,6 +22831,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
               )
             )
           ),
+          defaultTransition.type==='page' && React.createElement('div', {className:'text-[10px] text-white/55 mb-2'}, '📄 字幕は紙と一緒にめくれません。めくる場面には字幕を重ねないのがおすすめです。'),
           React.createElement('div', {className:'flex items-center gap-2 mb-2'},
             React.createElement('div', {className:'text-[10px] text-white/50 w-12'}, '長さ'),
             React.createElement('input', {
@@ -23000,7 +23059,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     c._filterDot && React.createElement('span', {className:'text-[10px]'}, c._filterDot),
                     c._filterName && React.createElement('span', {className:'text-[8px] px-1 py-0.5 rounded bg-white/10 truncate'}, c._filterName),
                     hasTrans && React.createElement('span', {className:'text-[8px] px-1.5 py-0.5 rounded-full bg-green-600/40 border border-green-500/30 text-green-100 flex items-center gap-0.5'},
-                      React.createElement('span', null, trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→': trans.type==='slide-right'?'←': trans.type==='zoom'?'◎': trans.type==='black'?'●': trans.type==='iris'?'○': trans.type==='wipe'?'⇥': trans.type==='slide-up'?'↑':'✂️'),
+                      React.createElement('span', null, trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→': trans.type==='slide-right'?'←': trans.type==='zoom'?'◎': trans.type==='black'?'●': trans.type==='iris'?'○': trans.type==='wipe'?'⇥': trans.type==='slide-up'?'↑':trans.type==='page'?'📄':'✂️'),
                       `${trans.type} ${trans.duration.toFixed(1)}s`
                     ),
                     !hasTrans && i<clips.length-1 && React.createElement('span', {className:'text-[8px] px-1 py-0.5 rounded bg-white/5 text-white/30'}, 'カット')
@@ -23081,7 +23140,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       const currentTrans = targetClip._transitionToNext;
                       const newType = prompt('トランジション種類: none, fade, white, slide-left, slide-right, zoom, black, iris, wipe, slide-up\n現在: ' + (currentTrans?currentTrans.type:'none'), currentTrans?currentTrans.type:'none');
                       if(newType===null) return;
-                      const valid=['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up'];
+                      const valid=['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up','page'];
                       if(!valid.includes(newType)){ alert('無効な種類です: ' + valid.join(', ')); return; }
                       let newClips;
                       if(newType==='none'){
@@ -23138,7 +23197,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     },
                     className:`w-8 h-6 rounded-full text-[10px] flex items-center justify-center ${hasTrans?'bg-green-600/30 border border-green-500/40 text-green-200':'bg-white/10 text-white/40'}`,
                     title:i===clips.length-1 ? 'このカットのラストを見て次を撮る' : 'トランジションを設定'
-                  }, hasTrans ? (trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→': trans.type==='black'?'●': trans.type==='iris'?'○': trans.type==='wipe'?'⇥': trans.type==='slide-up'?'↑':'◎') : '+'),
+                  }, hasTrans ? (trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→': trans.type==='black'?'●': trans.type==='iris'?'○': trans.type==='wipe'?'⇥': trans.type==='slide-up'?'↑':trans.type==='page'?'📄':'◎') : '+'),
                   React.createElement('button', {
                     onClick:()=>{
                       if(c._splitScreen){
@@ -23459,7 +23518,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       const targetClip = currentClips.find(x=> x.id===c.id);
                       if(!targetClip) return;
                       const currentTrans = targetClip._transitionToNext || {type:'none', duration:0.5};
-                      const types = ['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up'];
+                      const types = ['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up','page'];
                       const currentIdx = types.indexOf(currentTrans.type);
                       const nextType = types[(currentIdx+1)%types.length];
                       let newClips;
@@ -23536,7 +23595,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     className:`text-[9px] px-2.5 py-1 rounded-full border flex items-center gap-1 ${hasTrans?'bg-green-600/20 border-green-500/30 text-green-200':'bg-[#1a1a1d] border-white/10 text-white/40 hover:text-white/70'}`,
                     title:'タップでトランジション切り替え'
                   },
-                    hasTrans ? `${trans.type==='fade'?'◐':trans.type==='white'?'◑':trans.type==='slide-left'?'→':trans.type==='slide-right'?'←':trans.type==='zoom'?'◎':trans.type==='black'?'●':trans.type==='iris'?'○':trans.type==='wipe'?'⇥':trans.type==='slide-up'?'↑':'✂️'} ${trans.type} ${trans.duration.toFixed(1)}s` : '+ トランジション追加'
+                    hasTrans ? `${trans.type==='fade'?'◐':trans.type==='white'?'◑':trans.type==='slide-left'?'→':trans.type==='slide-right'?'←':trans.type==='zoom'?'◎':trans.type==='black'?'●':trans.type==='iris'?'○':trans.type==='wipe'?'⇥':trans.type==='slide-up'?'↑':trans.type==='page'?'📄':'✂️'} ${trans.type} ${trans.duration.toFixed(1)}s` : '+ トランジション追加'
                   ),
                   React.createElement('div', {className:'w-6 h-px bg-white/10'})
                 ),
