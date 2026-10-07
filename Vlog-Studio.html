@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-07-split-end';
+const VLOG_PREVIEW_BUILD='2026-10-07-split-prepare';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -10023,8 +10023,9 @@ const syncVlogSplitMedia=(scene,local,getMedia,playing=false,rate=1,onPlay=video
     }
     if(video.readyState<1){ready=false;continue;}
     // 素材を終わりまで使う子は、終わりに着くと再生終了になる。iPhone は終了後の play() で頭から再生し直し、
-    // 戻すシークと繰り返して準備が整わず、場面の最後で止まる。目標も終わり付近なら、再生を頼まずそろったとみなす。
-    if((video.ended || video.currentTime>=end-0.03) && target>=end-0.05 && video.readyState>=2 && !video.seeking) continue;
+    // 戻すシークと繰り返して準備が整わず、場面の最後で止まる。目標も終わり付近（再生中のずれの許容内）なら、
+    // 再生を頼まずそろったとみなす（子の動画がタイムラインより少し先に終わりへ着く場合も含む）。
+    if((video.ended || video.currentTime>=end-0.03) && end-target<=(playing?0.35:0.05) && video.readyState>=2 && !video.seeking) continue;
     if(!video.seeking && Math.abs(video.currentTime-target)>(playing?0.35:0.025)){
       try{video.currentTime=target;}catch{}ready=false;
     }
@@ -14277,6 +14278,43 @@ function App(){
         }
       }
     }
+    // 次の素材が画面分割のときも、重なりの1.2秒前から子の動画を読み込んで頭へ合わせ、音なしで一度動かして戻しておく。
+    // 準備がないと重なりの入口で読み込み・シーク・動き出しが重なり、待ちと引っかかりになる（iPhone の診断で確認）。
+    if(next?._splitScreen && t>=overlapStart-1.2 && t<overlapStart &&
+       (state.heldTime===null || state.heldTime===undefined)){
+      if(state.splitPrewarm?.id!==next.id) state.splitPrewarm={id:next.id,children:new Map()};
+      const warm=state.splitPrewarm;
+      for(const child of next._splitScreen.clips){
+        if(child.type!=='video') continue;
+        const video=videoRefs.current.get(child.id);
+        if(!video) continue;
+        if(video.preload!=='auto'){
+          video.preload='auto';
+          if(video.readyState<1) try{ video.load(); }catch{}
+        }
+        const start=(child.trimStart||0)+(next.trimStart||0)*(child._playbackRate||1);
+        const childWarm=warm.children.get(child.id);
+        if(!childWarm){
+          if(positionPreviewVideo(video,child,start,'split-incoming-prepare')) warm.children.set(child.id,{phase:'prepared'});
+        }else if(childWarm.phase==='prepared'){
+          if(!video.seeking && video.readyState>=2 && video.paused){
+            childWarm.wasMuted=video.muted;video.muted=true;
+            childWarm.phase='playing';childWarm.startAt=now;childWarm.from=video.currentTime;
+            requestPreviewPlay(video,child,'split-incoming-prewarm');
+          }
+        }else if(childWarm.phase==='playing'){
+          const moved=video.currentTime-childWarm.from;
+          if(moved>=0.02 || now-childWarm.startAt>=900){
+            try{ video.pause(); }catch{}
+            video.muted=childWarm.wasMuted;
+            childWarm.phase='done';
+            recordPreviewDiagnostic('split-incoming-prewarm',{clip:child.name,ms:Math.round(now-childWarm.startAt),
+              moved:Number(moved.toFixed(3)),timelineTime:Number(t.toFixed(3))});
+            positionPreviewVideo(video,child,start,'split-incoming-prewarm-rewind',0.02);
+          }
+        }
+      }
+    }
     // 切れ目（トランジションなし）でも、次の素材を音なしで一度動かして止め、頭へ戻しておく。
     // そのうえで、動き出しまでの見込み時間だけ切れ目より前に再生し始める（切れ目の直後に絵が止まらないように）。
     if(cutNext && cutNextVideo && state.cutPreparedId===cutNext.id && t<cutNext.timelineStart &&
@@ -14553,6 +14591,7 @@ function App(){
     if(active?.type==='video') liveIds.add(active.id);
     if(inOverlap && incoming) liveIds.add(next.id);
     if(state.prewarm?.phase==='playing') liveIds.add(state.prewarm.id);
+    if(state.splitPrewarm) for(const [id,childWarm] of state.splitPrewarm.children) if(childWarm.phase==='playing') liveIds.add(id);
     if(state.cutPrewarm?.phase==='playing' || state.cutPrewarm?.phase==='started') liveIds.add(state.cutPrewarm.id);
     if(audioCrossfadeActive?.to?.type==='video')liveIds.add(audioCrossfadeActive.to.id);
     livePreviewIdsRef.current=liveIds;
