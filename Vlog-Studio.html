@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-06-photo-motion-row';
+const VLOG_PREVIEW_BUILD='2026-10-07-split-float';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -9648,7 +9648,10 @@ const vlogSavedMaterialThumbnails=(clips,saved)=>{
   }));
 };
 const vlogSplitIsSideBySide=scene=>scene?._splitScreen?.layout==='side-by-side';
-const vlogSplitLabel=scene=>vlogSplitIsSideBySide(scene)?'左右':'上下';
+const vlogSplitIsFloat=scene=>scene?._splitScreen?.layout==='float';
+const vlogSplitLabel=scene=>vlogSplitIsFloat(scene)?'浮かせる':vlogSplitIsSideBySide(scene)?'左右':'上下';
+// ２素材の置き場所の呼び名（0=1つ目、1=2つ目）。
+const vlogSplitPlaceLabel=(scene,index)=>vlogSplitIsFloat(scene)?(index?'写真':'背景'):vlogSplitIsSideBySide(scene)?(index?'右':'左'):(index?'下':'上');
 const vlogSplitPosition=value=>Number.isFinite(value)?Math.max(0,Math.min(1,value)):0.5;
 const vlogSplitFraming=(scene,id)=>{
   const saved=scene._splitScreen.framing?.[id]||{};
@@ -9721,13 +9724,81 @@ const drawVlogSideBySideFrame=(canvas,scene,getMedia,filterId,intensity)=>{
   if(hasLightCorrection(scene._light)){const pixels=ctx.getImageData(0,0,width,height);ctx.putImageData(correctLightPixels(pixels,scene._light),0,0);}
   ctx.restore();return true;
 };
-const drawVlogSplitFrame=(canvas,scene,getMedia,filterId='none',intensity=100)=>{
+// 紙のカード（生成りの白フチ＋柔らかい影）。source は描き終えた画像、rect はその表示先（中心で回す）。
+const paintVlogPaperCard=(ctx,source,rect,{angle=0,border=0,bottom=0,alpha=1,shadow=true}={})=>{
+  if(!(alpha>0)) return;
+  ctx.save();
+  ctx.globalAlpha*=Math.min(1,alpha);ctx.filter='none';
+  ctx.translate(rect.x+rect.w/2,rect.y+rect.h/2);ctx.rotate(angle);
+  const x=-rect.w/2,y=-rect.h/2;
+  if(shadow){
+    ctx.shadowColor='rgba(20,16,12,0.38)';ctx.shadowBlur=Math.max(6,rect.w*0.05);ctx.shadowOffsetY=Math.max(2,rect.w*0.018);
+  }
+  ctx.fillStyle='#FFFBF5';
+  ctx.fillRect(x-border,y-border,rect.w+border*2,rect.h+border*2+bottom);
+  ctx.shadowColor='transparent';ctx.shadowBlur=0;ctx.shadowOffsetY=0;
+  ctx.drawImage(source,x,y,rect.w,rect.h);
+  ctx.restore();
+};
+// 浮かせる: 1つ目を背景（画面いっぱい・少し暗く柔らかく・ゆっくり寄る）、2つ目を紙のカードで浮かせる。
+// local は場面の頭からの秒数。頭0.5秒で少し下から浮き上がる。
+const VLOG_FLOAT_UPPER_Y=0.38;
+const vlogFloatEntrance=local=>{
+  const e=vlogEase(Math.max(0,local)/0.5);
+  return {dy:0.03*(1-e),scale:1.04-0.04*e,alpha:e};
+};
+const vlogFloatCanvasCache=new WeakMap();
+const drawVlogFloatFrame=(canvas,scene,getMedia,filterId,intensity,local)=>{
+  const ctx=canvas.getContext('2d'),width=canvas.width,height=canvas.height;
+  let panes=vlogFloatCanvasCache.get(canvas);
+  if(!panes){panes={bg:document.createElement('canvas'),fg:document.createElement('canvas')};vlogFloatCanvasCache.set(canvas,panes);}
+  const [bgClip,fgClip]=scene._splitScreen.clips;
+  const bgMedia=getMedia(bgClip),fgMedia=getMedia(fgClip);
+  ctx.save();ctx.filter='none';ctx.globalAlpha=1;
+  // 背景: 1/3の大きさで描いて引き伸ばし、軽くやわらげる。
+  const bg=panes.bg,bw=Math.max(1,Math.round(width/3)),bh=Math.max(1,Math.round(height/3));
+  if(bg.width!==bw||bg.height!==bh){bg.width=bw;bg.height=bh;}
+  const bc=bg.getContext('2d');bc.save();bc.filter='none';bc.globalAlpha=1;
+  bc.fillStyle=getMoodPaperColor();bc.fillRect(0,0,bw,bh);
+  const {width:bmw,height:bmh}=vlogMediaDimensions(bgMedia,bgClip);
+  const zoom=1+0.05*vlogEase(Math.max(0,local)/Math.max(0.5,scene.duration||1));
+  const cover=Math.max(bw/bmw,bh/bmh)*zoom;
+  bc.imageSmoothingEnabled=true;bc.imageSmoothingQuality='high';
+  vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(bc,bgMedia,bgClip,(bw-bmw*cover)/2,(bh-bmh*cover)/2,bmw*cover,bmh*cover));
+  bc.restore();
+  if(hasLightCorrection(bgClip._light)){const pixels=bc.getImageData(0,0,bw,bh);bc.putImageData(correctLightPixels(pixels,bgClip._light),0,0);}
+  applyVlogCanvasFilter(bg,getClipPreviewFilter(bgClip,filterId,intensity));
+  ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
+  vlogExportProfileMeasure('material.composite',()=>ctx.drawImage(bg,0,0,width,height));
+  ctx.fillStyle='rgba(0,0,0,0.18)';ctx.fillRect(0,0,width,height);
+  // 浮かぶ素材: 横は幅86%、縦は高さ55%までに収める。
+  const {width:fmw,height:fmh}=vlogMediaDimensions(fgMedia,fgClip);
+  const fit=Math.min(width*0.86/fmw,height*0.55/fmh);
+  const fw=Math.max(1,Math.round(fmw*fit)),fh=Math.max(1,Math.round(fmh*fit));
+  const fg=panes.fg;
+  if(fg.width!==fw||fg.height!==fh){fg.width=fw;fg.height=fh;}
+  const fc=fg.getContext('2d');fc.save();fc.filter='none';fc.globalAlpha=1;
+  fc.fillStyle=getMoodPaperColor();fc.fillRect(0,0,fw,fh);
+  vlogExportProfileMeasure('material.foregroundDraw',()=>drawVlogMedia(fc,fgMedia,fgClip,0,0,fw,fh));
+  fc.restore();
+  if(hasLightCorrection(fgClip._light)){const pixels=fc.getImageData(0,0,fw,fh);fc.putImageData(correctLightPixels(pixels,fgClip._light),0,0);}
+  applyVlogCanvasFilter(fg,getClipPreviewFilter(fgClip,filterId,intensity));
+  const enter=vlogFloatEntrance(local);
+  const cy=height*(scene._splitScreen.floatY==='upper'?VLOG_FLOAT_UPPER_Y:0.5)+height*enter.dy;
+  const w=fw*enter.scale,h=fh*enter.scale;
+  paintVlogPaperCard(ctx,fg,{x:width/2-w/2,y:cy-h/2,w,h},
+    {angle:-1.5*Math.PI/180,border:Math.max(2,Math.round(width*0.015)),alpha:enter.alpha});
+  if(hasLightCorrection(scene._light)){const pixels=ctx.getImageData(0,0,width,height);ctx.putImageData(correctLightPixels(pixels,scene._light),0,0);}
+  ctx.restore();return true;
+};
+const drawVlogSplitFrame=(canvas,scene,getMedia,filterId='none',intensity=100,local=Infinity)=>{
   return vlogExportProfileMeasure('frame.splitScreen',()=>{
   const ctx=canvas.getContext('2d'),width=canvas.width,height=canvas.height;
   const children=scene._splitScreen.clips;
   if(children.some(child=>{const media=getMedia(child);return !media ||
       !(media.videoWidth||media.naturalWidth) || !(media.videoHeight||media.naturalHeight) || (child.type==='video'?media.readyState<2:!media.complete);})) return false;
   if(vlogSplitIsSideBySide(scene))return drawVlogSideBySideFrame(canvas,scene,getMedia,filterId,intensity);
+  if(vlogSplitIsFloat(scene))return drawVlogFloatFrame(canvas,scene,getMedia,filterId,intensity,local);
   let panes=vlogSplitCanvasCache.get(canvas);
   if(!panes){panes=[document.createElement('canvas'),document.createElement('canvas')];vlogSplitCanvasCache.set(canvas,panes);}
   ctx.save();ctx.filter='none';ctx.globalAlpha=1;
@@ -9811,7 +9882,7 @@ function VlogSplitPreview({scene,activeFilter='none',intensity=100,audible=false
       });
       if(ready && playRef.current)local+=delta;
       if(local>=current.duration){local=0;playRef.current=false;setPlaying(false);}
-      if(drawVlogSplitFrame(canvas,current,getMedia,settings.activeFilter,settings.intensity)){
+      if(drawVlogSplitFrame(canvas,current,getMedia,settings.activeFilter,settings.intensity,local)){
         setNotice('');
         if(settings.onPositionChange&&vlogSplitIsSideBySide(current)){
           const index=current._splitScreen.clips.findIndex(child=>child.id===settings.selectedSourceId);
@@ -11611,7 +11682,7 @@ function App(){
         if(!surface){surface=document.createElement('canvas');splitFrameCanvasesRef.current.set(clip.id,surface);}
         if(surface.width!==cw || surface.height!==ch){surface.width=cw;surface.height=ch;}
         const compared=modeRef.current==='hikariyomi' && lightCompareHeldRef.current && lightCompareClipIdRef.current===clip.id;
-        const drawn=drawVlogSplitFrame(surface,compared?{...clip,_light:null}:clip,getMedia,activeFilterRef.current,filterIntensityRef.current);
+        const drawn=drawVlogSplitFrame(surface,compared?{...clip,_light:null}:clip,getMedia,activeFilterRef.current,filterIntensityRef.current,lTime);
         if(!drawn){if(exportJobRef.current){exportJobRef.current.failure=`${vlogSplitLabel(clip)}素材「${clip.name}」を描画できません。`;exportJobRef.current.cancelled=true;}return false;}
         const target=c.getContext('2d');target.save();target.globalAlpha=alpha;
         vlogExportProfileMeasure('material.composite',()=>target.drawImage(surface,offsetX+(cw-cw*scale)/2,offsetY+(ch-ch*scale)/2,cw*scale,ch*scale));target.restore();
@@ -22640,7 +22711,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 if(child._sourceAudioMuted) return '消音';
                 const gain=Math.max(0,Math.min(1,Number.isFinite(child._sourceAudioGain)?child._sourceAudioGain:1));
                 if(Math.round(gain*100)===100) return '';
-                const place=vlogSplitIsSideBySide(c)?(selectedIndex===0?'左':'右'):(selectedIndex===0?'上':'下');
+                const place=vlogSplitPlaceLabel(c,selectedIndex);
                 return `${place}・${Math.round(gain*100)}%`;
               }
               if(c.type!=='video') return '';
@@ -22997,13 +23068,13 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 const splitVideos=audioScene._splitScreen?.clips.filter(child=>child.type==='video')||[];
                 const gain=audioTarget?(Number.isFinite(audioTarget._sourceAudioGain)?audioTarget._sourceAudioGain:1):1;
                 const muted=!!audioTarget?._sourceAudioMuted;
-                const position=audioScene._splitScreen&&audioTarget?(()=>{const ix=audioScene._splitScreen.clips.findIndex(child=>child.id===audioTarget.id);return `${vlogSplitIsSideBySide(audioScene)?(ix===0?'左':'右'):(ix===0?'上':'下')}素材の音声`;})():'元動画の音声';
+                const position=audioScene._splitScreen&&audioTarget?(()=>{const ix=audioScene._splitScreen.clips.findIndex(child=>child.id===audioTarget.id);return `${vlogSplitPlaceLabel(audioScene,ix)}素材の音声`;})():'元動画の音声';
                 return React.createElement('div',{className:'camera-detail-panel self-stretch ml-2 mt-2 max-w-[380px] rounded-xl border border-white/20 bg-black/35 p-3',onClick:e=>e.stopPropagation(),'data-inline-audio':c.id},
                   React.createElement('div',{className:'flex items-center justify-between gap-2'},
                     React.createElement('div',{className:'text-[11px] font-bold'},`🔊 ${c.name}の音量`),
                     React.createElement('button',{type:'button',className:'text-[10px] px-2 py-1 rounded-full bg-white/10',onClick:()=>{stopQuickPeekAudition();commitQuickPeekAudioEdit();setInlineAudioId(null);}},'閉じる')),
                   audioScene._splitScreen && React.createElement('div',{className:'mt-2 flex flex-wrap gap-1.5','aria-label':'分割素材の音声を選択'},
-                    splitVideos.map(child=>React.createElement('button',{key:child.id,type:'button',className:`px-2.5 py-1 rounded-full text-[10px] ${audioScene._splitScreen.audioId===child.id?'bg-violet-600 text-white':'bg-white/10 text-white/75'}`,'aria-pressed':audioScene._splitScreen.audioId===child.id,onClick:()=>{beginQuickPeekAudioEdit();updateQuickPeekAudioSetting('_splitAudioId',child.id,c.id);commitQuickPeekAudioEdit();}},`${vlogSplitIsSideBySide(audioScene)?(audioScene._splitScreen.clips[0].id===child.id?'左':'右'):(audioScene._splitScreen.clips[0].id===child.id?'上':'下')}：${child.name}`)),
+                    splitVideos.map(child=>React.createElement('button',{key:child.id,type:'button',className:`px-2.5 py-1 rounded-full text-[10px] ${audioScene._splitScreen.audioId===child.id?'bg-violet-600 text-white':'bg-white/10 text-white/75'}`,'aria-pressed':audioScene._splitScreen.audioId===child.id,onClick:()=>{beginQuickPeekAudioEdit();updateQuickPeekAudioSetting('_splitAudioId',child.id,c.id);commitQuickPeekAudioEdit();}},`${vlogSplitPlaceLabel(audioScene,audioScene._splitScreen.clips[0].id===child.id?0:1)}：${child.name}`)),
                     React.createElement('button',{type:'button',className:`px-2.5 py-1 rounded-full text-[10px] ${audioScene._splitScreen.audioId==null?'bg-violet-600 text-white':'bg-white/10 text-white/75'}`,'aria-pressed':audioScene._splitScreen.audioId==null,onClick:()=>{beginQuickPeekAudioEdit();updateQuickPeekAudioSetting('_splitAudioId',null,c.id);commitQuickPeekAudioEdit();}},'なし')),
                   audioTarget ? React.createElement(React.Fragment,null,
                     React.createElement('div',{className:'mt-2 flex items-center justify-between gap-2'},React.createElement('div',{className:'text-[10px] text-white/75'},position),React.createElement('button',{type:'button',onClick:()=>{beginQuickPeekAudioEdit();updateQuickPeekAudioSetting('_sourceAudioMuted',!muted,c.id);commitQuickPeekAudioEdit();},className:`px-2.5 py-1 rounded-full text-[9px] font-bold ${muted?'bg-white/10 text-white/60':'bg-emerald-700 text-white'}`,'aria-pressed':muted},muted?'消音中':'消音')),
@@ -25640,9 +25711,9 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         React.createElement('span',{className:'text-[12px] font-bold'},'２素材を並べる'),
         React.createElement('button',{type:'button',onClick:()=>setSplitDraft(null),className:'w-7 h-7 rounded-full bg-white/10 text-[14px]','aria-label':'変更せず閉じる'},'×')),
       React.createElement('div',{className:'flex gap-2 mb-2'},
-        [{id:'top-bottom',label:'上下'},{id:'side-by-side',label:'左右'}].map(option=>React.createElement('button',{
-          key:option.id,type:'button','aria-pressed':side===(option.id==='side-by-side'),
-          className:'flex-1 text-[10px] py-1.5 rounded-full '+(side===(option.id==='side-by-side')?'bg-violet-600':'bg-white/10'),
+        [{id:'top-bottom',label:'上下'},{id:'side-by-side',label:'左右'},{id:'float',label:'浮かせる'}].map(option=>React.createElement('button',{
+          key:option.id,type:'button','aria-pressed':(splitDraft._splitScreen.layout||'top-bottom')===option.id,
+          className:'flex-1 text-[10px] py-1.5 rounded-full '+((splitDraft._splitScreen.layout||'top-bottom')===option.id?'bg-violet-600':'bg-white/10'),
           onClick:()=>setSplitDraft(scene=>({...scene,_splitScreen:{...scene._splitScreen,layout:option.id}}))
         },option.label))),
       React.createElement('div',{'data-paper-preserve':true,className:'w-full aspect-[9/16] bg-black overflow-hidden',style:{maxHeight:'48dvh'}},
@@ -25657,10 +25728,10 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             className:'truncate flex-1 min-w-0 text-left px-2 py-1 rounded '+(selected.id===child.id?'bg-white/10 text-white':'text-white/75'),
             'aria-pressed':selected.id===child.id,
             onClick:()=>setSplitAdjustId(child.id)
-          },(side?(index?'右':'左'):(index?'下':'上'))+'：'+child.name),
+          },vlogSplitPlaceLabel(splitDraft,index)+'：'+child.name),
           React.createElement('button',{type:'button',
             className:'shrink-0 px-2 py-1 rounded-full bg-white/10 text-[9px]',
-            'aria-label':(side?(index?'右':'左'):(index?'下':'上'))+'素材を90度回転',
+            'aria-label':vlogSplitPlaceLabel(splitDraft,index)+'素材を90度回転',
             'aria-pressed':!!vlogClipRotation(child),
             onClick:()=>setSplitDraft(scene=>({...scene,_splitScreen:{...scene._splitScreen,
               clips:scene._splitScreen.clips.map(item=>item.id===child.id
@@ -25668,8 +25739,15 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           },`↻ 回転 ${vlogClipRotation(child)}°`)))),
       React.createElement('button',{type:'button',className:'text-[10px] px-3 py-1.5 rounded-full bg-white/10 mt-2',
         onClick:()=>setSplitDraft(scene=>({...scene,name:scene._splitScreen.clips.slice().reverse().map(child=>child.name).join(' / '),
-          _splitScreen:{...scene._splitScreen,clips:scene._splitScreen.clips.slice().reverse()}}))},label+'を入れ替える'),
-      !side && React.createElement('button',{type:'button',
+          _splitScreen:{...scene._splitScreen,clips:scene._splitScreen.clips.slice().reverse()}}))},vlogSplitIsFloat(splitDraft)?'背景と写真を入れ替える':label+'を入れ替える'),
+      vlogSplitIsFloat(splitDraft) && React.createElement('div',{className:'mt-2'},
+        React.createElement('div',{className:'text-[9px] text-white/60 mb-1'},'1つ目が背景、2つ目が浮かぶ写真です。写真の位置:'),
+        React.createElement('div',{className:'flex gap-2'},
+          [{id:'center',label:'中央'},{id:'upper',label:'やや上'}].map(option=>React.createElement('button',{key:option.id,type:'button',
+            'aria-pressed':(splitDraft._splitScreen.floatY||'center')===option.id,
+            className:'text-[10px] px-3 py-1.5 rounded-full '+((splitDraft._splitScreen.floatY||'center')===option.id?'bg-violet-600':'bg-white/10'),
+            onClick:()=>setSplitDraft(scene=>({...scene,_splitScreen:{...scene._splitScreen,floatY:option.id}}))},option.label)))),
+      !side && !vlogSplitIsFloat(splitDraft) && React.createElement('button',{type:'button',
         className:`text-[10px] px-3 py-1.5 rounded-full mt-2 ml-2 ${splitDraft._splitScreen.centered?'bg-violet-600':'bg-white/10'}`,
         'aria-pressed':!!splitDraft._splitScreen.centered,
         onClick:()=>setSplitDraft(scene=>({...scene,_splitScreen:{...scene._splitScreen,centered:!scene._splitScreen.centered}}))},'中央寄りにする'),
@@ -25686,8 +25764,8 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           className:'flex-1 accent-violet-500',onChange:e=>setSplitDraft(scene=>({...scene,duration:Number(e.target.value)}))}),
         React.createElement('span',{className:'w-10 text-right'},splitDraft.duration.toFixed(1)+'秒')),
       React.createElement('div',{className:'flex items-center gap-1 text-[10px] mt-3'},'素材音',
-        [{id:splitDraft._splitScreen.clips[0].type==='video'?splitDraft._splitScreen.clips[0].id:undefined,label:side?'左':'上'},
-         {id:splitDraft._splitScreen.clips[1].type==='video'?splitDraft._splitScreen.clips[1].id:undefined,label:side?'右':'下'},
+        [{id:splitDraft._splitScreen.clips[0].type==='video'?splitDraft._splitScreen.clips[0].id:undefined,label:vlogSplitPlaceLabel(splitDraft,0)},
+         {id:splitDraft._splitScreen.clips[1].type==='video'?splitDraft._splitScreen.clips[1].id:undefined,label:vlogSplitPlaceLabel(splitDraft,1)},
          {id:null,label:'なし'}].map(option=>React.createElement('button',{key:option.label,type:'button',disabled:option.id===undefined,
            className:'px-3 py-1.5 rounded-full disabled:opacity-25 '+(splitDraft._splitScreen.audioId===option.id?'bg-violet-600':'bg-white/10'),
            onClick:()=>setSplitDraft(scene=>({...scene,_splitScreen:{...scene._splitScreen,audioId:option.id}}))},option.label))),
@@ -25711,7 +25789,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       const quickPeekFilter=getClipPreviewFilter(clip,activeFilter,filterIntensity);
       const quickAudioClip=quickPeekAudioTarget(clip);
       const quickAudioIndex=clip._splitScreen&&quickAudioClip?clip._splitScreen.clips.findIndex(child=>child.id===quickAudioClip.id):-1;
-      const quickAudioPosition=quickAudioIndex<0?'':`${vlogSplitIsSideBySide(clip)?(quickAudioIndex===0?'左':'右'):(quickAudioIndex===0?'上':'下')}素材の元音声`;
+      const quickAudioPosition=quickAudioIndex<0?'':`${vlogSplitPlaceLabel(clip,quickAudioIndex)}素材の元音声`;
       const quickAudioGain=quickAudioClip?(Number.isFinite(quickAudioClip._sourceAudioGain)?quickAudioClip._sourceAudioGain:1):1;
       const quickAudioMuted=!!quickAudioClip?._sourceAudioMuted;
       return React.createElement('div', {
