@@ -812,48 +812,27 @@ function ynStampDraw(ctx,items,pad,st,img){
 }
 function ynStampHasAlpha(cv){const d=cv.getContext('2d').getImageData(0,0,cv.width,cv.height).data;for(let i=3;i<d.length;i+=4)if(d[i]<250)return true;return false}
 // Opaque images (JPEG, or a PNG whose transparency was lost): make the near-white background connected to the image border transparent.
-function ynStampCutout(src){
+function ynStampCutout(src,tol){
  const w=src.width,h=src.height,out=document.createElement('canvas');out.width=w;out.height=h;const ctx=out.getContext('2d');ctx.drawImage(src,0,0);
- const img=ctx.getImageData(0,0,w,h),d=img.data,seen=new Uint8Array(w*h),q=new Int32Array(w*h);let qh=0,qt=0;
- const push=i=>{if(seen[i])return;const o=i*4;if(d[o]>=232&&d[o+1]>=232&&d[o+2]>=232){seen[i]=1;q[qt++]=i}};
+ const img=ctx.getImageData(0,0,w,h),d=img.data;
+ // The background level is measured on the image border; only pixels almost as light as it (within tol) that connect to the border are removed.
+ let sum=0,cnt=0;const bp=(x,y)=>{const o=(y*w+x)*4;sum+=Math.min(d[o],d[o+1],d[o+2]);cnt++};
+ for(let x=0;x<w;x++){bp(x,0);bp(x,h-1)}for(let y=0;y<h;y++){bp(0,y);bp(w-1,y)}
+ const bg=sum/cnt;if(bg<200)return src;
+ const thr=bg-(Number.isFinite(tol)?tol:6),light=new Uint8Array(w*h),core=new Uint8Array(w*h),seen=new Uint8Array(w*h),q=new Int32Array(w*h);let qh=0,qt=0;
+ for(let i=0;i<w*h;i++){const o=i*4;if(Math.min(d[o],d[o+1],d[o+2])>=thr)light[i]=1}
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){const i=y*w+x;if(!light[i])continue;if(x===0||y===0||x===w-1||y===h-1||(light[i-1]&&light[i+1]&&light[i-w]&&light[i+w]))core[i]=1}
+ const push=i=>{if(!seen[i]&&core[i]){seen[i]=1;q[qt++]=i}};
  for(let x=0;x<w;x++){push(x);push((h-1)*w+x)}for(let y=0;y<h;y++){push(y*w);push(y*w+w-1)}
  while(qh<qt){const i=q[qh++],x=i%w,y=(i-x)/w;if(x>0)push(i-1);if(x<w-1)push(i+1);if(y>0)push(i-w);if(y<h-1)push(i+w)}
- if(qt>w*h*.95||qt===0)return src;
+ const grow=[];for(let i=0;i<w*h;i++){if(seen[i]||!light[i])continue;const x=i%w,y=(i-x)/w;if((x>0&&seen[i-1])||(x<w-1&&seen[i+1])||(y>0&&seen[i-w])||(y<h-1&&seen[i+w]))grow.push(i)}
+ for(const i of grow)seen[i]=1;
+ let removed=0;for(let i=0;i<w*h;i++)if(seen[i])removed++;
+ if(removed>w*h*.95||removed===0)return src;
  const edge=[];for(let i=0;i<w*h;i++){if(seen[i])continue;const x=i%w,y=(i-x)/w;if((x>0&&seen[i-1])||(x<w-1&&seen[i+1])||(y>0&&seen[i-w])||(y<h-1&&seen[i+w]))edge.push(i)}
  for(let i=0;i<w*h;i++)if(seen[i])d[i*4+3]=0;
  for(const i of edge){const o=i*4;if(Math.min(d[o],d[o+1],d[o+2])>=200)d[o+3]=110}
  ctx.putImageData(img,0,0);return out;
-}
-// Adaptive sampling for the automatic face search: while the picture and the faces stay the same, skip fine samples; if a probe disagrees, detect the skipped ones.
-function ynSigDiff(a,b){let d=0;for(let i=0;i<384;i++)d+=Math.abs(a.luma[i]-b.luma[i])/384;return d}
-function ynStableDet(prev,next,vw,vh){
- if(!prev||!next)return false;
- if(ynSceneChanged(prev.signature,next.signature)||ynSigDiff(prev.signature,next.signature)>=.05)return false;
- const a=prev.Le,b=next.Le;if(a.length!==b.length)return false;
- const edge=f=>{const m=Math.max(f.w,f.h)*.5;return f.x<=m||f.y<=m||f.x+f.w>=vw-m||f.y+f.h>=vh-m};
- for(const f of a.concat(b))if(edge(f)||(f.score||0)<.8)return false;
- const used=new Set();
- for(const p of a){let best=-1,bd=Infinity;b.forEach((q,i)=>{if(used.has(i))return;const size=Math.max(p.w/q.w,q.w/p.w,p.h/q.h,q.h/p.h),dist=Math.hypot(p.x+p.w/2-q.x-q.w/2,p.y+p.h/2-q.y-q.h/2)/Math.max(p.w,p.h,1);if(size<=1.25&&dist<=.5&&dist<bd){bd=dist;best=i}});if(best<0)return false;used.add(best)}
- return true;
-}
-async function ynAdaptiveRun(n,maxJump,detect,commit,stable,check){
- const cache=new Map();let L=0,prevIdx=-1,prevDet=null,run=0,skipped=0;
- while(L<n){
-  check();
-  let det=cache.get(L);if(det!==undefined)cache.delete(L);else det=await detect(L);
-  if(det)await commit(L,det,prevIdx);
-  run=det&&prevDet&&stable(prevDet,det)?run+1:0;
-  if(det){prevDet=det;prevIdx=L}
-  let next=L+1;
-  const m=maxJump>1&&det&&run>=1?(run>=2?maxJump:Math.min(2,maxJump)):1;
-  if(m>1&&L+m<n){
-   const target=L+m,probe=await detect(target);
-   cache.set(target,probe);
-   if(probe&&stable(det,probe)){skipped+=m-1;next=target}
-  }
-  L=next;
- }
- return skipped;
 }
 function ynWritableMask(map,key,w,h){
  let canvas=map.get(key);
@@ -1564,9 +1543,9 @@ const ynLeakJump=item=>{
 const ynStampSrc=E.useRef(null);
 const ynStampApply=(patch,persist=true)=>{
   const next={...ynStampRef.current,...patch};ynStampRef.current=next;ynSetStamp(prev=>({...prev,...patch}));ynRefresh();
-  if(persist){clearTimeout(ynStampSave.current);ynStampSave.current=setTimeout(()=>{ynDbRun('readwrite',(ss)=>ss.put({on:!!next.on,scale:next.scale,cut:!!next.cut,strict:next.strict!==false},'__stampcfg__')).catch(()=>{})},400)}
+  if(persist){clearTimeout(ynStampSave.current);ynStampSave.current=setTimeout(()=>{ynDbRun('readwrite',(ss)=>ss.put({on:!!next.on,scale:next.scale,cut:!!next.cut,strict:next.strict!==false,tol:next.tol},'__stampcfg__')).catch(()=>{})},400)}
 };
-const ynStampBuild=(cut)=>{const src=ynStampSrc.current;if(!src)return null;const cv=cut&&!src.hasAlpha?ynStampCutout(src.cv):src.cv;ynStampImg.current=cv;return cv};
+const ynStampBuild=(cut)=>{const src=ynStampSrc.current;if(!src)return null;const tol=ynStampRef.current.tol,cv=cut&&!src.hasAlpha?ynStampCutout(src.cv,tol):src.cv;ynStampImg.current=cv;return cv};
 const ynStampPick=async(file)=>{
   if(!file)return;
   try{
@@ -1579,6 +1558,7 @@ const ynStampPick=async(file)=>{
     ynStampApply({on:true,hasImg:true,name:file.name||'',type:file.type||'',hasAlpha,cut,thumb:shown.toDataURL('image/png')});
   }catch(error){ynSetMessage('画像を取り込めませんでした: '+(error&&error.message||error))}
 };
+const ynStampSetTol=(tol)=>{ynStampRef.current={...ynStampRef.current,tol};const shown=ynStampBuild(true);ynStampApply({tol,thumb:shown?shown.toDataURL('image/png'):''})};
 const ynStampToggleCut=()=>{const cut=!ynStampRef.current.cut,shown=ynStampBuild(cut);if(!shown)return;ynStampApply({cut,thumb:shown.toDataURL('image/png')})};
 const ynStampRemove=()=>{
   if(!confirm('取り込んだ画像を外します。よろしいですか？'))return;
@@ -1591,8 +1571,8 @@ E.useEffect(()=>{
     const rec=await ynDbLoad('__stamp__'),cfg=await ynDbLoad('__stampcfg__');if(dead||!rec||!rec.png)return;
     const el=await ynLoadImage(rec.png),cv=document.createElement('canvas');cv.width=el.naturalWidth;cv.height=el.naturalHeight;cv.getContext('2d').drawImage(el,0,0);
     if(dead)return;const hasAlpha=ynStampHasAlpha(cv);ynStampSrc.current={cv,hasAlpha};
-    const cut=cfg&&typeof cfg.cut==='boolean'?cfg.cut:!hasAlpha,shown=ynStampBuild(cut);
-    ynStampApply({on:!!(cfg&&cfg.on),scale:cfg&&Number.isFinite(cfg.scale)?cfg.scale:2,hasImg:true,name:rec.name||'',type:rec.type||'',hasAlpha,cut,strict:!(cfg&&cfg.strict===false),thumb:shown.toDataURL('image/png')},false);
+    const cut=cfg&&typeof cfg.cut==='boolean'?cfg.cut:!hasAlpha,tol=cfg&&Number.isFinite(cfg.tol)?cfg.tol:6;ynStampRef.current={...ynStampRef.current,tol};const shown=ynStampBuild(cut);
+    ynStampApply({on:!!(cfg&&cfg.on),scale:cfg&&Number.isFinite(cfg.scale)?cfg.scale:2,hasImg:true,name:rec.name||'',type:rec.type||'',hasAlpha,cut,strict:!(cfg&&cfg.strict===false),tol,thumb:shown.toDataURL('image/png')},false);
   }catch{}})();
   return()=>{dead=true};
 },[]);
@@ -1609,6 +1589,7 @@ const ynStampCard=()=>{
     ]}),
     st.hasImg&&D('p',{className:'yn-stamp-info',children:st.hasAlpha?'透過: あり':`透過: なし（ファイル形式 ${st.type||'不明'}）`}),
     st.hasImg&&!st.hasAlpha&&G('label',{className:'yn-stamp-cut',children:[D('input',{type:'checkbox',checked:!!st.cut,onChange:ynStampToggleCut}),D('span',{children:'白い背景を透明にする'})]}),
+    st.hasImg&&!st.hasAlpha&&st.cut&&G('div',{className:'yn-stamp-size',children:[D('span',{children:`背景の抜き具合 ${st.tol??6}（大きいほど白に近い色も抜く。画像の中が抜けたら小さく）`}),D('input',{type:'range',min:1,max:30,step:1,value:st.tol??6,onChange:e=>ynStampSetTol(Number(e.target.value))})]}),
     st.hasImg&&G('label',{className:'yn-stamp-cut',children:[D('input',{type:'checkbox',checked:st.strict!==false,onChange:()=>ynStampApply({strict:st.strict===false})}),D('span',{children:'1秒以上続く顔にだけ貼る（厳しめ・おすすめ）'})]}),
     st.hasImg&&G('div',{className:'yn-stamp-size',children:[D('span',{children:`大きさ 顔の${st.scale.toFixed(2)}倍`}),D('input',{type:'range',min:1,max:4,step:.05,value:st.scale,onChange:e=>ynStampApply({scale:parseFloat(e.target.value)})})]}),
     D('p',{className:'yn-stamp-note',children:'取り込んだ画像は、顔らしいと判定し、1秒以上続く顔の上に貼ります（それ以外の顔や予測位置はモザイク／ぼかしのみ）。貼られない顔は、「顔を追加」して追従すると貼れます。下のモザイク／ぼかしはそのまま残るので、画像からはみ出した部分も隠れます。写真アプリから選ぶと透過が消えることがあるので、透過PNGは「ファイル」から選んでください。なぞって隠した場所には貼りません。'})
