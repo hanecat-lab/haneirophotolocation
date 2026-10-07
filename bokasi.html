@@ -201,6 +201,9 @@ body{background:var(--yn-paper)}
 .yn-stamp-ctl{flex:1;display:flex;flex-direction:column;gap:6px}
 .yn-stamp-pick{display:flex;align-items:center;justify-content:center;min-height:44px;font-size:12px;text-align:center;cursor:pointer}
 .yn-stamp-remove{background:none;border:0;padding:6px 4px;color:var(--yn-green);font-size:11px;text-decoration:underline;min-height:32px;align-self:flex-start}
+.yn-stamp-info{margin:6px 0 0;color:var(--yn-muted);font-size:11px}
+.yn-stamp-cut{display:flex;align-items:center;gap:8px;margin-top:4px;min-height:36px;font-size:12px}
+.yn-stamp-cut input{width:18px;height:18px}
 .yn-stamp-size{display:flex;flex-direction:column;gap:2px;margin-top:6px}
 .yn-stamp-size input{width:100%}
 .yn-stamp-note{margin:6px 0 0;color:var(--yn-muted);font-size:10px}
@@ -804,6 +807,20 @@ function ynStampDraw(ctx,items,pad,st,img){
   if(lm&&lm.length>=2&&lm[0]&&lm[1]){const dx=lm[1].x-lm[0].x,dy=lm[1].y-lm[0].y;if(Math.hypot(dx,dy)>1){ang=Math.atan2(dy,dx);if(!Number.isFinite(ang)||Math.abs(ang)>Math.PI/2)ang=0;ang=Math.max(-.61,Math.min(.61,ang))}}
   ctx.save();ctx.translate(cx,cy);ctx.rotate(ang);ctx.drawImage(img,-dw/2,-dh/2,dw,dh);ctx.restore();
  }
+}
+function ynStampHasAlpha(cv){const d=cv.getContext('2d').getImageData(0,0,cv.width,cv.height).data;for(let i=3;i<d.length;i+=4)if(d[i]<250)return true;return false}
+// Opaque images (JPEG, or a PNG whose transparency was lost): make the near-white background connected to the image border transparent.
+function ynStampCutout(src){
+ const w=src.width,h=src.height,out=document.createElement('canvas');out.width=w;out.height=h;const ctx=out.getContext('2d');ctx.drawImage(src,0,0);
+ const img=ctx.getImageData(0,0,w,h),d=img.data,seen=new Uint8Array(w*h),q=new Int32Array(w*h);let qh=0,qt=0;
+ const push=i=>{if(seen[i])return;const o=i*4;if(d[o]>=232&&d[o+1]>=232&&d[o+2]>=232){seen[i]=1;q[qt++]=i}};
+ for(let x=0;x<w;x++){push(x);push((h-1)*w+x)}for(let y=0;y<h;y++){push(y*w);push(y*w+w-1)}
+ while(qh<qt){const i=q[qh++],x=i%w,y=(i-x)/w;if(x>0)push(i-1);if(x<w-1)push(i+1);if(y>0)push(i-w);if(y<h-1)push(i+w)}
+ if(qt>w*h*.95||qt===0)return src;
+ const edge=[];for(let i=0;i<w*h;i++){if(seen[i])continue;const x=i%w,y=(i-x)/w;if((x>0&&seen[i-1])||(x<w-1&&seen[i+1])||(y>0&&seen[i-w])||(y<h-1&&seen[i+w]))edge.push(i)}
+ for(let i=0;i<w*h;i++)if(seen[i])d[i*4+3]=0;
+ for(const i of edge){const o=i*4;if(Math.min(d[o],d[o+1],d[o+2])>=200)d[o+3]=110}
+ ctx.putImageData(img,0,0);return out;
 }
 function ynWritableMask(map,key,w,h){
  let canvas=map.get(key);
@@ -1507,24 +1524,28 @@ const ynLeakJump=item=>{
   ynSetIdToast({time:t,text:`${item.label} · ${item.text}`});bn.current?.();
   try{if(ynMobile)l.current?.scrollIntoView({block:'center',behavior:'smooth'})}catch{}
 };
+const ynStampSrc=E.useRef(null);
 const ynStampApply=(patch,persist=true)=>{
   const next={...ynStampRef.current,...patch};ynStampRef.current=next;ynSetStamp(prev=>({...prev,...patch}));ynRefresh();
-  if(persist){clearTimeout(ynStampSave.current);ynStampSave.current=setTimeout(()=>{ynDbRun('readwrite',(ss)=>ss.put({on:!!next.on,scale:next.scale},'__stampcfg__')).catch(()=>{})},400)}
+  if(persist){clearTimeout(ynStampSave.current);ynStampSave.current=setTimeout(()=>{ynDbRun('readwrite',(ss)=>ss.put({on:!!next.on,scale:next.scale,cut:!!next.cut},'__stampcfg__')).catch(()=>{})},400)}
 };
+const ynStampBuild=(cut)=>{const src=ynStampSrc.current;if(!src)return null;const cv=cut&&!src.hasAlpha?ynStampCutout(src.cv):src.cv;ynStampImg.current=cv;return cv};
 const ynStampPick=async(file)=>{
   if(!file)return;
   try{
     const url=URL.createObjectURL(file);let img;try{img=await ynLoadImage(url)}finally{URL.revokeObjectURL(url)}
     const iw=img.naturalWidth,ih=img.naturalHeight;if(!iw||!ih)throw Error('画像を読み込めませんでした');
     const k=Math.min(1,512/Math.max(iw,ih)),cv=document.createElement('canvas');cv.width=Math.max(1,Math.round(iw*k));cv.height=Math.max(1,Math.round(ih*k));cv.getContext('2d').drawImage(img,0,0,cv.width,cv.height);
-    const png=cv.toDataURL('image/png');ynStampImg.current=cv;
-    await ynDbRun('readwrite',(ss)=>ss.put({png,name:file.name||''},'__stamp__')).catch(()=>{});
-    ynStampApply({on:true,hasImg:true,name:file.name||'',thumb:png});
+    const hasAlpha=ynStampHasAlpha(cv),png=cv.toDataURL('image/png');
+    ynStampSrc.current={cv,hasAlpha};const cut=!hasAlpha,shown=ynStampBuild(cut);
+    await ynDbRun('readwrite',(ss)=>ss.put({png,name:file.name||'',type:file.type||''},'__stamp__')).catch(()=>{});
+    ynStampApply({on:true,hasImg:true,name:file.name||'',type:file.type||'',hasAlpha,cut,thumb:shown.toDataURL('image/png')});
   }catch(error){ynSetMessage('画像を取り込めませんでした: '+(error&&error.message||error))}
 };
+const ynStampToggleCut=()=>{const cut=!ynStampRef.current.cut,shown=ynStampBuild(cut);if(!shown)return;ynStampApply({cut,thumb:shown.toDataURL('image/png')})};
 const ynStampRemove=()=>{
   if(!confirm('取り込んだ画像を外します。よろしいですか？'))return;
-  ynStampImg.current=null;ynStampApply({on:false,hasImg:false,name:'',thumb:''},false);
+  ynStampImg.current=null;ynStampSrc.current=null;ynStampApply({on:false,hasImg:false,name:'',type:'',thumb:''},false);
   ynDbRun('readwrite',(ss)=>{ss.delete('__stamp__');return ss.delete('__stampcfg__')}).catch(()=>{});
 };
 E.useEffect(()=>{
@@ -1532,8 +1553,9 @@ E.useEffect(()=>{
   (async()=>{try{
     const rec=await ynDbLoad('__stamp__'),cfg=await ynDbLoad('__stampcfg__');if(dead||!rec||!rec.png)return;
     const el=await ynLoadImage(rec.png),cv=document.createElement('canvas');cv.width=el.naturalWidth;cv.height=el.naturalHeight;cv.getContext('2d').drawImage(el,0,0);
-    if(dead)return;ynStampImg.current=cv;
-    ynStampApply({on:!!(cfg&&cfg.on),scale:cfg&&Number.isFinite(cfg.scale)?cfg.scale:1.15,hasImg:true,name:rec.name||'',thumb:rec.png},false);
+    if(dead)return;const hasAlpha=ynStampHasAlpha(cv);ynStampSrc.current={cv,hasAlpha};
+    const cut=cfg&&typeof cfg.cut==='boolean'?cfg.cut:!hasAlpha,shown=ynStampBuild(cut);
+    ynStampApply({on:!!(cfg&&cfg.on),scale:cfg&&Number.isFinite(cfg.scale)?cfg.scale:1.15,hasImg:true,name:rec.name||'',type:rec.type||'',hasAlpha,cut,thumb:shown.toDataURL('image/png')},false);
   }catch{}})();
   return()=>{dead=true};
 },[]);
@@ -1548,8 +1570,10 @@ const ynStampCard=()=>{
         st.hasImg&&D('button',{className:'yn-stamp-remove',onClick:ynStampRemove,children:'画像を外す'})
       ]})
     ]}),
+    st.hasImg&&D('p',{className:'yn-stamp-info',children:st.hasAlpha?'透過: あり':`透過: なし（ファイル形式 ${st.type||'不明'}）`}),
+    st.hasImg&&!st.hasAlpha&&G('label',{className:'yn-stamp-cut',children:[D('input',{type:'checkbox',checked:!!st.cut,onChange:ynStampToggleCut}),D('span',{children:'白い背景を透明にする'})]}),
     st.hasImg&&G('div',{className:'yn-stamp-size',children:[D('span',{children:`大きさ 顔の${st.scale.toFixed(2)}倍`}),D('input',{type:'range',min:1,max:2,step:.05,value:st.scale,onChange:e=>ynStampApply({scale:parseFloat(e.target.value)})})]}),
-    D('p',{className:'yn-stamp-note',children:'取り込んだ画像は、隠している顔すべての上に貼ります。下のモザイク／ぼかしはそのまま残るので、画像からはみ出した部分も隠れます。透過PNGがきれいです。なぞって隠した場所には貼りません。'})
+    D('p',{className:'yn-stamp-note',children:'取り込んだ画像は、隠している顔すべての上に貼ります。下のモザイク／ぼかしはそのまま残るので、画像からはみ出した部分も隠れます。写真アプリから選ぶと透過が消えることがあるので、透過PNGは「ファイル」から選んでください。なぞって隠した場所には貼りません。'})
   ]});
 };
 const ynLeakSeek=t=>{const video=n.current;if(!video)return;const to=m(Math.max(0,Math.min(t,(video.duration||t)-.04)));video.pause();xn(false);video.currentTime=to;Lt(to);ynLastPreview.current=null;bn.current?.()};
