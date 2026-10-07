@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-07-page-curl';
+const VLOG_PREVIEW_BUILD='2026-10-07-hold-trace';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -9919,6 +9919,18 @@ const paintVlogPageCurl=(ctx,cw,ch,prog,drawFrom,drawTo)=>{
   ctx.restore();
   ctx.restore();
 };
+// 診断: プレビューの「待ち」（タイムラインを止める）の始まり・理由の変化・再開だけを記録する（最新80件）。
+const vlogHoldTraceNote=(diag,entry)=>{
+  const key=entry.held?entry.reasons:'released';
+  if(diag.holdLastKey===key) return false;
+  diag.holdLastKey=key;
+  const summary=diag.holdSummary||(diag.holdSummary=new Map());
+  summary.set(key,(summary.get(key)||0)+1);
+  const trace=diag.holdTrace||(diag.holdTrace=[]);
+  trace.push(entry);
+  if(trace.length>80) trace.splice(0,trace.length-80);
+  return true;
+};
 // 時刻 t に映っている素材（切り替えの途中は、後から始まる入ってくる側）。
 const vlogClipAtTime=(clips,t)=>(clips||[]).filter(c=>t>=c.timelineStart && t<c.timelineStart+c.duration)
   .sort((a,b)=>b.timelineStart-a.timelineStart)[0]||null;
@@ -12987,7 +12999,8 @@ function App(){
   const resetPreviewHitchStats=()=>{
     previewAdvanceProbeRef.current=new WeakMap();
     Object.assign(previewDiagnosticRef.current,{hitches:[],hitchCount:0,hitchSummary:new Map(),
-      drawMs:[],drawCount:0,drawMaxMs:0,drawSlow:0,drawProfiler:createVlogExportDrawProfiler(),mediaActivity:new Map()});
+      drawMs:[],drawCount:0,drawMaxMs:0,drawSlow:0,drawProfiler:createVlogExportDrawProfiler(),mediaActivity:new Map(),
+      holdTrace:[],holdSummary:new Map(),holdLastKey:undefined});
   };
   const recordPreviewDiagnostic=(type,detail={})=>{
     const diag=previewDiagnosticRef.current;
@@ -13889,6 +13902,9 @@ function App(){
       hitchSummary:[...diag.hitchSummary.values()].sort((a,b)=>b.count-a.count),
       hitches:diag.hitches.slice(),
       mediaActivity:[...diag.mediaActivity.values()].map(({lastPlayAt,lastPauseAt,lastRequestAt,...rest})=>rest),
+      // 待ち（タイムラインを止める）の理由ごとの回数と、移り変わり（ms は最初の記録からの経過）。
+      holdSummary:Object.fromEntries(diag.holdSummary||[]),
+      holdTrace:(diag.holdTrace||[]).map((entry,i,list)=>({...entry,ms:entry.ms-list[0].ms})),
       frameTiming:(()=>{
         const sorted=diag.drawMs.slice().sort((a,b)=>a-b);
         const pick=p=>sorted.length?Number(sorted[Math.min(sorted.length-1,Math.ceil(sorted.length*p)-1)].toFixed(1)):0;
@@ -14537,6 +14553,25 @@ function App(){
     if(state.cutPrewarm?.phase==='playing' || state.cutPrewarm?.phase==='started') liveIds.add(state.cutPrewarm.id);
     if(audioCrossfadeActive?.to?.type==='video')liveIds.add(audioCrossfadeActive.to.id);
     livePreviewIdsRef.current=liveIds;
+    // 観測: 待ちの始まり・理由の変化・再開を記録する（再生の動作は変えない）。
+    {
+      const diag=previewDiagnosticRef.current;
+      const reasons=waiting?waitReasons.join(','):'';
+      if(diag.holdLastKey!==(waiting?reasons:'released')){
+        const media=(video,clip,target)=>video?{name:clip?.name,paused:video.paused,ct:Number(video.currentTime.toFixed(3)),
+          rs:video.readyState,seeking:video.seeking,...(Number.isFinite(target)?{target:Number(target.toFixed(3))}:{})}:null;
+        const incomingState=next?._splitScreen
+          ? next._splitScreen.clips.filter(child=>child.type==='video').map(child=>media(videoRefs.current.get(child.id),child,
+              (child.trimStart||0)+((next.trimStart||0)+Math.max(0,t-overlapStart))*(child._playbackRate||1)))
+          : next?.type==='video' ? [media(incoming,next,(next.trimStart||0)+Math.max(0,t-overlapStart)*(next._playbackRate||1))] : [];
+        vlogHoldTraceNote(diag,{ms:Math.round(now),t:Number(t.toFixed(3)),held:waiting,reasons,inOverlap,
+          heldTime:Number.isFinite(state.heldTime)?Number(state.heldTime.toFixed(3)):null,
+          active:active?.type==='video'
+            ? media(activeVideo,active,(active.trimStart||0)+Math.max(0,t-active.timelineStart)*vlogClipSourceRate(active))
+            : active ? {name:active.name,type:active._splitScreen?'split':active.type} : null,
+          incoming:incomingState});
+      }
+    }
     if(waiting){
       if(state.heldTime===null || state.heldTime===undefined) state.heldTime=timeRef.current;
       timeRef.current=state.heldTime;
