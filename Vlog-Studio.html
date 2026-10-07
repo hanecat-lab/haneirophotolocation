@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-07-split-float';
+const VLOG_PREVIEW_BUILD='2026-10-07-snapshot-pop';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -9725,7 +9725,7 @@ const drawVlogSideBySideFrame=(canvas,scene,getMedia,filterId,intensity)=>{
   ctx.restore();return true;
 };
 // 紙のカード（生成りの白フチ＋柔らかい影）。source は描き終えた画像、rect はその表示先（中心で回す）。
-const paintVlogPaperCard=(ctx,source,rect,{angle=0,border=0,bottom=0,alpha=1,shadow=true}={})=>{
+const paintVlogPaperCard=(ctx,source,rect,{angle=0,border=0,bottom=0,alpha=1,shadow=true,caption=''}={})=>{
   if(!(alpha>0)) return;
   ctx.save();
   ctx.globalAlpha*=Math.min(1,alpha);ctx.filter='none';
@@ -9738,6 +9738,12 @@ const paintVlogPaperCard=(ctx,source,rect,{angle=0,border=0,bottom=0,alpha=1,sha
   ctx.fillRect(x-border,y-border,rect.w+border*2,rect.h+border*2+bottom);
   ctx.shadowColor='transparent';ctx.shadowBlur=0;ctx.shadowOffsetY=0;
   ctx.drawImage(source,x,y,rect.w,rect.h);
+  if(caption && bottom>0){
+    // 下の余白に手書きの文字（カードと一緒に傾く）。
+    ctx.fillStyle='#4a4038';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.font=`${Math.max(8,Math.round(bottom*0.36))}px ${vlogTextFont('hand')}`;
+    ctx.fillText(caption,0,y+rect.h+(border+bottom)/2,rect.w*0.92);
+  }
   ctx.restore();
 };
 // 浮かせる: 1つ目を背景（画面いっぱい・少し暗く柔らかく・ゆっくり寄る）、2つ目を紙のカードで浮かせる。
@@ -9790,6 +9796,56 @@ const drawVlogFloatFrame=(canvas,scene,getMedia,filterId,intensity,local)=>{
     {angle:-1.5*Math.PI/180,border:Math.max(2,Math.round(width*0.015)),alpha:enter.alpha});
   if(hasLightCorrection(scene._light)){const pixels=ctx.getImageData(0,0,width,height);ctx.putImageData(correctLightPixels(pixels,scene._light),0,0);}
   ctx.restore();return true;
+};
+// その場で撮った写真が飛び出す。経過秒数 e から、光→飛び出す→止まる→飛び去るの状態を出す（2.3秒で終わり）。
+const VLOG_SNAPSHOT_SPAN=2.3;
+const vlogSnapshotPopState=e=>{
+  if(!(e>=0) || e>=VLOG_SNAPSHOT_SPAN) return null;
+  const flash=e<0.12 ? 0.55*(1-e/0.12) : 0;
+  let scale=0,angle=-12,alpha=0,dx=0,dy=0;
+  if(e>=0.1){
+    const p=Math.min(1,(e-0.1)/0.4),c1=1.35,c3=c1+1;
+    const back=1+c3*Math.pow(p-1,3)+c1*Math.pow(p-1,2);
+    scale=0.55+0.45*back; angle=-12+6*p; alpha=Math.min(1,p*3);
+  }
+  if(e>=1.9){
+    const q=Math.min(1,(e-1.9)/0.4),a=q*q;
+    dx=0.6*a; dy=-0.35*a; angle=-6+10*q; alpha=1-q;
+  }
+  return {flash,scale,angle,alpha,dx,dy};
+};
+const paintVlogSnapshotPop=(ctx,cw,ch,img,label,e)=>{
+  const st=vlogSnapshotPopState(e);
+  if(!st) return;
+  ctx.save();ctx.filter='none';ctx.globalAlpha=1;
+  if(st.flash>0){ctx.fillStyle=`rgba(255,255,255,${st.flash})`;ctx.fillRect(0,0,cw,ch);}
+  if(img && st.alpha>0 && st.scale>0){
+    const vertical=ch>=cw;
+    const ratio=(img.naturalWidth||img.width)/(img.naturalHeight||img.height) || (vertical?0.75:4/3);
+    let w=vertical?cw*0.58:ch*0.5*ratio,h=w/ratio;
+    w*=st.scale;h*=st.scale;
+    const border=w*0.045,bottom=w*0.22;
+    const cx=cw*((vertical?0.62:0.64)+st.dx),cy=ch*((vertical?0.60:0.55)+st.dy);
+    paintVlogPaperCard(ctx,img,{x:cx-w/2,y:cy-(h+bottom)/2,w,h},
+      {angle:st.angle*Math.PI/180,border,bottom,alpha:st.alpha,caption:label||''});
+  }
+  ctx.restore();
+};
+const VLOG_SNAPSHOT_IMAGES=new Map();
+const vlogSnapshotImage=snap=>{
+  if(!snap?.image) return null;
+  let img=VLOG_SNAPSHOT_IMAGES.get(snap.id);
+  if(!img || img._vlogSrc!==snap.image){
+    img=new Image();img._vlogSrc=snap.image;img.src=snap.image;
+    VLOG_SNAPSHOT_IMAGES.set(snap.id,img);
+  }
+  return img;
+};
+const vlogSnapshotReady=img=>!!img && img.complete && img.naturalWidth>0;
+const vlogLoadSnapshotImages=async clips=>{
+  const images=[];
+  for(const clip of clips||[]) for(const snap of clip._snapshots||[]){ const img=vlogSnapshotImage(snap); if(img) images.push(img); }
+  await Promise.all(images.map(img=>img.decode ? img.decode().catch(()=>{}) : Promise.resolve()));
 };
 const drawVlogSplitFrame=(canvas,scene,getMedia,filterId='none',intensity=100,local=Infinity)=>{
   return vlogExportProfileMeasure('frame.splitScreen',()=>{
@@ -10107,6 +10163,7 @@ function App(){
   const [dateStampFormat, setDateStampFormat] = useState(()=>{ try{ return localStorage.getItem('vlogDateStampFormat')||'dot'; }catch{ return 'dot'; } });
   const [dateStampBusy, setDateStampBusy] = useState(false);
   const [dateStampNote, setDateStampNote] = useState('');
+  const [snapshotNote, setSnapshotNote] = useState(null);
   const [showSafeArea, setShowSafeArea] = useState(true);
   const [autoLayoutEnabled, setAutoLayoutEnabled] = useState(true);
   // ひかりよみシアター用
@@ -12295,6 +12352,19 @@ function App(){
       setTimeout(()=> setPikuTrigger(false), 400);
       window._lastActiveClipId = activeClip.id;
     }
+
+    // その場で撮った写真（素材の _snapshots）。タイムラインの時刻で数え、映像の後・文字の前に描く。
+    if(!drawFrame._skipSnapshots) vlogExportProfileMeasure('frame.snapshots',()=>{
+      for(const clip of clipsNow){
+        if(!clip?._snapshots?.length) continue;
+        for(const snap of clip._snapshots){
+          const elapsed=t-(clip.timelineStart+(snap.at||0));
+          if(!(elapsed>=0 && elapsed<VLOG_SNAPSHOT_SPAN)) continue;
+          const img=vlogSnapshotImage(snap);
+          paintVlogSnapshotPop(ctx,cw,ch,vlogSnapshotReady(img)?img:null,snap.label,elapsed);
+        }
+      }
+    });
 
     // テキスト描画（アニメーション対応）
     vlogExportProfileMeasure('frame.texts',()=>{
@@ -15176,6 +15246,7 @@ function App(){
       if(EXPORT_FRAME_ENGINE && typeof VideoEncoder==='function' && typeof VideoFrame==='function'){
         // なめらか書き出し: 1コマずつ素材の位置を合わせて描き、時刻付きでエンコードする（実時間の録画を使わない）。
         job.stats.engine='frame';
+        await vlogLoadSnapshotImages(items);
         const frameStartedAt=performance.now();
         if(bgm){ try{ bgm.pause(); }catch{} }
         for(const {video} of job.videos.values()){ try{ video.pause(); }catch{} }
@@ -16997,6 +17068,64 @@ function App(){
     clipsRef.current=next;
     setTimeout(()=>{ try{ drawFrameRef.current._forceNext=true; drawFrameRef.current(timeRef.current); }catch{} },10);
   };
+  // その場で撮る: 再生位置の映像（フィルター込み・文字なし）を 3:4（横の画面は 4:3）の小さな JPEG にして素材に持たせる。
+  const takeSnapshot=async clipId=>{
+    if(playingRef.current) handleStop();
+    const t=timeRef.current;
+    const clip=clipsRef.current.find(c=>c.id===clipId);
+    if(!clip) return;
+    const at=t-clip.timelineStart;
+    if(!(at>=0 && at<clip.duration)){ setSnapshotNote({clipId,text:'再生位置をこの素材に合わせてから押してください。'}); return; }
+    if((clip._snapshots||[]).length>=3){ setSnapshotNote({clipId,text:'1つの素材に3枚までです。'}); return; }
+    const canvas=canvasRef.current;
+    if(!canvas) return;
+    let image='';
+    try{
+      drawFrameRef.current._skipSnapshots=true;
+      drawFrameRef.current._forceNext=true;
+      drawFrameRef.current(t,null,[]);
+      const cw=canvas.width,ch=canvas.height,ratio=ch>=cw?3/4:4/3;
+      let sw=cw,sh=cw/ratio;
+      if(sh>ch){ sh=ch; sw=ch*ratio; }
+      const k=Math.min(1,480/Math.max(sw,sh));
+      const out=document.createElement('canvas');
+      out.width=Math.max(1,Math.round(sw*k));out.height=Math.max(1,Math.round(sh*k));
+      out.getContext('2d').drawImage(canvas,(cw-sw)/2,(ch-sh)/2,sw,sh,0,0,out.width,out.height);
+      image=out.toDataURL('image/jpeg',0.8);
+    }catch{ image=''; }
+    finally{
+      drawFrameRef.current._skipSnapshots=false;
+      drawFrameRef.current._forceNext=true;
+      drawFrameRef.current(t);
+    }
+    if(!image || image.length<100){ setSnapshotNote({clipId,text:'撮れませんでした。もう一度押してください。'}); return; }
+    let ymd=clip._capturedAt||null;
+    if(!ymd){ try{ ymd=await vlogReadCaptureDate(clip); }catch{ ymd=null; } }
+    const snap={id:`snap-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,at:Math.round(at*100)/100,image,
+      label:ymd?vlogFormatCaptureDate(ymd,dateStampFormat):''};
+    const next=clipsRef.current.map(c=>c.id===clipId
+      ? {...c,_snapshots:[...(c._snapshots||[]),snap],...(ymd && !c._capturedAt?{_capturedAt:ymd}:{})} : c);
+    setClips(next);
+    clipsRef.current=next;
+    setSnapshotNote({clipId,text:`${at.toFixed(1)}秒の瞬間を撮りました。再生すると飛び出します。`});
+    vlogLoadSnapshotImages([{_snapshots:[snap]}]).then(()=>{ if(!playingRef.current){ drawFrameRef.current._forceNext=true; drawFrameRef.current(timeRef.current); } });
+  };
+  const clearSnapshots=clipId=>{
+    const next=clipsRef.current.map(c=>c.id===clipId?{...c,_snapshots:[]}:c);
+    setClips(next);
+    clipsRef.current=next;
+    setSnapshotNote({clipId,text:'撮った写真を外しました。'});
+    setTimeout(()=>{ try{ drawFrameRef.current._forceNext=true; drawFrameRef.current(timeRef.current); }catch{} },10);
+  };
+  // 保存から開いた作品などの撮った写真を読み込み、止まっていれば描き直す。
+  useEffect(()=>{
+    if(!clips.some(c=>c._snapshots?.length)) return;
+    let alive=true;
+    vlogLoadSnapshotImages(clips).then(()=>{
+      if(alive && !playingRef.current){ try{ drawFrameRef.current._forceNext=true; drawFrameRef.current(timeRef.current); }catch{} }
+    });
+    return ()=>{ alive=false; };
+  },[clips]);
   const exportCameraFile=async(file)=>{
     if(!file) return;
     try{
@@ -23016,6 +23145,15 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 )
               ),
 
+              // その場で撮った写真が飛び出す。素材の行は高さが固定なので、行の下に置く。
+              c.type==='video' && !c._splitScreen && React.createElement('div', {className:'flex items-center gap-1 flex-wrap self-start ml-2',
+                  onClick:e=>e.stopPropagation(), 'aria-label':`${c.name}のその場で撮る写真`},
+                React.createElement('button', {type:'button', onClick:()=>takeSnapshot(c.id),
+                  className:'px-2.5 py-1 rounded-full text-[10px] bg-white/10 text-white/70'}, '📸 ここで撮る'),
+                (c._snapshots||[]).length>0 && React.createElement('button', {type:'button', onClick:()=>clearSnapshots(c.id),
+                  className:'px-2.5 py-1 rounded-full text-[10px] bg-white/10 text-white/60'}, `📸×${c._snapshots.length} 外す`),
+                snapshotNote?.clipId===c.id && React.createElement('span', {className:'text-[10px] text-white/55'}, snapshotNote.text)
+              ),
               // 写真の動き。素材の行は高さが固定なので、行の下に置く。
               isPhoto && !c._splitScreen && React.createElement('div', {className:'flex items-center gap-1 flex-wrap self-start ml-2',
                   onClick:e=>e.stopPropagation(), 'aria-label':`${c.name}の動き`},
