@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-07-snapshot-shutter';
+const VLOG_PREVIEW_BUILD='2026-10-07-snapshot-stack';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -9797,25 +9797,59 @@ const drawVlogFloatFrame=(canvas,scene,getMedia,filterId,intensity,local)=>{
   if(hasLightCorrection(scene._light)){const pixels=ctx.getImageData(0,0,width,height);ctx.putImageData(correctLightPixels(pixels,scene._light),0,0);}
   ctx.restore();return true;
 };
-// その場で撮った写真が飛び出す。経過秒数 e から、光→飛び出す→止まる→飛び去るの状態を出す（2.3秒で終わり）。
+// その場で撮った写真が飛び出す。光→飛び出す→止まる→飛び去る。
+// 前の写真が画面にある間（開始から2.3秒未満）に撮った写真は、同じ山に少しずらして積み、
+// 山の最後の写真の開始から1.9秒後に、上の写真から順に0.4秒でまとめて飛び去る。1枚だけなら2.3秒で終わる。
 const VLOG_SNAPSHOT_SPAN=2.3;
-const vlogSnapshotPopState=e=>{
-  if(!(e>=0) || e>=VLOG_SNAPSHOT_SPAN) return null;
+const VLOG_SNAPSHOT_HOLD=1.9;
+const VLOG_SNAPSHOT_LEAVE=0.4;
+const VLOG_SNAPSHOT_SLOTS=[
+  {dx:0,dy:0,angle:-6},{dx:-0.10,dy:-0.04,angle:5},{dx:0.06,dy:-0.08,angle:-2},{dx:-0.06,dy:0.04,angle:8}
+];
+// entries: {start,...} の並び。時刻順に山へ分け、slot（山の中の順番）と飛び去りの開始時刻を付ける。
+const vlogSnapshotStack=entries=>{
+  const sorted=[...entries].sort((a,b)=>a.start-b.start);
+  const out=[];
+  let group=[];
+  const close=()=>{
+    if(!group.length) return;
+    const leaveStart=group[group.length-1].start+VLOG_SNAPSHOT_HOLD;
+    group.forEach((item,index)=>out.push({...item,slot:index,size:group.length,
+      leaveStart:leaveStart+(group.length-1-index)*0.05}));
+    group=[];
+  };
+  for(const item of sorted){
+    if(group.length && item.start>=group[group.length-1].start+VLOG_SNAPSHOT_SPAN) close();
+    group.push(item);
+  }
+  close();
+  return out;
+};
+const vlogSnapshotEntries=clips=>{
+  const entries=[];
+  for(const clip of clips||[]) for(const snap of clip?._snapshots||[])
+    entries.push({snap,clipId:clip.id,start:clip.timelineStart+(snap.at||0)});
+  return entries;
+};
+const vlogSnapshotPlan=clips=>vlogSnapshotStack(vlogSnapshotEntries(clips));
+// e: 自分の開始からの秒数、sinceLeave: 自分の飛び去り開始からの秒数、slot: 山の中の順番。
+const vlogSnapshotPopState=(e,sinceLeave=e-VLOG_SNAPSHOT_HOLD,slot=0)=>{
+  if(!(e>=0) || sinceLeave>=VLOG_SNAPSHOT_LEAVE) return null;
+  const place=VLOG_SNAPSHOT_SLOTS[Math.min(slot,VLOG_SNAPSHOT_SLOTS.length-1)];
   const flash=e<0.12 ? 0.55*(1-e/0.12) : 0;
-  let scale=0,angle=-12,alpha=0,dx=0,dy=0;
+  let scale=0,angle=place.angle-6,alpha=0,dx=place.dx,dy=place.dy;
   if(e>=0.1){
     const p=Math.min(1,(e-0.1)/0.4),c1=1.35,c3=c1+1;
     const back=1+c3*Math.pow(p-1,3)+c1*Math.pow(p-1,2);
-    scale=0.55+0.45*back; angle=-12+6*p; alpha=Math.min(1,p*3);
+    scale=0.55+0.45*back; angle=place.angle-6+6*p; alpha=Math.min(1,p*3);
   }
-  if(e>=1.9){
-    const q=Math.min(1,(e-1.9)/0.4),a=q*q;
-    dx=0.6*a; dy=-0.35*a; angle=-6+10*q; alpha=1-q;
+  if(sinceLeave>=0){
+    const q=Math.min(1,sinceLeave/VLOG_SNAPSHOT_LEAVE),a=q*q;
+    dx+=0.6*a; dy-=0.35*a; angle=place.angle+10*q; alpha*=1-q;
   }
   return {flash,scale,angle,alpha,dx,dy};
 };
-const paintVlogSnapshotPop=(ctx,cw,ch,img,label,e)=>{
-  const st=vlogSnapshotPopState(e);
+const paintVlogSnapshotPop=(ctx,cw,ch,img,label,st)=>{
   if(!st) return;
   ctx.save();ctx.filter='none';ctx.globalAlpha=1;
   if(st.flash>0){ctx.fillStyle=`rgba(255,255,255,${st.flash})`;ctx.fillRect(0,0,cw,ch);}
@@ -9834,11 +9868,13 @@ const paintVlogSnapshotPop=(ctx,cw,ch,img,label,e)=>{
 // 時刻 t に映っている素材（切り替えの途中は、後から始まる入ってくる側）。
 const vlogClipAtTime=(clips,t)=>(clips||[]).filter(c=>t>=c.timelineStart && t<c.timelineStart+c.duration)
   .sort((a,b)=>b.timelineStart-a.timelineStart)[0]||null;
-// 撮れない理由: 'limit'（1素材3枚まで）、'overlap'（前後の写真と2.3秒以内）。撮れるなら null。
+// 撮れない理由: 'limit'（1素材3枚まで）、'tooClose'（前後の写真と0.5秒未満）、'stackFull'（1つの山が4枚を超える）。撮れるなら null。
 const vlogSnapshotBlock=(clips,clip,t)=>{
   if((clip?._snapshots||[]).length>=3) return 'limit';
-  for(const c of clips||[]) for(const snap of c._snapshots||[])
-    if(Math.abs(c.timelineStart+(snap.at||0)-t)<VLOG_SNAPSHOT_SPAN) return 'overlap';
+  const entries=vlogSnapshotEntries(clips);
+  if(entries.some(item=>Math.abs(item.start-t)<0.5)) return 'tooClose';
+  const added=vlogSnapshotStack([...entries,{start:t,isNew:true}]).find(item=>item.isNew);
+  if(added && added.size>VLOG_SNAPSHOT_SLOTS.length) return 'stackFull';
   return null;
 };
 // 撮る写真の切り抜き: 縦の画面は 3:4、横の画面は 4:3、長辺480px。
@@ -12386,14 +12422,12 @@ function App(){
 
     // その場で撮った写真（素材の _snapshots）。タイムラインの時刻で数え、映像の後・文字の前に描く。
     vlogExportProfileMeasure('frame.snapshots',()=>{
-      for(const clip of clipsNow){
-        if(!clip?._snapshots?.length) continue;
-        for(const snap of clip._snapshots){
-          const elapsed=t-(clip.timelineStart+(snap.at||0));
-          if(!(elapsed>=0 && elapsed<VLOG_SNAPSHOT_SPAN)) continue;
-          const img=vlogSnapshotImage(snap);
-          paintVlogSnapshotPop(ctx,cw,ch,vlogSnapshotReady(img)?img:null,snap.label,elapsed);
-        }
+      // 山の古い写真から描き、後から積んだ写真を手前にする。
+      for(const item of vlogSnapshotPlan(clipsNow)){
+        const st=vlogSnapshotPopState(t-item.start,t-item.leaveStart,item.slot);
+        if(!st) continue;
+        const img=vlogSnapshotImage(item.snap);
+        paintVlogSnapshotPop(ctx,cw,ch,vlogSnapshotReady(img)?img:null,item.snap.label,st);
       }
     });
 
@@ -17107,7 +17141,7 @@ function App(){
     setSnapshotToast(toast);
     snapshotToastTimerRef.current=setTimeout(()=>setSnapshotToast(null),4000);
   };
-  const snapshotBlockText=reason=>reason==='limit'?'1つの素材に3枚までです。':'前の写真が出ている間は撮れません。';
+  const snapshotBlockText=reason=>reason==='limit'?'1つの素材に3枚までです。':reason==='stackFull'?'重ねられるのは4枚までです。':'近すぎます（0.5秒以上あけてください）。';
   const takeSnapshot=async()=>{
     if(snapshotBusyRef.current) return;
     const first=vlogClipAtTime(clipsRef.current,timeRef.current);
