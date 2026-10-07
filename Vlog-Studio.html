@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-07-split-prepare';
+const VLOG_PREVIEW_BUILD='2026-10-07-start-probe';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -6673,6 +6673,52 @@ const PREVIEW_AUDIO_PROBE=(()=>{try{const params=new URLSearchParams(location.se
 // 次の素材の予熱を、その素材の速度（倍速・スロー）で行う。1倍で予熱すると、2倍速の素材は繋ぎ目で動き出した直後に止まった
 // （実機 A/B: 止まり 106ms→0ms、動き出し後300msの進み 0.11→0.62秒）。?fastwarm=off で従来の予熱に戻せる。
 const PREVIEW_FAST_WARM=(()=>{try{return new URLSearchParams(location.search).get('fastwarm')!=='off';}catch{return true;}})();
+// 観測用の試験（既定は今の動き）。?warmrewind=off: 予熱の後に頭へ巻き戻さない。
+// ?warmlimit=2: 今の素材が分割（2本再生中）のときは、次の動画の予熱をしない（同時に動く動画を2本までにする）。
+const PREVIEW_WARM_REWIND=(()=>{try{return new URLSearchParams(location.search).get('warmrewind')!=='off';}catch{return true;}})();
+const PREVIEW_WARM_LIMIT=(()=>{try{return Number(new URLSearchParams(location.search).get('warmlimit'))||0;}catch{return 0;}})();
+// 診断: 一時停止中の動画に再生を頼んでから、実際に位置が進み出すまでの時間を測る（動作は変えない）。
+const vlogStartProbeBegin=(video,name,phase)=>{
+  if(!video._vlogSeekWatch){
+    video._vlogSeekWatch=true;
+    try{ video.addEventListener('seeking',()=>{ video._vlogLastSeekAt=performance.now(); }); }catch{}
+  }
+  const now=performance.now();
+  video._vlogStartProbe={name,phase,at:now,from:video.currentTime,seeks:0,lastSeekSeen:video._vlogLastSeekAt,
+    sinceSeekMs:Number.isFinite(video._vlogLastSeekAt)?Math.round(now-video._vlogLastSeekAt):null};
+};
+// 結果: advanced（進み出した）／paused（進む前に止められた）／stuck（3秒進まない）。途中のシークは位置を数え直す。
+const vlogStartProbeCheck=(video,now,playing)=>{
+  const probe=video._vlogStartProbe;
+  if(!probe) return null;
+  if(video._vlogLastSeekAt!==probe.lastSeekSeen){
+    probe.lastSeekSeen=video._vlogLastSeekAt;probe.seeks++;probe.from=video.currentTime;
+    return null;
+  }
+  if(video.seeking) return null;
+  const elapsed=now-probe.at;
+  let result=null;
+  if(video.currentTime-probe.from>=0.02) result='advanced';
+  else if(video.paused && elapsed>50) result='paused';
+  else if(elapsed>3000) result='stuck';
+  if(!result) return null;
+  video._vlogStartProbe=null;
+  return {name:probe.name,phase:probe.phase,result,ms:Math.round(elapsed),sinceSeekMs:probe.sinceSeekMs,
+    seeksDuring:probe.seeks,playing};
+};
+const vlogStartLatencySummary=list=>{
+  const groups={};
+  for(const item of list||[]){
+    const g=groups[item.phase]||(groups[item.phase]={count:0,advanced:[],paused:0,stuck:0});
+    g.count++;
+    if(item.result==='advanced') g.advanced.push(item.ms); else g[item.result]++;
+  }
+  return Object.fromEntries(Object.entries(groups).map(([phase,g])=>{
+    const sorted=g.advanced.slice().sort((a,b)=>a-b);
+    return [phase,{count:g.count,medianMs:sorted.length?sorted[Math.floor((sorted.length-1)/2)]:null,
+      maxMs:sorted.length?sorted[sorted.length-1]:null,paused:g.paused,stuck:g.stuck}];
+  }));
+};
 // 書き出しの予熱（素材に入る前に音なしで一度動かして止め、頭へ戻す）。実機 A/B では録画中の予熱が動き出さず（moved 0）、
 // 映像のコマ数が 82%→72%、最大の止まりが 265→453ms と悪化したため既定では使わない。?exportwarm=on で試せる。
 const EXPORT_PREWARM=(()=>{try{return new URLSearchParams(location.search).get('exportwarm')==='on';}catch{return false;}})();
@@ -13004,7 +13050,7 @@ function App(){
     previewAdvanceProbeRef.current=new WeakMap();
     Object.assign(previewDiagnosticRef.current,{hitches:[],hitchCount:0,hitchSummary:new Map(),
       drawMs:[],drawCount:0,drawMaxMs:0,drawSlow:0,drawProfiler:createVlogExportDrawProfiler(),mediaActivity:new Map(),
-      holdTrace:[],holdSummary:new Map(),holdLastKey:undefined});
+      holdTrace:[],holdSummary:new Map(),holdLastKey:undefined,startLatency:[]});
   };
   const recordPreviewDiagnostic=(type,detail={})=>{
     const diag=previewDiagnosticRef.current;
@@ -13170,6 +13216,7 @@ function App(){
         audibleOthers};
     };
     const requestInfo=clip?describeRequest():null;
+    if(clip && video.paused && video instanceof HTMLVideoElement) vlogStartProbeBegin(video,clip.name,phase);
     try{
       const result=video.play();
       if(!result?.then) return;
@@ -13907,6 +13954,10 @@ function App(){
       hitches:diag.hitches.slice(),
       mediaActivity:[...diag.mediaActivity.values()].map(({lastPlayAt,lastPauseAt,lastRequestAt,...rest})=>rest),
       // 待ち（タイムラインを止める）の理由ごとの回数と、移り変わり（ms は最初の記録からの経過）。
+      experiments:{warmrewind:PREVIEW_WARM_REWIND?'on':'off',warmlimit:PREVIEW_WARM_LIMIT||null},
+      // 再生を頼んでから実際に進み出すまでの時間（段階ごとの中央値・最大と、最新40件）。
+      startLatencySummary:vlogStartLatencySummary(diag.startLatency),
+      startLatency:(diag.startLatency||[]).slice(),
       holdSummary:Object.fromEntries(diag.holdSummary||[]),
       holdTrace:(diag.holdTrace||[]).map((entry,i,list)=>({...entry,ms:entry.ms-list[0].ms})),
       frameTiming:(()=>{
@@ -14261,7 +14312,7 @@ function App(){
        (state.heldTime===null || state.heldTime===undefined)){
       const warm=state.prewarm;
       if(!warm || warm.id!==next.id){
-        if(!incoming.seeking && incoming.readyState>=2 && incoming.paused){
+        if(!incoming.seeking && incoming.readyState>=2 && incoming.paused && !(PREVIEW_WARM_LIMIT && active?._splitScreen)){
           incoming.muted=true;
           if(PREVIEW_FAST_WARM) try{ incoming.playbackRate=rate*vlogClipSourceRate(next); }catch{}
           state.prewarm={id:next.id,phase:'playing',startAt:now,from:incoming.currentTime,unmuted:false};
@@ -14274,7 +14325,7 @@ function App(){
           warm.phase='done';
           recordPreviewDiagnostic('incoming-prewarm',{clip:next.name,ms:Math.round(now-warm.startAt),
             moved:Number(moved.toFixed(3)),playbackRate:incoming.playbackRate,timelineTime:Number(t.toFixed(3))});
-          positionPreviewVideo(incoming,next,next.trimStart||0,'incoming-prewarm-rewind',0.02);
+          if(PREVIEW_WARM_REWIND) positionPreviewVideo(incoming,next,next.trimStart||0,'incoming-prewarm-rewind',0.02);
         }
       }
     }
@@ -14310,7 +14361,7 @@ function App(){
             childWarm.phase='done';
             recordPreviewDiagnostic('split-incoming-prewarm',{clip:child.name,ms:Math.round(now-childWarm.startAt),
               moved:Number(moved.toFixed(3)),timelineTime:Number(t.toFixed(3))});
-            positionPreviewVideo(video,child,start,'split-incoming-prewarm-rewind',0.02);
+            if(PREVIEW_WARM_REWIND) positionPreviewVideo(video,child,start,'split-incoming-prewarm-rewind',0.02);
           }
         }
       }
@@ -14321,7 +14372,7 @@ function App(){
        (state.heldTime===null || state.heldTime===undefined)){
       const warm=state.cutPrewarm;
       if(!warm || warm.id!==cutNext.id){
-        if(!cutNextVideo.seeking && cutNextVideo.readyState>=2 && cutNextVideo.paused){
+        if(!cutNextVideo.seeking && cutNextVideo.readyState>=2 && cutNextVideo.paused && !(PREVIEW_WARM_LIMIT && active?._splitScreen)){
           cutNextVideo.muted=true;
           if(PREVIEW_FAST_WARM) try{ cutNextVideo.playbackRate=rate*vlogClipSourceRate(cutNext); }catch{}
           state.cutPrewarm={id:cutNext.id,phase:'playing',startAt:now,from:cutNextVideo.currentTime};
@@ -14334,7 +14385,7 @@ function App(){
           warm.phase='done';
           recordPreviewDiagnostic('incoming-prewarm',{clip:cutNext.name,ms:Math.round(now-warm.startAt),cut:true,
             moved:Number(moved.toFixed(3)),playbackRate:cutNextVideo.playbackRate,timelineTime:Number(t.toFixed(3))});
-          positionPreviewVideo(cutNextVideo,cutNext,cutNext.trimStart||0,'incoming-prewarm-rewind',0.02);
+          if(PREVIEW_WARM_REWIND) positionPreviewVideo(cutNextVideo,cutNext,cutNext.trimStart||0,'incoming-prewarm-rewind',0.02);
         }
       }else if(warm.phase==='done' && cutNextVideo.paused && !cutNextVideo.seeking){
         const samples=state.cutStartSamples||[];
@@ -14623,6 +14674,20 @@ function App(){
       t=state.heldTime;
     }else{
       timeRef.current=t;
+    }
+    {
+      // 診断: 再生を頼んだ動画が実際に進み出すまでの時間（最新40件）。
+      const diag=previewDiagnosticRef.current;
+      let playingVideos=0;
+      videoRefs.current.forEach(video=>{ if(video && !video.paused) playingVideos++; });
+      videoRefs.current.forEach(video=>{
+        const entry=video?._vlogStartProbe ? vlogStartProbeCheck(video,now,playingVideos) : null;
+        if(!entry) return;
+        entry.timelineTime=Number(timeRef.current.toFixed(3));
+        const list=diag.startLatency||(diag.startLatency=[]);
+        list.push(entry);
+        if(list.length>40) list.splice(0,list.length-40);
+      });
     }
     const stalledMs=trackPreviewProgress(now,timeRef.current,active,waitReasons.join(','));
     if(stalledMs>=15000 && active?.type==='video' &&
