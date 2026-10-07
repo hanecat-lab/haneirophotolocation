@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-07-warm-default';
+const VLOG_PREVIEW_BUILD='2026-10-07-polaroid-insert';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -9989,6 +9989,26 @@ const vlogSnapshotBlock=(clips,clip,t)=>{
   if(added && added.size>VLOG_SNAPSHOT_SLOTS.length) return 'stackFull';
   return null;
 };
+// 差し込み写真をまとめて出すときの判定。times は撮る時刻の並び（タイムライン秒）。
+const vlogSnapshotBlockMany=(clips,clip,times)=>{
+  if((clip?._snapshots||[]).length+times.length>3) return 'limit';
+  const entries=vlogSnapshotEntries(clips);
+  if(entries.some(item=>times.some(t=>Math.abs(item.start-t)<0.5))) return 'tooClose';
+  const added=vlogSnapshotStack([...entries,...times.map(t=>({start:t,isNew:true}))]).filter(item=>item.isNew);
+  if(added.some(item=>item.size>VLOG_SNAPSHOT_SLOTS.length)) return 'stackFull';
+  return null;
+};
+// 差し込む写真の切り抜き: 画面の向きに合わせて、縦は 3:4、横は 4:3 の真ん中を切る。長辺480px。
+const vlogSnapshotCropImage=(img,vertical)=>{
+  const iw=img.naturalWidth||img.width,ih=img.naturalHeight||img.height,ratio=vertical?3/4:4/3;
+  let sw=iw,sh=iw/ratio;
+  if(sh>ih){ sh=ih; sw=ih*ratio; }
+  const k=Math.min(1,480/Math.max(sw,sh));
+  const out=document.createElement('canvas');
+  out.width=Math.max(1,Math.round(sw*k));out.height=Math.max(1,Math.round(sh*k));
+  out.getContext('2d').drawImage(img,(iw-sw)/2,(ih-sh)/2,sw,sh,0,0,out.width,out.height);
+  return out;
+};
 // 撮る写真の切り抜き: 縦の画面は 3:4、横の画面は 4:3、長辺480px。
 const vlogSnapshotCrop=canvas=>{
   const cw=canvas.width,ch=canvas.height,ratio=ch>=cw?3/4:4/3;
@@ -10338,6 +10358,10 @@ function App(){
   const [dateStampNote, setDateStampNote] = useState('');
   const [snapshotNote, setSnapshotNote] = useState(null);
   const [snapshotToast, setSnapshotToast] = useState(null);
+  // ポラに差し込む写真（素材ごと）。作品の保存には含めない。{[clipId]:[{id,image,ymd,caption}]}
+  const [snapshotInserts, setSnapshotInserts] = useState({});
+  const snapshotInsertsRef = useRef({});
+  const [snapshotInsertNote, setSnapshotInsertNote] = useState(null);
   const [showSafeArea, setShowSafeArea] = useState(true);
   const [autoLayoutEnabled, setAutoLayoutEnabled] = useState(true);
   // ひかりよみシアター用
@@ -12546,6 +12570,7 @@ function App(){
         const st=vlogSnapshotPopState(t-item.start,t-item.leaveStart,item.slot);
         if(!st) continue;
         const img=vlogSnapshotImage(item.snap);
+        if(item.snap.noFlash) st.flash=0;
         paintVlogSnapshotPop(ctx,cw,ch,vlogSnapshotReady(img)?img:null,item.snap.label,st);
       }
     });
@@ -17344,11 +17369,44 @@ function App(){
     snapshotToastTimerRef.current=setTimeout(()=>setSnapshotToast(null),4000);
   };
   const snapshotBlockText=reason=>reason==='limit'?'1つの素材に3枚までです。':reason==='stackFull'?'重ねられるのは4枚までです。':'近すぎます（0.5秒以上あけてください）。';
+  const updateSnapshotInserts=(clipId,fn)=>{
+    const cur=snapshotInsertsRef.current;
+    const list=fn(cur[clipId]||[]);
+    const next={...cur};
+    if(list.length) next[clipId]=list; else delete next[clipId];
+    snapshotInsertsRef.current=next;
+    setSnapshotInserts(next);
+  };
+  // 差し込む写真を読む。素材の残り枠（3枚 − 撮った写真）を超える分は入れない。
+  const addSnapshotInserts=async(clip,files)=>{
+    const room=3-(clip._snapshots||[]).length-(snapshotInsertsRef.current[clip.id]||[]).length;
+    const list=[...(files||[])].filter(f=>/^image\//.test(f.type)||/\.(jpe?g|png|heic|webp)$/i.test(f.name||''));
+    if(room<=0){ setSnapshotInsertNote({clipId:clip.id,text:'この素材にはもう入れられません（3枚まで）。'}); return; }
+    const cv=canvasRef.current,vertical=cv?cv.height>=cv.width:true;
+    const added=[];
+    for(const file of list.slice(0,room)){
+      try{
+        const url=URL.createObjectURL(file);
+        const img=await new Promise((resolve,reject)=>{ const im=new Image(); im.onload=()=>resolve(im); im.onerror=reject; im.src=url; });
+        const out=vlogSnapshotCropImage(img,vertical);
+        URL.revokeObjectURL(url);
+        const image=out.toDataURL('image/jpeg',0.8);
+        let ymd=null;
+        try{ ymd=vlogJpegCaptureDate(new Uint8Array(await file.slice(0,256*1024).arrayBuffer())); }catch{ ymd=null; }
+        added.push({id:`ins-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,image,ymd,caption:''});
+      }catch{}
+    }
+    if(added.length) updateSnapshotInserts(clip.id,cur=>[...cur,...added]);
+    setSnapshotInsertNote(list.length>room ? {clipId:clip.id,text:`この素材にはあと${room}枚までなので、${added.length}枚だけ入れました。`}
+      : added.length<list.length ? {clipId:clip.id,text:'読めない写真がありました。'} : null);
+  };
   const takeSnapshot=async()=>{
     if(snapshotBusyRef.current) return;
     const first=vlogClipAtTime(clipsRef.current,timeRef.current);
     if(!first){ showSnapshotToast({text:'再生位置に素材がありません。'}); return; }
-    const firstBlock=vlogSnapshotBlock(clipsRef.current,first,timeRef.current);
+    const insertTimes=(t,clip)=>(snapshotInsertsRef.current[clip.id]||[]).map((_,i)=>t+i*0.25);
+    const blockAt=(clip,t)=>snapshotInsertsRef.current[clip.id]?.length ? vlogSnapshotBlockMany(clipsRef.current,clip,insertTimes(t,clip)) : vlogSnapshotBlock(clipsRef.current,clip,t);
+    const firstBlock=blockAt(first,timeRef.current);
     if(firstBlock){ showSnapshotToast({text:snapshotBlockText(firstBlock)}); return; }
     snapshotBusyRef.current=true;
     try{
@@ -17361,33 +17419,47 @@ function App(){
       if(!shot){ showSnapshotToast({text:'撮れませんでした。もう一度押してください。'}); return; }
       const clip=vlogClipAtTime(clipsRef.current,shot.t);
       if(!clip){ showSnapshotToast({text:'再生位置に素材がありません。'}); return; }
-      const block=vlogSnapshotBlock(clipsRef.current,clip,shot.t);
+      const block=blockAt(clip,shot.t);
       if(block){ showSnapshotToast({text:snapshotBlockText(block)}); return; }
-      const blob=await new Promise(resolve=>shot.canvas.toBlob(resolve,'image/jpeg',0.8));
-      const image=blob ? await new Promise(resolve=>{ const reader=new FileReader(); reader.onload=()=>resolve(String(reader.result||'')); reader.onerror=()=>resolve(''); reader.readAsDataURL(blob); }) : '';
-      if(!image || image.length<100){ showSnapshotToast({text:'撮れませんでした。もう一度押してください。'}); return; }
-      const at=Math.round((shot.t-clip.timelineStart)*100)/100;
-      const snap={id:`snap-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,at,image,label:''};
-      const next=clipsRef.current.map(c=>c.id===clip.id?{...c,_snapshots:[...(c._snapshots||[]),snap]}:c);
+      const inserts=snapshotInsertsRef.current[clip.id]||[];
+      let snaps;
+      if(inserts.length){
+        // 差し込み写真: 0.25秒ずつずらして山に積む。光るのは最初の1枚だけ。
+        snaps=inserts.map((ins,i)=>({id:`snap-${Date.now()}-${i}-${Math.random().toString(36).slice(2,6)}`,
+          at:Math.round((shot.t+i*0.25-clip.timelineStart)*100)/100,image:ins.image,
+          label:(ins.caption||'').trim()||(ins.ymd?vlogFormatCaptureDate(ins.ymd,dateStampFormat):''),
+          ...(i>0?{noFlash:true}:{})}));
+        updateSnapshotInserts(clip.id,()=>[]);
+      }else{
+        const blob=await new Promise(resolve=>shot.canvas.toBlob(resolve,'image/jpeg',0.8));
+        const image=blob ? await new Promise(resolve=>{ const reader=new FileReader(); reader.onload=()=>resolve(String(reader.result||'')); reader.onerror=()=>resolve(''); reader.readAsDataURL(blob); }) : '';
+        if(!image || image.length<100){ showSnapshotToast({text:'撮れませんでした。もう一度押してください。'}); return; }
+        const at=Math.round((shot.t-clip.timelineStart)*100)/100;
+        snaps=[{id:`snap-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,at,image,label:''}];
+      }
+      const next=clipsRef.current.map(c=>c.id===clip.id?{...c,_snapshots:[...(c._snapshots||[]),...snaps]}:c);
       setClips(next);
       clipsRef.current=next;
-      showSnapshotToast({clipId:clip.id,snapId:snap.id,thumb:image,text:`${at.toFixed(1)}秒で撮影`});
-      vlogLoadSnapshotImages([{_snapshots:[snap]}]).then(()=>{ if(!playingRef.current){ drawFrameRef.current._forceNext=true; drawFrameRef.current(timeRef.current); } });
+      const snapIds=snaps.map(x=>x.id);
+      showSnapshotToast({clipId:clip.id,snapIds,thumb:snaps[0].image,
+        text:inserts.length?`差し込み写真を${snaps.length}枚出しました`:`${snaps[0].at.toFixed(1)}秒で撮影`});
+      vlogLoadSnapshotImages([{_snapshots:snaps}]).then(()=>{ if(!playingRef.current){ drawFrameRef.current._forceNext=true; drawFrameRef.current(timeRef.current); } });
       // 撮影日は後から読んで、下の余白の文字を書き足す（再生を止めないため）。
-      (async()=>{
+      const blankIds=snaps.filter(x=>!x.label).map(x=>x.id);
+      if(blankIds.length) (async()=>{
         let ymd=clip._capturedAt||null;
         if(!ymd){ try{ ymd=await vlogReadCaptureDate(clip._splitScreen?.clips?.[0]||clip); }catch{ ymd=null; } }
         if(!ymd) return;
         const label=vlogFormatCaptureDate(ymd,dateStampFormat);
         const updated=clipsRef.current.map(c=>c.id!==clip.id?c:{...c,...(c._capturedAt?{}:{_capturedAt:ymd}),
-          _snapshots:(c._snapshots||[]).map(x=>x.id===snap.id?{...x,label}:x)});
+          _snapshots:(c._snapshots||[]).map(x=>blankIds.includes(x.id)?{...x,label}:x)});
         setClips(updated);
         clipsRef.current=updated;
       })();
     }finally{ snapshotBusyRef.current=false; }
   };
-  const undoSnapshot=(clipId,snapId)=>{
-    const next=clipsRef.current.map(c=>c.id===clipId?{...c,_snapshots:(c._snapshots||[]).filter(x=>x.id!==snapId)}:c);
+  const undoSnapshot=(clipId,snapIds)=>{
+    const next=clipsRef.current.map(c=>c.id===clipId?{...c,_snapshots:(c._snapshots||[]).filter(x=>!snapIds.includes(x.id))}:c);
     setClips(next);
     clipsRef.current=next;
     showSnapshotToast({text:'取り消しました。'});
@@ -22453,16 +22525,25 @@ const recomputeStarts=(arr)=>{
         React.createElement('div', {className:'flex-1 flex items-center gap-2'},
           // その場で撮る（飛び出す写真）。再生ボタンと離して左端に置き、再生中も押せる。
           clips.length>0 && React.createElement('div', {className:'relative shrink-0'},
-            React.createElement('button', {type:'button',
-              onClick:e=>{ e.preventDefault(); e.stopPropagation(); takeSnapshot(); },
-              className:'w-11 h-11 rounded-full bg-white/10 border border-white/20 text-[18px] flex items-center justify-center active:scale-95',
-              'aria-label':'今の瞬間を撮る（飛び出す写真）'}, '📸'),
+            (()=>{
+              // 再生位置の素材に差し込む写真があれば、縁を琥珀色にして1枚目と枚数を見せる。
+              const at=vlogClipAtTime(clips,currentTime);
+              const ins=(at&&snapshotInserts[at.id])||[];
+              return React.createElement('button', {type:'button',
+                onClick:e=>{ e.preventDefault(); e.stopPropagation(); takeSnapshot(); },
+                className:`relative w-11 h-11 rounded-full bg-white/10 border text-[18px] flex items-center justify-center active:scale-95 ${ins.length?'border-2 border-amber-300 shadow-[0_0_10px_rgba(252,211,77,0.45)]':'border-white/20'}`,
+                'aria-label':ins.length?`セットした写真を出す（${ins.length}枚）`:'今の瞬間を撮る（飛び出す写真）'},
+                '📸',
+                ins.length>0 && React.createElement('span', {className:'absolute -top-1.5 -right-1.5 w-[22px] h-[28px] rounded-[3px] bg-white p-[2px] pb-[5px] shadow-md rotate-6', 'aria-hidden':true},
+                  React.createElement('img', {src:ins[0].image, alt:'', className:'w-full h-full object-cover'}),
+                  React.createElement('span', {className:'absolute -bottom-1.5 -right-1.5 min-w-[15px] h-[15px] px-0.5 rounded-full bg-amber-400 text-black text-[9px] font-bold leading-[15px] text-center'}, ins.length)));
+            })(),
             snapshotToast && React.createElement('div', {role:'status',
               className:'absolute left-0 bottom-full mb-2 z-30 flex items-center gap-2 p-1.5 pr-2 rounded-xl bg-black/80 border border-white/15 text-[11px] text-white whitespace-nowrap shadow-lg'},
               snapshotToast.thumb && React.createElement('img', {src:snapshotToast.thumb, alt:'', className:'w-8 h-10 object-cover rounded'}),
               React.createElement('span', null, snapshotToast.text),
-              snapshotToast.snapId && React.createElement('button', {type:'button',
-                onClick:e=>{ e.stopPropagation(); undoSnapshot(snapshotToast.clipId,snapshotToast.snapId); },
+              snapshotToast.snapIds && React.createElement('button', {type:'button',
+                onClick:e=>{ e.stopPropagation(); undoSnapshot(snapshotToast.clipId,snapshotToast.snapIds); },
                 className:'px-2 py-0.5 rounded-full bg-white/15 text-[10px]'}, '取り消す'))),
           clips.length>0 && React.createElement('div', {className:'font-mono text-[11px] text-white/60'}, `${currentTime.toFixed(1)}s`),
           clips.length>0 && React.createElement('div', {className:'w-px h-4 bg-white/10'}),
@@ -23450,6 +23531,36 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   className:'px-2.5 py-1 rounded-full text-[10px] bg-white/10 text-white/60'}, `📸×${c._snapshots.length} 外す`),
                 snapshotNote?.clipId===c.id && React.createElement('span', {className:'text-[10px] text-white/55'}, snapshotNote.text)
               ),
+              // ポラに差し込む写真。次のシャッターで、今のコマの代わりにこの写真が出る（保存には含めない）。
+              (()=>{
+                const ins=snapshotInserts[c.id]||[];
+                const room=3-(c._snapshots||[]).length-ins.length;
+                const picker=label=>React.createElement('label', {className:`px-2.5 py-1 rounded-full text-[10px] ${room>0?'bg-amber-300/15 border border-amber-300/40 text-amber-100 cursor-pointer':'bg-white/5 text-white/30'}`},
+                  label,
+                  room>0 && React.createElement('input', {type:'file', accept:'image/*', multiple:true, className:'hidden',
+                    onChange:e=>{ const files=[...(e.target.files||[])]; e.target.value=''; addSnapshotInserts(c,files); }}));
+                return React.createElement('div', {className:'flex flex-col gap-1 self-start ml-2',
+                    onClick:e=>e.stopPropagation(), 'aria-label':`${c.name}のポラに差し込む写真`},
+                  ins.length===0 ? picker('🖼 ポラに差し込む ＋')
+                  : React.createElement('div', {className:'flex items-start gap-2 flex-wrap'},
+                    ins.map(x=>React.createElement('div', {key:x.id, className:'flex flex-col items-center gap-1'},
+                      React.createElement('div', {className:'relative w-[42px] bg-white p-[3px] pb-[8px] rounded-[2px] shadow'},
+                        React.createElement('img', {src:x.image, alt:'', className:'w-full aspect-[3/4] object-cover'}),
+                        React.createElement('button', {type:'button', 'aria-label':'この写真を外す',
+                          onClick:()=>updateSnapshotInserts(c.id,cur=>cur.filter(y=>y.id!==x.id)),
+                          className:'absolute -top-2 -right-2 w-5 h-5 rounded-full bg-black/80 border border-white/30 text-white text-[10px] leading-none'}, '✕')),
+                      React.createElement('input', {type:'text', value:x.caption, maxLength:16, placeholder:'空なら撮影日',
+                        'aria-label':'ポラの下に書くひとこと',
+                        onChange:e=>{ const v=e.target.value; updateSnapshotInserts(c.id,cur=>cur.map(y=>y.id===x.id?{...y,caption:v}:y)); },
+                        className:'w-[96px] h-6 px-1.5 rounded bg-white/10 border border-white/15 text-[10px] text-white placeholder:text-white/35'}))),
+                    React.createElement('div', {className:'flex flex-col gap-1 pt-1'},
+                      React.createElement('span', {className:'text-[10px] text-amber-100/90'}, `🖼 次のシャッターでこの${ins.length}枚が出ます`),
+                      React.createElement('div', {className:'flex items-center gap-1'},
+                        room>0 && picker('＋ 追加'),
+                        React.createElement('button', {type:'button', onClick:()=>updateSnapshotInserts(c.id,()=>[]),
+                          className:'px-2.5 py-1 rounded-full text-[10px] bg-white/10 text-white/60'}, 'すべて外す')))),
+                  snapshotInsertNote?.clipId===c.id && React.createElement('span', {className:'text-[10px] text-white/55'}, snapshotInsertNote.text));
+              })(),
               // 写真の動き。素材の行は高さが固定なので、行の下に置く。
               isPhoto && !c._splitScreen && React.createElement('div', {className:'flex items-center gap-1 flex-wrap self-start ml-2',
                   onClick:e=>e.stopPropagation(), 'aria-label':`${c.name}の動き`},
