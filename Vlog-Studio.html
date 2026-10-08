@@ -6659,7 +6659,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-07-transition-fit';
+const VLOG_PREVIEW_BUILD='2026-10-08-photo-length';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -9373,10 +9373,12 @@ function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
 
 // 上下分割は編集上の1素材。元素材と使用範囲は解除・復元用に保持する。
 const vlogSplitChildren=clip=>clip?._splitScreen?.clips || (clip?[clip]:[]);
+const vlogIsPhotoOnlySplit=clip=>!!clip?._splitScreen && clip._splitScreen.clips.every(child=>child.type==='photo');
 const vlogSplitMaxDuration=clip=>{
   const children=vlogSplitChildren(clip);
   const videos=children.filter(item=>item.type==='video');
-  return Math.max(0.3,videos.length?Math.min(...videos.map(item=>item.duration)):clip._splitScreen?.photoDuration||children[0]?.duration||3);
+  // 写真だけの組は、写真のレバーと同じく10秒まで伸ばせる。
+  return Math.max(0.3,videos.length?Math.min(...videos.map(item=>item.duration)):10);
 };
 const vlogMediaClips=list=>list.flatMap(clip=>clip._splitScreen
   ? clip._splitScreen.clips.map(child=>({...child,timelineStart:clip.timelineStart,duration:clip.duration,
@@ -9675,7 +9677,8 @@ const makeVlogSplitScene=(children,id)=>{
     assetId:originals[0].assetId||originals[0]._parentId||originals[0].id,
     trimStart:0,timelineStart:0,_splitScreen:{clips:originals,photoDuration:originals[0].duration,
       audioId:originals.find(child=>child.type==='video')?.id||null}};
-  return {...group,duration:vlogSplitMaxDuration(group)};
+  // 写真だけの組は、1枚目の写真の長さで始める（上限の10秒にはしない）。
+  return {...group,duration:vlogIsPhotoOnlySplit(group)?Math.min(vlogSplitMaxDuration(group),Math.max(0.3,Number(originals[0].duration)||3)):vlogSplitMaxDuration(group)};
 };
 const serializeVlogClip=clip=>{
   const {url,...saved}=clip;
@@ -23005,24 +23008,12 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 // bulk apply
                 const currentClips = clipsRef.current;
                 if(!currentClips || currentClips.length===0) return;
-                const photoCount = currentClips.filter(c=> c.type==='photo').length;
+                const isBulkTarget = c=> c.type==='photo' || vlogIsPhotoOnlySplit(c);
+                const photoCount = currentClips.filter(isBulkTarget).length;
                 if(photoCount===0) return;
                 const currentBulk = bulkPhotoDurationRef.current || 2.5;
-                // no confirm;
-                
-                // 即時反映版 - recomputeStartsをインラインで実行
-                let cur = 0;
-                const recomputed = currentClips.map((c,i)=>{
-                  const newDur = c.type==='photo' ? currentBulk : c.duration;
-                  const n = {...c, duration: newDur, timelineStart: cur};
-                  const transDur = (c._transitionToNext && c._transitionToNext.type!=='none') ? (c._transitionToNext.duration||0.5) : 0;
-                  if(i < currentClips.length-1 && transDur>0){
-                    cur+= Math.max(0.1, newDur - transDur);
-                  } else {
-                    cur+=newDur;
-                  }
-                  return n;
-                });
+                // 写真と写真だけの組を同じ長さに。つながりの長さは recomputeStarts で自動で合わせる。
+                const recomputed = recomputeStarts(currentClips.map(c=> isBulkTarget(c) ? {...c, duration: currentBulk} : c));
                 const maxEnd = recomputed.length ? Math.max(...recomputed.map(x=>x.timelineStart+x.duration)) : 3;
                 console.log('Recomputed', recomputed.map(c=>`${c.name}:${c.duration}`), 'maxEnd', maxEnd);
                 setClips(recomputed);
@@ -23374,10 +23365,10 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     materialAudioStatus && React.createElement('span', {className:'shrink-0 text-white/75',title:'この素材の元音声の個別設定'},materialAudioStatus),
 
                   ),
-                  isPhoto && React.createElement('div', {className:'flex flex-col gap-1 mt-1'},
+                  (isPhoto || vlogIsPhotoOnlySplit(c)) && React.createElement('div', {className:'flex flex-col gap-1 mt-1'},
                     React.createElement('div', {className:'flex items-center gap-1'},
                       React.createElement('input', {
-                        type:'range', min:0.5, max:10, step:0.1, value:c.duration,
+                        type:'range', min:0.5, max:10, step:0.1, value:c.duration, style:{zoom:1.3},
                         onPointerDown:()=>{beginRangeEdit();setSelectedTimelineItem({type:'clip',id:c.id});},
                         onPointerUp:finishRangeEdit,
                         onPointerCancel:finishRangeEdit,
@@ -23392,7 +23383,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       }),
                       React.createElement('span', {className:'text-[9px] text-white/50 font-mono'}, `${c.duration.toFixed(1)}s`)
                     ),
-                    verticalPriority && (()=>{ 
+                    isPhoto && verticalPriority && (()=>{ 
                       const img=photoRefs.current.get(c.id); 
                       const dims=vlogMediaDimensions(img,c);
                       const isH = img && dims.width>=dims.height; 
