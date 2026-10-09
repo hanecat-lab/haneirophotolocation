@@ -497,6 +497,26 @@ async function ynFrameSeek(video,time,nudge=false){
  let target=time;if(Math.abs(target-video.currentTime)<.0001)target=target+.0003<video.duration?target+.0003:Math.max(0,target-.0003);
  try{await ynSeek(video,target);const frame=await pts;frame.requested=video.currentTime;ynFrameTimes.set(video,frame);return frame}finally{clearTimeout(timer);video.cancelVideoFrameCallback(id)}
 }
+// A plain seek can resolve while the element still presents the previous frame (seen when analysis starts with the playhead at the end).
+// Confirm with the presented frame's own timestamp and come back once if it is far from the requested time.
+const ynSeekStats={ok:0,retry:0,stale:0,unverified:0};
+async function ynSeekReal(video,time){
+ const dur=Number.isFinite(video.duration)?video.duration:0,target=Math.max(0,Math.min(Math.max(0,dur-.001),time)),rvfc=typeof video.requestVideoFrameCallback==='function';
+ const once=async t=>{
+  let id=null,timer=null;
+  const pres=rvfc?new Promise(res=>{timer=setTimeout(()=>res(null),300);id=video.requestVideoFrameCallback((_,m)=>{clearTimeout(timer);res(m)})}):Promise.resolve(null);
+  try{await ynSeek(video,t);return await pres}finally{clearTimeout(timer);if(id!==null)try{video.cancelVideoFrameCallback(id)}catch{}}
+ };
+ let m=await once(target);
+ if(m&&Number.isFinite(m.mediaTime)&&Math.abs(m.mediaTime-target)>.25){
+  ynSeekStats.retry++;
+  await ynSeek(video,target+1<dur?target+1:Math.max(0,target-1));
+  m=await once(target);
+  if(m&&Number.isFinite(m.mediaTime)&&Math.abs(m.mediaTime-target)>.25){ynSeekStats.stale++;return {time:m.mediaTime,exact:false,stale:true}}
+ }
+ if(m&&Number.isFinite(m.mediaTime)){ynSeekStats.ok++;return {time:m.mediaTime,exact:true}}
+ ynSeekStats.unverified++;await new Promise(r=>setTimeout(r,40));return {time:video.currentTime,exact:false}
+}
 function ynPolyPath(ctx,poly){if(!poly?.length)return;ctx.beginPath();ctx.moveTo(poly[0].x,poly[0].y);for(const p of poly.slice(1))ctx.lineTo(p.x,p.y);ctx.closePath()}
 // Circumscribed ellipse: keep every specified face corner covered, including rotated faces.
 function ynFaceMaskPath(ctx,poly,padding=0){
@@ -1469,7 +1489,7 @@ if(!T.current&&!Hs.current){ynSetMessage('顔検出AIがまだ利用できませ
 if(i.readyState<2||!i.videoWidth||!Number.isFinite(i.duration)||i.duration<=0){ynSetMessage('動画の読込が終わってから解析してください。');return}
 ynSetReviewed(false);ynSetEdit(null);ynSetInspect("none");ynSetExclusive(false);ynBusy.current=true;ynCancel.current=false;const session=++ynSession.current,originalTime=i.currentTime;
 Ys(!0);qe(!1);Dl(0);ynSetMessage('解析中。終了後に元の再生位置へ戻ります。');
-let y=!i.paused;try{i.pause(),xn(!1);let{videoWidth:g,videoHeight:d}=i,N=i.duration,times=ynSampleTimes(N,ynFPS),_=times.length,v=1/ynFPS,a=[],z=new Map,A=1,O=0,cuts=[],issues=[],scene=0,previousSignature=null,previousCount=0,W=L=>ynSeek(i,L);
+ynSeekStats.ok=ynSeekStats.retry=ynSeekStats.stale=ynSeekStats.unverified=0;let y=!i.paused;try{i.pause(),xn(!1);let{videoWidth:g,videoHeight:d}=i,N=i.duration,times=ynSampleTimes(N,ynFPS),_=times.length,v=1/ynFPS,a=[],z=new Map,A=1,O=0,cuts=[],issues=[],scene=0,previousSignature=null,previousCount=0,W=L=>ynSeekReal(i,L);
 let maxGap=v;const ynTm={seek:0,det:0},tAll=performance.now();
 const detectAt=async(Q,L)=>{const tS=performance.now();await W(Q);const tD=performance.now();ynTm.seek+=tD-tS;ot();let $=s.getContext("2d");if(!$)return null;$.clearRect(0,0,g,d),$.drawImage(i,0,0,g,d);const signature=ynSceneSignature(s);
 let Y=[],F=((j)=>{let C=0,x=0,wn=g,ln=d;if(j==="bottom60")x=d*0.4,ln=d*0.6;else if(j==="center80")C=g*0.1,x=d*0.1,wn=g*0.8,ln=d*0.8;else if(j==="center50")C=g*0.25,x=d*0.25,wn=g*0.5,ln=d*0.5;let zn=document.createElement("canvas");return zn.width=Math.max(64,Math.floor(wn)),zn.height=Math.max(64,Math.floor(ln)),zn.getContext("2d")?.drawImage(s,C,x,wn,ln,0,0,zn.width,zn.height),{canvas:zn,rx:C,ry:x,sx:zn.width/wn,sy:zn.height/ln}})(Js),cn=(j,C)=>{
@@ -1491,7 +1511,7 @@ Dl(Math.round((L+1)/_*100)),Co(O),Be(a.length)};
 const maxJump=ynAdaptive?Math.max(1,Math.floor(.5*ynFPS+1e-9)):1;
 const skipped=await ynAdaptiveRun(_,maxJump,(L)=>detectAt(times[L],L),commitAt,(p0,q0)=>ynStableDet(p0,q0,g,d),()=>{if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。前回の解析結果を維持しました。')});if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。前回の解析結果を維持しました。');
 c.current=z;ynCuts.current=cuts;ynStep.current=Math.max(v,maxGap/2.1+.001);ynSetIssues(issues);let I=f.current;if(I){ot();let L=I.getContext("2d");if(L){L.clearRect(0,0,I.width,I.height);for(let Q of a){let $=Q.union.x,Y=Q.union.y,tn=Q.union.x2-Q.union.x,F=Q.union.y2-Q.union.y,cn=tn*ynPadding,R=F*ynPadding,it=$+tn/2,ql=Y+F/2,oi=(tn+cn*2)/2,Le=(F+R*2)/2;L.fillStyle="white",L.beginPath(),L.ellipse(it,ql,Math.max(1,oi),Math.max(1,Le),0,0,Math.PI*2),L.fill()}}}ynDeletedStack.current=[],ynTruthDeleted.current=[],ynKeptIds.current=new Set();ynSetUndoCount(0);je([...a]);Be(a.length);qe(a.length===0);Dl(100);b(count=>count+1);
-ynSetMessage(`自動で顔を探しました。「大きく確認」で映像を見て、抜けた顔は追加してください。 · ${times.length}フレーム / ${ynFPS}fps · 確認候補${issues.length}箇所 · 所要${((performance.now()-tAll)/1000).toFixed(1)}秒（動画の移動${Math.round(ynTm.seek/Math.max(1,ynTm.seek+ynTm.det)*100)}% / 顔検出${Math.round(ynTm.det/Math.max(1,ynTm.seek+ynTm.det)*100)}%）${skipped>0?` · 間引きで${skipped}/${_}フレームを省略`:''}`);ynSetExpandedView("review");
+ynSetMessage(`自動で顔を探しました。「大きく確認」で映像を見て、抜けた顔は追加してください。 · ${times.length}フレーム / ${ynFPS}fps · 確認候補${issues.length}箇所 · 所要${((performance.now()-tAll)/1000).toFixed(1)}秒（動画の移動${Math.round(ynTm.seek/Math.max(1,ynTm.seek+ynTm.det)*100)}% / 顔検出${Math.round(ynTm.det/Math.max(1,ynTm.seek+ynTm.det)*100)}%）${skipped>0?` · 間引きで${skipped}/${_}フレームを省略`:''}${ynSeekStats.retry>0?` · 古い映像を${ynSeekStats.retry}回取り直しました`:''}`);ynSetExpandedView("review");
 }catch(error){Be(Ut.length);ynSetMessage(error.message)}finally{
  try{await ynSeek(i,originalTime)}catch{}
  Lt(i.currentTime);Ys(false);ynBusy.current=false;bn.current?.();
@@ -1746,7 +1766,7 @@ const ynRedetRun=async()=>{
     stCfg.on=false;
     for(let i=0;i<times.length;i++){
       if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。');
-      const tm=times[i];await ynSeek(video,tm);
+      const tm=times[i];await ynSeekReal(video,tm);
       const out=li(vw,vh,tm,video,null,false,null);if(!out)continue;
       const rc=document.createElement('canvas');rc.width=Math.max(64,Math.round(vw*scale));rc.height=Math.max(64,Math.round(vh*scale));const rx=rc.getContext('2d');if(!rx)continue;rx.drawImage(out,0,0,rc.width,rc.height);
       const found=Kl(await Bl(rc,tm,0,0,{sx:rc.width/vw,sy:rc.height/vh,x:0,y:0},'redetect'),vw,vh,rc,rc,thr);
@@ -2058,7 +2078,7 @@ const ynTruthBuild=()=>{
     return {id:g.id,type:g.type,start:r3(g.start),end:r3(g.end),fps:g.fps,anchors:(g.anchors||[]).map(a=>({t:r3(a.time),faces:(a.faces||[]).map(f=>({id:f.id,box:f.poly&&f.poly.length>2?(()=>{const b0=ynFaceBoxFromPoly(f.poly);return [r1(b0.x),r1(b0.y),r1(b0.w),r1(b0.h)]})():null}))})),rowFormat:'[t,ok,estimated,fallback,areaRatio,aspectRatio,edge,cx,cy,size]',frames:rows,weakRuns:weak};
   });
   return {format:'bokasi-truth',version:2,exportedAt:new Date().toISOString(),video:{name,duration:r3(video?.duration||0),width:video?.videoWidth||0,height:video?.videoHeight||0},
-    detect:{fps:ynFPS,step:ynStep.current,padding:ynPadding,cuts:[...ynCuts.current].map(r3)},tracks,
+    detect:{fps:ynFPS,step:ynStep.current,padding:ynPadding,cuts:[...ynCuts.current].map(r3),seekStats:{...ynSeekStats}},tracks,
     truth:{corrections:ynBoxFix.current.map(r=>({t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot})),faceCorrections:Object.entries(ynFaceFix.current).flatMap(([k,arr])=>arr.map(r=>({key:k,t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot}))),manualFaces:manual,deletedTracks:ynTruthDeleted.current.map(d=>({...d,t0:r3(d.t0),t1:r3(d.t1),maxScore:r3(d.maxScore)})),keptTrackIds:[...ynKeptIds.current]},
     groups:ynGroupsOut,
     metrics:ynTruthReport};
