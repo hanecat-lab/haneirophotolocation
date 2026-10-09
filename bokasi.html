@@ -542,13 +542,57 @@ function ynQuadHealth(poly,ref){
  if(!(a.edge>=.35))why.push('枠がゆがんでいます');
  return {weak:why.length>0,why:why.join('・'),area,asp,edge:a.edge,cx:a.cx,cy:a.cy,size:a.size};
 }
+// Judge each tracked frame against the group's own recent healthy frames (not only the specified shape): a mistaken anchor, or a face that really gets smaller, is not flagged; a sudden collapse is.
+const ynHealthCache=new WeakMap();
+function ynMedianMetrics(list){const g=k=>ynMedian(list.map(x=>x[k]));return {area:g('area'),asp:g('asp'),edge:g('edge'),size:g('size'),cx:g('cx'),cy:g('cy')}}
+function ynHealthSeries(group){
+ const frames=group.frames||[],anchors=(group.anchors||[]).slice().sort((x,y)=>x.time-y.time),mid=frames[frames.length>>1],hs=mid&&mid.faces&&mid.faces[0]&&mid.faces[0].poly&&mid.faces[0].poly[0]?mid.faces[0].poly[0].x:0;
+ const sig=frames.length+'|'+anchors.map(x=>x.time+':'+(x.faces||[]).length).join(',')+'|'+hs,cached=ynHealthCache.get(group);
+ if(cached&&cached.frames===frames&&cached.sig===sig)return cached.map;
+ const map=new Map(),maxGap=2.5/(group.fps||30),ids=new Set();
+ for(const f of frames)if(f.ok&&!f.fallback&&f.faces)for(const x of f.faces)ids.add(x.id);
+ for(const id of ids){
+  const out=[];let seg=-2,boot=[],recent=[],base=null,prev=null,anchorM=null,areaRun=[];
+  for(const f of frames){
+   if(!f.ok||f.fallback||!f.faces){prev=null;continue}
+   const face=f.faces.find(x=>x.id===id);if(!face||!face.poly||face.poly.length!==4){prev=null;continue}
+   let sIdx=-1;for(let i=0;i<anchors.length;i++)if(anchors[i].time<=f.time+1e-6)sIdx=i;
+   if(sIdx!==seg){seg=sIdx;boot=[];recent=[];base=null;prev=null;anchorM=null;areaRun=[];const af=sIdx>=0?(anchors[sIdx].faces||[]).find(x=>x.id===id):null;if(af&&af.poly&&af.poly.length===4){const am=ynPolyMetrics(af.poly);if(am.area>1&&am.asp>0)anchorM=am}}
+   const m=ynPolyMetrics(face.poly);if(!(m.area>1)||!(m.asp>0)){out.push({time:f.time,h:null});prev=null;continue}
+   if(!base){boot.push(m);if(boot.length>=5){base=ynMedianMetrics(boot);recent=boot.map((x,i)=>({t:f.time-(boot.length-1-i)/(group.fps||30),m:x}))}}
+   const ref=base||ynMedianMetrics(boot),why=[],area=m.area/ref.area,asp=m.asp/ref.asp;
+   if(area<.45)why.push('小さくつぶれています');else if(area>2.2)why.push('大きく広がっています');
+   if(!(asp>=.6&&asp<=1.65))why.push('縦横の比率が崩れています');
+   if(m.edge<.35&&m.edge<.6*ref.edge)why.push('枠がゆがんでいます');
+   if(prev&&f.time-prev.t<=maxGap+1e-6&&Math.hypot(m.cx-prev.cx,m.cy-prev.cy)>.6*Math.max(ref.size,1))why.push('枠が急に跳びました');
+   if(!base&&anchorM){const aa=m.area/anchorM.area,ap=m.asp/anchorM.asp;if(aa<.25||aa>4||ap<.45||ap>2.2)why.push('指定した形から大きく外れています')}
+   const weak=why.length>0;
+   out.push({time:f.time,h:{weak,why:why.join('・'),area,asp,edge:m.edge,cx:m.cx,cy:m.cy,size:m.size,faceId:id}});
+   prev={t:f.time,cx:m.cx,cy:m.cy};
+   // A change of size alone (shape intact) that stays stable for ~1s is a real change of the face (leaning in/out): accept it as the new baseline. A collapsed shape never is.
+   if(base&&weak&&why.length===1&&(area<.45||area>2.2)){areaRun.push(m);if(areaRun.length>=Math.round(group.fps||30)){const ar=areaRun.map(x=>x.area);if(Math.max(...ar)/Math.min(...ar)<1.3){base=ynMedianMetrics(areaRun);recent=areaRun.map((x,i)=>({t:f.time-(areaRun.length-1-i)/(group.fps||30),m:x}));areaRun=[]}else areaRun.shift()}}else areaRun=[];
+   if(!weak&&base){recent.push({t:f.time,m});while(recent.length&&f.time-recent[0].t>1)recent.shift();if(recent.length>=3)base=ynMedianMetrics(recent.map(x=>x.m))}
+  }
+  map.set(id,out);
+ }
+ ynHealthCache.set(group,{frames,sig,map});return map;
+}
 function ynGroupHealthAt(group,time,fr){
  fr=fr||ynMotionAt(group,time);
  if(!fr||!fr.ok||fr.fallback||!fr.faces)return null;
- let worst=null;
+ const series=ynHealthSeries(group),tol=Math.max(.04,1.5/(group.fps||30));let worst=null;
  for(const face of fr.faces){
-  let ref=null,bd=Infinity;for(const a of group.anchors||[]){const f=(a.faces||[]).find(x=>x.id===face.id);if(f&&f.poly&&f.poly.length===4){const d=Math.abs(a.time-time);if(d<bd){bd=d;ref=f.poly}}}
-  const h=ref&&ynQuadHealth(face.poly,ref);if(!h)continue;
+  let h=null;const arr=series.get(face.id);
+  if(arr&&arr.length){
+   let lo=0,hi=arr.length;while(lo<hi){const mid=(lo+hi)>>1;if(arr[mid].time<time)lo=mid+1;else hi=mid}
+   let best=null;for(const k of [lo-1,lo]){const e=arr[k];if(e&&e.h&&Math.abs(e.time-time)<=tol&&(!best||Math.abs(e.time-time)<Math.abs(best.time-time)))best=e}
+   if(best)h=best.h;
+  }
+  if(!h){
+   let ref=null,bd=Infinity;for(const an of group.anchors||[]){const f=(an.faces||[]).find(x=>x.id===face.id);if(f&&f.poly&&f.poly.length===4){const d=Math.abs(an.time-time);if(d<bd){bd=d;ref=f.poly}}}
+   const q=ref&&ynQuadHealth(face.poly,ref);if(q)h=q;
+  }
+  if(!h)continue;
   if(!worst||(h.weak&&!worst.weak)||(h.weak===worst.weak&&h.area<worst.area))worst={...h,faceId:face.id};
  }
  return worst;
@@ -2078,7 +2122,7 @@ const ynTruthBuild=()=>{
       if(i%stride===0||!f.ok)rows.push(h?[t,1,f.estimated?1:0,0,r3(h.area),r3(h.asp),r3(h.edge),r1(h.cx),r1(h.cy),r1(h.size)]:[t,f.ok?1:0,f.estimated?1:0,f.fallback?1:0]);
       if(h&&h.weak){if(cur&&t-cur.t1<=2.5/(g.fps||30)+.001){cur.t1=t;cur.minArea=Math.min(cur.minArea,r3(h.area))}else{cur={group:g.id,face:h.faceId,t0:t,t1:t,why:h.why,minArea:r3(h.area)};weak.push(cur)}}
     });
-    return {id:g.id,type:g.type,start:r3(g.start),end:r3(g.end),fps:g.fps,anchors:(g.anchors||[]).map(a=>({t:r3(a.time),faces:(a.faces||[]).map(f=>({id:f.id,box:f.poly&&f.poly.length>2?(()=>{const b0=ynFaceBoxFromPoly(f.poly);return [r1(b0.x),r1(b0.y),r1(b0.w),r1(b0.h)]})():null}))})),rowFormat:'[t,ok,estimated,fallback,areaRatio,aspectRatio,edge,cx,cy,size]',frames:rows,weakRuns:weak};
+    return {id:g.id,type:g.type,start:r3(g.start),end:r3(g.end),fps:g.fps,anchors:(g.anchors||[]).map(a=>({t:r3(a.time),faces:(a.faces||[]).map(f=>({id:f.id,box:f.poly&&f.poly.length>2?(()=>{const b0=ynFaceBoxFromPoly(f.poly);return [r1(b0.x),r1(b0.y),r1(b0.w),r1(b0.h)]})():null}))})),rowFormat:'[t,ok,estimated,fallback,areaRatio,aspectRatio,edge,cx,cy,size] (ratios are against the group\'s own recent healthy frames)',frames:rows,weakRuns:weak};
   });
   return {format:'bokasi-truth',version:2,exportedAt:new Date().toISOString(),video:{name,duration:r3(video?.duration||0),width:video?.videoWidth||0,height:video?.videoHeight||0},
     detect:{fps:ynFPS,step:ynStep.current,padding:ynPadding,cuts:[...ynCuts.current].map(r3),seekStats:{...ynSeekStats}},tracks,
