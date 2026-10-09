@@ -542,6 +542,35 @@ function ynQuadHealth(poly,ref){
  if(!(a.edge>=.35))why.push('枠がゆがんでいます');
  return {weak:why.length>0,why:why.join('・'),area,asp,edge:a.edge,cx:a.cx,cy:a.cy,size:a.size};
 }
+// Lost manual faces at time t that no later-specified, still-tracked group takes over (the user usually re-specifies a face where the previous group failed).
+function ynLastOkFrame(group,t){
+ const fr=group.frames||[];let lo=0,hi=fr.length;while(lo<hi){const m=(lo+hi)>>1;if(fr[m].time<=t+1e-6)lo=m+1;else hi=m}
+ for(let i=lo-1;i>=0;i--){const f=fr[i];if(f.ok&&!f.fallback&&f.faces&&f.faces.length&&f.faces[0].poly&&f.faces[0].poly.length===4)return {time:f.time,m:ynPolyMetrics(f.faces[0].poly)}}
+ let best=null;for(const a of group.anchors||[])if(a.time<=t+1e-6&&a.faces&&a.faces[0]&&a.faces[0].poly&&a.faces[0].poly.length===4&&(!best||a.time>best.time))best={time:a.time,m:ynPolyMetrics(a.faces[0].poly)};
+ return best;
+}
+function ynLostFacesAt(groups,t){
+ const ok=[],lost=[];
+ for(const g of groups){const fr=ynMotionAt(g,t);if(fr===null||fr===undefined)continue;if(fr.ok)ok.push({g,fr});else lost.push(g)}
+ let n=0;
+ for(const g of lost){
+  const last=ynLastOkFrame(g,t),lt=last?last.time:g.start;
+  const taken=ok.some(({g:h,fr})=>{
+   if(h===g)return false;
+   // a group specified after this one went lost, near where it was
+   if((h.anchors||[]).some(a=>{
+    if(a.time<lt-.3)return false;if(!last)return true;
+    const f=a.faces&&a.faces[0];if(!f||!f.poly||f.poly.length!==4)return true;
+    const b=ynPolyMetrics(f.poly);return Math.hypot(b.cx-last.m.cx,b.cy-last.m.cy)<=2*Math.max(last.m.size,b.size);
+   }))return true;
+   // a duplicate: another tracked face is right where this group was last seen
+   if(last&&fr.faces)for(const face of fr.faces){if(!face.poly||face.poly.length!==4)continue;const b=ynPolyMetrics(face.poly);if(Math.hypot(b.cx-last.m.cx,b.cy-last.m.cy)<=Math.max(last.m.size,b.size))return true}
+   return false;
+  });
+  if(!taken)n+=Math.max(1,(g.faces||[]).length);
+ }
+ return n;
+}
 // Judge each tracked frame against the group's own recent healthy frames (not only the specified shape): a mistaken anchor, or a face that really gets smaller, is not flagged; a sudden collapse is.
 const ynHealthCache=new WeakMap();
 function ynMedianMetrics(list){const g=k=>ynMedian(list.map(x=>x[k]));return {area:g('area'),asp:g('asp'),edge:g('edge'),size:g('size'),cx:g('cx'),cy:g('cy')}}
@@ -2050,9 +2079,10 @@ const ynTl=E.useMemo(()=>{
   const sample=t=>{
     let worst='none',faces=[];try{faces=nc(t).faces||[]}catch{}
     for(const f of faces){let st='ok';if(f.src==='hold'||f.src==='hold-back')st='hold';else if(f.src==='interp'&&f.gap>step*1.25)st='gap';if(rank[st]>rank[worst])worst=st}
-    let lostFaces=0;
-    if(nn==='track')for(const g of ynGroups.current){try{const fr=ynMotionAt(g,t);if(fr===null||fr===undefined)continue;if(!fr.ok){lostFaces+=Math.max(1,g.faces.length);continue}const hh=ynGroupHealthAt(g,t,fr);if(hh&&hh.weak&&rank.weak>rank[worst])worst='weak';else if(rank.ok>rank[worst])worst='ok'}catch{}}
-    // A manual face that lost its track is only "lost" when the automatic faces drawn at this time cannot cover it (one automatic face per lost manual face).
+    let lostAny=false;
+    if(nn==='track')for(const g of ynGroups.current){try{const fr=ynMotionAt(g,t);if(fr===null||fr===undefined)continue;if(!fr.ok){lostAny=true;continue}const hh=ynGroupHealthAt(g,t,fr);if(hh&&hh.weak&&rank.weak>rank[worst])worst='weak';else if(rank.ok>rank[worst])worst='ok'}catch{}}
+    // A manual face that lost its track is only "lost" when no later-specified group has taken it over and the automatic faces drawn at this time cannot cover it (one automatic face per lost manual face).
+    const lostFaces=lostAny?ynLostFacesAt(ynGroups.current,t):0;
     if(lostFaces>0&&!(!(ynExclusive&&ynGroups.current.length)&&faces.length>=lostFaces))return 'lost';
     return worst;
   };
