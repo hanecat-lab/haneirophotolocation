@@ -508,6 +508,37 @@ function ynFaceMaskPath(ctx,poly,padding=0){
  const steps=96,scale=radius*(1+2*Math.max(0,padding))/Math.cos(Math.PI/steps);
  ctx.beginPath();for(let i=0;i<steps;i++){const q=ynSuperPoint(i*Math.PI*2/steps),qy=q.y*YN_SHAPE_TALL,x=center.x+scale*(u.x*q.x+v.x*qy),y=center.y+scale*(u.y*q.x+v.y*qy);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)}ctx.closePath();
 }
+// Is a tracked (manual) face still shaped like the face that was specified? Judged against the nearest specified shape.
+function ynPolyMetrics(p){
+ const d=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y),top=d(p[0],p[1]),right=d(p[1],p[2]),bot=d(p[2],p[3]),left=d(p[3],p[0]),w=(top+bot)/2,h=(left+right)/2;
+ return {w,h,area:Math.abs(ynPolyArea(p)),asp:h>0?w/h:0,edge:Math.min(top,right,bot,left)/Math.max(top,right,bot,left,1e-6),cx:(p[0].x+p[1].x+p[2].x+p[3].x)/4,cy:(p[0].y+p[1].y+p[2].y+p[3].y)/4,size:Math.max(w,h)};
+}
+function ynQuadHealth(poly,ref){
+ if(!poly||poly.length!==4||!ref||ref.length!==4)return null;
+ const a=ynPolyMetrics(poly),r=ynPolyMetrics(ref);if(!(r.area>1)||!(r.asp>0))return null;
+ const area=a.area/r.area,asp=a.asp/r.asp,why=[];
+ if(!(area>=.4))why.push('小さくつぶれています');else if(!(area<=2.6))why.push('大きく広がっています');
+ if(!(asp>=.55&&asp<=1.8))why.push('縦横の比率が崩れています');
+ if(!(a.edge>=.35))why.push('枠がゆがんでいます');
+ return {weak:why.length>0,why:why.join('・'),area,asp,edge:a.edge,cx:a.cx,cy:a.cy,size:a.size};
+}
+function ynGroupHealthAt(group,time,fr){
+ fr=fr||ynMotionAt(group,time);
+ if(!fr||!fr.ok||fr.fallback||!fr.faces)return null;
+ let worst=null;
+ for(const face of fr.faces){
+  let ref=null,bd=Infinity;for(const a of group.anchors||[]){const f=(a.faces||[]).find(x=>x.id===face.id);if(f&&f.poly&&f.poly.length===4){const d=Math.abs(a.time-time);if(d<bd){bd=d;ref=f.poly}}}
+  const h=ref&&ynQuadHealth(face.poly,ref);if(!h)continue;
+  if(!worst||(h.weak&&!worst.weak)||(h.weak===worst.weak&&h.area<worst.area))worst={...h,faceId:face.id};
+ }
+ return worst;
+}
+// Re-detection hits (face still found in the blurred result) -> attention items.
+function ynRedetGroup(hits,step){
+ const sorted=hits.slice().sort((a,b)=>a.t-b.t),runs=[];
+ for(const h of sorted){const last=runs[runs.length-1];if(last&&h.t-last.end<=step*1.5+1e-6){last.end=h.t;last.n++;last.max=Math.max(last.max,h.score)}else runs.push({start:h.t,end:h.t,n:1,max:h.score})}
+ return runs.map(r=>({type:'seen',sev:(r.n>=2||r.max>=.8)?'high':'mid',start:r.start,end:r.end,focus:(r.start+r.end)/2,label:r.start===r.end?ynClockText(r.start):`${ynClockText(r.start)}〜${ynClockText(r.end)}`,text:`ぼかしをかけた後の映像でも、顔が検出されました（確からしさ ${Math.round(r.max*100)}%）。顔が見えている可能性があります`}));
+}
 function ynPolyArea(p){return p.reduce((a,b,i)=>{const c=p[(i+1)%p.length];return a+b.x*c.y-c.x*b.y},0)/2}
 function ynQuadValid(poly,w,h){
  if(poly?.length!==4||poly.some(p=>!Number.isFinite(p.x)||!Number.isFinite(p.y)||p.x<0||p.y<0||p.x>w||p.y>h)||Math.abs(ynPolyArea(poly))<60)return false;
@@ -1111,10 +1142,12 @@ const ynPointer=(event,expanded,phase)=>{
  }
  const x=Math.min(drag.start.x,pos.x),y=Math.min(drag.start.y,pos.y),w=Math.abs(pos.x-drag.start.x),h=Math.abs(pos.y-drag.start.y);
  if(w<6||h<6){ynSetMessage('小さすぎます。ドラッグして顔を囲んでください。');ynRefresh();return true}
+ {const asp=w/h;if((asp<.6||asp>1.6)&&!confirm(`囲んだ枠が${asp<.6?'縦長':'横長'}です（縦横比 ${asp.toFixed(2)}）。顔らしくない形です。\nこのまま使いますか？（キャンセルで囲み直し）`)){ynSetMessage('囲み直してください。');ynRefresh();return true}}
  const poly=[{x,y},{x:x+w,y},{x:x+w,y:y+h},{x,y:y+h}],selected=ynGroups.current.find(g=>g.id===ynSelected),isPlane=selected?.type==='plane'&&ynCorrect.current!=='newGroup';
  let geometry=selected&&ynGroupGeometry(selected);
  if(isPlane&&!geometry){const pending=selected.anchors.find(a=>Math.abs(a.time-time)<.04);geometry=pending;if(!geometry){ynSetMessage('この位置の写真四隅を先に指定し直してください。');ynRefresh();return true}}
  if(isPlane&&poly.some(p=>!ynInside(geometry.plane,p))){ynSetMessage('写真の内側に顔を囲んでください。写真枠がずれている場合は四隅を再指定してください。');ynRefresh();return true}
+ if(typeof ynCorrect.current==='number'&&selected&&selected.type==='face'&&selected.faces.length&&!selected.pendingFaces&&!selected.faces.some(f=>f.id===ynCorrect.current)){ynSetMessage(`対象${selected.id}には顔${ynCorrect.current}がありません。顔の一覧で、直したい顔を選び直してください。`);ynRefresh();return true}
  ynSaveUndo();ynSetReviewed(false);const pendingId=selected?.pendingFaces&&selected.faces.find(f=>!geometry?.faces.some(v=>v.id===f.id))?.id;const faceId=typeof ynCorrect.current==='number'?ynCorrect.current:pendingId||Math.max(0,...ynGroups.current.flatMap(g=>g.faces.map(f=>f.id)))+1;
  if(isPlane||typeof ynCorrect.current==='number'){
   const group=selected;if(!geometry&&group.type==='face')geometry={plane:ynPadPoly(poly,.45).map(p=>({x:Math.max(0,Math.min(video.videoWidth,p.x)),y:Math.max(0,Math.min(video.videoHeight,p.y))})),faces:[]};if(!geometry){ynSetMessage('この位置の写真四隅を先に指定し直してください。');ynUndo.current.pop();ynRefresh();return true}
@@ -1215,10 +1248,15 @@ const ynStatusLine=()=>ynEdit&&D('div',{className:'yn-mode-status',role:'status'
 // Viewing state never changes anchors, tracking results, time, zoom, or draft points.
 const ynChooseFace=async(groupId,faceId,seek=true)=>{
  if(ynBusy.current)return;const group=ynGroups.current.find(g=>g.id===groupId),face=group?.faces.find(f=>f.id===faceId);if(!face)return;
- ynSetSelected(group.id);ynSetSelectedFace(face.id);
+ ynSetSelected(group.id);ynSetSelectedFace(face.id);if(typeof ynCorrect.current==='number')ynCorrect.current=face.id;
  if(seek)try{n.current.pause();xn(false);await ynSeek(n.current,face.specifiedAt??group.anchors[0]?.time??group.start);Lt(n.current.currentTime)}catch(error){ynSetMessage(error.message)}
  ynSetFaceListOpen(false);ynRefresh();
 };
+E.useEffect(()=>{
+ if(typeof ynCorrect.current!=='number')return;
+ const g=ynGroups.current.find(x=>x.id===ynSelected);if(!g||g.faces.some(f=>f.id===ynCorrect.current))return;
+ const f=g.faces.find(x=>x.id===ynSelectedFace)||g.faces[0];if(f){ynCorrect.current=f.id;ynRefresh()}
+},[ynSelected,ynSelectedFace]);
 const ynRepairSelected=()=>{
  if(ynBusy.current)return;const group=ynGroups.current.find(g=>g.id===ynSelected);if(!group?.faces.length){ynSetMessage('顔の一覧から直したい顔を選んでください。');ynSetFaceListOpen(true);return}
  const time=ynCurrentFrameTime();if(time<group.start-.001||time>group.end+.001){ynSetMessage('この場面はぼかす区間の外です。下の「この場面から／までぼかす」で区間を広げてください。');return}
@@ -1553,7 +1591,7 @@ const ynToggleAutoSelect=E.useCallback((id)=>{
     return next;
   });
 },[]);
-const ynRecordDeleted=(removed,label)=>{if(!removed.length)return;const st=ynDeletedStack.current;st.push({tracks:removed,label});if(st.length>10)st.shift();ynSetUndoCount(st.length);for(const tr of removed){const h=tr.history||[];let t0=Infinity,t1=-Infinity,mx=0;for(const f of h){const t=f.time||0;if(t<t0)t0=t;if(t>t1)t1=t;if((f.score||0)>mx)mx=f.score||0}ynTruthDeleted.current.push({id:tr.id,t0:isFinite(t0)?t0:0,t1:isFinite(t1)?t1:0,n:h.length,maxScore:mx,label})}ynSetTruthTick(v=>v+1)};
+const ynRecordDeleted=(removed,label)=>{if(!removed.length)return;const st=ynDeletedStack.current;st.push({tracks:removed,label});if(st.length>10)st.shift();ynSetUndoCount(st.length);for(const tr of removed){const h=tr.history||[];let t0=Infinity,t1=-Infinity,mx=0;for(const f of h){const t=f.time||0;if(t<t0)t0=t;if(t>t1)t1=t;if((f.score||0)>mx)mx=f.score||0}ynTruthDeleted.current.push({id:tr.id,t0:isFinite(t0)?t0:0,t1:isFinite(t1)?t1:0,n:h.length,maxScore:mx,label,samples:h.map(f=>{const q=v=>Math.round((v||0)*10)/10;return [Math.round((f.time||0)*1000)/1000,q(f.x),q(f.y),q(f.w),q(f.h),Math.round((f.score||0)*1000)/1000,...(f.landmarks||[]).slice(0,6).flatMap(l=>[q(l.x),q(l.y)])]})})}ynSetTruthTick(v=>v+1)};
 const ynUndoDelete=()=>{
   const st=ynDeletedStack.current,last=st.pop();if(!last)return;
   {const ids=new Set(last.tracks.map(t=>t.id));ynTruthDeleted.current=ynTruthDeleted.current.filter(e=>!ids.has(e.id));ynSetTruthTick(v=>v+1)}
@@ -1695,6 +1733,37 @@ const ynLeakRun=()=>{
     ynSetLeak({ut:Ut,list,note:''});
   }catch(error){ynSetLeak({ut:Ut,list:[],note:'チェックに失敗しました: '+(error&&error.message||error)})}
 };
+const ynRedetRun=async()=>{
+  const video=n.current;if(!Ln||!video||ynBusy.current)return;
+  if(!(eu||lu)){ynSetRedet({run:false,pct:0,msg:'顔検出AIがまだ使えません。上部の読込状態を確認してください。'});return}
+  if(!ynHasEdits()){ynSetRedet({run:false,pct:0,msg:'ぼかしがまだありません。先に顔を隠してください。'});return}
+  if(video.readyState<2||!video.videoWidth||!Number.isFinite(video.duration)||video.duration<=0){ynSetRedet({run:false,pct:0,msg:'動画の読込が終わってから実行してください。'});return}
+  ynBusy.current=true;ynCancel.current=false;const session=++ynSession.current,orig=video.currentTime,stCfg=ynStampRef.current,stampWas=stCfg.on;
+  const vw=video.videoWidth,vh=video.videoHeight,fps=Math.min(4,Math.max(1,ynFPS)),times=ynSampleTimes(video.duration,fps),scale=Math.min(1,960/Math.max(vw,vh)),hits=[],thr=Math.max(ve,.6);
+  video.pause();xn(false);ynSetRedet({run:true,pct:0,msg:'仕上がりを再検出中…'});
+  let msg='';
+  try{
+    stCfg.on=false;
+    for(let i=0;i<times.length;i++){
+      if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。');
+      const tm=times[i];await ynSeek(video,tm);
+      const out=li(vw,vh,tm,video,null,false,null);if(!out)continue;
+      const rc=document.createElement('canvas');rc.width=Math.max(64,Math.round(vw*scale));rc.height=Math.max(64,Math.round(vh*scale));const rx=rc.getContext('2d');if(!rx)continue;rx.drawImage(out,0,0,rc.width,rc.height);
+      const found=Kl(await Bl(rc,tm,0,0,{sx:rc.width/vw,sy:rc.height/vh,x:0,y:0},'redetect'),vw,vh,rc,rc,thr);
+      for(const f of found)hits.push({t:tm,score:f.score,box:{x:f.x,y:f.y,w:f.w,h:f.h}});
+      const pct=Math.round((i+1)/times.length*100);ynSetRedet({run:true,pct,msg:`仕上がりを再検出中… ${pct}%`});
+      await new Promise(r=>setTimeout(r,0));
+    }
+    const items=ynRedetGroup(hits,1/fps),base=(ynLeak&&ynLeak.ut===Ut&&Array.isArray(ynLeak.list)?ynLeak.list.filter(x=>x.type!=='seen'):[]);
+    ynSetLeak({ut:Ut,list:[...base,...items].sort((x,y)=>x.focus-y.focus),note:''});
+    msg=items.length?`再検出で、顔が見える可能性のある場面が${items.length}か所見つかりました。下の一覧から確認してください。`:'✓ ぼかしをかけた後の映像から、顔は検出されませんでした。';
+  }catch(error){msg=(error&&error.message)||'再検出に失敗しました。'}
+  finally{
+    stCfg.on=stampWas;ynBusy.current=false;
+    try{await ynSeek(video,orig);Lt(orig)}catch{}
+    ynLastPreview.current=null;b(v=>v+1);bn.current?.();ynSetRedet({run:false,pct:0,msg});
+  }
+};
 const ynLeakJump=item=>{
   const video=n.current;if(!Ln||!video||ynBusy.current)return;
   video.pause();xn(false);const t=m(Math.max(0,Math.min(item.focus,(video.duration||item.focus)-.04)));
@@ -1739,7 +1808,7 @@ E.useEffect(()=>{
   }catch{}})();
   return()=>{dead=true};
 },[]);
-const ynMiniGeo=E.useRef(null),ynMiniDrag=E.useRef(null),ynMiniRaf=E.useRef(0),[ynStampTab,ynSetStampTab]=E.useState('pos'),[ynMiniOrig,ynSetMiniOrig]=E.useState(false),ynFixUndo=E.useRef([]),ynFixTimer=E.useRef(null),[ynFixScope,ynSetFixScope]=E.useState('scene'),[ynFixTick,ynSetFixTick]=E.useState(0),[ynFixMsg,ynSetFixMsg]=E.useState(''),ynMiniRef=E.useRef(null),ynMiniHold=E.useRef(false),[ynMiniKey,ynSetMiniKey]=E.useState(null),[ynFixSheet,ynSetFixSheet]=E.useState(false),[ynFixOnly,ynSetFixOnly]=E.useState(false),[ynMiniInfo,ynSetMiniInfo]=E.useState({label:'',note:'',count:0});
+const ynMiniGeo=E.useRef(null),ynMiniDrag=E.useRef(null),ynMiniRaf=E.useRef(0),[ynStampTab,ynSetStampTab]=E.useState('pos'),[ynMiniOrig,ynSetMiniOrig]=E.useState(false),ynFixUndo=E.useRef([]),ynFixTimer=E.useRef(null),[ynFixScope,ynSetFixScope]=E.useState('scene'),[ynFixTick,ynSetFixTick]=E.useState(0),[ynFixMsg,ynSetFixMsg]=E.useState(''),ynMiniRef=E.useRef(null),ynMiniHold=E.useRef(false),[ynMiniKey,ynSetMiniKey]=E.useState(null),[ynFixSheet,ynSetFixSheet]=E.useState(false),[ynRedet,ynSetRedet]=E.useState({run:false,pct:0,msg:''}),[ynFixOnly,ynSetFixOnly]=E.useState(false),[ynMiniInfo,ynSetMiniInfo]=E.useState({label:'',note:'',count:0});
 // Faces the mini preview can show = the faces that are drawn at this time (auto IDs unless manual specs make them exclusive, plus manual faces), each with a stable key.
 const ynStampTargets=()=>{
   const video=n.current;if(!video||!video.videoWidth)return [];
@@ -1748,14 +1817,15 @@ const ynStampTargets=()=>{
   const manual=[];
   if(nn==='track')for(const g of ynGroups.current){try{const raw=ynMotionAt(g,time);if(!raw||!raw.ok||raw.fallback||!raw.faces)continue;const fr=ynGroupFrameFx(g,time,ynFaceFix.current,ynCuts.current);raw.faces.forEach((rf,i)=>{const rb=ynFaceBoxFromPoly(rf.poly),cf=fr.faces[i]||rf,cb=cf.box||rb;manual.push({w:cb.w,h:cb.h,gid:g.id,fid:rf.id,rawBox:{x:rb.x,y:rb.y,w:rb.w,h:rb.h},box:{x:cb.x,y:cb.y,w:cb.w,h:cb.h,ang:cf.ang}})})}catch{}}
   const autoT=(f,label)=>{const rw=f.trackId!=null?rawById.get(f.trackId):null;return {kind:'a',key:'a:'+(f.trackId==null?'-'+Math.round(f.x)+'_'+Math.round(f.y):f.trackId),rawBox:rw?{x:rw.x,y:rw.y,w:rw.w,h:rw.h}:null,box:{x:f.x,y:f.y,w:f.w,h:f.h,landmarks:f.landmarks,ang:f.ang,src:f.src},time,label,trackId:f.trackId==null?null:f.trackId,manual:false}};
-  const manT=(m,label)=>({kind:'m',key:'g:'+m.gid+':'+m.fid,gkey:'g:'+m.gid+':'+m.fid,rawBox:m.rawBox,box:m.box,time,label,trackId:null,manual:true});
-  const push=t=>{if(!(t.box.w>1)||!(t.box.h>1))return;if(out.some(o=>o.kind===t.kind&&(o.key===t.key||ynSameFace(o.box,t.box))))return;out.push(t)};
+  const manT=(m,label)=>({kind:'m',gid:m.gid,fid:m.fid,key:'g:'+m.gid+':'+m.fid,gkey:'g:'+m.gid+':'+m.fid,rawBox:m.rawBox,box:m.box,time,label,trackId:null,manual:true});
+  const push=t=>{if(!(t.box.w>1)||!(t.box.h>1))return;if(out.some(o=>o.key===t.key||(t.kind==='a'&&o.kind==='a'&&ynSameFace(o.box,t.box))))return;out.push(t)};
   const mlabel=m=>`指定した顔${m.fid}${ynGroups.current.length>1?`（対象${m.gid}）`:''}`;
   if(ynSelectedAutoIds.size)for(const f of faces)if(f.trackId!=null&&ynSelectedAutoIds.has(f.trackId))push(autoT(f,`選択したID:${f.trackId}`));
   const selFirst=manual.find(m=>m.gid===ynSelected&&m.fid===ynSelectedFace)||manual.find(m=>m.gid===ynSelected);
   if(selFirst)push(manT(selFirst,mlabel(selFirst)));
   [...faces.map(f=>({a:f,w:f.w,h:f.h})),...manual.map(m=>({m,w:m.w,h:m.h}))].sort((x,y)=>area(y)-area(x)).forEach((p,i)=>{if(p.a)push(autoT(p.a,i===0&&!out.length?'いちばん大きい顔（自動）':`ID:${p.a.trackId==null?'-':p.a.trackId}（自動）`));else push(manT(p.m,mlabel(p.m)))});
-  for(const t of out){const o=out.find(q=>q.kind!==t.kind&&ynSameFace(q.box,t.box));if(o&&!t.label.includes('重なって'))t.label+=o.kind==='a'?`（ID:${o.trackId}と重なっています）`:'（指定した顔と重なっています）'}
+  for(const t of out){t.base=t.label;t.ov=out.filter(q=>q!==t&&ynSameFace(q.box,t.box)).map(q=>({key:q.key,kind:q.kind,gid:q.gid,label:q.label}))}
+  for(const t of out)if(t.ov.length)t.label=`${t.base}（${t.ov.map(o=>o.label.replace(/（.*$/,'')).join('・')}と重なっています）`;
   return out;
 };
 const ynMiniDraw=()=>{
@@ -1787,6 +1857,7 @@ const ynMiniDraw=()=>{
     const inside=(q,ang)=>{const dx=q.x-cx0,dy=q.y-cy0,c=Math.cos(ang),sn=Math.sin(ang),u=dx*c+dy*sn,v=-dx*sn+dy*c;return Math.pow(Math.abs(u)/rx,YN_SHAPE_N)+Math.pow(Math.abs(v)/ry,YN_SHAPE_N)<=1};
     let n6=0;for(let i=0;i<6;i++){const q=lms[i];if(!q)continue;const ok=manualAng?(inside(q,tg.box.ang)||(ynStampRef.current.shape!=='rot'&&inside(q,0))):inside(q,0);if(ok)n6++}
     cover=`目・鼻・口・耳 ${n6}/6点が範囲内${n6<6?'（⚠ 顔が出ているかもしれません）':''}`}}
+  if(tg.gkey){try{const grp=ynGroups.current.find(x=>x.id===tg.gid),hh=grp&&ynGroupHealthAt(grp,tg.time);if(hh&&hh.weak)cover=`⚠ 追従の枠が怪しい: ${hh.why}（指定したときの${Math.round(hh.area*100)}%）。「この顔の追従をやり直す」がおすすめです`}catch{}}
   const st=ynStampRef.current,img=ynStampImg.current;
   if(st.on&&img){const iw=img.width||img.naturalWidth,ih=img.height||img.naturalHeight;if(iw&&ih){const pb=tg.box,pf=Math.max(pb.w,pb.h)*(1+2*pad),kk=pf*Math.max(1,st.scale)/Math.max(iw,ih),dw=iw*kk*k,dh=ih*kk*k,lift=(st.dy||0)*pf*k;ctx.save();ctx.translate(X(pb.x+pb.w/2),Y(pb.y+pb.h/2));ctx.rotate(pb.ang!==undefined?pb.ang:ynFaceAngle(pb));ctx.strokeStyle='#22d3ee';ctx.lineWidth=1.5;ctx.setLineDash([6,4]);ctx.strokeRect(-dw/2,-dh/2-lift,dw,dh);ctx.restore()}}
   let note='';
@@ -1894,16 +1965,16 @@ const ynFixSceneGo=dir=>{
 };
 const ynFixHold=(fn)=>({onPointerDown:e=>{e.preventDefault();fn();clearTimeout(ynFixTimer.current);ynFixTimer.current=setTimeout(function loop(){fn();ynFixTimer.current=setTimeout(loop,140)},380)},onPointerUp:()=>clearTimeout(ynFixTimer.current),onPointerCancel:()=>clearTimeout(ynFixTimer.current),onPointerLeave:()=>clearTimeout(ynFixTimer.current),onContextMenu:e=>e.preventDefault(),onKeyDown:e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();fn()}}});
 const ynTlRef1=E.useRef(null),ynTlRef2=E.useRef(null),ynTlRef3=E.useRef(null),ynTlDrag=E.useRef(null),[ynTlNavOn,ynSetTlNavOn]=E.useState(false),[ynTruthTick,ynSetTruthTick]=E.useState(0);
-const ynTlLabels={ok:'検出あり（検出の間は補間）',gap:'検出が抜けた区間を補間',hold:'予測だけで隠している区間',lost:'追従を見失った区間',none:'顔が見つかっていない区間'};
-const ynTlColors={none:'#d6dfd7',ok:'#34a853',gap:'#f2c94c',hold:'#f2994a',lost:'#d9534f'};
+const ynTlLabels={ok:'検出あり（検出の間は補間）',gap:'検出が抜けた区間を補間',hold:'予測だけで隠している区間',weak:'追従の枠が怪しい区間（顔の形から外れています）',lost:'追従を見失った区間',none:'顔が見つかっていない区間'};
+const ynTlColors={none:'#d6dfd7',ok:'#34a853',gap:'#f2c94c',hold:'#f2994a',weak:'#e4572e',lost:'#d9534f'};
 const ynTl=E.useMemo(()=>{
   const video=n.current,dur=Number.isFinite(video?.duration)&&video.duration>0?video.duration:Dn;
   if(!Ln||!(dur>0))return null;
-  const N=Math.max(20,Math.min(600,Math.ceil(dur/.05))),bin=dur/N,step=ynStep.current||.25,rank={none:0,ok:1,gap:2,hold:3,lost:4},cells=new Array(N);
+  const N=Math.max(20,Math.min(600,Math.ceil(dur/.05))),bin=dur/N,step=ynStep.current||.25,rank={none:0,ok:1,gap:2,hold:3,weak:3.5,lost:4},cells=new Array(N);
   const sample=t=>{
     let worst='none',faces=[];try{faces=nc(t).faces||[]}catch{}
     for(const f of faces){let st='ok';if(f.src==='hold'||f.src==='hold-back')st='hold';else if(f.src==='interp'&&f.gap>step*1.25)st='gap';if(rank[st]>rank[worst])worst=st}
-    if(nn==='track')for(const g of ynGroups.current){try{const fr=ynMotionAt(g,t);if(fr===null||fr===undefined)continue;if(!fr.ok)return 'lost';if(rank.ok>rank[worst])worst='ok'}catch{}}
+    if(nn==='track')for(const g of ynGroups.current){try{const fr=ynMotionAt(g,t);if(fr===null||fr===undefined)continue;if(!fr.ok)return 'lost';const hh=ynGroupHealthAt(g,t,fr);if(hh&&hh.weak&&rank.weak>rank[worst])worst='weak';else if(rank.ok>rank[worst])worst='ok'}catch{}}
     return worst;
   };
   const per=bin>.2?3:1;
@@ -1915,7 +1986,7 @@ const ynTl=E.useMemo(()=>{
   for(let i=0;i<N;i++){if(rank[cells[i]]>=2){if(cur&&rank[cells[i]]>rank[cur.worst])cur.worst=cells[i];if(!cur)cur={i0:i,worst:cells[i]};cur.i1=i}else if(cur){runs.push(cur);cur=null}}
   if(cur)runs.push(cur);
   for(const r of runs){r.t0=r.i0*bin;r.t1=(r.i1+1)*bin}
-  const counts={gap:0,hold:0,lost:0};for(const r of runs)counts[r.worst]++;
+  const counts={gap:0,hold:0,lost:0,weak:0};for(const r of runs)counts[r.worst]++;
   return {dur,N,bin,cells,fix,paint,runs,counts,cuts:[...ynCuts.current]};
 },[Ln,Dn,Ut,J,ynFixTick,nn,nc]);
 const ynTlDraw=(cv,tl)=>{
@@ -1945,7 +2016,7 @@ const ynTlStripEl=ref=>{
 };
 const ynTimelineStrip=(ref,withNav)=>{
   const tl=ynTl,dur=tl?tl.dur:0,idx=tl?Math.min(tl.N-1,Math.max(0,Math.floor(an/dur*tl.N))):0,cur=tl?tl.cells[idx]:'none';
-  const sum=tl?(tl.runs.length?`注意区間 ${tl.runs.length}か所（赤${tl.counts.lost}・橙${tl.counts.hold}・黄${tl.counts.gap}）`:'注意区間はありません'):'';
+  const sum=tl?(tl.runs.length?`注意区間 ${tl.runs.length}か所（赤${tl.counts.lost}・橙${tl.counts.hold+tl.counts.weak}・黄${tl.counts.gap}）`:'注意区間はありません'):'';
   return G('div',{className:'yn-tl-wrap',children:[
     ynTlStripEl(ref),
     G('div',{className:'yn-tl-now',children:[D('span',{children:`いまの位置 ${ynClockText(an)}: ${ynTlLabels[cur]}`}),sum&&D('span',{className:'yn-tl-sum',children:sum})]}),
@@ -1977,9 +2048,19 @@ const ynTruthBuild=()=>{
   const video=n.current,key=ynFileKey.current||'|',name=key.slice(0,key.lastIndexOf('|')),r1=v=>Math.round(v*10)/10,r3=v=>Math.round(v*1000)/1000;
   const tracks=Ut.map(tr=>{const h=ynSortedHist(tr),ev=ynIdEvidence([tr]);return {id:tr.id,scene:tr.scene,evidence:{n:ev.n,dur:r3(ev.dur),maxScore:r3(ev.maxScore),landmarks:ev.lm,cls:ev.cls},samples:h.map(f=>[r3(f.time||0),r1(f.x),r1(f.y),r1(f.w),r1(f.h),r3(f.score||0),...(f.landmarks||[]).slice(0,6).flatMap(q=>[r1(q.x),r1(q.y)])])}});
   const manual=[];for(const g of ynGroups.current)for(const a of g.anchors||[])for(const f of a.faces||[]){if(!f.poly)continue;const bx=ynFaceBoxFromPoly(f.poly);manual.push({group:g.id,face:f.id,time:r3(a.time),box:[r1(bx.x),r1(bx.y),r1(bx.w),r1(bx.h)]})}
-  return {format:'bokasi-truth',version:1,exportedAt:new Date().toISOString(),video:{name,duration:r3(video?.duration||0),width:video?.videoWidth||0,height:video?.videoHeight||0},
+  const ynGroupsOut=ynGroups.current.map(g=>{
+    const rows=[],weak=[];let cur=null;const frames=g.frames||[],stride=Math.max(1,Math.ceil(frames.length/800));
+    frames.forEach((f,i)=>{
+      const t=r3(f.time||0);let h=null;try{h=ynGroupHealthAt(g,f.time,f)}catch{}
+      if(i%stride===0||!f.ok)rows.push(h?[t,1,f.estimated?1:0,0,r3(h.area),r3(h.asp),r3(h.edge),r1(h.cx),r1(h.cy),r1(h.size)]:[t,f.ok?1:0,f.estimated?1:0,f.fallback?1:0]);
+      if(h&&h.weak){if(cur&&t-cur.t1<=2.5/(g.fps||30)+.001){cur.t1=t;cur.minArea=Math.min(cur.minArea,r3(h.area))}else{cur={group:g.id,face:h.faceId,t0:t,t1:t,why:h.why,minArea:r3(h.area)};weak.push(cur)}}
+    });
+    return {id:g.id,type:g.type,start:r3(g.start),end:r3(g.end),fps:g.fps,anchors:(g.anchors||[]).map(a=>({t:r3(a.time),faces:(a.faces||[]).map(f=>({id:f.id,box:f.poly&&f.poly.length>2?(()=>{const b0=ynFaceBoxFromPoly(f.poly);return [r1(b0.x),r1(b0.y),r1(b0.w),r1(b0.h)]})():null}))})),rowFormat:'[t,ok,estimated,fallback,areaRatio,aspectRatio,edge,cx,cy,size]',frames:rows,weakRuns:weak};
+  });
+  return {format:'bokasi-truth',version:2,exportedAt:new Date().toISOString(),video:{name,duration:r3(video?.duration||0),width:video?.videoWidth||0,height:video?.videoHeight||0},
     detect:{fps:ynFPS,step:ynStep.current,padding:ynPadding,cuts:[...ynCuts.current].map(r3)},tracks,
     truth:{corrections:ynBoxFix.current.map(r=>({t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot})),faceCorrections:Object.entries(ynFaceFix.current).flatMap(([k,arr])=>arr.map(r=>({key:k,t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot}))),manualFaces:manual,deletedTracks:ynTruthDeleted.current.map(d=>({...d,t0:r3(d.t0),t1:r3(d.t1),maxScore:r3(d.maxScore)})),keptTrackIds:[...ynKeptIds.current]},
+    groups:ynGroupsOut,
     metrics:ynTruthReport};
 };
 const ynTruthDownload=()=>{
@@ -2001,7 +2082,7 @@ const ynTimelineCard=()=>{
   return G('div',{className:'yn-tl',children:[
     D('strong',{className:'yn-tl-title',children:'隠れ具合のタイムライン'}),
     ynTimelineStrip(ynTlRef1,'open'),
-    G('div',{className:'yn-tl-legend',children:[['ok','検出あり'],['gap','検出が抜けた補間'],['hold','予測のみ'],['lost','見失い'],['none','顔なし']].map(([c,l])=>G('span',{children:[D('i',{style:{background:ynTlColors[c]}}),l]},c)).concat([G('span',{children:[D('i',{style:{background:'#3b82f6'}}),'補正済み']},'fx'),G('span',{children:[D('i',{style:{background:'#8b5cf6'}}),'塗りあり']},'pt'),G('span',{children:[D('i',{style:{background:'#263a33'}}),'場面の切れ目']},'ct')])}),
+    G('div',{className:'yn-tl-legend',children:[['ok','検出あり'],['gap','検出が抜けた補間'],['hold','予測のみ'],['weak','追従が怪しい'],['lost','見失い'],['none','顔なし']].map(([c,l])=>G('span',{children:[D('i',{style:{background:ynTlColors[c]}}),l]},c)).concat([G('span',{children:[D('i',{style:{background:'#3b82f6'}}),'補正済み']},'fx'),G('span',{children:[D('i',{style:{background:'#8b5cf6'}}),'塗りあり']},'pt'),G('span',{children:[D('i',{style:{background:'#263a33'}}),'場面の切れ目']},'ct')])}),
     ynFixMsg&&D('span',{className:'yn-tl-sum',role:'status',children:ynFixMsg}),
     G('details',{className:'yn-tl-report',children:[D('summary',{children:'精度のようす（あなたの修正から計算）'}),
       lines.length?D('div',{className:'yn-tl-lines',children:lines.map((t,i)=>D('p',{children:t},i))}):D('p',{className:'yn-tl-lines',children:'まだ修正がありません。顔を囲む、枠を補正する、IDを削除するなどすると、ここに精度の数字が出ます。'}),
@@ -2079,6 +2160,22 @@ const ynStampCard=()=>{
     tab==='pos'&&st.hasImg&&posTab,tab==='img'&&imgTab,tab==='adv'&&st.hasImg&&advTab
   ]});
 };
+const ynFixCopyToOverlaps=()=>{
+  const tg=ynFixTarget();if(!tg||!tg.ov||!tg.ov.length)return;
+  const key=ynFixKeyOf(tg),cur=ynFixAt(ynFixGet(key),tg.time);
+  if(!cur){ynSetFixMsg('この顔に、写せる補正がありません。先に位置を直してください');return}
+  const [t0,t1]=ynFixRange();ynFixPush();
+  for(const o of tg.ov)ynFixPut(o.key,ynFixAssign(ynFixGet(o.key),t0,t1,cur.dx,cur.dy,cur.rot));
+  ynSetFixMsg(`重なっている${tg.ov.length}つの枠に、同じ補正を写しました（「ひとつ戻す」で戻せます）`);ynFixRefresh();
+};
+const ynMergeGroup=gid=>{
+  if(ynBusy.current)return;const g=ynGroups.current.find(x=>x.id===gid);if(!g)return;
+  if(!confirm(`対象${gid}を削除して、重なっている枠をまとめます。（「元に戻す」で戻せます）`))return;
+  ynSaveUndo();ynGroups.current=ynGroups.current.filter(x=>x.id!==gid);
+  const o={...ynFaceFix.current};for(const k of Object.keys(o))if(k.startsWith('g:'+gid+':'))delete o[k];ynFaceFix.current=o;
+  if(ynSelected===gid){const f=ynGroups.current[0];ynSetSelected(f?f.id:0);ynSetSelectedFace(f&&f.faces[0]?f.faces[0].id:0)}
+  ynSetMiniKey(null);ynIssuesRefresh();ynSetFixMsg(`対象${gid}を削除しました。`);ynFixRefresh();
+};
 const ynOpenFixSheet=()=>{if(ynBusy.current)return;n.current?.pause();xn(false);ynSetMiniKey(null);ynSetMiniOrig(false);ynSetFixSheet(true)};
 const ynFixSheetEl=()=>{
   const info=ynMiniInfo,none=info.count===0,hasGroups=ynGroups.current.length>0,tg=ynFixTarget(),close=()=>ynSetFixSheet(false);
@@ -2091,6 +2188,10 @@ const ynFixSheetEl=()=>{
       G('div',{className:'yn-fix-sheet-actions',children:[btn('＋ 顔を追加（ここで囲む）',()=>{close();ynFlowAction('add')}),hasGroups&&btn('位置を指定し直す（追従をやり直す）',()=>{close();ynRepairSelected()})]})
     ]}),
     !none&&ynStampFix(true),
+    !none&&tg&&tg.ov&&tg.ov.length>0&&G('div',{className:'yn-fix-sheet-none',role:'status',children:[
+      D('p',{children:`この顔は、ほかの枠と重なっています（${tg.ov.map(o=>o.label.replace(/（.*$/,'')).join('・')}）。同じ顔に枠が重複している可能性があります。`}),
+      G('div',{className:'yn-fix-sheet-actions',children:[btn('同じ補正を重なる枠にも写す',ynFixCopyToOverlaps),...tg.ov.filter(o=>o.kind==='m').map(o=>btn(`重なる対象${o.gid}を削除（まとめる）`,()=>ynMergeGroup(o.gid)))]})
+    ]}),
     !none&&tg&&tg.gkey&&D('details',{className:'yn-fix-more',children:[D('summary',{children:'この顔の追従をやり直す'}),D('p',{className:'yn-stamp-fix-range',children:'手動で追加した顔を囲み直して、追従をやり直します。時間がかかる場合があります。'}),btn('位置を指定し直す',()=>{const p=tg.gkey.split(':');close();ynSetSelected(Number(p[1]));ynSetSelectedFace(Number(p[2]));ynEditing('face',Number(p[2]))})]})
   ]});
 };
@@ -2128,7 +2229,10 @@ const ynLeakNav=()=>{
 const ynLeakCard=()=>{
   const res=ynLeak,fresh=!!res&&res.ut===Ut,high=fresh?res.list.filter(x=>x.sev==='high').length:0,mid=fresh?res.list.length-high:0,todo=fresh?res.list.filter(x=>!x.done).length:0;
   return G('div',{className:'yn-leak',children:[
-    D('button',{className:'yn-button yn-leak-run',disabled:!Ln||Gs||js||ynSingleBusy,onClick:ynLeakRun,children:'🔍 隠し漏れをチェック（書き出し前）'}),
+    D('button',{className:'yn-button yn-leak-run',disabled:!Ln||Gs||js||ynSingleBusy||ynRedet.run,onClick:ynLeakRun,children:'🔍 隠し漏れをチェック（書き出し前）'}),
+    D('button',{className:'yn-button yn-leak-run',disabled:!Ln||Gs||js||ynSingleBusy||ynRedet.run,onClick:ynRedetRun,children:'🔎 仕上がりを再検出して確認（時間がかかります）'}),
+    ynRedet.run&&G('div',{className:'yn-leak-note',role:'status',children:[D('span',{children:ynRedet.msg+' '}),D('button',{className:'yn-button',onClick:()=>{ynCancel.current=true},children:'やめる'})]}),
+    !ynRedet.run&&ynRedet.msg&&D('p',{className:'yn-leak-note',role:'status',children:ynRedet.msg}),
     res&&G('div',{className:'yn-leak-body',role:'status',children:[
       !fresh&&D('p',{className:'yn-leak-note',children:'顔の一覧が変わりました。もう一度チェックしてください。'}),
       fresh&&res.note&&D('p',{className:'yn-leak-note',children:res.note}),
