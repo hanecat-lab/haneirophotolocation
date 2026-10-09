@@ -1081,9 +1081,48 @@ function ynFixSmooth(arr,time,cuts,ramp){
  return out;
 }
 // The single entry that turns a stored correction into the value used for drawing (mask, stamp, export, timeline).
-// Today a stored correction is a list of time ranges; other formats are added here only.
-function ynFixValue(v,time,cuts){if(!v)return null;if(Array.isArray(v))return v.length?ynFixSmooth(v,time,cuts,.2):null;return null}
-function ynFixHas(v,time){if(!v)return false;if(Array.isArray(v))return !!ynFixAt(v,time);return false}
+// A stored correction is either a list of time ranges (older edits) or correction points {kf:[{t,dx,dy,rot?,step?}]} sorted by time.
+function ynFixValue(v,time,cuts){if(!v)return null;if(Array.isArray(v))return v.length?ynFixSmooth(v,time,cuts,.2):null;if(Array.isArray(v.kf))return ynKfEval(v.kf,time,cuts);return null}
+function ynFixHas(v,time,cuts){if(!v)return false;if(Array.isArray(v))return !!ynFixAt(v,time);if(Array.isArray(v.kf)){const x=ynKfEval(v.kf,time,cuts);return !!x&&(!!x.dx||!!x.dy||x.rot!==undefined)}return false}
+// Number of stored ranges or points. A correction is edited the older way (ranges) only while it still holds ranges.
+function ynFixN(v){return Array.isArray(v)?v.length:v&&Array.isArray(v.kf)?v.kf.length:0}
+function ynFixIsRange(v){return Array.isArray(v)&&v.length>0}
+// Correction points: a straight line between two points of the same scene (a "step" point switches to its value at its time instead),
+// the first/last value holds to the scene edges, and a scene without points keeps the value of the nearest point. Never interpolates across a cut.
+function ynKfPick(p,time){
+ const a0=p[0],aN=p[p.length-1];let a=a0,b=null;
+ if(time>=aN.t)a=aN;else if(time>a0.t){let lo=0,hi=p.length-1;while(hi-lo>1){const m=(lo+hi)>>1;if(p[m].t<=time)lo=m;else hi=m}a=p[lo];b=p[hi]}
+ if(!b||b.step||b.t<=a.t){const o={dx:a.dx,dy:a.dy};if(a.rot!==undefined)o.rot=a.rot;return o}
+ const w=(time-a.t)/(b.t-a.t),mix=(x,y)=>x+(y-x)*w,o={dx:mix(a.dx,b.dx),dy:mix(a.dy,b.dy)};
+ if(a.rot!==undefined||b.rot!==undefined)o.rot=mix(a.rot||0,b.rot||0);
+ return o;
+}
+function ynKfEval(p,time,cuts){
+ if(!p.length)return null;
+ let s0=0,s1=1e9;for(const c of cuts||[]){if(!(c>0))continue;if(c<=time+1e-6){if(c>s0)s0=c}else if(c<s1)s1=c}
+ const inS=p.filter(q=>q.t+1e-6>=s0&&q.t+1e-6<s1);if(inS.length)return ynKfPick(inS,time);
+ let best=p[0],bd=Infinity;for(const q of p){const d=q.t<s0?s0-q.t:q.t-s1;if(d<bd){bd=d;best=q}}
+ return ynKfPick([best],time);
+}
+// Put or update the point of this frame (points closer than half a frame are the same point); `patch` holds dx, dy, rot, step.
+function ynKfSet(v,time,patch){
+ const p=v&&Array.isArray(v.kf)?v.kf.slice():[],i=p.findIndex(q=>Math.abs(q.t-time)<.02),q=i>=0?{...p[i],...patch}:{t:Math.round(time*1000)/1000,dx:0,dy:0,...patch};
+ if(q.rot===undefined)delete q.rot;if(!q.step)delete q.step;if(i>=0)p[i]=q;else p.push(q);
+ p.sort((a,b)=>a.t-b.t);return {kf:p};
+}
+function ynKfAt(v,time){const p=v&&Array.isArray(v.kf)?v.kf:[];return p.find(q=>Math.abs(q.t-time)<.02)||null}
+function ynKfDel(v,time){return {kf:(v&&Array.isArray(v.kf)?v.kf:[]).filter(q=>Math.abs(q.t-time)>=.02)}}
+// Older range corrections as points that draw the same: a range edge's 0.2 s easing becomes two points, a gap becomes zero, each scene starts with a point.
+function ynFixToKf(arr,cuts){
+ if(!ynFixIsRange(arr))return {kf:[]};
+ const cs=(cuts||[]).filter(c=>c>1e-6&&c<1e8),isCut=t=>cs.some(c=>Math.abs(c-t)<.02),starts=[0,...cs],pts=[],Z={dx:0,dy:0};
+ const add=(t,v,step)=>{t=Math.round(t*1000)/1000;if(pts.some(q=>Math.abs(q.t-t)<1e-6))return;const q={t,dx:v.dx,dy:v.dy};if(v.rot!==undefined)q.rot=v.rot;if(step)q.step=true;pts.push(q)};
+ for(const s of starts)add(s,ynFixSmooth(arr,s,cs,.2)||Z,true);
+ for(const r of arr)for(const t of [r.t0,r.t1]){if(t<=1e-6||t>=1e8||isCut(t))continue;if(!starts.some(s=>s>t-.1&&s<=t))add(t-.1,ynFixAt(arr,t-.001)||Z,true);add(t+.1,ynFixAt(arr,t+.001)||Z,false)}
+ pts.sort((a,b)=>a.t-b.t);return {kf:pts};
+}
+// Points as ranges (each point's value until the next point), for the summary metrics only.
+function ynFixAsRanges(v){if(Array.isArray(v))return v;const p=v&&Array.isArray(v.kf)?v.kf:[];return p.map((q,i)=>({t0:i?q.t:0,t1:i<p.length-1?p[i+1].t:1e9,dx:q.dx,dy:q.dy,rot:q.rot})).filter(r=>r.dx||r.dy||r.rot!==undefined)}
 // Same correction for a manually specified face (4-point polygon): shift in the head frame, optional rotation about its centre.
 function ynFixPoly(poly,fix){
  const b=ynFaceBoxFromPoly(poly),size=Math.max(b.w,b.h),manual=fix.rot!==undefined,a=manual?Math.max(-Math.PI/2,Math.min(Math.PI/2,fix.rot*Math.PI/180)):0,c=Math.cos(a),sn=Math.sin(a),X=(fix.dx*c+fix.dy*sn)*size,Y=(fix.dx*sn-fix.dy*c)*size;
@@ -1257,7 +1296,7 @@ const ynPointer=(event,expanded,phase)=>{
  }else{
   const id=Math.max(0,...ynGroups.current.map(g=>g.id))+1,plane=ynPadPoly(poly,.45).map(p=>({x:Math.max(0,Math.min(video.videoWidth,p.x)),y:Math.max(0,Math.min(video.videoHeight,p.y))})),start=Math.max(0,time);
   ynGroups.current.push({id,type:'face',faces:[{id:faceId,poly,thumbnail:ynFaceThumbnail(poly),specifiedAt:time}],anchors:[{time,plane,faces:[{id:faceId,poly}]}],frames:[],start,end:Math.max(start,video.duration-.001),fps:ynMotionFPS,revision:1,dirty:{from:start,to:video.duration-.001}});ynSetSelected(id);
-  ynInhNote.current='';if(ynInheritFix&&nn!=='fixed'&&ynFixDefaultDy.current!==null&&Math.abs(ynFixDefaultDy.current)>.001){const dy=ynFixDefaultDy.current;ynFaceFix.current={...ynFaceFix.current,['g:'+id+':'+faceId]:[{t0:0,t1:1e9,dx:0,dy}]};ynInhNote.current=`（直前の顔の上下の補正「${dy<0?'下':'上'}へ${Math.round(Math.abs(dy)*100)}%」を引き継ぎました。変えるときは「ぼかしの位置を直す」から）`;ynSetFixTick(v=>v+1);b(v=>v+1)}
+  ynInhNote.current='';if(ynInheritFix&&nn!=='fixed'&&ynFixDefaultDy.current!==null&&Math.abs(ynFixDefaultDy.current)>.001){const dy=ynFixDefaultDy.current;ynFaceFix.current={...ynFaceFix.current,['g:'+id+':'+faceId]:{kf:[{t:Math.round(start*1000)/1000,dx:0,dy}]}};ynInhNote.current=`（直前の顔の上下の補正「${dy<0?'下':'上'}へ${Math.round(Math.abs(dy)*100)}%」を引き継ぎました。変えるときは「ぼかしの位置を直す」から）`;ynSetFixTick(v=>v+1);b(v=>v+1)}
  }
  const wasCorrection=typeof ynCorrect.current==='number',savedGroup=ynGroups.current.find(g=>g.faces.some(f=>f.id===faceId));ynCorrect.current=selected?.pendingFaces?null:faceId;ynSetSelectedFace(faceId);ynSetAdded({id:savedGroup?.id||ynSelected,faceId,corrected:wasCorrection});ynSetPanMode(false);ynSetEdit(savedGroup?.pendingFaces?'face':'done');ynSetMessage(`✓ 顔${faceId}を${wasCorrection?'修正':'追加'}しました。別の顔も追加するか、一括追従してください。${ynInhNote.current}`);ynInhNote.current='';ynRefresh();return true;
 };
@@ -1809,7 +1848,7 @@ const ynDoRestore=async()=>{
     const st=rec.settings||{};
     if(st.lv)ynModeLevel.current={...ynModeLevel.current,...st.lv};
     if(st.pe)Bs(st.pe);if(st.nn)qs(st.nn);if(Number.isFinite(st.fe))d1(st.fe);if(Number.isFinite(st.pad))ynSetPadding(st.pad);if(Number.isFinite(st.feather))ynSetFeather(st.feather);if(Number.isFinite(st.fps))ynSetFPS(st.fps);
-    ynBoxFix.current=Array.isArray(rec.boxFix)?rec.boxFix:[];ynFaceFix.current=rec.faceFix&&typeof rec.faceFix==='object'&&!Array.isArray(rec.faceFix)?rec.faceFix:{};ynFixUndo.current=[];
+    ynBoxFix.current=Array.isArray(rec.boxFix)||(rec.boxFix&&Array.isArray(rec.boxFix.kf))?rec.boxFix:[];ynFaceFix.current=rec.faceFix&&typeof rec.faceFix==='object'&&!Array.isArray(rec.faceFix)?rec.faceFix:{};ynFixUndo.current=[];
     c.current=new Map(rec.samples||[]);ynCuts.current=rec.cuts||[];ynStep.current=rec.step||.25;
     ynDeletedStack.current=[];ynTruthDeleted.current=Array.isArray(rec.truthDeleted)?rec.truthDeleted:[];ynKeptIds.current=new Set(rec.kept||[]);ynSetUndoCount(0);ynSetKeptTick(v=>v+1);
     const tracks=rec.tracks||[];je(tracks);Be(tracks.length);qe(false);
@@ -1986,7 +2025,7 @@ const ynMiniRot=(pt,start)=>{
   const raw=tg.rawBox,size=Math.max(raw.w,raw.h),auto=ynFaceAngle(tg.box),cx=tg.box.x+tg.box.w/2,cy=tg.box.y+tg.box.h/2,r=v=>Math.max(-1,Math.min(1,Math.round(v*100)/100));
   if(start){ynFixPush();d.range=ynFixRange();d.key=ynFixKeyOf(tg);d.S={x:tg.box.x-raw.x,y:tg.box.y-raw.y};ynSetFixMsg('')}
   const theta=Math.max(-Math.PI/2,Math.min(Math.PI/2,Math.atan2(pt.x-cx,-(pt.y-cy)))),rot=Math.max(-90,Math.min(90,Math.round((theta-auto)*180/Math.PI*10)/10)),a2=auto+rot*Math.PI/180,c=Math.cos(a2),sn=Math.sin(a2),S=d.S;
-  ynFixPut(d.key,ynFixAssign(ynFixGet(d.key),d.range[0],d.range[1],r((S.x*c+S.y*sn)/size),r((S.x*sn-S.y*c)/size),rot));
+  {const fv=ynFixGet(d.key),ndx=r((S.x*c+S.y*sn)/size),ndy=r((S.x*sn-S.y*c)/size);ynFixPut(d.key,ynFixIsRange(fv)?ynFixAssign(fv,d.range[0],d.range[1],ndx,ndy,rot):ynKfSet(fv,tg.time,{dx:ndx,dy:ndy,rot}))}
   ynSetReviewed(false);
   if(!ynMiniRaf.current)ynMiniRaf.current=requestAnimationFrame(()=>{ynMiniRaf.current=0;ynSetFixTick(v=>v+1);b(v=>v+1);bn.current?.()});
   return true;
@@ -1997,7 +2036,7 @@ const ynMiniSet=(pt,start)=>{
   if(!tg.rawBox){ynSetFixMsg('この顔は補正できません（指定して追従した顔は、位置が正確です）');return false}
   const raw=tg.rawBox,size=Math.max(raw.w,raw.h),a=tg.box.ang!==undefined?tg.box.ang:ynFaceAngle(tg.box),c=Math.cos(a),sn=Math.sin(a),X=pt.x-(raw.x+raw.w/2),Y=pt.y-(raw.y+raw.h/2),r=v=>Math.max(-1,Math.min(1,Math.round(v*100)/100));
   if(start){ynFixPush();d.range=ynFixRange();d.key=ynFixKeyOf(tg);ynSetFixMsg('')}
-  {const cf=ynFixAt(ynFixGet(d.key),tg.time);ynFixPut(d.key,ynFixAssign(ynFixGet(d.key),d.range[0],d.range[1],r((X*c+Y*sn)/size),r((X*sn-Y*c)/size),cf?cf.rot:undefined))}
+  {const fv=ynFixGet(d.key),ndx=r((X*c+Y*sn)/size),ndy=r((X*sn-Y*c)/size);if(ynFixIsRange(fv)){const cf=ynFixAt(fv,tg.time);ynFixPut(d.key,ynFixAssign(fv,d.range[0],d.range[1],ndx,ndy,cf?cf.rot:undefined))}else{const cf=ynFixValue(fv,tg.time,ynCuts.current);ynFixPut(d.key,ynKfSet(fv,tg.time,{dx:ndx,dy:ndy,rot:ynRot1(cf&&cf.rot)}))}}
   ynSetReviewed(false);
   if(!ynMiniRaf.current)ynMiniRaf.current=requestAnimationFrame(()=>{ynMiniRaf.current=0;ynSetFixTick(v=>v+1);b(v=>v+1);bn.current?.()});
   return true;
@@ -2034,33 +2073,66 @@ const ynFixRange=()=>{
 };
 const ynFixTarget=()=>{const g=ynMiniGeo.current;return g&&g.tg?g.tg:null};
 // Where a correction for this target is stored: manual faces and "this face only" auto faces have their own key; otherwise the shared list.
-const ynFixKeyOf=tg=>{if(!tg)return null;if(tg.gkey)return tg.gkey;if(tg.trackId==null)return null;const k='a:'+tg.trackId;return ynFixOnly||(ynFaceFix.current[k]&&ynFaceFix.current[k].length)?k:null};
+const ynFixKeyOf=tg=>{if(!tg)return null;if(tg.gkey)return tg.gkey;if(tg.trackId==null)return null;const k='a:'+tg.trackId;return ynFixOnly||ynFixN(ynFaceFix.current[k])?k:null};
 const ynFixGet=key=>key?(ynFaceFix.current[key]||[]):ynBoxFix.current;
-const ynFixPut=(key,arr)=>{if(key){const o={...ynFaceFix.current};if(arr.length)o[key]=arr;else delete o[key];ynFaceFix.current=o;if(key.startsWith('g:')){const rec=ynFixAt(arr,ynCurrentFrameTime());if(rec&&Number.isFinite(rec.dy))ynFixDefaultDy.current=rec.dy}}else ynBoxFix.current=arr};
+const ynFixPut=(key,arr)=>{if(key){const o={...ynFaceFix.current};if(ynFixN(arr))o[key]=arr;else delete o[key];ynFaceFix.current=o;if(key.startsWith('g:')){const t=ynCurrentFrameTime(),rec=Array.isArray(arr)?ynFixAt(arr,t):ynFixValue(arr,t,ynCuts.current);if(rec&&Number.isFinite(rec.dy))ynFixDefaultDy.current=rec.dy}}else ynBoxFix.current=ynFixN(arr)?arr:[]};
 const ynFixPush=()=>{ynFixUndo.current.push({b:ynBoxFix.current,f:ynFaceFix.current});if(ynFixUndo.current.length>10)ynFixUndo.current.shift()};
 const ynFixRefresh=()=>{ynSetReviewed(false);ynSetFixTick(v=>v+1);b(v=>v+1);requestAnimationFrame(()=>bn.current?.())};
 const ynFixCommit=(key,next)=>{ynFixPush();ynFixPut(key,next);ynSetFixMsg('');ynFixRefresh()};
 const ynFixNudge=(ddx,ddy)=>{
   if(nn==='fixed'||!Ln)return;
-  const key=ynFixKeyOf(ynFixTarget()),time=ynCurrentFrameTime(),cur=ynFixAt(ynFixGet(key),time)||{dx:0,dy:0},[t0,t1]=ynFixRange(),r=v=>Math.max(-1,Math.min(1,Math.round(v*100)/100));
-  ynFixCommit(key,ynFixAssign(ynFixGet(key),t0,t1,r(cur.dx+ddx),r(cur.dy+ddy),cur.rot));
+  const key=ynFixKeyOf(ynFixTarget()),time=ynCurrentFrameTime(),v=ynFixGet(key),r=v=>Math.max(-1,Math.min(1,Math.round(v*100)/100));
+  if(!ynFixIsRange(v)){const cur=ynFixValue(v,time,ynCuts.current)||{dx:0,dy:0};ynFixCommit(key,ynKfSet(v,time,{dx:r(cur.dx+ddx),dy:r(cur.dy+ddy),rot:ynRot1(cur.rot)}));return}
+  const cur=ynFixAt(v,time)||{dx:0,dy:0},[t0,t1]=ynFixRange();
+  ynFixCommit(key,ynFixAssign(v,t0,t1,r(cur.dx+ddx),r(cur.dy+ddy),cur.rot));
 };
 const ynFixSetRot=(rot,delta)=>{
   const g=ynMiniGeo.current;if(nn==='fixed'||!Ln)return;
   if(!g||!g.tg.rawBox){ynSetFixMsg('この顔は、向きを決められません');return}
-  const tg=g.tg,key=ynFixKeyOf(tg),raw=tg.rawBox,size=Math.max(raw.w,raw.h),S={x:tg.box.x-raw.x,y:tg.box.y-raw.y},auto=ynFaceAngle(tg.box),[t0,t1]=ynFixRange(),cur=ynFixAt(ynFixGet(key),tg.time)||{dx:0,dy:0},r=v=>Math.max(-1,Math.min(1,Math.round(v*100)/100));
+  const tg=g.tg,key=ynFixKeyOf(tg),raw=tg.rawBox,size=Math.max(raw.w,raw.h),S={x:tg.box.x-raw.x,y:tg.box.y-raw.y},auto=ynFaceAngle(tg.box),[t0,t1]=ynFixRange(),fv=ynFixGet(key),kfm=!ynFixIsRange(fv),cur=(kfm?ynFixValue(fv,tg.time,ynCuts.current):ynFixAt(fv,tg.time))||{dx:0,dy:0},r=v=>Math.max(-1,Math.min(1,Math.round(v*100)/100));
   let next=rot;if(delta!==undefined){const base=cur.rot!==undefined?cur.rot:0;next=Math.max(-90,Math.min(90,Math.round((base+delta)*10)/10))}
   const a2=next!==undefined?Math.max(-Math.PI/2,Math.min(Math.PI/2,auto+next*Math.PI/180)):auto,c=Math.cos(a2),sn=Math.sin(a2);
-  ynFixCommit(key,ynFixAssign(ynFixGet(key),t0,t1,r((S.x*c+S.y*sn)/size),r((S.x*sn-S.y*c)/size),next));
+  const ndx=r((S.x*c+S.y*sn)/size),ndy=r((S.x*sn-S.y*c)/size);
+  ynFixCommit(key,kfm?ynKfSet(fv,tg.time,{dx:ndx,dy:ndy,rot:next}):ynFixAssign(fv,t0,t1,ndx,ndy,next));
 };
-const ynFixReset=()=>{const key=ynFixKeyOf(ynFixTarget()),arr=ynFixGet(key);if(!arr.length)return;const [t0,t1]=ynFixRange();ynFixCommit(key,ynFixAssign(arr,t0,t1,0,0))};
-const ynFixCount=()=>ynBoxFix.current.length+Object.values(ynFaceFix.current).reduce((q,x)=>q+x.length,0);
+const ynFixReset=()=>{const key=ynFixKeyOf(ynFixTarget()),arr=ynFixGet(key);if(!ynFixN(arr))return;if(!ynFixIsRange(arr)){const time=ynCurrentFrameTime();if(!ynKfAt(arr,time)){ynSetFixMsg('この時刻には、補正点がありません');return}ynFixCommit(key,ynKfDel(arr,time));ynSetFixMsg('この時刻の補正点を消しました（「ひとつ戻す」で戻せます）');return}const [t0,t1]=ynFixRange();ynFixCommit(key,ynFixAssign(arr,t0,t1,0,0))};
+const ynFixCount=()=>ynFixN(ynBoxFix.current)+Object.values(ynFaceFix.current).reduce((q,x)=>q+ynFixN(x),0);
 const ynFixClear=()=>{if(!ynFixCount())return;if(!confirm('枠の補正をすべて消します。よろしいですか？'))return;ynFixPush();ynBoxFix.current=[];ynFaceFix.current={};ynSetFixMsg('');ynFixRefresh()};
 const ynFixUndoOne=()=>{const prev=ynFixUndo.current.pop();if(!prev)return;ynBoxFix.current=prev.b;ynFaceFix.current=prev.f;ynFixRefresh()};
 const ynFixCopyPrev=()=>{
-  const key=ynFixKeyOf(ynFixTarget()),[t0,t1]=ynFixRange(),prev=ynFixAt(ynFixGet(key),t0-.001);
+  const key=ynFixKeyOf(ynFixTarget()),fv=ynFixGet(key);
+  if(!ynFixIsRange(fv)){
+    const time=ynCurrentFrameTime();let s0=0;for(const t of ynSceneBounds())if(t<=time+1e-6)s0=t;
+    const prev=s0>0?ynFixValue(fv,s0-.001,ynCuts.current):null;
+    if(!prev||(!prev.dx&&!prev.dy&&prev.rot===undefined)){ynSetFixMsg('直前の場面に、コピーできる補正がありません');return}
+    ynFixCommit(key,ynKfSet(fv,time,{dx:prev.dx,dy:prev.dy,rot:ynRot1(prev.rot)}));return;
+  }
+  const [t0,t1]=ynFixRange(),prev=ynFixAt(fv,t0-.001);
   if(!prev){ynSetFixMsg('直前の場面に、コピーできる補正がありません');return}
   ynFixCommit(key,ynFixAssign(ynFixGet(key),t0,t1,prev.dx,prev.dy,prev.rot));
+};
+const ynFixPointGo=dir=>{
+  const fv=ynFixGet(ynFixKeyOf(ynFixTarget())),p=fv&&Array.isArray(fv.kf)?fv.kf:[],time=ynCurrentFrameTime();let target=null;
+  if(dir>0){const q=p.find(q=>q.t>time+.02);if(q)target=q.t}else for(const q of p)if(q.t<time-.02)target=q.t;
+  if(target==null){ynSetFixMsg(dir>0?'これより後に、補正点はありません':'これより前に、補正点はありません');return}
+  ynSetFixMsg('');ynLeakSeek(target);
+};
+const ynFixStepToggle=()=>{
+  if(nn==='fixed'||!Ln)return;const key=ynFixKeyOf(ynFixTarget()),fv=ynFixGet(key),time=ynCurrentFrameTime();if(ynFixIsRange(fv))return;
+  const here=ynKfAt(fv,time);
+  if(here){ynFixCommit(key,ynKfSet(fv,time,{step:!here.step}));ynSetFixMsg(here.step?'この補正点を、前の補正点となだらかにつなぎました（「ひとつ戻す」で戻せます）':'この補正点で切り替えます。前の補正点とはつなぎません（「ひとつ戻す」で戻せます）');return}
+  const cur=ynFixValue(fv,time,ynCuts.current)||{dx:0,dy:0};
+  ynFixCommit(key,ynKfSet(fv,time,{dx:cur.dx,dy:cur.dy,rot:ynRot1(cur.rot),step:true}));ynSetFixMsg('ここに「切り替える」補正点を置きました。この時刻で直すと、ここから後が切り替わります（「ひとつ戻す」で戻せます）');
+};
+const ynFixAllSame=()=>{
+  if(nn==='fixed'||!Ln)return;const key=ynFixKeyOf(ynFixTarget()),fv=ynFixGet(key),time=ynCurrentFrameTime();if(ynFixIsRange(fv)||!ynFixN(fv))return;
+  const cur=ynFixValue(fv,time,ynCuts.current)||{dx:0,dy:0},q={t:Math.round(time*1000)/1000,dx:cur.dx,dy:cur.dy};if(cur.rot!==undefined)q.rot=ynRot1(cur.rot);
+  ynFixCommit(key,{kf:[q]});ynSetFixMsg('補正点を1つにまとめ、動画全体を、いまの補正にそろえました（「ひとつ戻す」で戻せます）');
+};
+const ynFixConvert=()=>{
+  const key=ynFixKeyOf(ynFixTarget()),fv=ynFixGet(key);if(!ynFixIsRange(fv))return;
+  if(!confirm(`${key?'この顔':'自動の顔に共通'}の「範囲」の補正を、補正点に置き換えます。見え方は、ほぼ同じです。（「ひとつ戻す」で戻せます）`))return;
+  const kv=ynFixToKf(fv,ynCuts.current);ynFixCommit(key,kv);ynSetFixMsg(`補正点に置き換えました（補正点 ${kv.kf.length}個。「ひとつ戻す」で戻せます）`);
 };
 const ynFixOnlyToggle=()=>{
   const tg=ynFixTarget();if(!tg||tg.trackId==null)return;const k='a:'+tg.trackId;
@@ -2094,7 +2166,7 @@ const ynTl=E.useMemo(()=>{
   const per=bin>.2?3:1;
   for(let i=0;i<N;i++){let w='none';for(let j=0;j<per;j++){const t=Math.min(dur-.001,(i+(per===1?.5:j/(per-1)))*bin),sv=sample(t);if(rank[sv]>rank[w])w=sv}cells[i]=w}
   const fix=new Array(N).fill(false),paint=new Array(N).fill(false);
-  for(let i=0;i<N;i++){const tt=(i+.5)*bin;fix[i]=ynFixHas(ynBoxFix.current,tt)||Object.values(ynFaceFix.current).some(a=>ynFixHas(a,tt))}
+  for(let i=0;i<N;i++){const tt=(i+.5)*bin;fix[i]=ynFixHas(ynBoxFix.current,tt,ynCuts.current)||Object.values(ynFaceFix.current).some(a=>ynFixHas(a,tt,ynCuts.current))}
   for(const key of [...k.current.keys(),...Nn.current.keys()]){const i=Math.floor(key/bin);if(i>=0&&i<N)paint[i]=true}
   const runs=[];let cur=null;
   for(let i=0;i<N;i++){if(rank[cells[i]]>=2){if(cur&&rank[cells[i]]>rank[cur.worst])cur.worst=cells[i];if(!cur)cur={i0:i,worst:cells[i]};cur.i1=i}else if(cur){runs.push(cur);cur=null}}
@@ -2156,7 +2228,7 @@ const ynTlNav=()=>{
 };
 const ynTruthReport=E.useMemo(()=>{
   const video=n.current;if(!Ln)return null;
-  try{return ynTruthMetrics({duration:Number.isFinite(video?.duration)?video.duration:Dn,fix:ynBoxFix.current,groups:ynGroups.current,deleted:ynTruthDeleted.current,kept:[...ynKeptIds.current],rawAt:t=>ynFacesAt(Ut,c.current,ynCuts.current,t,ynStep.current).faces||[]})}catch{return null}
+  try{return ynTruthMetrics({duration:Number.isFinite(video?.duration)?video.duration:Dn,fix:ynFixAsRanges(ynBoxFix.current),groups:ynGroups.current,deleted:ynTruthDeleted.current,kept:[...ynKeptIds.current],rawAt:t=>ynFacesAt(Ut,c.current,ynCuts.current,t,ynStep.current).faces||[]})}catch{return null}
 },[Ln,Dn,Ut,J,ynFixTick,ynKeptTick,ynTruthTick]);
 const ynTruthBuild=()=>{
   const video=n.current,key=ynFileKey.current||'|',name=key.slice(0,key.lastIndexOf('|')),r1=v=>Math.round(v*10)/10,r3=v=>Math.round(v*1000)/1000;
@@ -2173,7 +2245,7 @@ const ynTruthBuild=()=>{
   });
   return {format:'bokasi-truth',version:2,exportedAt:new Date().toISOString(),video:{name,duration:r3(video?.duration||0),width:video?.videoWidth||0,height:video?.videoHeight||0},
     detect:{fps:ynFPS,step:ynStep.current,padding:ynPadding,cuts:[...ynCuts.current].map(r3),seekStats:{...ynSeekStats}},tracks,
-    truth:{corrections:ynBoxFix.current.map(r=>({t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot})),faceCorrections:Object.entries(ynFaceFix.current).flatMap(([k,arr])=>arr.map(r=>({key:k,t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot}))),manualFaces:manual,deletedTracks:ynTruthDeleted.current.map(d=>({...d,t0:r3(d.t0),t1:r3(d.t1),maxScore:r3(d.maxScore)})),keptTrackIds:[...ynKeptIds.current]},
+    truth:{corrections:(Array.isArray(ynBoxFix.current)?ynBoxFix.current:[]).map(r=>({t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot})),faceCorrections:Object.entries(ynFaceFix.current).flatMap(([k,arr])=>(Array.isArray(arr)?arr:[]).map(r=>({key:k,t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot}))),correctionPoints:(ynBoxFix.current.kf||[]).map(q=>({t:r3(q.t),dx:q.dx,dy:q.dy,rot:q.rot===undefined?null:q.rot,step:!!q.step})),faceCorrectionPoints:Object.entries(ynFaceFix.current).flatMap(([k,v])=>(v&&Array.isArray(v.kf)?v.kf:[]).map(q=>({key:k,t:r3(q.t),dx:q.dx,dy:q.dy,rot:q.rot===undefined?null:q.rot,step:!!q.step}))),manualFaces:manual,deletedTracks:ynTruthDeleted.current.map(d=>({...d,t0:r3(d.t0),t1:r3(d.t1),maxScore:r3(d.maxScore)})),keptTrackIds:[...ynKeptIds.current]},
     groups:ynGroupsOut,
     metrics:ynTruthReport};
 };
@@ -2184,7 +2256,7 @@ const ynTruthDownload=()=>{
 const ynTruthLines=()=>{
   const r=ynTruthReport;if(!r)return [];const pct=v=>`${Math.round(Math.abs(v)*100)}%`,dir=(v,pos,neg)=>v===0?'':`${v>0?pos:neg}${pct(v)}`,out=[];
   if(r.fix.count)out.push(`枠の補正: ${r.fix.count}件（動画の${Math.round(r.fix.share*100)}%）。平均のずれ ${[dir(r.fix.meanDy,'上へ','下へ'),dir(r.fix.meanDx,'右へ','左へ')].filter(Boolean).join('・')||'なし'}、最大 ${[dir(r.fix.maxDy,'上へ','下へ'),dir(r.fix.maxDx,'右へ','左へ')].filter(Boolean).join('・')||'なし'}（顔の大きさに対する割合）`);
-  {const nf=Object.values(ynFaceFix.current).reduce((q,x)=>q+x.length,0);if(nf)out.push(`顔ごとの補正（指定した顔・この顔だけ）: ${nf}件`)}
+  {const nf=Object.values(ynFaceFix.current).reduce((q,x)=>q+ynFixN(x),0);if(nf)out.push(`顔ごとの補正（指定した顔・この顔だけ）: ${nf}件`)}
   if(r.anchors.total)out.push(`手動で囲んだ顔: ${r.anchors.total}か所のうち、自動が見つけていたのは${r.anchors.found}か所、見落としは${r.anchors.missed}か所${r.anchors.found?`。見つけていた顔は、中心のずれの中央値が顔の${Math.round(r.anchors.centerMed*100)}%、重なり（IoU）の中央値が${r.anchors.iouMed.toFixed(2)}、偏りは${[dir(-r.anchors.biasY,'上へ','下へ'),dir(-r.anchors.biasX,'右へ','左へ')].filter(Boolean).join('・')||'なし'}（自動の枠が、正解よりずれている向き）`:''}`);
   if(r.deleted.count)out.push(`削除したID（誤検出）: ${r.deleted.count}件、合計${r.deleted.seconds.toFixed(1)}秒。最高スコアの平均 ${r.deleted.meanMaxScore.toFixed(2)}`);
   if(r.kept)out.push(`顔と確認したID: ${r.kept}件`);
@@ -2206,13 +2278,14 @@ const ynTimelineCard=()=>{
     ]})
   ]});
 };
-const ynFixTxt=v=>{const a=[];if(v.dy)a.push(`${v.dy>0?'上':'下'}へ${Math.round(Math.abs(v.dy)*100)}%`);if(v.dx)a.push(`${v.dx>0?'右':'左'}へ${Math.round(Math.abs(v.dx)*100)}%`);if(v.rot!==undefined)a.push(v.rot===0?'向き:目の線に合わせる':`向き:目の線から${v.rot>0?'右':'左'}へ${Math.abs(v.rot)}°`);return a.join(' ')||'補正なし'};
+const ynRot1=v=>v===undefined||v===null?undefined:Math.round(v*10)/10;
+const ynFixTxt=v=>{const a=[];if(v.dy)a.push(`${v.dy>0?'上':'下'}へ${Math.round(Math.abs(v.dy)*100)}%`);if(v.dx)a.push(`${v.dx>0?'右':'左'}へ${Math.round(Math.abs(v.dx)*100)}%`);if(v.rot!==undefined)a.push(v.rot===0?'向き:目の線に合わせる':`向き:目の線から${v.rot>0?'右':'左'}へ${Math.abs(ynRot1(v.rot))}°`);return a.join(' ')||'補正なし'};
 const ynStampFix=(compact=false)=>{
-  const time=ynCurrentFrameTime(),tgt=ynFixTarget(),cur=ynFixAt(ynFixGet(ynFixKeyOf(tgt)),time),fixed=nn==='fixed',bounds=ynSceneBounds(),oneScene=bounds.length<=1,fmt=ynClockText;
+  const time=ynCurrentFrameTime(),tgt=ynFixTarget(),fkey=ynFixKeyOf(tgt),fv=ynFixGet(fkey),kfMode=!ynFixIsRange(fv),cur=kfMode?ynFixValue(fv,time,ynCuts.current):ynFixAt(fv,time),pts=kfMode&&fv&&Array.isArray(fv.kf)?fv.kf:[],here=kfMode?ynKfAt(fv,time):null,fixed=nn==='fixed',bounds=ynSceneBounds(),oneScene=bounds.length<=1,fmt=ynClockText;
   let s0=0,s1=1e9;for(const t of bounds){if(t<=time+1e-6)s0=t;else{s1=t;break}}
   const labels={scene:`この場面（${fmt(s0)}〜${s1>=1e8?'最後':fmt(s1)}）`,from:`ここから最後まで（${fmt(time)}〜）`,all:'動画全体'};
   const btn=(label,aria,extra={})=>D('button',{className:'yn-button','aria-label':aria,disabled:fixed||!Ln,...extra,children:label});
-  const rotEls=[D('span',{className:'yn-stamp-fix-range',children:`④ 向き: 十字の上の橙色の丸をドラッグ（または ↺ ↻）。${cur&&cur.rot!==undefined?(cur.rot===0?'いま: 目の線に合わせる':`いま: 目の線から${cur.rot>0?'右':'左'}へ${Math.abs(cur.rot)}°`):'いま: 指定なし（マスクは傾けません）'}`}),
+  const rotEls=[D('span',{className:'yn-stamp-fix-range',children:`④ 向き: 十字の上の橙色の丸をドラッグ（または ↺ ↻）。${cur&&cur.rot!==undefined?(cur.rot===0?'いま: 目の線に合わせる':`いま: 目の線から${cur.rot>0?'右':'左'}へ${Math.abs(ynRot1(cur.rot))}°`):'いま: 指定なし（マスクは傾けません）'}`}),
     G('div',{className:'yn-stamp-fix-pad',children:[
       btn('↺ 左へ','顔の向きを左へ回す',ynFixHold(()=>ynFixSetRot(undefined,-2))),btn('右へ ↻','顔の向きを右へ回す',ynFixHold(()=>ynFixSetRot(undefined,2))),
       btn('目の線に合わせる','マスクの傾きを、目の線に合わせる',{onClick:()=>ynFixSetRot(0)}),btn('向きの指定をやめる','向きの指定をやめる',{onClick:()=>ynFixSetRot(undefined),disabled:!(cur&&cur.rot!==undefined)})
@@ -2220,20 +2293,30 @@ const ynStampFix=(compact=false)=>{
   const sceneEls=[oneScene?D('span',{className:'yn-stamp-fix-range',children:'この動画は、1つの場面です（場面の切れ目がありません）。'}):G('div',{className:'yn-stamp-fix-pad',children:[
       btn('◀ 前の場面','前の場面へ',{onClick:()=>ynFixSceneGo(-1)}),btn('次の場面 ▶','次の場面へ',{onClick:()=>ynFixSceneGo(1)}),btn('前の補正を写す','直前の場面の補正を、この範囲に写す',{onClick:ynFixCopyPrev,disabled:fixed||!Ln})
     ]})];
+  const kfEls=[
+    D('span',{className:'yn-stamp-fix-range',children:pts.length?`補正点 ${pts.length}個。補正点のあいだは、なだらかにつながります（場面の切れ目はまたぎません）。${here?(here.step?'この時刻の点: ここで切り替える':'この時刻の点: なだらか'):'この時刻には点がありません。直すと、ここに点が置かれます。'}`:'直すと、この時刻に「補正点」が置かれます。1つだけなら、動画全体に同じ補正がかかります。別の時刻でも直すと、そのあいだがなだらかにつながります（場面の切れ目はまたぎません）。'}),
+    G('div',{className:'yn-stamp-fix-pad',children:[
+      btn('◀ 前の補正点','前の補正点へ',{onClick:()=>ynFixPointGo(-1),disabled:!pts.length}),btn('次の補正点 ▶','次の補正点へ',{onClick:()=>ynFixPointGo(1),disabled:!pts.length}),
+      btn(here&&here.step?'切り替えをやめる（なだらかにつなぐ）':'ここから切り替える','この時刻で、補正を切り替える（前の補正点となだらかにつながない）',{onClick:ynFixStepToggle}),
+      btn('動画全体を同じにする','補正点を1つにまとめて、動画全体を、いまの補正にそろえる',{onClick:ynFixAllSame,disabled:fixed||!Ln||!pts.length})
+    ]})
+  ];
+  const rangeNote=G('div',{className:'yn-stamp-fix-pad',children:[D('span',{className:'yn-stamp-fix-range',children:`${fkey?'この顔':'自動の顔に共通'}の補正は、以前の「範囲」の方式です。下の範囲のボタンで、これまでどおり直せます。`}),btn('補正点に置き換える',`${fkey?'この顔':'自動の顔に共通'}の補正を、補正点に置き換える`,{onClick:ynFixConvert})]});
   return G('div',{className:'yn-stamp-fix',children:[
     D('p',{className:'yn-stamp-hint',children:fixed?'「固定」方式では、位置の補正は使えません。':compact?'プレビューをタップ／ドラッグして、顔の中心に合わせます。':'① 上のプレビューで、顔の中心をタップ（またはドラッグ）します。'}),
     tgt&&(tgt.gkey?D('span',{className:'yn-stamp-fix-range',children:`直している顔: ${ynMiniInfo.label}。この顔だけに補正がかかります。`}):tgt.trackId!=null?G('label',{className:'yn-stamp-cut',children:[D('input',{type:'checkbox',checked:!!ynFixKeyOf(tgt),onChange:ynFixOnlyToggle}),D('span',{children:`この顔（ID:${tgt.trackId}）だけに補正する（ほかの顔には効かせない）`})]}):null),
-    D('span',{className:'yn-stamp-fix-range',children:`${compact?'矢印で細かく。':'② 細かく合わせる矢印（1回で顔の大きさの2%）。'}いまの場面: ${cur?ynFixTxt(cur):'補正なし'}`}),
+    D('span',{className:'yn-stamp-fix-range',children:`${compact?'矢印で細かく。':'② 細かく合わせる矢印（1回で顔の大きさの2%）。'}${kfMode?'いま':'いまの場面'}: ${cur?ynFixTxt(cur):'補正なし'}`}),
     G('div',{className:'yn-stamp-fix-pad',children:[
       btn('◀','枠を左へ',ynFixHold(()=>ynFixNudge(-.02,0))),btn('▲','枠を上へ',ynFixHold(()=>ynFixNudge(0,.02))),btn('▼','枠を下へ',ynFixHold(()=>ynFixNudge(0,-.02))),btn('▶','枠を右へ',ynFixHold(()=>ynFixNudge(.02,0)))
     ]}),
     ...(compact?[]:rotEls),
+    ...(kfMode?[D('span',{className:'yn-stamp-fix-range',children:compact?'補正点':'③ 補正点'}),...kfEls]:[rangeNote,
     D('span',{className:'yn-stamp-fix-range',children:compact?'どこまで効かせるか':'③ どこまで効かせるか'}),
-    G('div',{className:'yn-stamp-fix-scope',role:'group','aria-label':'補正を効かせる範囲',children:['scene','from','all'].map(v=>D('button',{className:'yn-stamp-chip','aria-pressed':ynFixScope===v,onClick:()=>ynSetFixScope(v),children:labels[v]},v))}),
+    G('div',{className:'yn-stamp-fix-scope',role:'group','aria-label':'補正を効かせる範囲',children:['scene','from','all'].map(v=>D('button',{className:'yn-stamp-chip','aria-pressed':ynFixScope===v,onClick:()=>ynSetFixScope(v),children:labels[v]},v))})]),
     ...(compact?[]:sceneEls),
     G('div',{className:'yn-stamp-fix-pad',children:[
       btn('↶ ひとつ戻す','補正を1つ元に戻す',{onClick:ynFixUndoOne,disabled:!ynFixUndo.current.length}),
-      btn('この範囲の補正をなくす','この範囲の補正を消す',{onClick:ynFixReset,disabled:fixed||!cur})
+      kfMode?btn('この補正点を消す','この時刻の補正点を消す',{onClick:ynFixReset,disabled:fixed||!here}):btn('この範囲の補正をなくす','この範囲の補正を消す',{onClick:ynFixReset,disabled:fixed||!cur})
     ]}),
     compact&&D('details',{className:'yn-fix-more',children:[D('summary',{children:'向き・場面の移動（くわしく）'}),...rotEls,...sceneEls]}),
     ynFixMsg&&D('span',{className:'yn-stamp-fix-range',role:'status',children:ynFixMsg})
@@ -2267,7 +2350,7 @@ const ynStampCard=()=>{
     G('div',{className:'yn-stamp-move',children:[D('span',{children:`画像だけを上下に動かす（${dyText}）`}),G('div',{className:'yn-stamp-move-btns',children:[D('button',{className:'yn-button','aria-label':'画像を上へ動かす',onClick:()=>ynStampNudge(.03),children:'▲ 上へ'}),D('button',{className:'yn-button','aria-label':'画像を中心に戻す',onClick:()=>ynStampApply({dy:0}),children:'中心に戻す'}),D('button',{className:'yn-button','aria-label':'画像を下へ動かす',onClick:()=>ynStampNudge(-.03),children:'▼ 下へ'})]}),D('span',{className:'yn-stamp-fix-range',children:'モザイク／ぼかしは動きません。「位置をなおす」で枠を合わせたあと、画像だけを微調整するときに使います。'})]}),
     G('div',{className:'yn-stamp-move',children:[D('span',{children:'向きを決めた顔の、モザイク／ぼかしの形'}),G('div',{className:'yn-stamp-fix-scope',role:'group',children:[['union','傾けない楕円も含めて覆う（安全）'],['rot','傾けた形だけ']].map(([v,l])=>D('button',{className:'yn-stamp-chip','aria-pressed':(st.shape||'union')===v,onClick:()=>ynStampApply({shape:v}),children:l},v))}),D('span',{className:'yn-stamp-fix-range',children:'「傾けた形だけ」は見た目が自然ですが、顔の端が出やすくなります。モザイクの格子は、傾けません。'})]}),
     G('label',{className:'yn-stamp-cut',children:[D('input',{type:'checkbox',checked:ynInheritFix,onChange:()=>ynSetInheritFix(v=>!v)}),D('span',{children:'新しく囲んだ手動の顔に、直前の上下の補正を引き継ぐ'})]}),
-    G('div',{className:'yn-stamp-fix-list',children:[D('strong',{children:`補正した範囲 ${ynFixCount()}件`}),...ynBoxFix.current.map((r,i)=>D('div',{children:`${ynClockText(r.t0)}〜${r.t1>=1e8?'最後':ynClockText(r.t1)}  ${ynFixTxt(r)}`},i)),...Object.entries(ynFaceFix.current).flatMap(([k,arr])=>arr.map((r,i)=>D('div',{children:`${k.startsWith('g:')?'指定した顔'+k.split(':')[2]:'ID:'+k.slice(2)}  ${ynClockText(r.t0)}〜${r.t1>=1e8?'最後':ynClockText(r.t1)}  ${ynFixTxt(r)}`},k+i))),ynFixCount()>0&&D('button',{className:'yn-stamp-remove',onClick:ynFixClear,children:'補正を全部消す'})]})
+    G('div',{className:'yn-stamp-fix-list',children:[D('strong',{children:`補正した範囲・補正点 ${ynFixCount()}件`}),...(Array.isArray(ynBoxFix.current)?ynBoxFix.current:[]).map((r,i)=>D('div',{children:`${ynClockText(r.t0)}〜${r.t1>=1e8?'最後':ynClockText(r.t1)}  ${ynFixTxt(r)}`},i)),...(ynBoxFix.current.kf||[]).map((q,i)=>D('div',{children:`補正点 ${ynClockText(q.t)}${q.step?'（切り替え）':''}  ${ynFixTxt(q)}`},'p'+i)),...Object.entries(ynFaceFix.current).flatMap(([k,arr])=>Array.isArray(arr.kf)?arr.kf.map((q,i)=>D('div',{children:`${k.startsWith('g:')?'指定した顔'+k.split(':')[2]:'ID:'+k.slice(2)}  補正点 ${ynClockText(q.t)}${q.step?'（切り替え）':''}  ${ynFixTxt(q)}`},k+'p'+i)):arr.map((r,i)=>D('div',{children:`${k.startsWith('g:')?'指定した顔'+k.split(':')[2]:'ID:'+k.slice(2)}  ${ynClockText(r.t0)}〜${r.t1>=1e8?'最後':ynClockText(r.t1)}  ${ynFixTxt(r)}`},k+i))),ynFixCount()>0&&D('button',{className:'yn-stamp-remove',onClick:ynFixClear,children:'補正を全部消す'})]})
   ]});
   return G('div',{className:'yn-stamp',children:[
     G('div',{className:'yn-stamp-head',children:[D('strong',{children:'画像で隠す（顔に貼る）'}),st.hasImg&&D('button',{className:'yn-stamp-toggle','aria-pressed':st.on,onClick:()=>ynStampApply({on:!st.on}),children:st.on?'ON':'OFF'})]}),
@@ -2277,10 +2360,10 @@ const ynStampCard=()=>{
 };
 const ynFixCopyToOverlaps=()=>{
   const tg=ynFixTarget();if(!tg||!tg.ov||!tg.ov.length)return;
-  const key=ynFixKeyOf(tg),cur=ynFixAt(ynFixGet(key),tg.time);
-  if(!cur){ynSetFixMsg('この顔に、写せる補正がありません。先に位置を直してください');return}
+  const key=ynFixKeyOf(tg),fv=ynFixGet(key),cur=ynFixIsRange(fv)?ynFixAt(fv,tg.time):ynFixValue(fv,tg.time,ynCuts.current);
+  if(!cur||(!cur.dx&&!cur.dy&&cur.rot===undefined)){ynSetFixMsg('この顔に、写せる補正がありません。先に位置を直してください');return}
   const [t0,t1]=ynFixRange();ynFixPush();
-  for(const o of tg.ov)ynFixPut(o.key,ynFixAssign(ynFixGet(o.key),t0,t1,cur.dx,cur.dy,cur.rot));
+  for(const o of tg.ov){const ov=ynFixGet(o.key);ynFixPut(o.key,ynFixIsRange(ov)?ynFixAssign(ov,t0,t1,cur.dx,cur.dy,cur.rot):ynKfSet(ov,tg.time,{dx:cur.dx,dy:cur.dy,rot:ynRot1(cur.rot)}))}
   ynSetFixMsg(`重なっている${tg.ov.length}つの枠に、同じ補正を写しました（「ひとつ戻す」で戻せます）`);ynFixRefresh();
 };
 const ynMergeGroup=gid=>{
