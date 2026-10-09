@@ -6663,7 +6663,7 @@ const hasLightCorrection=(light)=>LIGHT_CONTROLS.some(item=>Number(light?.[item.
 // 書き出し描画の同期処理だけを計測する。親区間から子区間を差し引き、時間を二重計上しない。
 let vlogExportDrawProfiler=null;
 // 診断に載せる版の目印。実機が最新の修正を読み込んだかを確かめるために使う。
-const VLOG_PREVIEW_BUILD='2026-10-08-photo-length-note';
+const VLOG_PREVIEW_BUILD='2026-10-09-check-expand';
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -8007,7 +8007,56 @@ function paintVlogCaptionGlyphs(ctx,paint,opacity,box,key,fontSize){
   ctx.restore();
 }
 
+// 字幕「ピント」（ブラー解像）: ぼけた文字がピントを合わせるように現れる（0.82秒）。終わりは0.35秒でぼけて消える。
+// Safari の canvas は filter の blur が効かないため、全面の下書きを縮小→拡大してぼかす。
+const VLOG_CAPTION_FOCUS_IN=0.82, VLOG_CAPTION_FOCUS_OUT=0.35;
+let vlogCaptionFocusSharp=null, vlogCaptionFocusSmall=null, vlogCaptionFocusMid=null;
+const vlogCaptionFocusState=(elapsed,remaining)=>{
+  let blur=0, alpha=1;
+  if(elapsed<VLOG_CAPTION_FOCUS_IN){
+    const p=Math.max(0,elapsed/VLOG_CAPTION_FOCUS_IN), e=1-Math.pow(1-p,3);
+    blur=1-e; alpha=Math.min(1,0.15+p*1.4);
+  }
+  if(remaining<VLOG_CAPTION_FOCUS_OUT){
+    const q=1-Math.max(0,remaining/VLOG_CAPTION_FOCUS_OUT);
+    blur=Math.max(blur,q*q); alpha=Math.min(alpha,1-q);
+  }
+  return {blur,alpha};
+};
+function drawVlogCaptionFocus(ctx,txt,width,height,options,st){
+  const sharp=vlogCaptionFocusSharp||(vlogCaptionFocusSharp=document.createElement('canvas'));
+  if(sharp.width!==width||sharp.height!==height){sharp.width=width;sharp.height=height;}
+  const sc=sharp.getContext('2d');
+  sc.setTransform(1,0,0,1,0,0);sc.clearRect(0,0,width,height);sc.globalAlpha=1;
+  drawVlogCaption(sc,{...txt,anim:'none'},width,height,{...options,elapsed:1,remaining:999});
+  // ぼけ具合 0〜1 を、縮小率 1〜1/9 に置き換える（大きいほどぼける）。
+  const k=1+8*st.blur;
+  ctx.save();
+  ctx.globalAlpha*=st.alpha;
+  if(k<1.15){ ctx.drawImage(sharp,0,0); ctx.restore(); return; }
+  const sw=Math.max(1,Math.round(width/k)), sh=Math.max(1,Math.round(height/k));
+  const small=vlogCaptionFocusSmall||(vlogCaptionFocusSmall=document.createElement('canvas'));
+  if(small.width!==sw||small.height!==sh){small.width=sw;small.height=sh;}
+  const mc=small.getContext('2d');
+  mc.clearRect(0,0,sw,sh);mc.imageSmoothingEnabled=true;mc.imageSmoothingQuality='high';
+  mc.drawImage(sharp,0,0,sw,sh);
+  // 一気に拡大すると格子が目立つので、中間の大きさを1回はさむ。
+  const mw=Math.min(width,sw*3), mh=Math.min(height,sh*3);
+  const mid=vlogCaptionFocusMid||(vlogCaptionFocusMid=document.createElement('canvas'));
+  if(mid.width!==mw||mid.height!==mh){mid.width=mw;mid.height=mh;}
+  const dc=mid.getContext('2d');
+  dc.clearRect(0,0,mw,mh);dc.imageSmoothingEnabled=true;dc.imageSmoothingQuality='high';
+  dc.drawImage(small,0,0,mw,mh);
+  ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
+  ctx.drawImage(mid,0,0,width,height);
+  ctx.restore();
+}
+
 function drawVlogCaption(ctx,txt,width,height,options={}){
+  if((txt.anim||'none')==='blur' && Number.isFinite(options.elapsed) && Number.isFinite(options.remaining)){
+    const st=vlogCaptionFocusState(options.elapsed,options.remaining);
+    if(st.blur>0 || st.alpha<1){ drawVlogCaptionFocus(ctx,txt,width,height,options,st); return 0; }
+  }
   const content=options.sampleText??txt.text??'';
   const x=options.x??(txt.x??50)/100*width;
   const y=options.y??(txt.y??50)/100*height;
@@ -9943,6 +9992,50 @@ const vlogPageCurlGeometry=(cw,ch,prog)=>{
   return {C,d,s,remain,curled,flap};
 };
 const vlogPolygonArea=poly=>Math.abs(poly.reduce((sum,a,i)=>{const b=poly[(i+1)%poly.length];return sum+a.x*b.y-b.x*a.y;},0))/2;
+// 切り替え効果「折る」（ペーパーフォールド）。前半: 右半分が中央の折り目で左へ折り重なり、裏の生成りの紙が見える。
+// 後半: 二つ折りになった紙が左へ抜けて、下から次の素材が現れる。
+const paintVlogPaperFold=(ctx,cw,ch,prog,drawFrom,drawTo)=>{
+  const ease=x=>x<0.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2;
+  const half=cw/2, paper='#FBF6EC', split=0.65;
+  drawTo();
+  if(prog<split){
+    const th=ease(prog/split)*Math.PI, c=Math.cos(th);
+    ctx.save(); ctx.beginPath(); ctx.rect(0,0,half,ch); ctx.clip(); drawFrom(); ctx.restore();
+    ctx.save(); ctx.filter='none'; ctx.globalAlpha=1;
+    if(c>0){
+      // 表のまま折れていく右半分（横に縮める）と、その影。
+      const w=half*c;
+      ctx.save(); ctx.beginPath(); ctx.rect(half,0,w,ch); ctx.clip();
+      ctx.translate(half,0); ctx.scale(c,1); ctx.translate(-half,0);
+      drawFrom(); ctx.restore();
+      ctx.fillStyle=`rgba(0,0,0,${0.32*(1-c)})`; ctx.fillRect(half,0,w,ch);
+      const sh=ctx.createLinearGradient(half+w,0,half+w+cw*0.08,0);
+      sh.addColorStop(0,`rgba(0,0,0,${0.25*(1-c)})`); sh.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle=sh; ctx.fillRect(half+w,0,cw*0.08,ch);
+    }else{
+      // 折り返して左半分に重なる紙の裏。
+      const w=half*(-c), x=half-w;
+      ctx.shadowColor='rgba(0,0,0,0.28)'; ctx.shadowBlur=16;
+      ctx.fillStyle=paper; ctx.fillRect(x,0,w,ch);
+      ctx.shadowColor='transparent'; ctx.shadowBlur=0;
+      const light=ctx.createLinearGradient(x,0,half,0);
+      light.addColorStop(0,'rgba(255,255,255,0.25)'); light.addColorStop(1,`rgba(60,45,30,${0.18*(1+c)})`);
+      ctx.fillStyle=light; ctx.fillRect(x,0,w,ch);
+    }
+    ctx.restore();
+    return;
+  }
+  // 二つ折りの紙（左半分の大きさ）が左へ抜ける。
+  const b=ease((prog-split)/(1-split)), x=-half*1.15*b;
+  ctx.save(); ctx.filter='none'; ctx.globalAlpha=1-0.35*b;
+  ctx.shadowColor='rgba(0,0,0,0.28)'; ctx.shadowBlur=16;
+  ctx.fillStyle=paper; ctx.fillRect(x,0,half,ch);
+  ctx.shadowColor='transparent'; ctx.shadowBlur=0;
+  const light=ctx.createLinearGradient(x,0,x+half,0);
+  light.addColorStop(0,'rgba(255,255,255,0.25)'); light.addColorStop(1,'rgba(60,45,30,0.10)');
+  ctx.fillStyle=light; ctx.fillRect(x,0,half,ch);
+  ctx.restore();
+};
 const paintVlogPageCurl=(ctx,cw,ch,prog,drawFrom,drawTo)=>{
   const g=vlogPageCurlGeometry(cw,ch,prog);
   const path=poly=>{ ctx.beginPath(); poly.forEach((pt,i)=>i?ctx.lineTo(pt.x,pt.y):ctx.moveTo(pt.x,pt.y)); ctx.closePath(); };
@@ -12327,6 +12420,9 @@ function App(){
           ctx.fillRect(edge-12, 0, 24, ch);
           ctx.restore();
         }
+      } else if(transitionType==='fold'){
+        paintVlogPaperFold(ctx,cw,ch,prog,()=>drawSingleClip(fromClip,fromLocal,1),()=>{ if(toClip) drawSingleClip(toClip,toLocal,1); });
+        ctx.filter='none';
       } else if(transitionType==='page'){
         paintVlogPageCurl(ctx,cw,ch,prog,()=>drawSingleClip(fromClip,fromLocal,1),()=>{ if(toClip) drawSingleClip(toClip,toLocal,1); });
         ctx.filter='none';
@@ -18256,11 +18352,15 @@ const recomputeStarts=(arr)=>{
     };
     requestAnimationFrame(watch);
   };
-  const openMaterialCheck=(clip)=>{
+  const openMaterialCheck=(clip,originEl=null)=>{
     closeQuickPeek(false);
     const cv=canvasRef.current;
     const start=clip.timelineStart,end=clip.timelineStart+clip.duration;
-    setMaterialCheck({clipId:clip.id,name:clip.name,start,end,ratio:cv&&cv.height?cv.width/cv.height:9/16});
+    // 一覧から詳細展開: 押した素材の行の位置から広がって開く。
+    const row=originEl?.closest?.('.material-order-row')||originEl;
+    const r=row?.getBoundingClientRect?.();
+    const origin=r&&r.width?{left:r.left,top:r.top,width:r.width,height:r.height}:null;
+    setMaterialCheck({clipId:clip.id,name:clip.name,start,end,ratio:cv&&cv.height?cv.width/cv.height:9/16,origin,openedAt:Date.now()});
     playMaterialCheck(start,end);
   };
   const closeMaterialCheck=()=>{
@@ -23113,7 +23213,8 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
               {id:'iris', name:'丸く開く', icon:'○'},
               {id:'wipe', name:'ワイプ', icon:'⇥'},
               {id:'slide-up', name:'上へ', icon:'↑'},
-              {id:'page', name:'めくる', icon:'📄'}
+              {id:'page', name:'めくる', icon:'📄'},
+              {id:'fold', name:'折る', icon:'📖'}
             ].map(t=>
               React.createElement('button', {
                 key:t.id,
@@ -23361,7 +23462,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     c._filterDot && React.createElement('span', {className:'text-[10px]'}, c._filterDot),
                     c._filterName && React.createElement('span', {className:'text-[8px] px-1 py-0.5 rounded bg-white/10 truncate'}, c._filterName),
                     hasTrans && React.createElement('span', {className:'text-[8px] px-1.5 py-0.5 rounded-full bg-green-600/40 border border-green-500/30 text-green-100 flex items-center gap-0.5'},
-                      React.createElement('span', null, trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→': trans.type==='slide-right'?'←': trans.type==='zoom'?'◎': trans.type==='black'?'●': trans.type==='iris'?'○': trans.type==='wipe'?'⇥': trans.type==='slide-up'?'↑':trans.type==='page'?'📄':'✂️'),
+                      React.createElement('span', null, trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→': trans.type==='slide-right'?'←': trans.type==='zoom'?'◎': trans.type==='black'?'●': trans.type==='iris'?'○': trans.type==='wipe'?'⇥': trans.type==='slide-up'?'↑':trans.type==='page'?'📄':trans.type==='fold'?'📖':'✂️'),
                       `${trans.type} ${trans.duration.toFixed(1)}s`
                     ),
                     !hasTrans && i<clips.length-1 && React.createElement('span', {className:'text-[8px] px-1 py-0.5 rounded bg-white/5 text-white/30'}, 'カット')
@@ -23440,9 +23541,9 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       const targetClip = currentClips.find(x=> x.id===c.id);
                       if(!targetClip) return;
                       const currentTrans = targetClip._transitionToNext;
-                      const newType = prompt('トランジション種類: none, fade, white, slide-left, slide-right, zoom, black, iris, wipe, slide-up\n現在: ' + (currentTrans?currentTrans.type:'none'), currentTrans?currentTrans.type:'none');
+                      const newType = prompt('トランジション種類: none, fade, white, slide-left, slide-right, zoom, black, iris, wipe, slide-up, page, fold\n現在: ' + (currentTrans?currentTrans.type:'none'), currentTrans?currentTrans.type:'none');
                       if(newType===null) return;
-                      const valid=['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up','page'];
+                      const valid=['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up','page','fold'];
                       if(!valid.includes(newType)){ alert('無効な種類です: ' + valid.join(', ')); return; }
                       let newClips;
                       if(newType==='none'){
@@ -23499,7 +23600,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     },
                     className:`w-8 h-6 rounded-full text-[10px] flex items-center justify-center ${hasTrans?'bg-green-600/30 border border-green-500/40 text-green-200':'bg-white/10 text-white/40'}`,
                     title:i===clips.length-1 ? 'このカットのラストを見て次を撮る' : 'トランジションを設定'
-                  }, hasTrans ? (trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→': trans.type==='black'?'●': trans.type==='iris'?'○': trans.type==='wipe'?'⇥': trans.type==='slide-up'?'↑':trans.type==='page'?'📄':'◎') : '+'),
+                  }, hasTrans ? (trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→': trans.type==='black'?'●': trans.type==='iris'?'○': trans.type==='wipe'?'⇥': trans.type==='slide-up'?'↑':trans.type==='page'?'📄':trans.type==='fold'?'📖':'◎') : '+'),
                   React.createElement('button', {
                     onClick:()=>{
                       if(c._splitScreen){
@@ -23542,7 +23643,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 React.createElement('span',{className:'text-[10px] text-emerald-100 break-all'},
                   `${i+1}/${clips.length} · ${c.name} · ${c.timelineStart.toFixed(1)}秒`),
                 React.createElement('div',{className:'flex items-center gap-2'},
-                  React.createElement('button',{type:'button',onClick:e=>{ e.stopPropagation(); openMaterialCheck(c); },
+                  React.createElement('button',{type:'button',onClick:e=>{ e.stopPropagation(); openMaterialCheck(c,e.currentTarget); },
                     className:'rounded-full bg-emerald-100 px-3 py-2 text-[10px] font-bold text-black'},'▶ この場で確認'),
                   React.createElement('button',{type:'button',onClick:()=>openTimelineForClip(c),
                     className:'rounded-full border border-white/25 px-3 py-2 text-[10px] text-white/85'},'タイムラインへ'),
@@ -23864,7 +23965,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       const targetClip = currentClips.find(x=> x.id===c.id);
                       if(!targetClip) return;
                       const currentTrans = targetClip._transitionToNext || {type:'none', duration:0.5};
-                      const types = ['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up','page'];
+                      const types = ['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up','page','fold'];
                       const currentIdx = types.indexOf(currentTrans.type);
                       const nextType = types[(currentIdx+1)%types.length];
                       let newClips;
@@ -23941,7 +24042,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     className:`text-[9px] px-2.5 py-1 rounded-full border flex items-center gap-1 ${hasTrans?'bg-green-600/20 border-green-500/30 text-green-200':'bg-[#1a1a1d] border-white/10 text-white/40 hover:text-white/70'}`,
                     title:'タップでトランジション切り替え'
                   },
-                    hasTrans ? `${trans.type==='fade'?'◐':trans.type==='white'?'◑':trans.type==='slide-left'?'→':trans.type==='slide-right'?'←':trans.type==='zoom'?'◎':trans.type==='black'?'●':trans.type==='iris'?'○':trans.type==='wipe'?'⇥':trans.type==='slide-up'?'↑':trans.type==='page'?'📄':'✂️'} ${trans.type} ${trans.duration.toFixed(1)}s` : '+ トランジション追加'
+                    hasTrans ? `${trans.type==='fade'?'◐':trans.type==='white'?'◑':trans.type==='slide-left'?'→':trans.type==='slide-right'?'←':trans.type==='zoom'?'◎':trans.type==='black'?'●':trans.type==='iris'?'○':trans.type==='wipe'?'⇥':trans.type==='slide-up'?'↑':trans.type==='page'?'📄':trans.type==='fold'?'📖':'✂️'} ${trans.type} ${trans.duration.toFixed(1)}s` : '+ トランジション追加'
                   ),
                   React.createElement('div', {className:'w-6 h-px bg-white/10'})
                 ),
@@ -24611,8 +24712,8 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
         ),
 
 React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニメーション'),
-        React.createElement('div', {className:'grid grid-cols-4 gap-2 mb-4'},
-          [{k:'none',l:'なし',e:'→'},{k:'fade',l:'ふわっと',e:'✨'},{k:'bounce',l:'ポンッ',e:'⚡️'},{k:'slide',l:'スッと',e:'➡️'}].map(a=>
+        React.createElement('div', {className:'grid grid-cols-5 gap-2 mb-4'},
+          [{k:'none',l:'なし',e:'→'},{k:'fade',l:'ふわっと',e:'✨'},{k:'bounce',l:'ポンッ',e:'⚡️'},{k:'slide',l:'スッと',e:'➡️'},{k:'blur',l:'ピント',e:'🔍'}].map(a=>
             React.createElement('button', {
               key:a.k,
               onClick:()=>{
@@ -26170,7 +26271,24 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         const total=Math.max(0.01,materialCheck.end-materialCheck.start);
         const pos=Math.max(0,Math.min(total,currentTime-materialCheck.start));
         return React.createElement('div', {className:'flex flex-col gap-2 rounded-2xl bg-[#141416] border border-white/15 p-2.5 shadow-2xl text-white',
-            onClick:e=>e.stopPropagation()},
+            onClick:e=>e.stopPropagation(),
+            ref:el=>{
+              // 開いた時に1回だけ、行の位置・大きさから今の位置へ広げる（820ms）。動きを減らす設定では行わない。
+              if(!el || el._vlogOpenedAt===materialCheck.openedAt) return;
+              el._vlogOpenedAt=materialCheck.openedAt;
+              const o=materialCheck.origin;
+              let reduce=false; try{ reduce=matchMedia('(prefers-reduced-motion: reduce)').matches; }catch{}
+              if(!o || reduce || !el.animate) return;
+              const f=el.getBoundingClientRect();
+              if(!f.width || !f.height) return;
+              const dx=(o.left+o.width/2)-(f.left+f.width/2), dy=(o.top+o.height/2)-(f.top+f.height/2);
+              const sx=Math.max(0.05,o.width/f.width), sy=Math.max(0.05,o.height/f.height);
+              el._vlogOpenAnimation=el.animate([
+                {transform:`translate(${dx}px,${dy}px) scale(${sx},${sy})`,opacity:0.6,borderRadius:'12px'},
+                {transform:'none',opacity:1,borderRadius:'16px'}
+              ],{duration:820,easing:'cubic-bezier(0.22,1,0.36,1)'});
+              el.parentElement?.animate?.([{backgroundColor:'rgba(0,0,0,0)'},{backgroundColor:'rgba(0,0,0,0.7)'}],{duration:420,easing:'ease-out'});
+            }},
           React.createElement('div', {className:'flex items-center justify-between gap-2 px-1'},
             React.createElement('span', {className:'text-[12px] font-bold truncate'}, materialCheck.name),
             React.createElement('button', {type:'button',onClick:closeMaterialCheck,'aria-label':'閉じる',
