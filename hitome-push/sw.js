@@ -1,4 +1,4 @@
-/* hitome v3.20 notifications only. Separate scope; no fetch cache, no root SW replacement. */
+/* hitome v3.21 notifications only. Separate scope; no fetch cache, no root SW replacement. */
 'use strict';
 self.addEventListener('install',event=>event.waitUntil(self.skipWaiting()));
 function notificationURL(raw){const fallback=new URL('../snslink.html',self.location.href);try{const url=new URL(String(raw||''),fallback);return url.origin===self.location.origin&&url.protocol==='https:'?url.href:fallback.href}catch{return fallback.href}}
@@ -10,7 +10,7 @@ self.addEventListener('push',event=>{
  const url=notificationURL(payload.url||data.url||raw.url);
  event.waitUntil(self.registration.showNotification(title,{
   body:String(payload.body||'予定を確認できます。').slice(0,280),
-  icon:new URL('./icon-192.png',self.location.href).href,
+  icon:new URL('./icon-192.png?v=3.21',self.location.href).href,
   tag:String(payload.tag||payload.scheduleKey||raw.scheduleKey||'hitome:'+url),
   data:{url},renotify:false
  }));
