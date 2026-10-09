@@ -497,6 +497,26 @@ async function ynFrameSeek(video,time,nudge=false){
  let target=time;if(Math.abs(target-video.currentTime)<.0001)target=target+.0003<video.duration?target+.0003:Math.max(0,target-.0003);
  try{await ynSeek(video,target);const frame=await pts;frame.requested=video.currentTime;ynFrameTimes.set(video,frame);return frame}finally{clearTimeout(timer);video.cancelVideoFrameCallback(id)}
 }
+// A plain seek can resolve while the element still presents the previous frame (seen when analysis starts with the playhead at the end).
+// Confirm with the presented frame's own timestamp and come back once if it is far from the requested time.
+const ynSeekStats={ok:0,retry:0,stale:0,unverified:0};
+async function ynSeekReal(video,time){
+ const dur=Number.isFinite(video.duration)?video.duration:0,target=Math.max(0,Math.min(Math.max(0,dur-.001),time)),rvfc=typeof video.requestVideoFrameCallback==='function';
+ const once=async t=>{
+  let id=null,timer=null;
+  const pres=rvfc?new Promise(res=>{timer=setTimeout(()=>res(null),300);id=video.requestVideoFrameCallback((_,m)=>{clearTimeout(timer);res(m)})}):Promise.resolve(null);
+  try{await ynSeek(video,t);return await pres}finally{clearTimeout(timer);if(id!==null)try{video.cancelVideoFrameCallback(id)}catch{}}
+ };
+ let m=await once(target);
+ if(m&&Number.isFinite(m.mediaTime)&&Math.abs(m.mediaTime-target)>.25){
+  ynSeekStats.retry++;
+  await ynSeek(video,target+1<dur?target+1:Math.max(0,target-1));
+  m=await once(target);
+  if(m&&Number.isFinite(m.mediaTime)&&Math.abs(m.mediaTime-target)>.25){ynSeekStats.stale++;return {time:m.mediaTime,exact:false,stale:true}}
+ }
+ if(m&&Number.isFinite(m.mediaTime)){ynSeekStats.ok++;return {time:m.mediaTime,exact:true}}
+ ynSeekStats.unverified++;await new Promise(r=>setTimeout(r,40));return {time:video.currentTime,exact:false}
+}
 function ynPolyPath(ctx,poly){if(!poly?.length)return;ctx.beginPath();ctx.moveTo(poly[0].x,poly[0].y);for(const p of poly.slice(1))ctx.lineTo(p.x,p.y);ctx.closePath()}
 // Circumscribed ellipse: keep every specified face corner covered, including rotated faces.
 function ynFaceMaskPath(ctx,poly,padding=0){
@@ -522,13 +542,57 @@ function ynQuadHealth(poly,ref){
  if(!(a.edge>=.35))why.push('枠がゆがんでいます');
  return {weak:why.length>0,why:why.join('・'),area,asp,edge:a.edge,cx:a.cx,cy:a.cy,size:a.size};
 }
+// Judge each tracked frame against the group's own recent healthy frames (not only the specified shape): a mistaken anchor, or a face that really gets smaller, is not flagged; a sudden collapse is.
+const ynHealthCache=new WeakMap();
+function ynMedianMetrics(list){const g=k=>ynMedian(list.map(x=>x[k]));return {area:g('area'),asp:g('asp'),edge:g('edge'),size:g('size'),cx:g('cx'),cy:g('cy')}}
+function ynHealthSeries(group){
+ const frames=group.frames||[],anchors=(group.anchors||[]).slice().sort((x,y)=>x.time-y.time),mid=frames[frames.length>>1],hs=mid&&mid.faces&&mid.faces[0]&&mid.faces[0].poly&&mid.faces[0].poly[0]?mid.faces[0].poly[0].x:0;
+ const sig=frames.length+'|'+anchors.map(x=>x.time+':'+(x.faces||[]).length).join(',')+'|'+hs,cached=ynHealthCache.get(group);
+ if(cached&&cached.frames===frames&&cached.sig===sig)return cached.map;
+ const map=new Map(),maxGap=2.5/(group.fps||30),ids=new Set();
+ for(const f of frames)if(f.ok&&!f.fallback&&f.faces)for(const x of f.faces)ids.add(x.id);
+ for(const id of ids){
+  const out=[];let seg=-2,boot=[],recent=[],base=null,prev=null,anchorM=null,areaRun=[];
+  for(const f of frames){
+   if(!f.ok||f.fallback||!f.faces){prev=null;continue}
+   const face=f.faces.find(x=>x.id===id);if(!face||!face.poly||face.poly.length!==4){prev=null;continue}
+   let sIdx=-1;for(let i=0;i<anchors.length;i++)if(anchors[i].time<=f.time+1e-6)sIdx=i;
+   if(sIdx!==seg){seg=sIdx;boot=[];recent=[];base=null;prev=null;anchorM=null;areaRun=[];const af=sIdx>=0?(anchors[sIdx].faces||[]).find(x=>x.id===id):null;if(af&&af.poly&&af.poly.length===4){const am=ynPolyMetrics(af.poly);if(am.area>1&&am.asp>0)anchorM=am}}
+   const m=ynPolyMetrics(face.poly);if(!(m.area>1)||!(m.asp>0)){out.push({time:f.time,h:null});prev=null;continue}
+   if(!base){boot.push(m);if(boot.length>=5){base=ynMedianMetrics(boot);recent=boot.map((x,i)=>({t:f.time-(boot.length-1-i)/(group.fps||30),m:x}))}}
+   const ref=base||ynMedianMetrics(boot),why=[],area=m.area/ref.area,asp=m.asp/ref.asp;
+   if(area<.45)why.push('小さくつぶれています');else if(area>2.2)why.push('大きく広がっています');
+   if(!(asp>=.6&&asp<=1.65))why.push('縦横の比率が崩れています');
+   if(m.edge<.35&&m.edge<.6*ref.edge)why.push('枠がゆがんでいます');
+   if(prev&&f.time-prev.t<=maxGap+1e-6&&Math.hypot(m.cx-prev.cx,m.cy-prev.cy)>.6*Math.max(ref.size,1))why.push('枠が急に跳びました');
+   if(!base&&anchorM){const aa=m.area/anchorM.area,ap=m.asp/anchorM.asp;if(aa<.25||aa>4||ap<.45||ap>2.2)why.push('指定した形から大きく外れています')}
+   const weak=why.length>0;
+   out.push({time:f.time,h:{weak,why:why.join('・'),area,asp,edge:m.edge,cx:m.cx,cy:m.cy,size:m.size,faceId:id}});
+   prev={t:f.time,cx:m.cx,cy:m.cy};
+   // A change of size alone (shape intact) that stays stable for ~1s is a real change of the face (leaning in/out): accept it as the new baseline. A collapsed shape never is.
+   if(base&&weak&&why.length===1&&(area<.45||area>2.2)){areaRun.push(m);if(areaRun.length>=Math.round(group.fps||30)){const ar=areaRun.map(x=>x.area);if(Math.max(...ar)/Math.min(...ar)<1.3){base=ynMedianMetrics(areaRun);recent=areaRun.map((x,i)=>({t:f.time-(areaRun.length-1-i)/(group.fps||30),m:x}));areaRun=[]}else areaRun.shift()}}else areaRun=[];
+   if(!weak&&base){recent.push({t:f.time,m});while(recent.length&&f.time-recent[0].t>1)recent.shift();if(recent.length>=3)base=ynMedianMetrics(recent.map(x=>x.m))}
+  }
+  map.set(id,out);
+ }
+ ynHealthCache.set(group,{frames,sig,map});return map;
+}
 function ynGroupHealthAt(group,time,fr){
  fr=fr||ynMotionAt(group,time);
  if(!fr||!fr.ok||fr.fallback||!fr.faces)return null;
- let worst=null;
+ const series=ynHealthSeries(group),tol=Math.max(.04,1.5/(group.fps||30));let worst=null;
  for(const face of fr.faces){
-  let ref=null,bd=Infinity;for(const a of group.anchors||[]){const f=(a.faces||[]).find(x=>x.id===face.id);if(f&&f.poly&&f.poly.length===4){const d=Math.abs(a.time-time);if(d<bd){bd=d;ref=f.poly}}}
-  const h=ref&&ynQuadHealth(face.poly,ref);if(!h)continue;
+  let h=null;const arr=series.get(face.id);
+  if(arr&&arr.length){
+   let lo=0,hi=arr.length;while(lo<hi){const mid=(lo+hi)>>1;if(arr[mid].time<time)lo=mid+1;else hi=mid}
+   let best=null;for(const k of [lo-1,lo]){const e=arr[k];if(e&&e.h&&Math.abs(e.time-time)<=tol&&(!best||Math.abs(e.time-time)<Math.abs(best.time-time)))best=e}
+   if(best)h=best.h;
+  }
+  if(!h){
+   let ref=null,bd=Infinity;for(const an of group.anchors||[]){const f=(an.faces||[]).find(x=>x.id===face.id);if(f&&f.poly&&f.poly.length===4){const d=Math.abs(an.time-time);if(d<bd){bd=d;ref=f.poly}}}
+   const q=ref&&ynQuadHealth(face.poly,ref);if(q)h=q;
+  }
+  if(!h)continue;
   if(!worst||(h.weak&&!worst.weak)||(h.weak===worst.weak&&h.area<worst.area))worst={...h,faceId:face.id};
  }
  return worst;
@@ -1166,6 +1230,17 @@ const ynPointer=(event,expanded,phase)=>{
 const ynRemove=(faceId)=>{ynSetReviewed(false);const group=ynGroups.current.find(g=>g.id===ynSelected);if(!group)return;ynSaveUndo();if(faceId===null||group.faces.length===1){ynGroups.current=ynGroups.current.filter(g=>g!==group);ynApprovedIssues.current=ynApprovedIssues.current.filter(issue=>issue.groupId!==group.id);ynSetSelected(ynGroups.current[0]?.id||0)}else{group.faces=group.faces.filter(f=>f.id!==faceId);for(const a of [...group.anchors,...group.frames])if(a.faces)a.faces=a.faces.filter(f=>f.id!==faceId)}ynIssuesRefresh();ynRefresh()};
 const ynRange=(side)=>{const group=ynGroups.current.find(g=>g.id===ynSelected);if(!group)return;const time=ynCurrentFrameTime();if(side==='start'&&time>=group.end||side==='end'&&time<=group.start){ynSetMessage('開始は終了より前に指定してください。');return}ynSetReviewed(false);ynSaveUndo();const expanding=side==='start'?time<group.start:time>group.end;group[side]=time;group.anchors=group.anchors.filter(a=>a.time>=group.start&&a.time<=group.end);if(!group.anchors.length){ynSetMessage('範囲内で写真と顔を指定し直してください。');group.frames=[];group.dirty={from:group.start,to:group.end}}else ynInvalidate(group,time,!expanding);ynRefresh()};
 const ynUndoAction=()=>{if(ynBusy.current)return;ynSetReviewed(false);if(ynDraft.current.length){ynDraft.current.pop();ynRefresh();return}if(!ynUndo.current.length)return;ynGroups.current=ynUndo.current.pop();ynApprovedIssues.current=[];ynSetSelected(ynGroups.current[0]?.id||0);ynDraft.current=[];ynSetEdit(null);ynIssuesRefresh();ynSetMessage('指定を1つ戻しました。確認済み区間も再確認してください。');ynRefresh()};
+// Right after a face was added or corrected: cancel exactly that box and start drawing again at the same playback position.
+const ynRedoBox=()=>{
+ if(ynBusy.current||ynEdit!=='done'||!ynAdded||!ynUndo.current.length)return;
+ const added=ynAdded;
+ ynGroups.current=ynUndo.current.pop();ynApprovedIssues.current=[];ynSetReviewed(false);
+ {const alive=new Set(ynGroups.current.map(g=>g.id)),o={};for(const k of Object.keys(ynFaceFix.current)){if(k.startsWith('g:')&&!alive.has(Number(k.split(':')[1])))continue;o[k]=ynFaceFix.current[k]}ynFaceFix.current=o}
+ const keep=ynGroups.current.find(g=>g.id===added.id);
+ ynSetSelected(keep?keep.id:(ynGroups.current[0]?.id||0));
+ ynDraft.current=[];ynIssuesRefresh();ynSetAdded(null);
+ ynEditing('face',added.corrected?added.faceId:'newGroup');
+};
 const ynMotionAnalyse=async(targetId=null,batch=false)=>{
  const notify=text=>ynSetMessage(ynBatch.current?`一括追従 ${ynBatch.current.index}/${ynBatch.current.total} · ${text}`:text);
  const preview=n.current,group=ynGroups.current.find(g=>g.id===(typeof targetId==='number'?targetId:ynSelected));if(!preview||!group?.faces.length||!group.anchors.length||ynBusy.current&&!batch)return false;
@@ -1339,6 +1414,7 @@ const ynEditorToolbar=()=>{
  return G('div',{className:'yn-editor-toolbar yn-compact-editor',children:[
   D('p',{className:'yn-mode-hint',role:'status',children:ynEdit?state.hint:'「顔を追加」で囲むか、対象を選んで位置を直してください。'}),
   G('div',{className:'yn-compact-actions',children:[
+   ynEdit==='done'&&ynAdded&&ynUndo.current.length>0&&button('↶ 囲み直す',ynRedoBox),
    button(ynEdit==='done'?'別の顔も追加':'顔を追加',()=>ynEditing('face',ynGroups.current.find(g=>g.id===ynSelected)?.type==='plane'?null:'newGroup')),
    button(ynPanMode?state.returnLabel:'画面を移動',()=>{ynDrag.current=null;ynSetPanMode(v=>!v);ynRefresh()},false,ynPanMode),
    button('仕上がりを見る',()=>ynShowPreview('review'))
@@ -1469,7 +1545,7 @@ if(!T.current&&!Hs.current){ynSetMessage('顔検出AIがまだ利用できませ
 if(i.readyState<2||!i.videoWidth||!Number.isFinite(i.duration)||i.duration<=0){ynSetMessage('動画の読込が終わってから解析してください。');return}
 ynSetReviewed(false);ynSetEdit(null);ynSetInspect("none");ynSetExclusive(false);ynBusy.current=true;ynCancel.current=false;const session=++ynSession.current,originalTime=i.currentTime;
 Ys(!0);qe(!1);Dl(0);ynSetMessage('解析中。終了後に元の再生位置へ戻ります。');
-let y=!i.paused;try{i.pause(),xn(!1);let{videoWidth:g,videoHeight:d}=i,N=i.duration,times=ynSampleTimes(N,ynFPS),_=times.length,v=1/ynFPS,a=[],z=new Map,A=1,O=0,cuts=[],issues=[],scene=0,previousSignature=null,previousCount=0,W=L=>ynSeek(i,L);
+ynSeekStats.ok=ynSeekStats.retry=ynSeekStats.stale=ynSeekStats.unverified=0;let y=!i.paused;try{i.pause(),xn(!1);let{videoWidth:g,videoHeight:d}=i,N=i.duration,times=ynSampleTimes(N,ynFPS),_=times.length,v=1/ynFPS,a=[],z=new Map,A=1,O=0,cuts=[],issues=[],scene=0,previousSignature=null,previousCount=0,W=L=>ynSeekReal(i,L);
 let maxGap=v;const ynTm={seek:0,det:0},tAll=performance.now();
 const detectAt=async(Q,L)=>{const tS=performance.now();await W(Q);const tD=performance.now();ynTm.seek+=tD-tS;ot();let $=s.getContext("2d");if(!$)return null;$.clearRect(0,0,g,d),$.drawImage(i,0,0,g,d);const signature=ynSceneSignature(s);
 let Y=[],F=((j)=>{let C=0,x=0,wn=g,ln=d;if(j==="bottom60")x=d*0.4,ln=d*0.6;else if(j==="center80")C=g*0.1,x=d*0.1,wn=g*0.8,ln=d*0.8;else if(j==="center50")C=g*0.25,x=d*0.25,wn=g*0.5,ln=d*0.5;let zn=document.createElement("canvas");return zn.width=Math.max(64,Math.floor(wn)),zn.height=Math.max(64,Math.floor(ln)),zn.getContext("2d")?.drawImage(s,C,x,wn,ln,0,0,zn.width,zn.height),{canvas:zn,rx:C,ry:x,sx:zn.width/wn,sy:zn.height/ln}})(Js),cn=(j,C)=>{
@@ -1490,8 +1566,8 @@ await new Promise(resolve=>setTimeout(resolve,0));
 Dl(Math.round((L+1)/_*100)),Co(O),Be(a.length)};
 const maxJump=ynAdaptive?Math.max(1,Math.floor(.5*ynFPS+1e-9)):1;
 const skipped=await ynAdaptiveRun(_,maxJump,(L)=>detectAt(times[L],L),commitAt,(p0,q0)=>ynStableDet(p0,q0,g,d),()=>{if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。前回の解析結果を維持しました。')});if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。前回の解析結果を維持しました。');
-c.current=z;ynCuts.current=cuts;ynStep.current=Math.max(v,maxGap/2.1+.001);ynSetIssues(issues);let I=f.current;if(I){ot();let L=I.getContext("2d");if(L){L.clearRect(0,0,I.width,I.height);for(let Q of a){let $=Q.union.x,Y=Q.union.y,tn=Q.union.x2-Q.union.x,F=Q.union.y2-Q.union.y,cn=tn*ynPadding,R=F*ynPadding,it=$+tn/2,ql=Y+F/2,oi=(tn+cn*2)/2,Le=(F+R*2)/2;L.fillStyle="white",L.beginPath(),L.ellipse(it,ql,Math.max(1,oi),Math.max(1,Le),0,0,Math.PI*2),L.fill()}}}ynDeletedStack.current=[],ynTruthDeleted.current=[],ynKeptIds.current=new Set();ynSetUndoCount(0);je([...a]);Be(a.length);qe(a.length===0);Dl(100);b(count=>count+1);
-ynSetMessage(`自動で顔を探しました。「大きく確認」で映像を見て、抜けた顔は追加してください。 · ${times.length}フレーム / ${ynFPS}fps · 確認候補${issues.length}箇所 · 所要${((performance.now()-tAll)/1000).toFixed(1)}秒（動画の移動${Math.round(ynTm.seek/Math.max(1,ynTm.seek+ynTm.det)*100)}% / 顔検出${Math.round(ynTm.det/Math.max(1,ynTm.seek+ynTm.det)*100)}%）${skipped>0?` · 間引きで${skipped}/${_}フレームを省略`:''}`);ynSetExpandedView("review");
+c.current=z;ynCuts.current=cuts;ynStep.current=Math.max(v,maxGap/2.1+.001);ynSetIssues(issues);let I=f.current;if(I){ot();let L=I.getContext("2d");if(L){L.clearRect(0,0,I.width,I.height);for(let Q of a){let $=Q.union.x,Y=Q.union.y,tn=Q.union.x2-Q.union.x,F=Q.union.y2-Q.union.y,cn=tn*ynPadding,R=F*ynPadding,it=$+tn/2,ql=Y+F/2,oi=(tn+cn*2)/2,Le=(F+R*2)/2;L.fillStyle="white",L.beginPath(),L.ellipse(it,ql,Math.max(1,oi),Math.max(1,Le),0,0,Math.PI*2),L.fill()}}}ynDeletedStack.current=[],ynTruthDeleted.current=[],ynKeptIds.current=new Set();{const o={};for(const k of Object.keys(ynFaceFix.current))if(!k.startsWith('a:'))o[k]=ynFaceFix.current[k];ynFaceFix.current=o}ynSetUndoCount(0);je([...a]);Be(a.length);qe(a.length===0);Dl(100);b(count=>count+1);
+ynSetMessage(`自動で顔を探しました。「大きく確認」で映像を見て、抜けた顔は追加してください。 · ${times.length}フレーム / ${ynFPS}fps · 確認候補${issues.length}箇所 · 所要${((performance.now()-tAll)/1000).toFixed(1)}秒（動画の移動${Math.round(ynTm.seek/Math.max(1,ynTm.seek+ynTm.det)*100)}% / 顔検出${Math.round(ynTm.det/Math.max(1,ynTm.seek+ynTm.det)*100)}%）${skipped>0?` · 間引きで${skipped}/${_}フレームを省略`:''}${ynSeekStats.retry>0?` · 古い映像を${ynSeekStats.retry}回取り直しました`:''}`);ynSetExpandedView("review");
 }catch(error){Be(Ut.length);ynSetMessage(error.message)}finally{
  try{await ynSeek(i,originalTime)}catch{}
  Lt(i.currentTime);Ys(false);ynBusy.current=false;bn.current?.();
@@ -1591,11 +1667,11 @@ const ynToggleAutoSelect=E.useCallback((id)=>{
     return next;
   });
 },[]);
-const ynRecordDeleted=(removed,label)=>{if(!removed.length)return;const st=ynDeletedStack.current;st.push({tracks:removed,label});if(st.length>10)st.shift();ynSetUndoCount(st.length);for(const tr of removed){const h=tr.history||[];let t0=Infinity,t1=-Infinity,mx=0;for(const f of h){const t=f.time||0;if(t<t0)t0=t;if(t>t1)t1=t;if((f.score||0)>mx)mx=f.score||0}ynTruthDeleted.current.push({id:tr.id,t0:isFinite(t0)?t0:0,t1:isFinite(t1)?t1:0,n:h.length,maxScore:mx,label,samples:h.map(f=>{const q=v=>Math.round((v||0)*10)/10;return [Math.round((f.time||0)*1000)/1000,q(f.x),q(f.y),q(f.w),q(f.h),Math.round((f.score||0)*1000)/1000,...(f.landmarks||[]).slice(0,6).flatMap(l=>[q(l.x),q(l.y)])]})})}ynSetTruthTick(v=>v+1)};
+const ynRecordDeleted=(removed,label)=>{if(!removed.length)return;const st=ynDeletedStack.current,fx={};for(const tr of removed){const k='a:'+tr.id;if(ynFaceFix.current[k])fx[k]=ynFaceFix.current[k]}if(Object.keys(fx).length){const o={...ynFaceFix.current};for(const k of Object.keys(fx))delete o[k];ynFaceFix.current=o;ynSetFixTick(v=>v+1);b(v=>v+1)}st.push({tracks:removed,label,fix:fx});if(st.length>10)st.shift();ynSetUndoCount(st.length);for(const tr of removed){const h=tr.history||[];let t0=Infinity,t1=-Infinity,mx=0;for(const f of h){const t=f.time||0;if(t<t0)t0=t;if(t>t1)t1=t;if((f.score||0)>mx)mx=f.score||0}ynTruthDeleted.current.push({id:tr.id,t0:isFinite(t0)?t0:0,t1:isFinite(t1)?t1:0,n:h.length,maxScore:mx,label,samples:h.map(f=>{const q=v=>Math.round((v||0)*10)/10;return [Math.round((f.time||0)*1000)/1000,q(f.x),q(f.y),q(f.w),q(f.h),Math.round((f.score||0)*1000)/1000,...(f.landmarks||[]).slice(0,6).flatMap(l=>[q(l.x),q(l.y)])]})})}ynSetTruthTick(v=>v+1)};
 const ynUndoDelete=()=>{
   const st=ynDeletedStack.current,last=st.pop();if(!last)return;
   {const ids=new Set(last.tracks.map(t=>t.id));ynTruthDeleted.current=ynTruthDeleted.current.filter(e=>!ids.has(e.id));ynSetTruthTick(v=>v+1)}
-  const next=ynRestoreTracks(Ut,last.tracks);je(next);Be(next.length);b(v=>v+1);ynSetUndoCount(st.length);
+  const next=ynRestoreTracks(Ut,last.tracks);je(next);Be(next.length);if(last.fix&&Object.keys(last.fix).length){ynFaceFix.current={...ynFaceFix.current,...last.fix};ynSetFixTick(v=>v+1)}b(v=>v+1);ynSetUndoCount(st.length);
   ynSetIdToast({time:ynCurrentFrameTime(),text:last.label+' を元に戻しました'});
 };
 const ynToggleAutoGroup=E.useCallback((ids)=>{ynSetSelectedAutoIds(prev=>{const next=new Set(prev),all=ids.every(i=>next.has(i));ids.forEach(i=>all?next.delete(i):next.add(i));return next})},[]); const ynDeleteAutoIds=E.useCallback((ids)=>{const set=new Set(ids),cleaned=Ut.filter(t=>!set.has(t.id));ynRecordDeleted(Ut.filter(t=>set.has(t.id)),'ID:'+Math.min(...ids)+(ids.length>1?' 他'+(ids.length-1):''));try{ynSaveUndo&&ynSaveUndo();}catch{}je(cleaned);Be(cleaned.length);b(v=>v+1);ynSetSelectedAutoIds(prev=>{const n=new Set(prev);ids.forEach(i=>n.delete(i));return n})},[Ut]); const ynDeleteSingleAutoDirect=E.useCallback((id)=>{
@@ -1746,7 +1822,7 @@ const ynRedetRun=async()=>{
     stCfg.on=false;
     for(let i=0;i<times.length;i++){
       if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。');
-      const tm=times[i];await ynSeek(video,tm);
+      const tm=times[i];await ynSeekReal(video,tm);
       const out=li(vw,vh,tm,video,null,false,null);if(!out)continue;
       const rc=document.createElement('canvas');rc.width=Math.max(64,Math.round(vw*scale));rc.height=Math.max(64,Math.round(vh*scale));const rx=rc.getContext('2d');if(!rx)continue;rx.drawImage(out,0,0,rc.width,rc.height);
       const found=Kl(await Bl(rc,tm,0,0,{sx:rc.width/vw,sy:rc.height/vh,x:0,y:0},'redetect'),vw,vh,rc,rc,thr);
@@ -1974,7 +2050,10 @@ const ynTl=E.useMemo(()=>{
   const sample=t=>{
     let worst='none',faces=[];try{faces=nc(t).faces||[]}catch{}
     for(const f of faces){let st='ok';if(f.src==='hold'||f.src==='hold-back')st='hold';else if(f.src==='interp'&&f.gap>step*1.25)st='gap';if(rank[st]>rank[worst])worst=st}
-    if(nn==='track')for(const g of ynGroups.current){try{const fr=ynMotionAt(g,t);if(fr===null||fr===undefined)continue;if(!fr.ok)return 'lost';const hh=ynGroupHealthAt(g,t,fr);if(hh&&hh.weak&&rank.weak>rank[worst])worst='weak';else if(rank.ok>rank[worst])worst='ok'}catch{}}
+    let lostFaces=0;
+    if(nn==='track')for(const g of ynGroups.current){try{const fr=ynMotionAt(g,t);if(fr===null||fr===undefined)continue;if(!fr.ok){lostFaces+=Math.max(1,g.faces.length);continue}const hh=ynGroupHealthAt(g,t,fr);if(hh&&hh.weak&&rank.weak>rank[worst])worst='weak';else if(rank.ok>rank[worst])worst='ok'}catch{}}
+    // A manual face that lost its track is only "lost" when the automatic faces drawn at this time cannot cover it (one automatic face per lost manual face).
+    if(lostFaces>0&&!(!(ynExclusive&&ynGroups.current.length)&&faces.length>=lostFaces))return 'lost';
     return worst;
   };
   const per=bin>.2?3:1;
@@ -1988,7 +2067,7 @@ const ynTl=E.useMemo(()=>{
   for(const r of runs){r.t0=r.i0*bin;r.t1=(r.i1+1)*bin}
   const counts={gap:0,hold:0,lost:0,weak:0};for(const r of runs)counts[r.worst]++;
   return {dur,N,bin,cells,fix,paint,runs,counts,cuts:[...ynCuts.current]};
-},[Ln,Dn,Ut,J,ynFixTick,nn,nc]);
+},[Ln,Dn,Ut,J,ynFixTick,nn,nc,ynExclusive]);
 const ynTlDraw=(cv,tl)=>{
   const ctx=cv.getContext('2d');if(!ctx)return;ctx.clearRect(0,0,cv.width,cv.height);if(!tl)return;
   const W=cv.width,H=cv.height,barH=Math.round(H*.64),rowH=Math.round(H*.15),x0=i=>Math.floor(i/tl.N*W),x1=i=>Math.ceil((i+1)/tl.N*W);
@@ -2055,10 +2134,10 @@ const ynTruthBuild=()=>{
       if(i%stride===0||!f.ok)rows.push(h?[t,1,f.estimated?1:0,0,r3(h.area),r3(h.asp),r3(h.edge),r1(h.cx),r1(h.cy),r1(h.size)]:[t,f.ok?1:0,f.estimated?1:0,f.fallback?1:0]);
       if(h&&h.weak){if(cur&&t-cur.t1<=2.5/(g.fps||30)+.001){cur.t1=t;cur.minArea=Math.min(cur.minArea,r3(h.area))}else{cur={group:g.id,face:h.faceId,t0:t,t1:t,why:h.why,minArea:r3(h.area)};weak.push(cur)}}
     });
-    return {id:g.id,type:g.type,start:r3(g.start),end:r3(g.end),fps:g.fps,anchors:(g.anchors||[]).map(a=>({t:r3(a.time),faces:(a.faces||[]).map(f=>({id:f.id,box:f.poly&&f.poly.length>2?(()=>{const b0=ynFaceBoxFromPoly(f.poly);return [r1(b0.x),r1(b0.y),r1(b0.w),r1(b0.h)]})():null}))})),rowFormat:'[t,ok,estimated,fallback,areaRatio,aspectRatio,edge,cx,cy,size]',frames:rows,weakRuns:weak};
+    return {id:g.id,type:g.type,start:r3(g.start),end:r3(g.end),fps:g.fps,anchors:(g.anchors||[]).map(a=>({t:r3(a.time),faces:(a.faces||[]).map(f=>({id:f.id,box:f.poly&&f.poly.length>2?(()=>{const b0=ynFaceBoxFromPoly(f.poly);return [r1(b0.x),r1(b0.y),r1(b0.w),r1(b0.h)]})():null}))})),rowFormat:'[t,ok,estimated,fallback,areaRatio,aspectRatio,edge,cx,cy,size] (ratios are against the group\'s own recent healthy frames)',frames:rows,weakRuns:weak};
   });
   return {format:'bokasi-truth',version:2,exportedAt:new Date().toISOString(),video:{name,duration:r3(video?.duration||0),width:video?.videoWidth||0,height:video?.videoHeight||0},
-    detect:{fps:ynFPS,step:ynStep.current,padding:ynPadding,cuts:[...ynCuts.current].map(r3)},tracks,
+    detect:{fps:ynFPS,step:ynStep.current,padding:ynPadding,cuts:[...ynCuts.current].map(r3),seekStats:{...ynSeekStats}},tracks,
     truth:{corrections:ynBoxFix.current.map(r=>({t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot})),faceCorrections:Object.entries(ynFaceFix.current).flatMap(([k,arr])=>arr.map(r=>({key:k,t0:r3(r.t0),t1:r.t1>=1e8?null:r3(r.t1),dx:r.dx,dy:r.dy,rot:r.rot===undefined?null:r.rot}))),manualFaces:manual,deletedTracks:ynTruthDeleted.current.map(d=>({...d,t0:r3(d.t0),t1:r3(d.t1),maxScore:r3(d.maxScore)})),keptTrackIds:[...ynKeptIds.current]},
     groups:ynGroupsOut,
     metrics:ynTruthReport};
