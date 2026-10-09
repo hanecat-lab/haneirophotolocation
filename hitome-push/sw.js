@@ -1,4 +1,4 @@
-/* hitome v3.17 notifications only. Separate scope; no fetch cache, no root SW replacement. */
+/* hitome v3.20 notifications only. Separate scope; no fetch cache, no root SW replacement. */
 'use strict';
 self.addEventListener('install',event=>event.waitUntil(self.skipWaiting()));
 function notificationURL(raw){const fallback=new URL('../snslink.html',self.location.href);try{const url=new URL(String(raw||''),fallback);return url.origin===self.location.origin&&url.protocol==='https:'?url.href:fallback.href}catch{return fallback.href}}
@@ -21,7 +21,7 @@ self.addEventListener('notificationclick',event=>{
  event.waitUntil((async()=>{
   const windows=await self.clients.matchAll({type:'window',includeUncontrolled:true});
   for(const client of windows){const current=new URL(client.url);if(current.origin===target.origin&&current.pathname===target.pathname){
-   if(taskId)client.postMessage({type:'HITOME_OPEN_TASK',taskId});
+   if(taskId)client.postMessage({type:'HITOME_OPEN_TASK',taskId,sessionId:target.searchParams.get('hitome-session')||''});
    await client.focus();return;
   }}
   await self.clients.openWindow(url);
