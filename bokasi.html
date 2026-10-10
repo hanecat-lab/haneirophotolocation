@@ -655,8 +655,8 @@ function ynFaceRef(faces,groups,time,scale,fallback){let size=0;for(const f of f
 function ynExportSummary(log){
  const rows=log.rows.filter(r=>r[3]!==null),late=rows.filter(r=>r[5]>67).length;let skipped=0;
  for(let i=1;i<rows.length;i++){const a=rows[i-1][2],b=rows[i][2];if(Number.isFinite(a)&&Number.isFinite(b)&&b-a>1)skipped+=b-a-1}
- const sec=(a,b)=>a!=null&&b!=null?Math.round(b-a)/1000:null;
- return {frames:rows.length,late,skipped,startWait:sec(log.recStart,log.firstAt),playWait:sec(log.recStart,log.playAt),lastTime:log.rows.length?Math.max(...log.rows.map(r=>r[1])):null,duration:log.duration??null,capSkipped:log.capSkipped??null,renders:log.renders??null,secondFrameMs:log.rows.length>2&&log.rows[2][3]!=null&&log.rows[1][3]!=null?log.rows[2][3]-log.rows[1][3]:null,end:log.end||null,onstopMissing:!!log.onstopMissing};
+ const sec=(a,b)=>a!=null&&b!=null?Math.round(b-a)/1000:null,lagAvg=rows.length?Math.round(rows.reduce((q,r)=>q+Math.max(0,r[5]),0)/rows.length)/1000:null;
+ return {frames:rows.length,late,skipped,startWait:sec(log.recStart,log.firstAt),playWait:sec(log.recStart,log.playAt),lastTime:log.rows.length?Math.max(...log.rows.map(r=>r[1])):null,duration:log.duration??null,capSkipped:log.capSkipped??null,renders:log.renders??null,lagAvg,startPause:sec(log.recStart,log.resumeAt),audioSkip:log.audioSkip??null,secondFrameMs:log.rows.length>2&&log.rows[2][3]!=null&&log.rows[1][3]!=null?log.rows[2][3]-log.rows[1][3]:null,end:log.end||null,onstopMissing:!!log.onstopMissing};
 }
 // ?diag export only: burn the frame number and source time, each face's tracked box (thin, dashed) and drawn box (thick), and hand-painted areas into the video.
 function ynDiagBurn(ctx,W,H,row,paints){
@@ -1739,18 +1739,21 @@ ynSetMessage(`自動で顔を探しました。「大きく確認」で映像を
   const finished=new Promise((resolve,reject)=>{finishNow=resolve;recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};recorder.onstop=resolve;recorder.onerror=e=>{failure=Error(e.error?.message||'録画に失敗しました');stop(failure);reject(failure)}});
   // The recording takes 30 frames per second; compose only the first video frame at or after each 1/30 s step (a 60 fps video otherwise doubles the work).
   let nextDue=0;
-  const frame=(now,metadata)=>{if(stopped)return;if(ynLog.firstAt===null&&ynLog.recStart!==null)ynLog.firstAt=performance.now();const mt=metadata?.mediaTime??video.currentTime;if(ynLog.rows.length>1&&mt<nextDue-.002){ynLog.capSkipped++;if(video.requestVideoFrameCallback)frameID=video.requestVideoFrameCallback(frame);else frameID=requestAnimationFrame(frame);return}while(nextDue<=mt+.002)nextDue+=1/30;try{draw(mt,metadata)}catch(err){stop(err);return}if(video.requestVideoFrameCallback)frameID=video.requestVideoFrameCallback(frame);else frameID=requestAnimationFrame(frame)};
+  const frame=(now,metadata)=>{if(stopped)return;if(ynLog.firstAt===null&&ynLog.recStart!==null)ynLog.firstAt=performance.now();const mt=metadata?.mediaTime??video.currentTime;if(ynLog.startPaused&&mt>.001&&recorder.state==='paused')resumeRec();if(ynLog.rows.length>1&&mt<nextDue-.002){ynLog.capSkipped++;if(video.requestVideoFrameCallback)frameID=video.requestVideoFrameCallback(frame);else frameID=requestAnimationFrame(frame);return}while(nextDue<=mt+.002)nextDue+=1/30;try{draw(mt,metadata)}catch(err){stop(err);return}if(video.requestVideoFrameCallback)frameID=video.requestVideoFrameCallback(frame);else frameID=requestAnimationFrame(frame)};
   document.addEventListener('visibilitychange',visibility);video.addEventListener('ended',ended);video.addEventListener('error',videoError);
   timerID=setInterval(()=>{if(ynCancel.current){cancelled=true;stop()}},80);
   let lastTime=0,lastProgress=performance.now();watchdogID=setInterval(()=>{if(video.currentTime>lastTime+0.001){lastTime=video.currentTime;lastProgress=performance.now()}else if(performance.now()-lastProgress>20000)stop(Error('再生が止まったため書き出しを中止しました。'))},1000);
   frameID=video.requestVideoFrameCallback?video.requestVideoFrameCallback(frame):requestAnimationFrame(frame);
   ynLog.recStart=performance.now();recorder.start(250);
-  try{await video.play();ynLog.playAt=performance.now()}catch(err){stop(Error('動画の再生を開始できませんでした。'));}
+  // On iPhone the second frame comes ~0.6 s after play(); keep the recording paused until frames flow so the file does not start with a freeze.
+  try{recorder.pause();ynLog.startPaused=true}catch{}
+  const resumeRec=()=>{if(recorder.state!=='paused')return;try{recorder.resume()}catch{}ynLog.resumeAt=performance.now();ynLog.audioSkip=Math.round(video.currentTime*1000)};
+  try{await video.play();ynLog.playAt=performance.now();setTimeout(()=>{if(!stopped)resumeRec()},2000)}catch(err){stop(Error('動画の再生を開始できませんでした。'));}
   await finished;ynLog.end=endReason;ynLog.onstopMissing=onstopMissing;ynLog.renders=ynRenderCount.current;
   if(failure)throw failure;if(cancelled||ynCancel.current){ynSetMessage('書き出しを中止しました。');ynSetExportNote('書き出しを中止しました。');return}
   const actualMime=recorder.mimeType||mime,blob=new Blob(chunks,{type:actualMime});if(!blob.size)throw Error(onstopMissing?'録画の保存が完了しませんでした（端末の録画機能から応答がありません）。もう一度書き出してください。':'保存する映像がありません。');
   const url=URL.createObjectURL(blob),anchor=document.createElement('a');anchor.href=url;anchor.download=`blur_${nn}_${Date.now()}.${actualMime.includes('mp4')?'mp4':'webm'}`;document.body.appendChild(anchor);anchor.click();anchor.remove();setTimeout(()=>{try{URL.revokeObjectURL(url)}catch{}},15000);
-  Dl(100);{const sm=ynExportSummary(ynLog),dur=video.duration||0,cut=sm.lastTime!=null&&dur>0&&sm.lastTime<dur-.2,head=cut?`⚠ 途中までしか書き出せませんでした。元の動画の${sm.lastTime.toFixed(1)}秒まで（全${dur.toFixed(1)}秒）しか入っていません。合成が再生に追いつきませんでした。この動画は投稿しないでください。`:`書き出し完了 · ${actualMime.includes('mp4')?'MP4':'WebM'} · 元の解像度 / 検出枠なし`,text=`${head}${onstopMissing?' 保存の完了を確認できなかったため、それまでに録画できた分を保存しました。':''}${YN_DIAG?' · 診断の線入り（投稿には使わないでください）':''} · 記録: 再生が始まるまで${sm.startWait??'?'}秒・合成が遅れたコマ${sm.late}・とばしたコマ${sm.skipped}`;ynSetMessage(text);ynSetExportNote(text)}
+  Dl(100);{const sm=ynExportSummary(ynLog),dur=video.duration||0,cut=sm.lastTime!=null&&dur>0&&sm.lastTime<dur-.2,head=cut?`⚠ 途中までしか書き出せませんでした。元の動画の${sm.lastTime.toFixed(1)}秒まで（全${dur.toFixed(1)}秒）しか入っていません。合成が再生に追いつきませんでした。この動画は投稿しないでください。`:`書き出し完了 · 最後まで入りました · ${actualMime.includes('mp4')?'MP4':'WebM'} · 元の解像度 / 検出枠なし`,text=`${head}${onstopMissing?' 保存の完了を確認できなかったため、それまでに録画できた分を保存しました。':''}${YN_DIAG?' · 診断の線入り（投稿には使わないでください）':''} · 映像の遅れ 平均${sm.lagAvg??'?'}秒${sm.startPause!=null&&sm.startPause>.1?` · 始めの待ち${sm.startPause.toFixed(1)}秒は動画から除きました`:''}`;ynSetMessage(text);ynSetExportNote(text)}
  }catch(error){ynSetMessage(error.message);ynSetExportNote(error.message)}finally{
   clearTimeout(stopGuard);if(wakeLock)wakeLock.release().catch(()=>{});
   stopped=true;video.pause();if(recorder?.state&&recorder.state!=='inactive')try{recorder.stop()}catch{}
