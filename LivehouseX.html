@@ -6652,6 +6652,41 @@
       const d=tbl[lo+1]-tbl[lo];
       return (lo+(d>1e-12?(u-tbl[lo])/d:0))*(Math.PI*2/SMALL_RUN_ARC_N);
     };
+    /* 走りの幾何。描いている式と診断（?diag=cat）で同じものを使う。
+       別々に計算すると、診断の数字が画面と食い違って役に立たなくなる。 */
+    function smallRunGeom(key){
+      const w=smallModelDisplayed[key],meta=w?.userData?.smallModel,base=meta?.base;
+      if(!base)return null;
+      const s=smallModelSlots[key];
+      /* ステージからはみ出さない。接地影の groundY はステージ基準で
+         キャッシュしてあるので、床が変わる所まで走らせない。 */
+      const lim=Math.max(0,STAGE_W/2-SMALL_RUN_MARGIN-Math.abs(base.x));
+      const A=Math.max(.05,Math.min(s.runSpan,lim));
+      const limZ=Math.max(0,STAGE_D/2-SMALL_RUN_MARGIN-Math.abs(base.z-STAGE_Z));
+      const B=Math.max(.02,Math.min(SMALL_RUN_DEPTH,A*.30,limZ));
+      const arc=smallRunArc(meta,A,B);
+      const om=SMALL_RUN_W*(s.runSpeed/100),period=Math.PI*2/om;
+      return {s,w,meta,base,A,B,arc,period,sp:arc.total/period,
+              lap:key==='b'?arc.total*.5:0,clamped:A<s.runSpan-1e-6};
+    }
+    /* 時刻 t の場所・向き・傾き。1周の時間は角速度で決め、その中を弧長で
+       等速に回る（角速度一定だと端で遅くなり、そこに居座る）。 */
+    function smallRunAt(g,t){
+      const dist=g.sp*t+g.lap;
+      const th=smallRunTheta(g.arc,dist),ca=Math.cos(th),sa=Math.sin(th);
+      const r=Math.hypot(g.A*ca,g.B*sa);
+      return {
+        x:g.base.x+g.A*sa,
+        y:g.base.y+SMALL_RUN_BOB*Math.abs(Math.sin(Math.PI*dist/SMALL_RUN_STRIDE)),
+        z:g.base.z+g.B*ca,
+        // この猫は局所 +Z が前。rotation.y=θ は +Z を (sinθ,0,cosθ) へ向ける
+        yaw:Math.atan2(g.A*ca,-g.B*sa),
+        /* 曲がりでの傾き。Euler 順 'XYZ' では rotation.z が先に効くので、
+           これは前後軸まわりの傾き＝バンク。等速なので横向きの加速度は
+           v²×曲率で、曲率 A*B/r³ が最大になる端でいちばん傾く。 */
+        lean:-Math.min(SMALL_RUN_LEAN*Math.atan2(g.sp*g.sp*g.A*g.B/Math.max(r*r*r,1e-9),9.8),SMALL_RUN_LEAN_MAX)
+      };
+    }
     function updateSmallModelRun(t){
       for(const key of SMALL_MODEL_SLOT_KEYS){
         const w=smallModelDisplayed[key],meta=w?.userData?.smallModel,base=meta?.base;
@@ -6663,32 +6698,9 @@
           continue;
         }
         meta.running=true;
-        const s=smallModelSlots[key];
-        /* ステージからはみ出さない。接地影の groundY はステージ基準で
-           キャッシュしてあるので、床が変わる所まで走らせない。 */
-        const lim=Math.max(0,STAGE_W/2-SMALL_RUN_MARGIN-Math.abs(base.x));
-        const A=Math.max(.05,Math.min(s.runSpan,lim));
-        const limZ=Math.max(0,STAGE_D/2-SMALL_RUN_MARGIN-Math.abs(base.z-STAGE_Z));
-        const B=Math.max(.02,Math.min(SMALL_RUN_DEPTH,A*.30,limZ));
-        /* 1周の時間は今までどおり角速度で決め、その中を弧長で等速に回る。
-           進んだ距離 → θ なので、端で居座らない。 */
-        const arc=smallRunArc(meta,A,B);
-        const om=SMALL_RUN_W*(s.runSpeed/100), period=Math.PI*2/om;
-        const sp=arc.total/period;                       // 速さ[m/s]。一定
-        const dist=sp*t+(key==='b'?arc.total*.5:0);      // 2体いるとき半周ずらす
-        const th=smallRunTheta(arc,dist);
-        const ca=Math.cos(th),sa=Math.sin(th);
-        // 上下動は進んだ距離で刻む。遅く走れば足もゆっくりになる
-        const bob=SMALL_RUN_BOB*Math.abs(Math.sin(Math.PI*dist/SMALL_RUN_STRIDE));
-        w.position.set(base.x+A*sa, base.y+bob, base.z+B*ca);
-        // この猫は局所 +Z が前。rotation.y=θ は +Z を (sinθ,0,cosθ) へ向ける
-        w.rotation.y=Math.atan2(A*ca,-B*sa);
-        /* 曲がりでの傾き。Euler 順 'XYZ' では rotation.z が先に効くので、
-           これは猫の前後軸まわりの傾き＝バンクになる。等速なので横向きの
-           加速度は v²×曲率で、曲率 A*B/r³ が最大になる端でいちばん傾く。 */
-        const r=Math.hypot(A*ca,B*sa);
-        const aN=sp*sp*A*B/Math.max(r*r*r,1e-9);
-        w.rotation.z=-Math.min(SMALL_RUN_LEAN*Math.atan2(aN,9.8),SMALL_RUN_LEAN_MAX);
+        const g=smallRunGeom(key);if(!g)continue;
+        const p=smallRunAt(g,t);
+        w.position.set(p.x,p.y,p.z);w.rotation.y=p.yaw;w.rotation.z=p.lean;
       }
     }
     function applyFollowingSmallModels(){
@@ -11751,6 +11763,69 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
        ワールド座標をカメラへ投影した NDC x で測る（NDC x>0 が画面の右）。
        本人の右が画面のどちら側かも、図形の右方向ベクトルを投影して測る。
        表示をタップするとログの更新が止まる（スマホで読むため）。 */
+    /* --- 小型モデルの居場所（?diag=cat）--------------------------------------
+       「走らせると消えて居場所がわからない」が2回続いたので、推測で直すのを
+       やめて実機から読み出せるようにする。描いている式（smallRunGeom /
+       smallRunAt）をそのまま使うので、表示と画面が食い違わない。
+       表示専用で、描画にも状態にも触れない。 */
+    const diagCat=(()=>{
+      if(!diagHas('cat'))return null;
+      const el=document.createElement('div');el.id='diagCat';
+      el.style.cssText='position:fixed;left:8px;top:8px;z-index:9999;max-width:94vw;padding:8px 10px;'
+        +'background:rgba(0,0,0,.85);color:#ffd784;font:10px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;'
+        +'white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid rgba(224,168,58,.5);border-radius:6px;'
+        +'-webkit-user-select:text;user-select:text';
+      document.body.append(el);
+      let frozen=false;el.addEventListener('click',()=>{frozen=!frozen});
+      const _v=new THREE.Vector3();
+      const f2=v=>(v>=0?'+':'')+v.toFixed(2);
+      /* 枠の内側を NDC で表した半分の大きさ。枠ありのときキャンバスの画角は
+         枠より広げてあるので、枠の中は ±(枠/キャンバス) になる。 */
+      function limits(){
+        const r=cameraMode==='map'?null:frameRect();
+        return r?{x:r.w/r.hostW,y:r.h/r.hostH}:{x:1,y:1};
+      }
+      function where(p,lim){
+        const q=_v.set(p.x,p.y+.19,p.z).project(camera);   // 胴の高さで測る
+        if(!(q.z>-1&&q.z<1))return{txt:'カメラの後ろ',inside:false};
+        const ox=Math.abs(q.x)/lim.x, oy=Math.abs(q.y)/lim.y;
+        if(ox<=1&&oy<=1)return{txt:`枠の中 ndc(${f2(q.x)},${f2(q.y)})`,inside:true};
+        const dir=[];
+        if(ox>1)dir.push((q.x>0?'右':'左')+'へ'+Math.round((ox-1)*100)+'%');
+        if(oy>1)dir.push((q.y>0?'上':'下')+'へ'+Math.round((oy-1)*100)+'%');
+        return{txt:`枠の外（${dir.join(' / ')}） ndc(${f2(q.x)},${f2(q.y)})`,inside:false};
+      }
+      return {tick(t){
+        if(frozen)return;
+        const lim=limits(),out=[];
+        for(const key of SMALL_MODEL_SLOT_KEYS){
+          const s=smallModelSlots[key],w=smallModelDisplayed[key];
+          if(s.id==='off'){out.push(`${key.toUpperCase()} OFF`);continue}
+          const label=SMALL_MODELS[s.id]?.label||s.id;
+          if(!w){out.push(`${key.toUpperCase()} ${label}  読み込み中／失敗`);continue}
+          const g=smallRunGeom(key);
+          if(!s.run||!g){
+            const r=where(w.position,lim);
+            out.push(`${key.toUpperCase()} ${label}  走り OFF`);
+            out.push(`  いま x${f2(w.position.x)} z${f2(w.position.z)}  ${r.txt}`);
+            continue;
+          }
+          out.push(`${key.toUpperCase()} ${label}  走り ON  速さ${Math.round(s.runSpeed)}% 幅${s.runSpan.toFixed(2)}m`);
+          out.push(`  基準 x${f2(g.base.x)} z${f2(g.base.z)}${s.followMain?'（人物追従）':''}`
+            +`  楕円 左右±${g.A.toFixed(2)} 奥行±${g.B.toFixed(2)}`+(g.clamped?' ※ステージ端で縮小':''));
+          const p=smallRunAt(g,t),r=where(p,lim);
+          out.push(`  いま x${f2(p.x)} y${f2(p.y)} z${f2(p.z)}  向き${Math.round(p.yaw*180/Math.PI)}°`
+            +`  速さ${g.sp.toFixed(2)}m/s  1周${g.period.toFixed(1)}s`);
+          out.push(`  ${r.txt}`);
+          if(cameraMode==='map'){out.push('  俯瞰中（枠の判定はしない）');continue}
+          let inside=0;const NS=36;
+          for(let i=0;i<NS;i++)if(where(smallRunAt(g,t+i/NS*g.period),lim).inside)inside++;
+          out.push(`  1周のうち枠の中にいる時間 ${Math.round(inside/NS*100)}%`);
+        }
+        const txt='猫（小型モデル）の居場所  タップで停止\n'+out.join('\n');
+        if(el.textContent!==txt)el.textContent=txt;
+      }};
+    })();
     const diagFan=(()=>{
       if(!diagHas('fan'))return null;
       const el=document.createElement('div');el.id='diagFan';
@@ -12622,6 +12697,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       if(diagPerf)diagPerf.tick(now);
       if(diagRain)diagRain.tick(clock);
       if(diagFan)diagFan.tick(clock);
+      if(diagCat)diagCat.tick(clock);
       if(diagBlur)diagBlur.tick();
     }
     requestAnimationFrame(loop);
