@@ -654,6 +654,138 @@ function ynMosaicBlockSize(level,ref){return Math.max(1.5,ref*0.012*ynLevelScale
 function ynFaceRef(faces,groups,time,scale,fallback){let size=0;for(const f of faces||[])size=Math.max(size,f.w,f.h);for(const g of groups||[]){const frame=ynMotionAt(g,time);if(frame?.ok&&!frame.fallback)for(const face of frame.faces){const b=ynFaceBoxFromPoly(face.poly);size=Math.max(size,b.w,b.h)}}return size>0?size*scale:fallback}
 // Export record, one row per drawn frame: [n, source time, presented frame count, ms since recording started, compose ms, ms the video had moved on after composing, faces].
 // A face is [label, x, y, w, h of the drawn box, tracked box [x,y,w,h] or null].
+// Frame-by-frame export (same approach as Vlog-Studio): seek each frame, compose it, and encode it with WebCodecs into an MP4.
+// MediaRecorder on iPhone stops delivering anything once the page has been in the background; this path does not use it.
+const YN_REALTIME_EXPORT=(()=>{try{return new URLSearchParams(location.search).get('exportengine')==='realtime'}catch{return false}})();
+// AudioSpecificConfig (tag 5) found in the raw bytes of an esds box. QuickTime .mov keeps esds inside 'wave', which mp4box may not parse.
+function ynFindAsc(bytes){
+ for(let i=4;i+8<bytes.length;i++){
+  if(bytes[i]!==0x65||bytes[i+1]!==0x73||bytes[i+2]!==0x64||bytes[i+3]!==0x73)continue;
+  let at=i+8;const read=()=>{const tag=bytes[at++];let size=0;for(let k=0;k<4;k++){const v=bytes[at++];size=(size<<7)|(v&0x7f);if(!(v&0x80))break}return {tag,size}};
+  try{if(read().tag!==3)continue;at+=2;const flags=bytes[at++];if(flags&0x80)at+=2;if(flags&0x40)at+=1+bytes[at];if(flags&0x20)at+=2;if(read().tag!==4)continue;at+=13;const s=read();if(s.tag!==5||s.size<2||at+s.size>bytes.length)continue;return bytes.slice(at,at+s.size)}catch{continue}
+ }
+ return null;
+}
+// iPhone's AudioEncoder returns an ES_Descriptor (tag 3) as description; MP4 needs only the inner AudioSpecificConfig (tag 5).
+function ynAscFromDescription(bytes){
+ if(!bytes||!bytes.length||bytes[0]!==0x03)return bytes;
+ let at=0;const read=()=>{const tag=bytes[at++];let size=0;for(let k=0;k<4;k++){const v=bytes[at++];size=(size<<7)|(v&0x7f);if(!(v&0x80))break}return {tag,size}};
+ try{if(read().tag!==3)return null;at+=2;const flags=bytes[at++];if(flags&0x80)at+=2;if(flags&0x40)at+=1+bytes[at];if(flags&0x20)at+=2;if(read().tag!==4)return null;at+=13;const s=read();if(s.tag!==5||s.size<2||at+s.size>bytes.length)return null;return bytes.slice(at,at+s.size)}catch{return null}
+}
+// Audio samples and settings of a .mov/.mp4 file; {reason} when there is no audio track or it cannot be read.
+function ynDemuxAudio(MP4Box,arrayBuffer){return new Promise(resolve=>{
+ let settled=false;const done=v=>{if(!settled){settled=true;resolve(v)}};
+ try{
+  const file=MP4Box.createFile(),samples=[];let meta=null;
+  file.onError=e=>done({reason:'demux-error',detail:String(e).slice(0,80)});
+  file.onReady=info=>{
+   const track=info.audioTracks?.[0];if(!track){done({reason:'no-audio-track'});return}
+   const trak=file.getTrackById(track.id),entry=trak?.mdia?.minf?.stbl?.stsd?.entries?.[0];
+   const find=node=>{if(!node)return null;if(node.tag===5&&node.data)return node.data;for(const c of node.descs||[]){const f=find(c);if(f)return f}return null};
+   const specific=find(entry?.esds?.esd)||ynFindAsc(new Uint8Array(arrayBuffer));
+   const timescale=trak?.mdia?.mdhd?.timescale||track.timescale,edit=trak?.edts?.elst?.entries?.find(e=>e.media_time>=0);
+   const objectType=specific&&specific.length?(new Uint8Array(specific)[0]>>3):2;
+   const codec=/^mp4a\.40\.\d+$/.test(track.codec)?track.codec:track.codec&&track.codec.startsWith('mp4a')?`mp4a.40.${objectType||2}`:track.codec;
+   meta={codec,sampleRate:track.audio?.sample_rate,channels:track.audio?.channel_count,mediaTime:edit?edit.media_time/timescale:null,description:specific?new Uint8Array(specific):null,count:track.nb_samples};
+   file.setExtractionOptions(track.id,null,{nbSamples:Infinity});file.start();
+  };
+  file.onSamples=(id,user,list)=>{for(const s of list)samples.push({data:s.data,timestamp:Math.round(s.cts*1e6/s.timescale),duration:Math.round(s.duration*1e6/s.timescale)});if(meta&&samples.length>=meta.count)done({...meta,samples})};
+  const buffer=arrayBuffer.slice(0);buffer.fileStart=0;file.appendBuffer(buffer);file.flush();
+  setTimeout(()=>done(meta?(samples.length?{...meta,samples}:{reason:'no-samples'}):{reason:'not-mp4'}),0);
+ }catch(e){done({reason:'demux-error',detail:String(e?.message||e).slice(0,80)})}
+})}
+// The source audio as a 48 kHz stereo buffer covering [0, duration]. {none} without an audio track, {reason} when it cannot be read.
+async function ynFrameAudio(MP4Box,url,duration){
+ const rate=48000,Offline=window.OfflineAudioContext||window.webkitOfflineAudioContext;if(!Offline)return {reason:'no-offline-audio'};
+ let data;try{data=await (await fetch(url)).arrayBuffer()}catch(e){return {reason:'fetch-error'}}
+ const helper=new Offline(2,rate,rate);let decoded=null,method=null;
+ const demuxed=await ynDemuxAudio(MP4Box,data).catch(e=>({reason:'demux-error'}));
+ if(demuxed.reason==='no-audio-track')return {none:true};
+ if(!demuxed.reason&&typeof AudioDecoder==='function'){
+  const config={codec:demuxed.codec,sampleRate:demuxed.sampleRate,numberOfChannels:demuxed.channels,...(demuxed.description?{description:demuxed.description}:{})};
+  const ok=await AudioDecoder.isConfigSupported(config).then(r=>r.supported,()=>false);
+  if(ok){
+   const start=Number.isFinite(demuxed.mediaTime)?demuxed.mediaTime:demuxed.samples[0].timestamp/1e6,last=demuxed.samples[demuxed.samples.length-1],sr=demuxed.sampleRate;
+   const length=Math.max(1,Math.ceil(Math.max(.01,(last.timestamp+last.duration)/1e6-start)*sr)),L=new Float32Array(length),R=new Float32Array(length);
+   const chan=(d,c)=>{const n=d.numberOfFrames,out=new Float32Array(n);if(d.format==='f32'){const all=new Float32Array(n*d.numberOfChannels);d.copyTo(all,{planeIndex:0});for(let i=0;i<n;i++)out[i]=all[i*d.numberOfChannels+c];return out}d.copyTo(out,{planeIndex:c,format:'f32-planar'});return out};
+   const put=(t,s,at)=>{for(let i=0;i<s.length;i++){const k=at+i;if(k>=0&&k<length)t[k]=s[i]}};
+   let err=null;const dec=new AudioDecoder({output:d=>{try{const at=Math.round((d.timestamp/1e6-start)*sr),a=chan(d,0);put(L,a,at);put(R,d.numberOfChannels>1?chan(d,1):a,at)}catch(e){err=err||e}finally{d.close()}},error:e=>{err=err||e}});
+   dec.configure(config);for(const s of demuxed.samples)dec.decode(new EncodedAudioChunk({type:'key',timestamp:s.timestamp,duration:s.duration,data:s.data}));
+   let timer=0;await Promise.race([dec.flush(),new Promise((_,rej)=>{timer=setTimeout(()=>rej(Error('timeout')),15000)})]).catch(e=>{err=err||e}).finally(()=>clearTimeout(timer));try{dec.close()}catch{}
+   if(!err){decoded=helper.createBuffer(2,length,sr);decoded.copyToChannel(L,0);decoded.copyToChannel(R,1);method='demux'}
+  }
+ }
+ if(!decoded){
+  decoded=await new Promise(res=>{const fail=()=>res(null);try{const r=helper.decodeAudioData(data.slice(0),res,fail);if(r?.then)r.then(res,fail)}catch{fail()}});
+  if(!decoded)return {reason:demuxed.reason==='not-mp4'?'decode-failed':'decode-failed:'+(demuxed.reason||demuxed.codec)};
+  method='decodeAudioData';
+ }
+ const ctx=new Offline(2,Math.max(1,Math.ceil(duration*rate)),rate),src=ctx.createBufferSource();src.buffer=decoded;src.connect(ctx.destination);src.start(0);
+ return {buffer:await ctx.startRendering(),method,sourceRate:decoded.sampleRate};
+}
+async function ynFrameExport({video,canvas,url,draw,bitrate,isCancelled,log}){
+ if(typeof VideoEncoder!=='function'||typeof VideoFrame!=='function')return {fallback:'no-video-encoder'};
+ let Muxer,ArrayBufferTarget,MP4Box;
+ try{({Muxer,ArrayBufferTarget}=await import('https://esm.sh/mp4-muxer@5.1.3'));const m=await import('https://esm.sh/mp4box@0.5.2');MP4Box=m.default||m}catch{return {fallback:'module-load'}}
+ const W=canvas.width,H=canvas.height,fps=30,duration=video.duration,t0=performance.now();
+ // H.264 level from the frame size (4.0 up to 1080p, 5.0 / 5.1 above). VP9 / Opus only where H.264 / AAC cannot be encoded.
+ const mbs=Math.ceil(W/16)*Math.ceil(H/16),lv=mbs<=8192?'28':mbs<=22080?'32':'33';
+ let vcfg=null;for(const [codec,mux] of [[`avc1.6400${lv}`,'avc'],[`avc1.4d00${lv}`,'avc'],[`avc1.4200${lv}`,'avc'],['vp09.00.40.08','vp9']]){const c={codec,width:W,height:H,bitrate,framerate:fps,...(mux==='avc'?{avc:{format:'avc'}}:{})};if(await VideoEncoder.isConfigSupported(c).then(r=>r.supported,()=>false)){vcfg={c,mux};break}}
+ if(!vcfg)return {fallback:'no-video-codec'};
+ const audio=await ynFrameAudio(MP4Box,url,duration);
+ if(audio.reason)return {fallback:'audio-'+audio.reason};
+ let acfg=null;
+ if(audio.buffer){if(typeof AudioEncoder!=='function'||typeof AudioData!=='function')return {fallback:'no-audio-encoder'};for(const [codec,mux] of [['mp4a.40.2','aac'],['opus','opus']]){const c={codec,sampleRate:48000,numberOfChannels:2,bitrate:128000};if(await AudioEncoder.isConfigSupported(c).then(r=>r.supported,()=>false)){acfg={c,mux};break}}if(!acfg)return {fallback:'no-audio-codec'}}
+ log.engine='frame';log.vcodec=vcfg.c.codec;log.acodec=acfg?.c.codec||null;log.audioMethod=audio.method||'none';
+ const target=new ArrayBufferTarget(),muxer=new Muxer({target,fastStart:'in-memory',firstTimestampBehavior:'offset',video:{codec:vcfg.mux,width:W,height:H,frameRate:fps},...(acfg?{audio:{codec:acfg.mux,numberOfChannels:2,sampleRate:48000}}:{})});
+ let encErr=null;const venc=new VideoEncoder({output:(chunk,meta)=>muxer.addVideoChunk(chunk,meta),error:e=>{encErr=encErr||e}});venc.configure(vcfg.c);
+ const frameCount=Math.max(1,Math.round(duration*fps)),seekMs=[];let lastMT=null,frameDur=null,bad=0,unverified=0;
+ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+ // Move the video to time t and report which source frame is on screen. Targets inside the frame already shown need no seek.
+ const seekFrame=async t=>{
+  if(lastMT!=null&&frameDur!=null&&t>=lastMT-1e-4&&t<lastMT+frameDur-.002)return {pic:lastMT,ok:true};
+  const rvfc=typeof video.requestVideoFrameCallback==='function';let id=null,timer=null;
+  const pres=rvfc?new Promise(res=>{timer=setTimeout(()=>res(null),250);id=video.requestVideoFrameCallback((_,m)=>{clearTimeout(timer);res(m)})}):Promise.resolve(null);
+  let m=null;try{await ynSeek(video,t);m=await pres}finally{clearTimeout(timer);if(id!==null)try{video.cancelVideoFrameCallback(id)}catch{}}
+  if(m&&Number.isFinite(m.mediaTime)){if(lastMT!=null&&m.mediaTime-lastMT>.004)frameDur=frameDur==null?m.mediaTime-lastMT:Math.min(frameDur,m.mediaTime-lastMT);lastMT=m.mediaTime;return {pic:m.mediaTime,ok:Math.abs(m.mediaTime-t)<.25}}
+  return {pic:t,ok:!rvfc?true:null};
+ };
+ log.recStart=performance.now();
+ for(let i=0;i<frameCount;i++){
+  if(isCancelled())throw Error('cancelled');
+  while(document.visibilityState==='hidden'&&!isCancelled())await sleep(200);
+  const t=Math.min(duration-.001,i/fps),s0=performance.now(),sk=await seekFrame(t);seekMs.push(performance.now()-s0);
+  // A picture that cannot be confirmed to be the requested frame could carry the mask of another time: stop after 3 in a row.
+  if(sk.ok===false||sk.ok===null){unverified++;if(++bad>=3)throw Error('動画のコマを正しく読み込めませんでした（隠す位置がずれるおそれがあるため止めました）。ページを読み込み直してから、もう一度書き出してください。')}else bad=0;
+  draw(sk.pic);
+  const frame=new VideoFrame(canvas,{timestamp:Math.round(i*1e6/fps),duration:Math.round(1e6/fps)});venc.encode(frame,{keyFrame:i%(fps*2)===0});frame.close();
+  while(venc.encodeQueueSize>4&&!encErr)await sleep(4);
+  if(encErr)throw Error('映像のエンコードに失敗しました（'+(encErr.message||encErr.name||'不明')+'）。');
+ }
+ await venc.flush();venc.close();if(encErr)throw Error('映像のエンコードに失敗しました（'+(encErr.message||encErr.name||'不明')+'）。');
+ if(acfg){
+  const rate=48000,b=audio.buffer,Lc=b.getChannelData(0),Rc=b.numberOfChannels>1?b.getChannelData(1):Lc;
+  const fallbackAsc=new Uint8Array([(2<<3)|(3>>1),((3&1)<<7)|(2<<3)]);let first=true;
+  const aenc=new AudioEncoder({output:(chunk,meta)=>{
+   if(acfg.mux!=='aac'){muxer.addAudioChunk(chunk,meta);return}
+   const bytes=new Uint8Array(chunk.byteLength);chunk.copyTo(bytes);
+   const adts=bytes.length>7&&bytes[0]===0xff&&(bytes[1]&0xf0)===0xf0,out=adts?new EncodedAudioChunk({type:chunk.type,timestamp:chunk.timestamp,duration:chunk.duration??undefined,data:bytes.subarray((bytes[1]&1)?7:9)}):chunk;
+   let m=meta;if(first){const raw=meta?.decoderConfig?.description,rb=raw?new Uint8Array(raw.buffer||raw,raw.byteOffset||0,raw.byteLength):null,asc=ynAscFromDescription(rb);m={...(meta||{}),decoderConfig:{...(meta?.decoderConfig||{}),codec:'mp4a.40.2',sampleRate:rate,numberOfChannels:2,description:asc&&asc.length>=2?asc:fallbackAsc}};first=false}
+   muxer.addAudioChunk(out,m)},error:e=>{encErr=encErr||e}});
+  aenc.configure(acfg.c);
+  for(let at=0;at<b.length;at+=1024){
+   if(isCancelled())throw Error('cancelled');
+   const n=Math.min(1024,b.length-at),d=new Float32Array(n*2);d.set(Lc.subarray(at,at+n),0);d.set(Rc.subarray(at,at+n),n);
+   const ad=new AudioData({format:'f32-planar',sampleRate:rate,numberOfFrames:n,numberOfChannels:2,timestamp:Math.round(at/rate*1e6),data:d});aenc.encode(ad);ad.close();
+   while(aenc.encodeQueueSize>16&&!encErr)await sleep(2);
+  }
+  await aenc.flush();aenc.close();if(encErr)throw Error('音のエンコードに失敗しました（'+(encErr.message||encErr.name||'不明')+'）。');
+ }
+ muxer.finalize();
+ const sorted=seekMs.slice().sort((a,b)=>a-b),q=p=>sorted.length?Math.round(sorted[Math.min(sorted.length-1,Math.floor(p*sorted.length))]):null;
+ log.seekP50=q(.5);log.seekP95=q(.95);log.seekMax=q(1);log.unverified=unverified;log.encodedFrames=frameCount;log.frameTotalMs=Math.round(performance.now()-t0);log.bytes=target.buffer.byteLength;
+ return {blob:new Blob([target.buffer],{type:'video/mp4'}),audio:!!acfg};
+}
 // Recorder observation: which export of this page session it was, and the state of each recorded track.
 let ynExportCount=0;
 // Page visibility since load: recording stopped working on iPhone after the page went to the background and came back without a reload.
@@ -673,7 +805,7 @@ function ynExportSummary(log){
  const rows=log.rows.filter(r=>r[3]!==null),late=rows.filter(r=>r[5]>67).length;let skipped=0;
  for(let i=1;i<rows.length;i++){const a=rows[i-1][2],b=rows[i][2];if(Number.isFinite(a)&&Number.isFinite(b)&&b-a>1)skipped+=b-a-1}
  const sec=(a,b)=>a!=null&&b!=null?Math.round(b-a)/1000:null,lagAvg=rows.length?Math.round(rows.reduce((q,r)=>q+Math.max(0,r[5]),0)/rows.length)/1000:null;
- return {frames:rows.length,late,skipped,startWait:sec(log.recStart,log.firstAt),playWait:sec(log.recStart,log.playAt),lastTime:log.rows.length?Math.max(...log.rows.map(r=>r[1])):null,duration:log.duration??null,capSkipped:log.capSkipped??null,renders:log.renders??null,lagAvg,startPause:sec(log.recStart,log.resumeAt),audioSkip:log.audioSkip??null,dataEvents:log.dataEvents??0,bytes:log.bytes??0,lastDataMs:log.lastDataMs??null,stopMs:log.stopMs??null,stateAtStop:log.stateAtStop??null,stateAtGuard:log.stateAtGuard??null,secondFrameMs:log.rows.length>2&&log.rows[2][3]!=null&&log.rows[1][3]!=null?log.rows[2][3]-log.rows[1][3]:null,end:log.end||null,onstopMissing:!!log.onstopMissing,attempt:log.attempt??null,hiddenCount:log.hiddenCount??null,sinceShownMs:log.sinceShownMs??null,pageAgeMs:log.pageAgeMs??null,split:log.split??null,mime:log.mime??null,audioState:log.audioState??null,stateAfterStart:log.stateAfterStart??null,stateAfterResume:log.stateAfterResume??null,tracksAtStart:log.tracksAtStart??null,tracksAtStop:log.tracksAtStop??null,firstDataMs:log.firstDataMs??null,recError:log.recError??null,probeMs:log.probeMs??null,retryOf:log.retryOf??null};
+ return {frames:rows.length,late,skipped,startWait:sec(log.recStart,log.firstAt),playWait:sec(log.recStart,log.playAt),lastTime:log.rows.length?Math.max(...log.rows.map(r=>r[1])):null,duration:log.duration??null,capSkipped:log.capSkipped??null,renders:log.renders??null,lagAvg,startPause:sec(log.recStart,log.resumeAt),audioSkip:log.audioSkip??null,dataEvents:log.dataEvents??0,bytes:log.bytes??0,lastDataMs:log.lastDataMs??null,stopMs:log.stopMs??null,stateAtStop:log.stateAtStop??null,stateAtGuard:log.stateAtGuard??null,secondFrameMs:log.rows.length>2&&log.rows[2][3]!=null&&log.rows[1][3]!=null?log.rows[2][3]-log.rows[1][3]:null,end:log.end||null,onstopMissing:!!log.onstopMissing,attempt:log.attempt??null,hiddenCount:log.hiddenCount??null,sinceShownMs:log.sinceShownMs??null,pageAgeMs:log.pageAgeMs??null,split:log.split??null,mime:log.mime??null,audioState:log.audioState??null,stateAfterStart:log.stateAfterStart??null,stateAfterResume:log.stateAfterResume??null,tracksAtStart:log.tracksAtStart??null,tracksAtStop:log.tracksAtStop??null,firstDataMs:log.firstDataMs??null,recError:log.recError??null,probeMs:log.probeMs??null,engine:log.engine||'realtime',frameFallback:log.frameFallback??null,vcodec:log.vcodec??null,acodec:log.acodec??null,audioMethod:log.audioMethod??null,seekP50:log.seekP50??null,seekP95:log.seekP95??null,seekMax:log.seekMax??null,unverified:log.unverified??null,encodedFrames:log.encodedFrames??null,frameTotalMs:log.frameTotalMs??null,retryOf:log.retryOf??null};
 }
 // ?diag export only: burn the frame number and source time, each face's tracked box (thin, dashed) and drawn box (thick), and hand-painted areas into the video.
 function ynDiagBurn(ctx,W,H,row,paints){
@@ -1754,6 +1886,15 @@ ynSetMessage(`自動で顔を探しました。「大きく確認」で映像を
   const ynLog={at:new Date().toISOString(),diag:YN_DIAG,w:output.width,h:output.height,recStart:null,playAt:null,firstAt:null,rows:[],duration:video.duration,capSkipped:0},ynPaints=YN_DIAG?ynPaintBoxes(output.width,output.height):null;
   ynExportLog.current=ynLog;ynLog.attempt=++ynExportCount;ynLog.hiddenCount=ynPageShown.hidden;ynLog.sinceShownMs=ynPageShown.shownAt==null?null:Math.round(performance.now()-ynPageShown.shownAt);ynLog.pageAgeMs=Math.round(performance.now());if(ynRetry)ynLog.retryOf=ynExportSummary(ynRetry);
   const draw=(time,meta)=>{for(const group of ynGroups.current)if(time>=group.start-.001&&time<=group.end+.001&&!ynMotionAt(group,time)?.ok&&!ynManualCoveredAt(time)&&!ynIssueApprovedAt(group,time))throw Error('対象'+group.id+'の'+time.toFixed(3)+'秒が未処理です。手描きで覆うか、顔が映っていなければ確認済みにしてください。');const c0=performance.now(),composed=li(output.width,output.height,time,video,null,false);if(!composed)throw Error('映像を合成できませんでした。');ctx.drawImage(composed,0,0);{const c1=performance.now(),lag=Math.round((video.currentTime-time)*1000),row=[ynLog.rows.length,Math.round(time*1000)/1000,meta&&Number.isFinite(meta.presentedFrames)?meta.presentedFrames:null,ynLog.recStart===null?null:Math.round(c0-ynLog.recStart),Math.round((c1-c0)*10)/10,lag,ynExportFaces(time)];ynLog.rows.push(row);if(YN_DIAG)ynDiagBurn(ctx,output.width,output.height,row,ynPaints.filter(p=>Math.abs(p.t-time)<Xo+.001))}if(ynExportPct.current)ynExportPct.current.textContent=String(Math.min(99,Math.round(time/video.duration*100)))};
+  // Frame-by-frame export first: it keeps working after the page has been in the background. The real-time recorder below is the fallback.
+  if(!YN_REALTIME_EXPORT&&!ynRetry){
+   const fx=await ynFrameExport({video,canvas:output,url:video.currentSrc||video.src,draw:t=>draw(t),bitrate:Math.min(25000000,Math.max(5000000,output.width*output.height*2.5)),isCancelled:()=>ynCancel.current,log:ynLog});
+   if(fx.blob){
+    ynLog.end='ended';const url=URL.createObjectURL(fx.blob),anchor=document.createElement('a');anchor.href=url;anchor.download=`blur_${nn}_${Date.now()}.mp4`;document.body.appendChild(anchor);anchor.click();anchor.remove();setTimeout(()=>{try{URL.revokeObjectURL(url)}catch{}},15000);
+    Dl(100);const sec=ynLog.frameTotalMs!=null?(ynLog.frameTotalMs/1000).toFixed(1):'?',text=`書き出し完了 · 最後まで入りました · MP4 · 元の解像度 / 検出枠なし${fx.audio?'':' · 音声なし（元の動画に音がありません）'}${YN_DIAG?' · 診断の線入り（投稿には使わないでください）':''} · 1コマずつ書き出し（${sec}秒）`;ynSetMessage(text);ynSetExportNote(text);return;
+   }
+   ynLog.frameFallback=fx.fallback;ynLog.recStart=null;ynLog.rows=[];
+  }
   draw(0);stream=output.captureStream(30);
   if(ynAudio.current)ynAudio.current.destination.stream.getAudioTracks().forEach(track=>stream.addTrack(track.clone()));
   else{const native=video.captureStream?.()||video.mozCaptureStream?.();native?.getAudioTracks().forEach(track=>stream.addTrack(track))}
@@ -1781,7 +1922,7 @@ noDataID=setTimeout(()=>{if(stopped||ynLog.dataEvents>0)return;ynLog.probeMs=Mat
   const actualMime=recorder.mimeType||mime,blob=new Blob(chunks,{type:actualMime});if(!blob.size)throw Error(onstopMissing?'録画の保存が完了しませんでした（端末の録画機能から応答がありません）。もう一度書き出してください。':'保存する映像がありません。');
   const url=URL.createObjectURL(blob),anchor=document.createElement('a');anchor.href=url;anchor.download=`blur_${nn}_${Date.now()}.${actualMime.includes('mp4')?'mp4':'webm'}`;document.body.appendChild(anchor);anchor.click();anchor.remove();setTimeout(()=>{try{URL.revokeObjectURL(url)}catch{}},15000);
   Dl(100);{const sm=ynExportSummary(ynLog),dur=video.duration||0,cut=sm.lastTime!=null&&dur>0&&sm.lastTime<dur-.2,head=cut?`⚠ 途中までしか書き出せませんでした。元の動画の${sm.lastTime.toFixed(1)}秒まで（全${dur.toFixed(1)}秒）しか入っていません。合成が再生に追いつきませんでした。この動画は投稿しないでください。`:`書き出し完了 · 最後まで入りました · ${actualMime.includes('mp4')?'MP4':'WebM'} · 元の解像度 / 検出枠なし`,text=`${head}${onstopMissing?' 保存の完了を確認できなかったため、それまでに録画できた分を保存しました。':''}${ynRetry?' 1回目は録画が始まらなかったため、録画機能を作り直して書き出しました。':''}${YN_DIAG?' · 診断の線入り（投稿には使わないでください）':''} · 映像の遅れ 平均${sm.lagAvg??'?'}秒${sm.startPause!=null&&sm.startPause>.1?` · 始めの待ち${sm.startPause.toFixed(1)}秒は動画から除きました`:''}`;ynSetMessage(text);ynSetExportNote(text)}
- }catch(error){ynSetMessage(error.message);ynSetExportNote(error.message)}finally{
+ }catch(error){const msg=error.message==='cancelled'?'書き出しを中止しました。':error.message;ynSetMessage(msg);ynSetExportNote(msg)}finally{
   clearTimeout(stopGuard);clearTimeout(noDataID);{const L=ynExportLog.current;if(L&&L.attempt!=null&&!ynExportHistory.some(h=>h.attempt===L.attempt)){ynExportHistory.push({attempt:L.attempt,at:L.at,end:L.end||null,retry:!!ynRetry,dataEvents:L.dataEvents??0,bytes:L.bytes??0,firstDataMs:L.firstDataMs??null,hiddenCount:L.hiddenCount,sinceShownMs:L.sinceShownMs,split:L.split??null});if(ynExportHistory.length>10)ynExportHistory.shift()}}if(wakeLock)wakeLock.release().catch(()=>{});
   stopped=true;video.pause();if(recorder?.state&&recorder.state!=='inactive')try{recorder.stop()}catch{}
   if(frameID!=null){if(video.cancelVideoFrameCallback)video.cancelVideoFrameCallback(frameID);else cancelAnimationFrame(frameID)}
