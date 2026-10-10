@@ -656,7 +656,7 @@ function ynExportSummary(log){
  const rows=log.rows.filter(r=>r[3]!==null),late=rows.filter(r=>r[5]>67).length;let skipped=0;
  for(let i=1;i<rows.length;i++){const a=rows[i-1][2],b=rows[i][2];if(Number.isFinite(a)&&Number.isFinite(b)&&b-a>1)skipped+=b-a-1}
  const sec=(a,b)=>a!=null&&b!=null?Math.round(b-a)/1000:null;
- return {frames:rows.length,late,skipped,startWait:sec(log.recStart,log.firstAt),playWait:sec(log.recStart,log.playAt),lastTime:log.rows.length?Math.max(...log.rows.map(r=>r[1])):null,duration:log.duration??null,end:log.end||null,onstopMissing:!!log.onstopMissing};
+ return {frames:rows.length,late,skipped,startWait:sec(log.recStart,log.firstAt),playWait:sec(log.recStart,log.playAt),lastTime:log.rows.length?Math.max(...log.rows.map(r=>r[1])):null,duration:log.duration??null,warm:log.warm??null,secondFrameMs:log.rows.length>2&&log.rows[2][3]!=null&&log.rows[1][3]!=null?log.rows[2][3]-log.rows[1][3]:null,end:log.end||null,onstopMissing:!!log.onstopMissing};
 }
 // ?diag export only: burn the frame number and source time, each face's tracked box (thin, dashed) and drawn box (thick), and hand-painted areas into the video.
 function ynDiagBurn(ctx,W,H,row,paints){
@@ -809,6 +809,8 @@ function ynMotionAt(group,time){
  if(exact)return {...exact,ok:true,quality:1,anchor:true};
  const frames=group.frames||[];let lo=0,hi=frames.length;while(lo<hi){const mid=(lo+hi)>>1;if(frames[mid].time<time)lo=mid+1;else hi=mid}
  const a=frames[lo-1],b=frames[lo];if(b&&Math.abs(b.time-time)<0.001)return b;if(a?.ok&&!b&&time-a.time<=2.1/group.fps&&time<=group.end+.001)return a;
+ // Between two tracker frames (the video can have more frames than the tracker), a lost side does not open a one-frame hole: keep the tracked side.
+ if(a&&b&&a.ok!==b.ok&&b.time-a.time<=1.5/group.fps)return a.ok?a:b;
  if(!a||!b||!a.ok||!b.ok)return {time,ok:false};if(b.time-a.time>2.1/group.fps){if(a.observedUntil>=b.time-2.1/group.fps)return a;return {time,ok:false}};
  const alpha=(time-a.time)/(b.time-a.time),mix=(p,q)=>p.map((v,i)=>({x:v.x+(q[i].x-v.x)*alpha,y:v.y+(q[i].y-v.y)*alpha}));
  if(a.faces.length!==b.faces.length||a.faces.some((f,i)=>f.id!==b.faces[i].id))return {time,ok:false};
@@ -1726,7 +1728,9 @@ ynSetMessage(`自動で顔を探しました。「大きく確認」で映像を
   // Keep the screen on; a screen lock hides the page and stops the export.
   try{wakeLock=await navigator.wakeLock?.request('screen')||null}catch{}
   video.pause();video.playbackRate=1;video.muted=false;await ynSeek(video,0);
-  const ynLog={at:new Date().toISOString(),diag:YN_DIAG,w:output.width,h:output.height,recStart:null,playAt:null,firstAt:null,rows:[],duration:video.duration},ynPaints=YN_DIAG?ynPaintBoxes(output.width,output.height):null;
+  // Play once before recording: on iPhone the second frame came ~0.6 s after play(), which froze the start of the export.
+  let warmMs=null;{const w0=performance.now();video.muted=true;try{await video.play();await new Promise(res=>{let count=0;const timer=setTimeout(res,1500),tick=()=>{if(++count>=3){clearTimeout(timer);res()}else video.requestVideoFrameCallback(tick)};if(video.requestVideoFrameCallback)video.requestVideoFrameCallback(tick);else{clearTimeout(timer);setTimeout(res,500)}})}catch{}video.pause();video.muted=false;await ynSeek(video,0);warmMs=Math.round(performance.now()-w0)}
+  const ynLog={at:new Date().toISOString(),diag:YN_DIAG,w:output.width,h:output.height,recStart:null,playAt:null,firstAt:null,rows:[],duration:video.duration,warm:warmMs},ynPaints=YN_DIAG?ynPaintBoxes(output.width,output.height):null;
   ynExportLog.current=ynLog;
   const draw=(time,meta)=>{for(const group of ynGroups.current)if(time>=group.start-.001&&time<=group.end+.001&&!ynMotionAt(group,time)?.ok&&!ynManualCoveredAt(time)&&!ynIssueApprovedAt(group,time))throw Error('対象'+group.id+'の'+time.toFixed(3)+'秒が未処理です。手描きで覆うか、顔が映っていなければ確認済みにしてください。');const c0=performance.now(),composed=li(output.width,output.height,time,video,null,false);if(!composed)throw Error('映像を合成できませんでした。');ctx.drawImage(composed,0,0);{const c1=performance.now(),lag=Math.round((video.currentTime-time)*1000),row=[ynLog.rows.length,Math.round(time*1000)/1000,meta&&Number.isFinite(meta.presentedFrames)?meta.presentedFrames:null,ynLog.recStart===null?null:Math.round(c0-ynLog.recStart),Math.round((c1-c0)*10)/10,lag,ynExportFaces(time)];ynLog.rows.push(row);if(YN_DIAG)ynDiagBurn(ctx,output.width,output.height,row,ynPaints.filter(p=>Math.abs(p.t-time)<Xo+.001))}Dl(Math.min(99,Math.round(time/video.duration*100)))};
   draw(0);stream=output.captureStream(30);
