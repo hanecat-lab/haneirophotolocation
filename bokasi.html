@@ -980,7 +980,8 @@ function ynMotionAt(group,time){
 }
 // A specified face that is lost keeps a short cover (blur only; stamps skip it): up to 0.3 s after its last tracked frame (moved a little along its last motion, growing) and up to 0.3 s before it is found again or before it was specified (10 % larger).
 // Not across a sure cut (cuts with another cut within 1 s are often fast motion). A span the user switched off is listed in group.holdOff as {dir,t} (t = the tracked frame it comes from).
-const YN_GROUP_HOLD=.3;
+// A gap of at most 1 s with no cut is covered all through instead, along the straight line between the two known positions (held 'i'); two 0.3 s covers left a hole in a 0.6 s gap.
+const YN_GROUP_HOLD=.3,YN_GROUP_BRIDGE=1;
 function ynMotionHeld(group,time,cuts,ignoreOff){
  const fr=ynMotionAt(group,time);
  if(fr&&fr.ok)return fr;
@@ -989,15 +990,20 @@ function ynMotionHeld(group,time,cuts,ignoreOff){
  const frames=group.frames||[],W=YN_GROUP_HOLD+.001,usable=f=>f&&f.ok&&!f.fallback&&f.faces&&f.faces.length&&!ynGroupCutAt(group,f.time),cs=cuts||[],sure=cs.filter(c=>!cs.some(o=>o!==c&&Math.abs(o-c)<=1+1e-6));
  const off=(dir,t)=>!ignoreOff&&(group.holdOff||[]).some(o=>o.dir===dir&&Math.abs(o.t-t)<.002);
  let lo=0,hi=frames.length;while(lo<hi){const mid=(lo+hi)>>1;if(frames[mid].time<time)lo=mid+1;else hi=mid}
- let a=null,ai=-1,b=null;
- for(let i=lo-1;i>=0&&time-frames[i].time<=W;i--)if(frames[i].ok){if(usable(frames[i])){a=frames[i];ai=i}break}
- for(let i=lo;i<frames.length&&frames[i].time-time<=W;i++)if(frames[i].ok){if(usable(frames[i]))b=frames[i];break}
+ let a=null,ai=-1,b=null;const R=Math.max(W,YN_GROUP_BRIDGE+.001);
+ for(let i=lo-1;i>=0&&time-frames[i].time<=R;i--)if(frames[i].ok){if(usable(frames[i])){a=frames[i];ai=i}break}
+ for(let i=lo;i<frames.length&&frames[i].time-time<=R;i++)if(frames[i].ok){if(usable(frames[i]))b=frames[i];break}
+ const center=q=>({x:q.reduce((v,p)=>v+p.x,0)/q.length,y:q.reduce((v,p)=>v+p.y,0)/q.length});
+ const move=(poly,dx,dy,grow)=>{const c=center(poly);return poly.map(p=>({x:c.x+(p.x-c.x)*grow+dx,y:c.y+(p.y-c.y)*grow+dy}))};
+ if(a&&b&&b.time-a.time<=YN_GROUP_BRIDGE+.001&&!ynAcrossCut(cs,a.time,b.time)&&!off('i',a.time)&&a.faces.length===b.faces.length&&a.faces.every((f,i)=>f.id===b.faces[i].id&&f.poly.length===b.faces[i].poly.length)){
+  const k=(time-a.time)/(b.time-a.time);
+  return {time,ok:true,quality:Math.min(a.quality||1,b.quality||1),plane:a.plane,faces:a.faces.map((f,i)=>({id:f.id,poly:move(f.poly.map((p,j)=>({x:p.x+(b.faces[i].poly[j].x-p.x)*k,y:p.y+(b.faces[i].poly[j].y-p.y)*k})),0,0,1.1)})),estimated:true,uncertainty:.08,trackingState:'estimated',held:'i',heldFrom:a.time};
+ }
+ if(a&&time-a.time>W)a=null;if(b&&b.time-time>W)b=null;
  if(a&&(off('f',a.time)||ynAcrossCut(sure,a.time,time)))a=null;
  if(b&&(off('b',b.time)||ynAcrossCut(sure,time,b.time)))b=null;
  if(a&&b){if(time-a.time<=b.time-time)b=null;else a=null}
  if(!a&&!b)return fr;
- const center=q=>({x:q.reduce((v,p)=>v+p.x,0)/q.length,y:q.reduce((v,p)=>v+p.y,0)/q.length});
- const move=(poly,dx,dy,grow)=>{const c=center(poly);return poly.map(p=>({x:c.x+(p.x-c.x)*grow+dx,y:c.y+(p.y-c.y)*grow+dy}))};
  let faces;
  if(a){
   const dt=time-a.time,grow=1+.25*dt/YN_GROUP_HOLD,prev=ai>0&&usable(frames[ai-1])&&a.time-frames[ai-1].time<=.1+1e-6?frames[ai-1]:null;
@@ -1019,6 +1025,13 @@ function ynLostCandidate(tracks,linked,box,a,b){
 }
 // A held cover touching the frame edge: the face is most likely coming in or going out there, so the stamp is drawn on it too (elsewhere a held cover is blur only).
 function ynHeldAtEdge(fr,vw,vh){if(!fr||!fr.held||!vw||!vh)return false;const m=Math.min(vw,vh)*.02;return (fr.faces||[]).some(f=>{const b=ynFaceBoxFromPoly(f.poly);return b.x<m||b.y<m||b.x+b.w>vw-m||b.y+b.h>vh-m})}
+// Is a followed-back frame backed by a detection? (the face detector at that frame, or an automatic detection of similar place and size within 0.15 s)
+function ynLookBackSeen(f,bx,tracks){
+ if(f.lastDet!=null&&Math.abs(f.lastDet-f.time)<=.15)return true;
+ const s=Math.max(bx.w,bx.h),cx=bx.x+bx.w/2,cy=bx.y+bx.h/2;
+ return (tracks||[]).some(tr=>{const b=ynBoxAtSorted(ynSortedHist(tr),f.time,.15);if(!b)return false;const r=Math.sqrt(b.w*b.h/Math.max(1,bx.w*bx.h));return Math.hypot(b.x+b.w/2-cx,b.y+b.h/2-cy)<=.75*Math.max(s,b.w,b.h)&&r>=.5&&r<=2});
+}
+function ynBoxOutside(b,vw,vh){if(!vw||!vh||!(b.w>0)||!(b.h>0))return 0;const iw=Math.max(0,Math.min(b.x+b.w,vw)-Math.max(b.x,0)),ih=Math.max(0,Math.min(b.y+b.h,vh)-Math.max(b.y,0));return 1-iw*ih/(b.w*b.h)}
 function ynMotionIssues(group){const out=[];for(const f of group.frames||[]){if(f.ok||ynGroupCutAt(group,f.time))continue;const prev=out[out.length-1];if(prev&&f.time-prev.end<=2.1/group.fps)prev.end=f.time;else out.push({time:f.time,end:f.time,groupId:group.id,reason:`対象${group.id} · 追従を見失った区間（位置を再指定）`})}return out}
 function ynUncoveredMotionIssues(group,covered){const out=[];for(const f of group.frames||[]){if(f.ok||ynGroupCutAt(group,f.time)||covered(f.time))continue;const prev=out[out.length-1];if(prev&&f.time-prev.end<=2.1/group.fps)prev.end=f.time;else out.push({time:f.time,end:f.time,groupId:group.id,reason:`対象${group.id} · この区間で位置を確認できません`})}return out}
 function ynRestoreFace(face,transform){
@@ -1609,7 +1622,7 @@ const box=(p,q)=>{const xs=[...p,...q].map(v=>v.x),ys=[...p,...q].map(v=>v.y),x0
      else if(!result.ok){if(tracker.gray!==next)next.delete();const trackingState=updated.type==='face'&&!lost?'recapture':'lost';onLost();lost=true;save({time:mediaTime,requestedTime:time,ok:false,trackingState,reason:result.reason})}
      else{const faces=anchor.faces.map(face=>({id:face.id,poly:face.poly.map(p=>{const v=ynProject(result.H,{x:p.x*sx,y:p.y*sy});return {x:v.x/sx,y:v.y/sy}})})),errorLimit=Math.max(.5,minFace*Math.min(sx,sy)*ynPadding*.6);
       if(result.error>errorLimit&&!ynFallback){onLost();lost=true;save({time:mediaTime,requestedTime:time,ok:false,reason:'顔の余白に対して追従誤差が大きい'})}
-      else{lastReliableTime=mediaTime;lost=false;const estimated=updated.type==='face'&&(result.quality<.7||result.features<12||result.error>errorLimit*.55),uncertainty=estimated?Math.min(.18,.04+Math.max(0,.7-result.quality)*.25+Math.max(0,12-result.features)*.008+Math.min(.06,result.error/Math.max(errorLimit,.001)*.06)):0;save({time:mediaTime,requestedTime:time,mediaTime,exact,ok:true,plane:result.plane.map(p=>({x:p.x/sx,y:p.y/sy})),faces,quality:result.quality,H:result.H,features:result.features,error:result.error,estimated,uncertainty,trackingState:result.recovered?'confirmed':estimated?'estimated':'tracking',aiConfirmed:lastDetection!==null&&Math.abs(mediaTime-lastDetection)<=1,fallback:updated.type==='plane'&&ynFallback&&(result.quality<.75||result.error>errorLimit)})}
+      else{lastReliableTime=mediaTime;lost=false;const estimated=updated.type==='face'&&(result.quality<.7||result.features<12||result.error>errorLimit*.55),uncertainty=estimated?Math.min(.18,.04+Math.max(0,.7-result.quality)*.25+Math.max(0,12-result.features)*.008+Math.min(.06,result.error/Math.max(errorLimit,.001)*.06)):0;save({time:mediaTime,requestedTime:time,mediaTime,exact,ok:true,plane:result.plane.map(p=>({x:p.x/sx,y:p.y/sy})),faces,quality:result.quality,H:result.H,features:result.features,error:result.error,estimated,uncertainty,trackingState:result.recovered?'confirmed':estimated?'estimated':'tracking',aiConfirmed:lastDetection!==null&&Math.abs(mediaTime-lastDetection)<=1,lastDet:lastDetection,fallback:updated.type==='plane'&&ynFallback&&(result.quality<.75||result.error>errorLimit)})}
      }
      completed++;Dl(Math.min(99,Math.round(completed/expected*100)));if(completed%5===0){notify(`画像追従中 · 対象${group.id} · ${time.toFixed(2)}秒 · ${width}×${height}`);await new Promise(r=>setTimeout(r,0))}
     }}finally{tracker.close()}
@@ -1617,7 +1630,12 @@ const box=(p,q)=>{const xs=[...p,...q].map(v=>v.x),ys=[...p,...q].map(v=>v.y),x0
    if(anchor.time>=from&&anchor.time<=to)records.set(anchor.time,{...anchor,ok:true,quality:1,anchor:true,trackingState:'confirmed',estimated:false,uncertainty:0});
   }
   if(!records.size)for(const time of unique)records.set(time,{time,ok:false});
-  const recs=[...records.values()],seen=recs.filter(r=>!r.skipped);updated.frames=[...(updated.frames||[]).filter(f=>f.time<from-.001||f.time>to+.001),...recs.filter(r=>!r.skipped||!seen.some(o=>Math.abs(o.time-r.time)<.002))].sort((a,b)=>a.time-b.time);if(ynBack){const first=updated.frames.find(f=>f.ok&&f.time>=ynBack.b0-.001&&f.time<=ynBack.a0+.001);ynBack.ns=first?first.time:ynBack.a0;updated.start=ynBack.ns;updated.frames=updated.frames.filter(f=>f.time>=ynBack.ns-.001)}delete updated.lookBack;updated.fps=fps;updated.analysisPadding=ynPadding;updated.fallbackPolicy=ynFallback;updated.dirty=null;updated.cacheRevision=updated.revision;updated.workSize={width,height};
+  const recs=[...records.values()],seen=recs.filter(r=>!r.skipped);updated.frames=[...(updated.frames||[]).filter(f=>f.time<from-.001||f.time>to+.001),...recs.filter(r=>!r.skipped||!seen.some(o=>Math.abs(o.time-r.time)<.002))].sort((a,b)=>a.time-b.time);if(ynBack){
+   // Keep the followed-back part only while something backs it: the face detector found the face there, an automatic detection matches it, or the box is a quarter or more out of the frame (a face coming in at the edge). Stop after 0.5 s without.
+   const vw=n.current?.videoWidth||video.videoWidth,vh=n.current?.videoHeight||video.videoHeight,backs=updated.frames.filter(f=>f.ok&&f.faces&&f.faces.length&&f.time>=ynBack.b0-.001&&f.time<ynBack.a0-.001).sort((p,q)=>q.time-p.time);let last=ynBack.a0,cutAt=null;
+   for(const f of backs){const bx=ynFaceBoxFromPoly(f.faces[0].poly);if(ynLookBackSeen(f,bx,ynAutoTr)||ynBoxOutside(bx,vw,vh)>=.25){last=f.time;continue}if(last-f.time>.5){cutAt=last;break}}
+   if(cutAt!==null)ynBack.b0=cutAt;
+   const first=updated.frames.find(f=>f.ok&&f.time>=ynBack.b0-.001&&f.time<=ynBack.a0+.001);ynBack.ns=first?first.time:ynBack.a0;updated.start=ynBack.ns;updated.frames=updated.frames.filter(f=>f.time>=ynBack.ns-.001)}delete updated.lookBack;updated.fps=fps;updated.analysisPadding=ynPadding;updated.fallbackPolicy=ynFallback;updated.dirty=null;updated.cacheRevision=updated.revision;updated.workSize={width,height};
   if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。前回の結果を保持しました。');
   ynGroups.current=ynGroups.current.map(g=>g.id===updated.id?updated:g);ynIssuesRefresh();const issues=ynMotionIssues(updated);notify(`${ynBack&&ynBack.ns<ynBack.a0-.02?`さかのぼって${ynBack.ns.toFixed(2)}秒から追従 · `:''}${issues.length?'追従に未処理区間があります':'画像追従完了'} · 有効${updated.frames.filter(f=>f.ok).length}/${updated.frames.length}位置 · 要修正${issues.length}区間。${issues.length?'確認する場面へ移動し、顔の位置を直して再解析してください。':'枠を非表示にしました。ぼかし結果を確認してください。'}`);Dl(100);qs('track');ynSetInspect('none');return true;
  }catch(error){notify(error.message);return false}finally{if(video){video.pause();video.removeAttribute('src');video.load();video.remove()}if(!batch){ynBusy.current=false;ynSetMotionBusy(false)}ynRefresh()}
@@ -2480,7 +2498,7 @@ const ynGroupAskEl=()=>{
   const btn=(text,fn,primary)=>D('button',{className:primary?'yn-button yn-primary':'yn-button',onClick:fn,children:text}),close=()=>ynSetGroupAsk(null);
   if(q.done)return G('div',{className:'yn-fix-sheet-none yn-group-ask',role:'status',children:[D('p',{children:q.done}),G('div',{className:'yn-fix-sheet-actions',children:[btn('前後1秒を再生して確かめる',ynPlayAround),q.undo&&btn('元に戻す',()=>{ynUndoAction();ynSetGroupAsk({gid:q.gid,done:`対象${q.gid}を元に戻しました。`})}),btn('閉じる',close)]})]});
   const g=ynGroups.current.find(x=>x.id===q.gid);if(!g)return null;
-  if(q.held)return G('div',{className:'yn-fix-sheet-none yn-group-ask',role:'group',children:[D('p',{children:`対象${g.id}を${q.held.dir==='f'?'見失った後':'見つかる前'}の0.3秒は、予測の位置でぼかしています。`}),G('div',{className:'yn-fix-sheet-actions',children:[btn('この予測の隠しを切る',()=>{ynHoldSet(g,q.held.dir,q.held.from,false);ynSetGroupAsk({gid:g.id,done:`対象${g.id}の予測の隠しを切りました。`,undo:true})},true),btn('やめる',close)]})]});
+  if(q.held)return G('div',{className:'yn-fix-sheet-none yn-group-ask',role:'group',children:[D('p',{children:q.held.dir==='i'?`対象${g.id}を見失った間は、前後の位置をつないでぼかしています。`:`対象${g.id}を${q.held.dir==='f'?'見失った後':'見つかる前'}の0.3秒は、予測の位置でぼかしています。`}),G('div',{className:'yn-fix-sheet-actions',children:[btn('この予測の隠しを切る',()=>{ynHoldSet(g,q.held.dir,q.held.from,false);ynSetGroupAsk({gid:g.id,done:`対象${g.id}の予測の隠しを切りました。`,undo:true})},true),btn('やめる',close)]})]});
   const [t0,t1]=ynSceneAt(q.t,g);
   return G('div',{className:'yn-fix-sheet-none yn-group-ask',role:'group',children:[D('p',{children:`対象${g.id}（自分で囲んだ顔）をどうしますか？`}),G('div',{className:'yn-fix-sheet-actions',children:[btn(`この場面だけ消す（${ynSecText(t0)}〜${ynSecText(t1)}秒）`,()=>ynCutGroupScene(g.id),true),btn(`対象${g.id}を全部消す`,()=>ynRemoveGroupAll(g.id)),btn('やめる',close)]})]});
 };
@@ -2579,9 +2597,9 @@ const ynHoldSet=(g,dir,t,on)=>{ynSaveUndo();g.holdOff=on?(g.holdOff||[]).filter(
 const ynTlHoldRow=cur=>{
   if(nn!=='track')return null;const rows=[];
   for(const g of ynGroups.current){let fr=null,all=null;try{fr=ynMotionHeld(g,cur,ynCuts.current);all=fr&&fr.held?fr:ynMotionHeld(g,cur,ynCuts.current,true)}catch{}if(!all||!all.held)continue;
-    const on=!!(fr&&fr.held),what=all.held==='f'?'見失った後':'見つかる前';
+    const on=!!(fr&&fr.held),what=all.held==='f'?'見失った後':all.held==='b'?'見つかる前':'見失った間';
     const edge=on&&ynHeldAtEdge(fr,n.current?.videoWidth,n.current?.videoHeight);
-    rows.push(G('div',{className:'yn-hold-row',children:[D('span',{children:on?`対象${g.id}を${what}の0.3秒は、予測の位置でぼかしています（${edge?'画面の端なので猫も出します':'猫は出しません'}）。`:`対象${g.id}を${what}の予測の隠しは切ってあります。`}),
+    rows.push(G('div',{className:'yn-hold-row',children:[D('span',{children:on?`対象${g.id}を${what}${all.held==='i'?'は、前後の位置をつないで':'の0.3秒は、予測の位置で'}ぼかしています（${edge?'画面の端なので猫も出します':'猫は出しません'}）。`:`対象${g.id}を${what}の予測の隠しは切ってあります。`}),
       G('div',{className:'yn-fix-sheet-actions',children:on?[D('button',{className:'yn-button',onClick:()=>ynTlJump(1),children:'このままでよい（次へ）'}),D('button',{className:'yn-button',onClick:()=>ynHoldSet(g,all.held,all.heldFrom,false),children:'この予測の隠しを切る'})]:[D('button',{className:'yn-button',onClick:()=>ynHoldSet(g,all.held,all.heldFrom,true),children:'予測の隠しを戻す'})]})]}))}
   return rows.length?G('div',{className:'yn-hold-box',children:rows}):null;
 };
