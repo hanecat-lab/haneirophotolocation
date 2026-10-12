@@ -987,9 +987,35 @@ function ynMotionAt(group,time){
 // Not across a sure cut (cuts with another cut within 1 s are often fast motion). A span the user switched off is listed in group.holdOff as {dir,t} (t = the tracked frame it comes from).
 // A gap of at most 1 s with no cut is covered all through instead, along the straight line between the two known positions (held 'i'); two 0.3 s covers left a hole in a 0.6 s gap.
 const YN_GROUP_HOLD=.3,YN_GROUP_BRIDGE=1;
+// Face detections over the whole video (the kept IDs, and — for position only — deleted ones with a clear score), set by the editor.
+// A cover that is only estimated (the tracker stalled) or held/bridged is pulled toward where a detection saw the face: the path goes through the
+// tracked frames on both sides and the detections between them (a detection's box is shifted by its offset from this face's box at a tracked frame).
+let ynDetSamples=[];
+function ynSetDetections(arr){ynDetSamples=arr}
+function ynDetWindow(t0,t1){let lo=0,hi=ynDetSamples.length;while(lo<hi){const m=(lo+hi)>>1;if(ynDetSamples[m].time<t0)lo=m+1;else hi=m}const out=[];for(let i=lo;i<ynDetSamples.length&&ynDetSamples[i].time<=t1;i++)out.push(ynDetSamples[i]);return out}
+function ynSnapToDetections(group,time,fr){
+ if(!ynDetSamples.length||!fr||!fr.ok||!fr.faces||fr.faces.length!==1||fr.faces[0].parts||!fr.faces[0].poly)return fr;
+ const frames=group.frames||[],tracked=f=>f&&f.ok&&!f.estimated&&!f.fallback&&f.faces&&f.faces.length===1&&!f.faces[0].parts&&!ynGroupCutAt(group,f.time);
+ let lo=0,hi=frames.length;while(lo<hi){const m=(lo+hi)>>1;if(frames[m].time<time)lo=m+1;else hi=m}
+ let TB=null,TA=null;
+ for(let i=lo-1;i>=0&&time-frames[i].time<=1.001;i--)if(tracked(frames[i])){TB=frames[i];break}
+ for(let i=lo;i<frames.length&&frames[i].time-time<=1.001;i++)if(frames[i].time>time+1e-6&&tracked(frames[i])){TA=frames[i];break}
+ const center=p=>({x:p.reduce((v,q)=>v+q.x,0)/p.length,y:p.reduce((v,q)=>v+q.y,0)/p.length});
+ const c0=center(fr.faces[0].poly),b0=ynFaceBoxFromPoly(fr.faces[0].poly),s=Math.max(b0.w,b0.h),fits=d=>d.s>=.5*s&&d.s<=2*s;
+ let off=null;for(const T of [TB,TA]){if(!T)continue;const tc=center(T.faces[0].poly);let best=null,bd=.5*s;for(const d of ynDetWindow(T.time-.15,T.time+.15)){const dd=Math.hypot(d.cx-tc.x,d.cy-tc.y);if(fits(d)&&dd<=bd){bd=dd;best=d}}if(best){off={x:tc.x-best.cx,y:tc.y-best.cy};break}}
+ if(!off)return fr;
+ const t0=TB?TB.time:time-1,t1=TA?TA.time:time+1,byT=new Map();
+ for(const d of ynDetWindow(t0+1e-6,t1-1e-6)){const x=d.cx+off.x,y=d.cy+off.y,dist=Math.hypot(x-c0.x,y-c0.y);if(!fits(d)||dist>1.2*s)continue;const k=Math.round(d.time*1000),o=byT.get(k);if(!o||dist<o.dist)byT.set(k,{time:d.time,x,y,dist,det:true})}
+ if(!byT.size)return fr;
+ const keys=[...(TB?[{time:TB.time,...center(TB.faces[0].poly)}]:[]),...byT.values(),...(TA?[{time:TA.time,...center(TA.faces[0].poly)}]:[])].sort((a,b)=>a.time-b.time);
+ let kb=null,ka=null;for(const k of keys){if(k.time<=time+1e-6)kb=k;else if(!ka)ka=k}
+ if(!(kb&&kb.det)&&!(ka&&ka.det))return fr;
+ const tgt=kb&&ka?{x:kb.x+(ka.x-kb.x)*(time-kb.time)/(ka.time-kb.time),y:kb.y+(ka.y-kb.y)*(time-kb.time)/(ka.time-kb.time)}:(kb||ka),dx=tgt.x-c0.x,dy=tgt.y-c0.y;
+ return {...fr,faces:fr.faces.map(f=>({...f,poly:f.poly.map(p=>({x:p.x+dx,y:p.y+dy}))})),snapped:true};
+}
 function ynMotionHeld(group,time,cuts,ignoreOff){
  const fr=ynMotionAt(group,time);
- if(fr&&fr.ok)return fr;
+ if(fr&&fr.ok)return fr.estimated&&!fr.anchor?ynSnapToDetections(group,time,fr):fr;
  if(ynGroupCutAt(group,time))return null;
  if(time>group.end+.001||time<group.start-YN_GROUP_HOLD-.001)return fr;
  const frames=group.frames||[],W=YN_GROUP_HOLD+.001,usable=f=>f&&f.ok&&!f.fallback&&f.faces&&f.faces.length&&!ynGroupCutAt(group,f.time),cs=cuts||[],sure=cs.filter(c=>!cs.some(o=>o!==c&&Math.abs(o-c)<=1+1e-6));
@@ -1002,7 +1028,7 @@ function ynMotionHeld(group,time,cuts,ignoreOff){
  const move=(poly,dx,dy,grow)=>{const c=center(poly);return poly.map(p=>({x:c.x+(p.x-c.x)*grow+dx,y:c.y+(p.y-c.y)*grow+dy}))};
  if(a&&b&&b.time-a.time<=YN_GROUP_BRIDGE+.001&&!ynAcrossCut(cs,a.time,b.time)&&!off('i',a.time)&&a.faces.length===b.faces.length&&a.faces.every((f,i)=>f.id===b.faces[i].id&&f.poly.length===b.faces[i].poly.length)){
   const k=(time-a.time)/(b.time-a.time);
-  return {time,ok:true,quality:Math.min(a.quality||1,b.quality||1),plane:a.plane,faces:a.faces.map((f,i)=>({id:f.id,poly:move(f.poly.map((p,j)=>({x:p.x+(b.faces[i].poly[j].x-p.x)*k,y:p.y+(b.faces[i].poly[j].y-p.y)*k})),0,0,1.1)})),estimated:true,uncertainty:.08,trackingState:'estimated',held:'i',heldFrom:a.time};
+  return ynSnapToDetections(group,time,{time,ok:true,quality:Math.min(a.quality||1,b.quality||1),plane:a.plane,faces:a.faces.map((f,i)=>({id:f.id,poly:move(f.poly.map((p,j)=>({x:p.x+(b.faces[i].poly[j].x-p.x)*k,y:p.y+(b.faces[i].poly[j].y-p.y)*k})),0,0,1.1)})),estimated:true,uncertainty:.08,trackingState:'estimated',held:'i',heldFrom:a.time});
  }
  if(a&&time-a.time>W)a=null;if(b&&b.time-time>W)b=null;
  if(a&&(off('f',a.time)||ynAcrossCut(sure,a.time,time)))a=null;
@@ -1017,7 +1043,7 @@ function ynMotionHeld(group,time,cuts,ignoreOff){
    return {id:f.id,poly:move(f.poly,dx,dy,grow)}});
  }else faces=b.faces.map(f=>({id:f.id,poly:move(f.poly,0,0,1.1)}));
  const src=a||b;
- return {time,ok:true,quality:src.quality||1,plane:src.plane,faces,estimated:true,uncertainty:.08,trackingState:'estimated',held:a?'f':'b',heldFrom:src.time};
+ return ynSnapToDetections(group,time,{time,ok:true,quality:src.quality||1,plane:src.plane,faces,estimated:true,uncertainty:.08,trackingState:'estimated',held:a?'f':'b',heldFrom:src.time});
 }
 // While a specified face is lost, it is looked for in the automatic detections (taken 4 times a second over the whole video) instead of detecting every frame:
 // first the automatic ID that overlapped it when it was lost (that ID follows the same face even when it moves fast), else a face near where it was lost (within 1.5 face sizes, half to double the size).
@@ -2065,6 +2091,7 @@ const ynSelectionOverlayRef=E.useRef(null);
 // The selected (or asked-about) face is ringed on the big preview, so a change of 対象1 → 対象2 is seen on the picture and not only in a small label.
 // ynFocus = {items:[{key:'g:<group>'|'a:<id>',label}], until}; until Infinity stays while a question about those faces is open.
 const ynFocusRef=E.useRef(null),[ynFocus,ynSetFocus]=E.useState(null);
+E.useEffect(()=>{const arr=[];for(const tr of Ut)for(const q of tr.history||[])if(q&&Number.isFinite(q.time))arr.push({time:q.time,cx:q.x+q.w/2,cy:q.y+q.h/2,s:Math.max(q.w,q.h)});for(const tr of ynTruthDeleted.current||[])for(const q of tr.samples||[])if((q[5]||0)>=.6)arr.push({time:q[0],cx:q[1]+q[3]/2,cy:q[2]+q[4]/2,s:Math.max(q[3],q[4])});arr.sort((a,b)=>a.time-b.time);ynSetDetections(arr);b(v=>v+1)},[Ut,ynUndoCount]);
 const ynFlashFocus=items=>ynSetFocus(v=>v&&v.until===Infinity?v:{items,until:performance.now()+1800});
 const ynFocusBox=(key,t)=>{
   if(key.startsWith('g:')){const gid=Number(key.split(':')[1]),g=ynGroups.current.find(x=>x.id===gid);if(!g)return null;let fr=null;try{fr=ynGroupFrameFx(g,t,ynFaceFix.current,ynCuts.current)}catch{}
