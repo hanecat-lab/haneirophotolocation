@@ -2658,22 +2658,64 @@ function rebuildTrack(key){
   const centerLine=new THREE.Line(centerGeo, new THREE.LineDashedMaterial({color:0xffffff, dashSize:1.6, gapSize:1.6})); centerLine.computeLineDistances(); centerLine.userData.isWall=true; scene.add(centerLine);
 
   let wallLeftVerts=[], wallRightVerts=[];
+  let wallLeftBefore=[], wallLeftAfter=[];
+  // いろは坂の壁切れ目範囲を計算
+  let gapStartU = 0.42, gapEndU = 0.46; // デフォルト
+  if(currentKey==='irohaLocal' && typeof branchS!=='undefined' && totalLength>0){
+    gapStartU = THREE.MathUtils.clamp((branchS-15)/totalLength, 0, 1);
+    gapEndU = THREE.MathUtils.clamp((branchS+15)/totalLength, 0, 1);
+  }
   for(let i=0;i<=SEGMENTS;i++){
-    const {p,n}=getTrackAt(i/SEGMENTS);
+    const u=i/SEGMENTS;
+    const {p,n}=getTrackAt(u);
     const l=p.clone().add(n.clone().multiplyScalar(ROAD_HALF+WALL_OFFSET));
     const r=p.clone().add(n.clone().multiplyScalar(-(ROAD_HALF+WALL_OFFSET)));
-    wallLeftVerts.push(l.x,l.y+ROAD_Y,l.z,l.x,l.y+ROAD_Y+WALL_HEIGHT,l.z);
+    // 左壁（ショートカット側）は切れ目を作る
+    if(currentKey==='irohaLocal' && u>=gapStartU && u<=gapEndU){
+      // 切れ目区間は左壁を生成しない（壁途切れ）
+    } else {
+      if(currentKey==='irohaLocal' && u < gapStartU){
+        wallLeftBefore.push(l.x,l.y+ROAD_Y,l.z,l.x,l.y+ROAD_Y+WALL_HEIGHT,l.z);
+      } else if(currentKey==='irohaLocal' && u > gapEndU){
+        wallLeftAfter.push(l.x,l.y+ROAD_Y,l.z,l.x,l.y+ROAD_Y+WALL_HEIGHT,l.z);
+      } else {
+        wallLeftVerts.push(l.x,l.y+ROAD_Y,l.z,l.x,l.y+ROAD_Y+WALL_HEIGHT,l.z);
+      }
+    }
     wallRightVerts.push(r.x,r.y+ROAD_Y,r.z,r.x,r.y+ROAD_Y+WALL_HEIGHT,r.z);
   }
   function makeWallMeshFixed(verts,col){
-    const idx=[]; for(let i=0;i<SEGMENTS;i++){ const a=i*2,b=a+1,c=a+2,d=a+3; idx.push(a,b,c,b,d,c); }
+    if(verts.length===0) return null;
+    const segCount = verts.length/6 -1;
+    const idx=[]; for(let i=0;i<segCount;i++){ const a=i*2,b=a+1,c=a+2,d=a+3; idx.push(a,b,c,b,d,c); }
     const g=new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(verts,3)); g.setIndex(idx); g.computeVertexNormals();
     const m=new THREE.MeshLambertMaterial({color:col, side:THREE.DoubleSide});
     const mesh=new THREE.Mesh(g,m); mesh.userData.isWall=true; mesh.receiveShadow=true; mesh.castShadow=false; return mesh;
   }
-  const leftWall=makeWallMeshFixed(wallLeftVerts, 0xff6b6b);
+  // 通常コースは1枚の左壁、いろは坂は切れ目で2枚に分割
+  if(currentKey==='irohaLocal'){
+    const leftWallBefore=makeWallMeshFixed(wallLeftBefore, 0xff6b6b);
+    const leftWallAfter=makeWallMeshFixed(wallLeftAfter, 0xff6b6b);
+    if(leftWallBefore){ scene.add(leftWallBefore); wallMeshes.push(leftWallBefore); }
+    if(leftWallAfter){ scene.add(leftWallAfter); wallMeshes.push(leftWallAfter); }
+    // 切れ目の両端に壊れたコンクリとポール
+    const gapCenterU = (gapStartU+gapEndU)/2;
+    const gapPos = getTrackAt(gapCenterU);
+    // 壊れたポール
+    const poleGeo=new THREE.CylinderGeometry(0.08,0.08,1.2,6);
+    const poleMat=new THREE.MeshLambertMaterial({color:0xcccccc});
+    const pole1=new THREE.Mesh(poleGeo, poleMat);
+    pole1.position.copy(gapPos.p).add(gapPos.n.clone().multiplyScalar(ROAD_HALF+WALL_OFFSET)).add(new THREE.Vector3(0,0.6,0));
+    pole1.rotation.z=Math.PI/6; pole1.userData.isWall=true; scene.add(pole1);
+    const pole2=new THREE.Mesh(poleGeo, poleMat);
+    pole2.position.copy(getTrackAt(gapEndU).p).add(getTrackAt(gapEndU).n.clone().multiplyScalar(ROAD_HALF+WALL_OFFSET)).add(new THREE.Vector3(0,0.6,0));
+    pole2.rotation.z=-Math.PI/8; pole2.userData.isWall=true; scene.add(pole2);
+  } else {
+    const leftWall=makeWallMeshFixed(wallLeftVerts, 0xff6b6b);
+    if(leftWall){ scene.add(leftWall); wallMeshes.push(leftWall); }
+  }
   const rightWall=makeWallMeshFixed(wallRightVerts, 0x6bcf7f);
-  scene.add(leftWall); scene.add(rightWall); wallMeshes.push(leftWall,rightWall);
+  if(rightWall){ scene.add(rightWall); wallMeshes.push(rightWall); }
 
   // --- 200m手前からの矢印マーカー ---
   for(let u=0.78; u<0.97; u+=0.03){
@@ -3332,52 +3374,61 @@ function setupIrohaCurves(){
 }
 
 function isJumpEligible(){
-  // 条件: 速度85km/h以上 + ブレーキチャージ DEEP以上 + 左ステア + 横G
-  const speedKmh = speed*3.6*18; // speedは内部単位なのでkm/h換算は表示用speed値を使う方が正確
-  const displayedSpeed = typeof currentSpeedKmh!=='undefined' ? currentSpeedKmh : speed*60; // fallback
-  const hasSpeed = speed > 22; // 内部速度で22以上≒80km/h以上
-  const hasBrakeCharge = (typeof brakeTime!=='undefined' && brakeTime>0.4) || (typeof brakeChargeRatio!=='undefined' && brakeChargeRatio>0.8);
-  const hasLeftSteer = steerLeftPressed || (typeof joyVec!=='undefined' && joyVec.x < -0.5) || (typeof input!=='undefined' && input.steer < -0.3);
-  const hasDrift = typeof isDrifting!=='undefined' && isDrifting;
-  return hasSpeed && (hasBrakeCharge || hasDrift) && hasLeftSteer;
+  // 条件: 速度 + ブレーキ + 横位置（壁切れ目に入っている）+ 能動的な左入力
+  const hasSpeed = speed > 20; // 約75km/h以上
+  const hasBrakeCharge = (typeof brakeTime!=='undefined' && brakeTime>0.35) || (typeof brakeChargeRatio!=='undefined' && brakeChargeRatio>0.7) || isBrakingDrift;
+  // 横位置チェック: 左側（内側）に大きく寄っているか - lateralが負の大きな値
+  // ROAD_HALF=3.8なので、-2.0以下で壁際、-2.8以下で壁の外
+  const hasLateral = lateral < -1.8; // 左に寄っている
+  const hasLeftInput = (typeof input!=='undefined' && input.steer < -0.4) || (typeof joyVec!=='undefined' && joyVec.x < -0.4) || isSliding;
+  // 3条件: 速度 + (ブレーキorドリフト) + 横位置 + 入力
+  return hasSpeed && hasBrakeCharge && hasLateral && hasLeftInput;
 }
 
 function checkIrohaBranch(s){
   if(currentKey!=='irohaLocal') return s;
   if(irohaJumpDone) return s;
-  // 分岐ゾーン: sが branchS-30 〜 branchS+20 の間
-  if(s >= branchS-30 && s <= branchS+20){
+  // 分岐ゾーン: sが branchS-40 〜 branchS+20 の間 (てコーナー手前)
+  if(s >= branchS-40 && s <= branchS+20){
     if(!irohaJumpReserved && isJumpEligible()){
       irohaJumpReserved = true;
-      // UI表示
+      // UI表示 - ショートカット可能
       const el = document.getElementById('indicator');
-      if(el){ el.textContent='JUMP READY!'; el.style.display='block'; setTimeout(()=>{ el.style.display='none'; }, 800); }
+      if(el){ el.textContent='↖︎ JUMP READY! 左へ!'; el.style.display='block'; el.classList.add('on'); setTimeout(()=>{ if(!irohaOnJumpCurve) el.style.display='none'; }, 1200); }
       if(navigator.vibrate) navigator.vibrate([20,30,20]);
+      // カメラを左に寄せる演出
+      try{ camPos.add(new THREE.Vector3(-0.5,0,0)); }catch(e){}
     }
   }
-  // 分岐点を超えたら判定
-  if(s >= branchS+20 && s < branchS+40){
-    if(irohaJumpReserved && !irohaJumpDone){
-      // ショートカット実行: sを jumpSave 分ワープ
+  // 分岐点を超えたら判定 - 横位置がまだ左にいるか確認
+  if(s >= branchS+10 && s < branchS+35){
+    if(irohaJumpReserved && !irohaJumpDone && lateral < -1.5){
+      // ショートカット実行: sを jumpSave 分ワープ + ジャンプ開始
       irohaJumpDone = true;
       irohaOnJumpCurve = true;
-      // ワープでタイム短縮
       const newS = s + jumpSave;
       // エフェクト
       const banner = document.createElement('div');
       banner.textContent = '✈️ SHORTCUT! -' + jumpSave.toFixed(0) + 'm';
-      banner.style.cssText = 'position:absolute; top:40%; left:50%; transform:translate(-50%,-50%); background:linear-gradient(180deg,#ffec99,#ff8c00); color:#000; font-weight:900; padding:10px 18px; border-radius:12px; border:2px solid #fff; z-index:100; font-size:18px; animation: shortcutPop 0.6s ease;';
+      banner.style.cssText = 'position:absolute; top:38%; left:50%; transform:translate(-50%,-50%); background:linear-gradient(180deg,#ffec99,#ff8c00); color:#000; font-weight:900; padding:12px 20px; border-radius:14px; border:3px solid #fff; z-index:100; font-size:20px; box-shadow:0 4px 12px rgba(0,0,0,0.4); animation: shortcutPop 0.7s ease;';
       document.getElementById('app')?.appendChild(banner);
-      setTimeout(()=>banner.remove(), 1200);
+      setTimeout(()=>banner.remove(), 1500);
       // 水タンク -3%ペナルティだがタイム短縮
-      try{
-        if(typeof water!=='undefined'){
-          water = Math.max(0, water - 3);
-        }
-      }catch(e){}
-      console.log('JUMP EXECUTED, s', s, '->', newS);
+      try{ waterLevel = Math.max(0, waterLevel - 3); updateCup(); }catch(e){}
+      // 魚が跳ねる
+      try{ fishPhysics.vy = -18; fishPhysics.vx = lateral*2; }catch(e){}
+      console.log('JUMP SHORTCUT EXECUTED, s', s, '->', newS, 'lateral', lateral);
       return newS;
+    } else if(irohaJumpReserved && lateral >= -1.0){
+      // 予約したが戻ってしまった - キャンセル
+      irohaJumpReserved = false;
+      const el = document.getElementById('indicator');
+      if(el){ el.textContent='通常ルート'; setTimeout(()=>{ el.style.display='none'; }, 600); }
     }
+  }
+  // 分岐を過ぎたら予約クリア
+  if(s > branchS+50){
+    irohaJumpReserved = false;
   }
   return s;
 }
@@ -4097,8 +4148,26 @@ function tick(dt){
   }
 
   let hitWall=false, side=0;
-  if(lateral>ROAD_HALF-0.12){ hitWall=true; side=1; }
-  if(lateral<-ROAD_HALF+0.12){ hitWall=true; side=-1; }
+  // いろは坂は壁切れ目では壁判定を無効化（ショートカット予約時のみ）
+  let inGap = false;
+  if(currentKey==='irohaLocal' && typeof branchS!=='undefined'){
+    const gapS = branchS;
+    if(s >= gapS-15 && s <= gapS+15){
+      inGap = true;
+    }
+  }
+  if(lateral>ROAD_HALF-0.12){ 
+    // 右壁は常に有効
+    hitWall=true; side=1; 
+  }
+  if(lateral<-ROAD_HALF+0.12){ 
+    // 左壁は切れ目では予約時のみ無効
+    if(inGap && (irohaJumpReserved || irohaOnJumpCurve)){
+      hitWall=false;
+    } else {
+      hitWall=true; side=-1; 
+    }
+  }
   if(hitWall && wallHitCooldown<=0){
     wallHitCooldown=0.85; isSliding=false; speed*=0.32; lateral=THREE.MathUtils.clamp(lateral,-ROAD_HALF+0.35,ROAD_HALF-0.35); bank=-side*0.9;
     triggerWallFlash();
@@ -4113,20 +4182,22 @@ function tick(dt){
   s = checkIrohaBranch(s);
   const track=getTrackAtDist(s); const worldPos=track.p.clone().add(track.n.clone().multiplyScalar(lateral)); const roadY=track.p.y+ROAD_Y;
 
-  // === いろは坂 カイのジャンプ ===
+  // === V132 選択式ジャンプ - 通常は絶対飛ばない、ショートカット時のみ ===
   let jumpBoost = 0;
-  if(currentKey==='irohaLocal'){
-    // ジャンプ区間 s=190-230m付近
-    const jumpCenter = 205;
-    const jumpRadius = 25;
-    const distToJump = Math.abs(s - jumpCenter);
-    if(distToJump < jumpRadius && speed>20){
-      const t = 1 - distToJump/jumpRadius;
-      jumpBoost = Math.sin(t*Math.PI) * 1.8 * (speed/40);
-      // 空中でブレーキチャージがリセットされないように
-      if(jumpBoost>0.5 && !isSliding){
-        // 軽い浮遊感
+  if(currentKey==='irohaLocal' && irohaOnJumpCurve){
+    // ショートカット中のみジャンプ演出 - 放物線
+    const jumpDuration = 60; // 60mでジャンプ完了
+    const jumpProgress = THREE.MathUtils.clamp((s - branchS) / jumpDuration, 0, 1);
+    if(jumpProgress < 1){
+      // 放物線: 上がって下がる
+      jumpBoost = Math.sin(jumpProgress * Math.PI) * 2.8 * (1 + speed/50);
+      // 最高点で少し長く滞空
+      if(jumpProgress>0.3 && jumpProgress<0.7){
+        jumpBoost += 0.3;
       }
+    } else {
+      // 着地したらフラグクリア
+      irohaOnJumpCurve = false;
     }
   }
 
