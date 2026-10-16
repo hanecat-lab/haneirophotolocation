@@ -6706,6 +6706,17 @@ html[data-ui-motion="off"] .camera-shell .vlog-mode-dial-index,
 html[data-ui-motion="off"] .camera-shell .vlog-mode-dial::after{transition:none}
 /* 物語モードの中で選んだテンプレートのカード（カードは div なので、選択中の色をここで付ける）。 */
 .camera-shell.camera-shell .camera-template-card.is-selected.is-selected{background:#E4EEE6!important;border-color:var(--paper-accent)!important;box-shadow:0 0 0 1px var(--paper-accent),0 2px 5px rgba(41,58,52,.10)!important}
+/* 編集モードの見出しの右の「↶ 戻す：○○」と、操作直後の下の帯。 */
+.camera-shell .vlog-mode-dial-undo{max-width:58%; min-height:30px; padding:0 12px; border-radius:999px; font-size:11px; font-weight:700;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#fff; background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.3)}
+.camera-shell .vlog-mode-dial-undo:disabled{opacity:.45}
+.camera-shell .vlog-undo-toast{position:fixed; left:12px; right:12px; bottom:calc(16px + env(safe-area-inset-bottom)); z-index:60;
+  display:flex; align-items:center; gap:10px; padding:10px 10px 10px 16px; border-radius:16px; color:#fff;
+  background:#293A34; box-shadow:0 6px 20px rgba(0,0,0,.28); max-width:520px; margin:0 auto; animation:vlog-undo-toast-in .22s ease-out}
+.camera-shell .vlog-undo-toast-text{flex:1; min-width:0; font-size:12px; line-height:1.4}
+.camera-shell .vlog-undo-toast-btn{flex-shrink:0; min-height:36px; padding:0 14px; border-radius:999px; font-size:12px; font-weight:700; color:#1F2D28; background:#A7F3D0; border:0}
+@keyframes vlog-undo-toast-in{from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none}}
+html[data-ui-motion="off"] .camera-shell .vlog-undo-toast{animation:none}
 .finder-heart-edit{
   display:block; width:100%; min-height:34px; margin:2px 0 8px; border-radius:999px; border:1px solid rgba(244,114,182,0.45);
   background:rgba(244,114,182,0.16); color:#9d174d; font-size:11px; font-weight:700;
@@ -11760,6 +11771,7 @@ function App(){
   const closeFilterSheet = (apply=true) => {
     const session=filterSessionRef.current;
     if(apply && session?.dirty){
+      const filterBefore=editSnapshot(true);
       const draft=session.draft;
       const filter=FILTERS.find(f=>f.id===draft.id);
       const target=clipsRef.current.find(c=>c.id===session.clipId);
@@ -11779,6 +11791,7 @@ function App(){
           setActiveFilter(draft.id);
           setFilterIntensity(draft.intensity);
         }
+        recordEdit(filterBefore,{label:'フィルター'});
         setRecentFilters(prev=>{
           const next=[draft.id,...prev.filter(id=>id!==draft.id)].slice(0,5);
           try{localStorage.setItem('haneiro_recentFilters',JSON.stringify(next));}catch{}
@@ -12111,6 +12124,12 @@ function App(){
   },[]);
   const [previewScrubTime, setPreviewScrubTime] = useState(null);
   const [editHistoryCount, setEditHistoryCount] = useState(0);
+  const [undoToast, setUndoToast] = useState(null);
+  useEffect(()=>{
+    if(!undoToast) return;
+    const timer=setTimeout(()=>setUndoToast(t=>t?.key===undoToast.key?null:t),10000);
+    return()=>clearTimeout(timer);
+  },[undoToast?.key]);
   const [editNotice, setEditNotice] = useState('');
   const [dragPreviewText, setDragPreviewText] = useState(null);
   const [textDragGuides,setTextDragGuides] = useState(null);
@@ -18611,10 +18630,13 @@ const recomputeStarts=(arr)=>{
        settings.bulkPhotoDuration!==bulkPhotoDurationRef.current || settings.activeTemplateId!==activeTemplateIdRef.current ||
        JSON.stringify(settings.lightLeaks)!==JSON.stringify(lightLeaksRef.current)));
     if(!changed) return;
-    const entry={...before,allowIdentityChange:!!options.allowIdentityChange,
+    const label=options.label||'編集';
+    const entry={...before,label,allowIdentityChange:!!options.allowIdentityChange,
       afterIdentity:options.allowIdentityChange ? editIdentity() : null};
     editHistoryRef.current=[...editHistoryRef.current,entry].slice(-20);
     setEditHistoryCount(editHistoryRef.current.length);
+    // 操作した直後に「やったこと」と戻すを下に10秒出す。
+    setUndoToast({key:Date.now(),message:`✓ ${label}`,canUndo:true});
   };
   const undoEdit=()=>{
     const before=editHistoryRef.current.pop();
@@ -18622,7 +18644,10 @@ const recomputeStarts=(arr)=>{
     const current=editIdentity();
     const expectedIdentity=before.allowIdentityChange ? before.afterIdentity : before.identity;
     if(expectedIdentity.clips!==current.clips || expectedIdentity.texts!==current.texts){
-      editHistoryRef.current=[]; setEditHistoryCount(0); return;
+      // 記録の後に素材や文字の追加・削除があると、安全に戻せない。黙って捨てず理由を出す。
+      editHistoryRef.current=[]; setEditHistoryCount(0);
+      setUndoToast({key:Date.now(),message:'素材や文字の追加・削除があったので、ここから先は戻せません',canUndo:false});
+      return;
     }
     handleStop();
     const restored=before.clips.map(c=>({...c}));
@@ -18649,7 +18674,28 @@ const recomputeStarts=(arr)=>{
     timeRef.current=Math.min(before.time,Math.max(0,end-0.01));
     setCurrentTime(timeRef.current);
     setEditHistoryCount(editHistoryRef.current.length);
+    setUndoToast({key:Date.now(),message:`↶「${before.label||'編集'}」を戻しました`,canUndo:false});
     requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
+  // 文字の追加・削除・複製を1回の操作として記録する。
+  const commitTextsEdit=(next,label)=>{
+    const before=editSnapshot();
+    textsRef.current=next;setTexts(next);
+    recordEdit(before,{allowIdentityChange:true,label});
+    setTimeout(()=>drawFrameRef.current(timeRef.current),10);
+  };
+  // テキスト編集の「完了」やモードの切り替えで、開いた時からの変化（中身・見た目・追加）を1回分として記録する。
+  const recordTextEditSession=()=>{
+    const original=textEditOriginalRef.current;
+    if(!original || original.id!==selectedTextId) return;
+    const beforeTexts=original.text
+      ? textsRef.current.map(t=>t.id===original.id?{...original.text}:t)
+      : textsRef.current.filter(t=>t.id!==original.id);
+    const before={...editSnapshot(),texts:beforeTexts.map(t=>({...t})),
+      identity:{clips:editIdentity().clips,texts:beforeTexts.map(t=>t.id).sort().join('|')}};
+    recordEdit(before,{allowIdentityChange:true,label:original.text?'文字の編集':'文字の追加'});
+    const now=textsRef.current.find(t=>t.id===original.id);
+    textEditOriginalRef.current=now?{id:original.id,text:{...now}}:null;
   };
   const seekEditorTime=(value)=>{
     handleStop();
@@ -18814,7 +18860,7 @@ const recomputeStarts=(arr)=>{
     const next=clipsRef.current.map(c=>c.id===clipId ? {...c,_finderMarks:change(c._finderMarks||[])} : c);
     clipsRef.current=next;
     setClips(next);
-    recordEdit(before);
+    recordEdit(before,{label:'♡の変更'});
   };
   const addFinderMark=async()=>{
     if(finderMarkBusyRef.current || (modeRef.current!=='finder' && modeRef.current!=='hikariyomi')) return;
@@ -18912,7 +18958,7 @@ const recomputeStarts=(arr)=>{
   const finishRangeEdit=()=>{
     const before=rangeEditRef.current;
     rangeEditRef.current=null;
-    recordEdit(before);
+    recordEdit(before,{label:'長さの調整'});
   };
   const changeLightCorrection=(clipId,key,value)=>{
     const next=clipsRef.current.map(clip=>clip.id===clipId ?
@@ -18930,7 +18976,7 @@ const recomputeStarts=(arr)=>{
     });
     clipsRef.current=next;
     setClips(next);
-    recordEdit(before);
+    recordEdit(before,{label:'明るさ補正のリセット'});
     requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
   const setLightComparison=(held,clipId=null)=>{
@@ -18965,7 +19011,7 @@ const recomputeStarts=(arr)=>{
     timeRef.current=matching ? Math.min(matching.timelineStart+local,matching.timelineStart+matching.duration-0.01) : 0;
     setCurrentTime(timeRef.current);
     setSelectedTimelineItem({type:'clip',id:clipId});
-    recordEdit(before);
+    recordEdit(before,{label:'素材の順番'});
     if(plan.removed){
       setEditNotice('隣り合う素材が変わったつなぎ目を解除しました。履歴から戻せます。');
       setTimeout(()=>setEditNotice(''),4500);
@@ -19332,7 +19378,7 @@ const recomputeStarts=(arr)=>{
     const result=recomputeStarts(bounded);
     clipsRef.current=result;
     setClips(result);
-    recordEdit(before);
+    recordEdit(before,{label:'つながりの調整'});
     const end=Math.max(...result.map(c=>c.timelineStart+c.duration));
     durationRef.current=end;
     setDuration(end);
@@ -19777,7 +19823,7 @@ const recomputeStarts=(arr)=>{
     const next=recomputeStarts([...list.slice(0,index),...segments,...list.slice(index+1)]);
     clipsRef.current=next;
     setClips(next);
-    recordEdit(before,{allowIdentityChange:true});
+    recordEdit(before,{allowIdentityChange:true,label:'♡ごとの区間'});
     const end=Math.max(...next.map(c=>c.timelineStart+c.duration));
     durationRef.current=end; setDuration(end);
     timeRef.current=next[index].timelineStart; setCurrentTime(timeRef.current);
@@ -19805,7 +19851,7 @@ const recomputeStarts=(arr)=>{
         _analyzeReason:review.selectedIndex<0?'manual':review.candidates[review.selectedIndex]?.reason} : c));
     clipsRef.current=next;
     setClips(next);
-    recordEdit(before);
+    recordEdit(before,{label:'いいとこ3秒'});
     const end=Math.max(...next.map(c=>c.timelineStart+c.duration));
     durationRef.current=end; setDuration(end);
     const selected=next.find(c=>c.id===review.clipId);
@@ -19893,7 +19939,7 @@ const recomputeStarts=(arr)=>{
     lightLeaksRef.current=leaks;setLightLeaks(leaks);
     clipsRef.current=plan.clips;setClips(plan.clips);
     textsRef.current=plan.texts;setTexts(plan.texts);
-    recordEdit(before,{allowIdentityChange:true});
+    recordEdit(before,{allowIdentityChange:true,label:'途中をカット'});
     const total=plan.clips.length?Math.max(...plan.clips.map(c=>c.timelineStart+c.duration)):3;
     durationRef.current=total;setDuration(total);
     const front=plan.clips.find(c=>c.id===clip.id);
@@ -19965,7 +20011,7 @@ const recomputeStarts=(arr)=>{
     });
     clipsRef.current=next;setClips(next);
     textsRef.current=updatedTexts;setTexts(updatedTexts);
-    recordEdit(before);
+    recordEdit(before,{label:'使う範囲の調整'});
     const edited=next.find(c=>c.id===clip.id);
     const total=Math.max(...next.map(c=>c.timelineStart+c.duration));
     durationRef.current=total;setDuration(total);
@@ -20045,7 +20091,7 @@ const recomputeStarts=(arr)=>{
       setTexts(newTexts);
       textsRef.current = newTexts;
     }
-    recordEdit(before,{allowIdentityChange:true});
+    recordEdit(before,{allowIdentityChange:true,label:'使う範囲の調整'});
     setShowTemplateModal(false);
     setPendingTemplateId(null);
     setTimeout(()=> drawFrameRef.current(timeRef.current), 50);
@@ -20063,7 +20109,7 @@ const recomputeStarts=(arr)=>{
     const intensity=tpl.filterIntensity||100;
     setFilterIntensity(intensity); filterIntensityRef.current=intensity;
     if(tpl.mood) window.vlogSetLook?.(tpl.mood);
-    recordEdit(before,{allowIdentityChange:true});
+    recordEdit(before,{allowIdentityChange:true,label:'物語（見た目だけ）'});
     setShowTemplateModal(false);
     setPendingTemplateId(null);
     setTimeout(()=> drawFrameRef.current(timeRef.current), 50);
@@ -21059,7 +21105,7 @@ const recomputeStarts=(arr)=>{
       _clipId:attached?.id||null,
       _clipStart:attached?start-attached.timelineStart:null,
       _clipEnd:attached?end-attached.timelineStart:null} : t);
-    textsRef.current=next;setTexts(next);recordEdit(snapshot);
+    textsRef.current=next;setTexts(next);recordEdit(snapshot,{label:'文字の時間'});
     setTextRangeDraft(previous=>previous?.textId===id?{textId:id,start,end}:previous);
     setTextBarPreviewTime(Math.min(end-0.01,start+Math.min(0.12,(end-start)/2)));
     setEditNotice(`文字を ${start.toFixed(1)}〜${end.toFixed(1)}秒に配置しました（${attached?`${attached.name} にくっつく`:'動画全体の時間に固定'}${snapLabel?`・${snapLabel}にそろえました`:''}）。`);
@@ -21169,7 +21215,7 @@ const recomputeStarts=(arr)=>{
   const handleClipBarPointerUp = useCallback((e)=>{
     if(!draggingClipBar) return;
     try{ e.currentTarget.releasePointerCapture(e.pointerId); }catch{}
-    recordEdit(draggingClipBar.before);
+    recordEdit(draggingClipBar.before,{label:'素材バーの長さ'});
     setDraggingClipBar(null);
     setTimeout(()=> drawFrameRef.current(timeRef.current),0);
   },[draggingClipBar]);
@@ -21238,6 +21284,7 @@ const recomputeStarts=(arr)=>{
     requestAnimationFrame(()=>requestAnimationFrame(()=>{ if(!window.__userScrollingY){ try{ inlineTimelineRef.current?.scrollIntoView({behavior:'auto',block:'nearest',inline:'nearest'}); }catch{} } }));
   };
   const finishTextEditing=()=>{
+    recordTextEditSession();
     const draft=textRangeDraft?.textId===selectedTextId?textRangeDraft:null;
     const source=draft&&textsRef.current.find(t=>t.id===selectedTextId);
     if(source && (Math.abs(source.start-draft.start)>0.001 || Math.abs(source.end-draft.end)>0.001)){
@@ -21307,7 +21354,7 @@ const recomputeStarts=(arr)=>{
     const fields=attached ? {_clipId:owner.id,_clipStart:start-owner.timelineStart,_clipEnd:end-owner.timelineStart}
       : {_clipId:null,_clipStart:null,_clipEnd:null};
     const next=textsRef.current.map(t=>t.id===source.id?{...t,...fields,start,end}:t);
-    textsRef.current=next;setTexts(next);recordEdit(before);
+    textsRef.current=next;setTexts(next);recordEdit(before,{label:'文字の表示時間'});
     setTextMoveUndo({textId:source.id,
       before:{start:source.start,end:source.end,_clipId:source._clipId||null,
         _clipStart:source._clipStart??null,_clipEnd:source._clipEnd??null},
@@ -21338,7 +21385,7 @@ const recomputeStarts=(arr)=>{
     const before=editSnapshot();
     const next=textsRef.current.map(t=>t.id===id?{...t,_clipId:clip.id,
       _clipStart:source.start-clip.timelineStart,_clipEnd:source.end-clip.timelineStart}:t);
-    textsRef.current=next;setTexts(next);recordEdit(before);
+    textsRef.current=next;setTexts(next);recordEdit(before,{label:'文字を素材にくっつける'});
     setTextRangeNotice(`${clip.name} にくっつけました。素材を動かすと一緒に動きます。`);
   };
   const previewTextRange=()=>{
@@ -21676,7 +21723,7 @@ const recomputeStarts=(arr)=>{
     timeRef.current=focused?.timelineStart||0;setCurrentTime(timeRef.current);
     setSelectedClipIds(focused?[focusId]:[]);setFocusedClipId(focusId);
     setSelectedTimelineItem(focused?{type:'clip',id:focusId}:null);
-    recordEdit(before);requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+    recordEdit(before,{label:'2素材を並べる'});requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
   const rotateMaterialClip=(clipId)=>{
     const current=clipsRef.current.find(clip=>clip.id===clipId);
@@ -21687,7 +21734,7 @@ const recomputeStarts=(arr)=>{
     clipsRef.current=next;setClips(next);
     const thumb=makeRecentMaterialThumb(updatedClip,current.type==='video'?videoRefs.current.get(clipId):null);
     setMaterialThumbnails(previous=>{const updated={...previous};if(thumb)updated[clipId]=thumb;else delete updated[clipId];return updated;});
-    recordEdit(before);
+    recordEdit(before,{label:'回転'});
     requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
   const confirmSplitDraft=()=>{
@@ -21775,7 +21822,7 @@ const recomputeStarts=(arr)=>{
   const commitQuickPeekAudioEdit=()=>{
     const before=quickPeekAudioEditRef.current;
     quickPeekAudioEditRef.current=null;
-    if(before)recordEdit(before);
+    if(before)recordEdit(before,{label:'素材の音'});
   };
   const updateQuickPeekAudioSetting=(field,value,sceneId=quickPeekId)=>{
     const scene=clipsRef.current.find(item=>item.id===sceneId);
@@ -23341,6 +23388,10 @@ const recomputeStarts=(arr)=>{
           className:'min-h-11 px-5 rounded-full border border-white/25 bg-white/10 text-[11px] text-white font-bold active:bg-white/20 disabled:opacity-30',
           'aria-label':'最初から再生'}, '↺ 最初から再生'),
         React.createElement('button', {type:'button',onClick:handleStop, className:'min-h-11 px-4 rounded-full bg-white/5 text-[11px] text-white/50 active:bg-white/10'}, '停止 ■'),
+        React.createElement('button', {type:'button',
+          onClick:()=>{ try{ inlineTimelineRef.current?.scrollIntoView({block:'start',behavior:vlogUiMotionOn()?'smooth':'auto'}); }catch{} },
+          'aria-label':'タイムラインへ移動',
+          className:'ml-4 min-h-11 px-4 rounded-full bg-white/10 text-[11px] font-bold'}, '↓ タイムライン'),
         isPlaying && React.createElement('div', {className:'flex items-center gap-1'},
           React.createElement('div', {className:'nami-bar'}),
           React.createElement('div', {className:'nami-bar'}),
@@ -23455,19 +23506,6 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
             className:'absolute left-0 right-0 top-full pt-1 text-center text-[8px] leading-none text-white/35 pointer-events-none whitespace-nowrap'
           }, '※追加メニューの「ビデオを撮る」は写真アプリに保存されません')
         ),
-    (mode==='normal' || mode==='textEdit') && React.createElement('div', {className:'mx-3 mt-2 flex justify-between shrink-0'},
-      React.createElement('button', {
-        type:'button',
-        onClick:()=>{ try{ inlineTimelineRef.current?.scrollIntoView({block:'start',behavior:vlogUiMotionOn()?'smooth':'auto'}); }catch{} },
-        'aria-label':'タイムラインへ移動',
-        className:'px-4 h-9 rounded-full bg-white/10 text-[11px]'
-      }, '↓ タイムライン'),
-      React.createElement('button', {
-        onClick:undoEdit, disabled:editHistoryCount===0,
-        'aria-label':'直前の編集を戻す',
-        className:`px-4 h-9 rounded-full bg-white/10 text-[11px] ${editHistoryCount===0?'opacity-40':''}`
-      }, `↶ 戻す${editHistoryCount>0?` (${editHistoryCount})`:''}`)
-    ),
     // テキスト編集中も EDIT MENU を出し、完了を押さずにほかの画面へ移れるようにする。
     (mode==='normal' || mode==='textEdit') && React.createElement('div', {className:'px-3 py-3 bg-[#0a0a0b] shrink-0 border-b border-white/5'},
       // 編集モードのダイヤル。紙色テーマの一括の塗り直しから外し（data-paper-preserve）、深い緑の台に4つのモードを刻む。
@@ -23486,7 +23524,10 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
           React.createElement('span', {className:'vlog-mode-dial-engrave'}, 'MODE'),
           '編集モード'
         ),
-        React.createElement('div', {className:'vlog-mode-dial-hint'}, 'タップで切り替え')
+        // いつでも押せる戻す。次に戻る操作の名前を出す。
+        React.createElement('button', {type:'button',onClick:undoEdit,disabled:editHistoryCount===0,className:'vlog-mode-dial-undo',
+          'aria-label':editHistoryCount>0?`直前の操作「${editHistoryRef.current[editHistoryRef.current.length-1]?.label||'編集'}」を戻す`:'戻せる操作はありません'},
+          editHistoryCount>0?`↶ 戻す：${editHistoryRef.current[editHistoryRef.current.length-1]?.label||'編集'}`:'↶ 戻す')
       ),
       React.createElement('div', {className:'vlog-mode-dial-marks grid grid-cols-4 gap-2'},
         React.createElement('span', {className:'vlog-mode-dial-index','aria-hidden':true}),
@@ -23503,7 +23544,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                 setActiveTab(t.k);
                 // 物語タブは、押したらそのままテンプレートの一覧を開く（中のボタンを押す手間をなくす）。
                 if(t.k==='preset') setPendingTemplateId(null);
-                if(t.k!=='text' && modeRef.current==='textEdit'){ modeRef.current='normal'; setMode('normal'); }
+                if(t.k!=='text' && modeRef.current==='textEdit'){ recordTextEditSession(); modeRef.current='normal'; setMode('normal'); }
               }catch{}
             },
             'aria-pressed':isActive,
@@ -24536,6 +24577,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       const currentClips = clipsRef.current;
                       const targetClip = currentClips.find(x=> x.id===c.id);
                       if(!targetClip) return;
+                      const editBefore = editSnapshot();
                       const currentTrans = targetClip._transitionToNext || {type:'none', duration:0.5};
                       const types = ['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up','page','fold'];
                       const currentIdx = types.indexOf(currentTrans.type);
@@ -24575,6 +24617,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       clipsRef.current = recomputed;
                       setTexts(newTexts);
                       textsRef.current = newTexts;
+                      recordEdit(editBefore,{label:'つながりの種類'});
                       timeRef.current = newTime;
                       setCurrentTime(newTime);
                       const maxEnd = recomputed.length ? Math.max(...recomputed.map(x=>x.timelineStart+x.duration)) : 3;
@@ -25403,16 +25446,14 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                 onClick:(e)=>{
                   e.stopPropagation();
                   // confirmを外して即削除（動作不良対策）
-                  setTexts(prev=> prev.filter(x=> x.id!==t.id));
+                  commitTextsEdit(textsRef.current.filter(x=> x.id!==t.id),'文字の削除');
                   if(selectedTextId===t.id) setSelectedTextId(null);
-                  setTimeout(()=> drawFrameRef.current(timeRef.current),10);
                 },
                 onDoubleClick:(e)=>{
                   e.stopPropagation();
                   if(confirm(`「${(t.text||t.content||'')}」を削除しますか？`)){
-                    setTexts(prev=> prev.filter(x=> x.id!==t.id));
+                    commitTextsEdit(textsRef.current.filter(x=> x.id!==t.id),'文字の削除');
                     if(selectedTextId===t.id) setSelectedTextId(null);
-                    setTimeout(()=> drawFrameRef.current(timeRef.current),10);
                   }
                 },
                 className:'ml-2 w-8 h-8 rounded-full bg-red-500/20 border border-red-500/30 flex items-center justify-center text-[12px] text-red-300 shrink-0 active:bg-red-500/40'
@@ -25424,15 +25465,13 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             React.createElement('div', {className:'text-[10px] text-white/40 flex-1'}, `${texts.length}件のテキスト`),
             React.createElement('button', {
               onClick:()=>{
-                setTexts([]);
+                commitTextsEdit([],'文字の全削除');
                 setSelectedTextId(null);
-                setTimeout(()=> drawFrameRef.current(timeRef.current),10);
               },
               onDoubleClick:()=>{
                 if(confirm(`全てのテキスト(${texts.length}件)を削除しますか？`)){
-                  setTexts([]);
+                  commitTextsEdit([],'文字の全削除');
                   setSelectedTextId(null);
-                  setTimeout(()=> drawFrameRef.current(timeRef.current),10);
                 }
               },
               className:'text-[10px] px-3 py-1 rounded-full bg-red-500/10 border border-red-500/20 text-red-300 active:bg-red-500/20'
@@ -25940,7 +25979,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               ),
               textRangeNotice && React.createElement('div',{role:'status',className:'text-[11px] text-amber-200 mt-2 text-center'},textRangeNotice),
               canUndo && React.createElement('button',{type:'button',onClick:undoTextPlacement,
-                className:'mt-2 w-full min-h-10 rounded-full border border-white/25 px-3 text-[11px]'},'元に戻す'),
+                className:'mt-2 w-full min-h-10 rounded-full border border-white/25 px-3 text-[11px]'},'時間を戻す'),
               React.createElement('details',{className:'mt-3 rounded-xl border border-white/10 bg-black/20 px-2 py-1 text-[11px] text-white/70',
                 open:showAdvancedTextTime,onToggle:e=>setShowAdvancedTextTime(e.currentTarget.open)},
                 React.createElement('summary',{className:'cursor-pointer py-2'},'仕上げ',
@@ -26025,14 +26064,17 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                 const cur=texts.find(t=>t.id===selectedTextId);
                 if(!cur) return;
                 const nid=Math.random().toString(36).slice(2);
-                setTexts(prev=> [...prev, withTextTiming({...cur,id:nid,text:cur.text+' コピー'},cur.start+0.2,cur.end+0.2)]);
+                commitTextsEdit([...textsRef.current, withTextTiming({...cur,id:nid,text:cur.text+' コピー'},cur.start+0.2,cur.end+0.2)],'文字の複製');
               },
               className:'flex-1 h-10 rounded-full bg-white/10 text-[12px]'
             }, '複製'),
             React.createElement('button', {
               onClick:()=>{
-                setTexts(prev=> prev.filter(t=> t.id!==selectedTextId));
+                const original=textEditOriginalRef.current;
                 textEditOriginalRef.current=null;
+                // 追加したばかりの文字を消すだけなら記録しない（なかったことになる）。
+                if(original && original.id===selectedTextId && !original.text){ const next=textsRef.current.filter(t=> t.id!==selectedTextId); textsRef.current=next; setTexts(next); }
+                else commitTextsEdit(textsRef.current.filter(t=> t.id!==selectedTextId),'文字の削除');
                 setSelectedTextId(null);
               },
               className:'flex-1 h-10 rounded-full bg-red-500/20 border border-red-500/30 text-[12px] text-red-300'
@@ -26197,7 +26239,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   fillClip.timelineStart+fillClip.duration,editSnapshot(),null,fillClip.id),className:big},'素材いっぱい'),
               React.createElement('button',{type:'button',onClick:()=>{
                 const nid=Math.random().toString(36).slice(2);
-                setTexts(prev=>[...prev,withTextTiming({...t,id:nid,text:t.text+' コピー'},t.start+0.2,t.end+0.2)]);
+                commitTextsEdit([...textsRef.current,withTextTiming({...t,id:nid,text:t.text+' コピー'},t.start+0.2,t.end+0.2)],'文字の複製');
                 setEditNotice('文字を複製しました（0.2秒後ろに置きました）。');
               },className:big},'複製')
             ),
@@ -26217,7 +26259,8 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             React.createElement('div',{className:'mt-2 flex flex-wrap gap-1.5'},
               React.createElement('button',{type:'button',onClick:playTimelineText,
                 className:'rounded-full bg-amber-100 px-3 py-2 font-bold text-black'},'▶ 前後を再生'),
-              React.createElement('button',{type:'button',onClick:undoEdit,disabled:editHistoryCount===0,className:small},'↶ 元に戻す'),
+              React.createElement('button',{type:'button',onClick:undoEdit,disabled:editHistoryCount===0,className:`${small} max-w-[11rem] truncate`},
+                editHistoryCount>0?`↶ 戻す：${editHistoryRef.current[editHistoryRef.current.length-1]?.label||'編集'}`:'↶ 戻す'),
               React.createElement('button',{type:'button',onClick:()=>openTimelineTextAppearance(t),className:small},'編集画面へ')
             )
           );
@@ -26895,6 +26938,11 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       },
       className:'fixed bottom-20 right-3 z-[45] px-3 py-2 rounded-full bg-[#111113] border border-white/25 shadow-lg text-[11px]'
     },'編集へ戻る'),
+    // 操作した直後の「やったこと」と戻す（10秒で消える）。
+    undoToast && React.createElement('div',{key:undoToast.key,className:'vlog-undo-toast','data-paper-preserve':true,role:'status','aria-live':'polite'},
+      React.createElement('span',{className:'vlog-undo-toast-text'},undoToast.message),
+      undoToast.canUndo && editHistoryCount>0 && React.createElement('button',{type:'button',className:'vlog-undo-toast-btn',
+        onClick:()=>{ setUndoToast(null); undoEdit(); }},'↶ 戻す')),
     materialCheck && createPortal(React.createElement('div', {className:'soft-editorial-ui fixed inset-0 z-[10001] flex items-center justify-center bg-black/70 backdrop-blur-sm',
         role:'dialog','aria-modal':true,'aria-label':`${materialCheck.name}を確認`,onClick:closeMaterialCheck,
         style:{position:'fixed',inset:0,zIndex:10001,display:'flex',alignItems:'center',justifyContent:'center',background:'rgba(0,0,0,0.7)',
