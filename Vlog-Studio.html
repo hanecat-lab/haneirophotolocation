@@ -9101,9 +9101,78 @@ function VlogPhotoFocusPicker({clip,img,onChange,onClose}){
   ),document.body);
 }
 
-function VlogRangeFullscreen({clip,start,end,min,max,minSpan,onChange,onClose,mode='keep',toSource=t=>t}){
+// 範囲調整の確認動画に音を付ける（途中をカットと同じ作り）。on はタップの中で呼ぶ。
+// MediaElementSource は1つの動画要素に1回しか作れないので、要素ごとに覚えて使い回す。
+function useVlogRangeAudio(sourceAudioVolume){
+  const contextRef=useRef(null);
+  const entriesRef=useRef(new WeakMap());
+  const failedRef=useRef(false);
+  useEffect(()=>()=>{
+    try{ if(contextRef.current && contextRef.current.state!=='closed') contextRef.current.close(); }catch{}
+    contextRef.current=null;
+  },[]);
+  const on=(video,clip)=>{
+    if(!video) return;
+    const gain=vlogClipSourceGain(clip,sourceAudioVolume);
+    const Context=window.AudioContext||window.webkitAudioContext;
+    if(!contextRef.current && Context && !failedRef.current){ try{ contextRef.current=new Context(); }catch{ failedRef.current=true; } }
+    const context=contextRef.current;
+    let entry=entriesRef.current.get(video);
+    if(context && !entry && !failedRef.current){
+      try{
+        const source=context.createMediaElementSource(video),gainNode=context.createGain();
+        source.connect(gainNode);gainNode.connect(context.destination);
+        entry={source,gain:gainNode};entriesRef.current.set(video,entry);
+      }catch{ failedRef.current=true; }
+    }
+    if(entry){
+      if(context?.state==='suspended') context.resume().catch(()=>{});
+      entry.gain.gain.value=gain;video.volume=1;video.muted=gain===0;
+    }else{ video.volume=Math.max(0,Math.min(1,gain));video.muted=gain===0; }
+  };
+  const off=video=>{ if(video) video.muted=true; };
+  return {on,off};
+}
+// 確認動画を from から再生し、until の直前で止めて back へ戻す。timeupdate は遅れるので rAF で見張る。
+function vlogPlayRangeSnippet(video,{from,until,back,runRef,audio,clip,onStart,onEnd}){
+  if(!video || video.readyState<1) return;
+  if(runRef.current?.raf) cancelAnimationFrame(runRef.current.raf);
+  const token={};
+  try{
+    if(!video.paused) video.pause();
+    runRef.current={token,until,back,raf:0};
+    video.currentTime=Math.max(0,from);
+    audio.on(video,clip);
+    onStart?.();
+    video.play()?.catch?.(()=>{ if(runRef.current?.token===token){ runRef.current=null;audio.off(video);onEnd?.(); } });
+  }catch{ runRef.current=null;audio.off(video);onEnd?.();return; }
+  const watch=()=>{
+    const run=runRef.current;
+    if(!run || run.token!==token) return;
+    // 再生が始まった後に別の操作で止められたら、見張りも終える。
+    if(video.paused){ if(run.started){ runRef.current=null;audio.off(video);onEnd?.();return; } }
+    else run.started=true;
+    if(!video.paused && video.currentTime>=run.until-0.015){
+      runRef.current=null;
+      try{ video.pause();audio.off(video);video.currentTime=run.back; }catch{}
+      onEnd?.();return;
+    }
+    run.raf=requestAnimationFrame(watch);
+  };
+  runRef.current.raf=requestAnimationFrame(watch);
+}
+
+function VlogRangeFullscreen({clip,start,end,min,max,minSpan,onChange,onClose,mode='keep',toSource=t=>t,sourceAudioVolume=1,autoListen=false}){
   const videoRef=useRef(null);
   const playRef=useRef(null);
+  const rangeAudio=useVlogRangeAudio(sourceAudioVolume);
+  const snippetRef=useRef(null);
+  const listenEdge=(kind,a,b)=>{
+    if(mode!=='keep') return;
+    const from=kind==='end'?Math.max(a,b-1):a, until=kind==='end'?b:Math.min(b,a+1);
+    vlogPlayRangeSnippet(videoRef.current,{from:toSource(from),until:toSource(until),back:toSource(kind==='end'?b:a),
+      runRef:snippetRef,audio:rangeAudio,clip,onStart:()=>setPlaying(true),onEnd:()=>setPlaying(false)});
+  };
   const [edge,setEdge]=useState('start');
   const [playing,setPlaying]=useState(false);
   // 映像の拡大（100〜300%）。拡大中はドラッグで見る場所を動かし、2本指で拡大・縮小、ダブルタップで100%⇄200%。
@@ -9157,7 +9226,10 @@ function VlogRangeFullscreen({clip,start,end,min,max,minSpan,onChange,onClose,mo
     const video=videoRef.current;
     if(!video) return;
     try{
+      if(snippetRef.current?.raf) cancelAnimationFrame(snippetRef.current.raf);
+      snippetRef.current=null;
       if(!video.paused) video.pause();
+      rangeAudio.off(video);
       playRef.current=null;setPlaying(false);
       if(video.readyState>=1) video.currentTime=Math.min(Math.max(0,(video.duration||Infinity)-0.001),Math.max(0,toSource(time)));
     }catch{}
@@ -9175,12 +9247,18 @@ function VlogRangeFullscreen({clip,start,end,min,max,minSpan,onChange,onClose,mo
     if(nextStart===start && nextEnd===end){ seekTo(edge==='start'?start:end); return; }
     onChange(nextStart,nextEnd,edge);
     seekTo(edge==='start'?nextStart:nextEnd);
+    if(autoListen) listenEdge(edge,nextStart,nextEnd);
   };
   const selectEdge=next=>{ setEdge(next); seekTo(next==='start'?start:end); };
   const togglePlay=()=>{
     const video=videoRef.current;
     if(!video) return;
     if(!video.paused){ seekTo(edge==='start'?start:end); return; }
+    if(mode==='keep'){
+      vlogPlayRangeSnippet(video,{from:toSource(start),until:toSource(end),back:toSource(edge==='start'?start:end),
+        runRef:snippetRef,audio:rangeAudio,clip,onStart:()=>setPlaying(true),onEnd:()=>setPlaying(false)});
+      return;
+    }
     const center=edge==='start'?start:end;
     const from=mode==='cut'?Math.max(min,center-1):start;
     const to=mode==='cut'?Math.min(max,center+1):end;
@@ -9218,7 +9296,7 @@ function VlogRangeFullscreen({clip,start,end,min,max,minSpan,onChange,onClose,mo
       React.createElement(VlogRotatedMedia,{as:'video',clip,ref:videoRef,src:clip.url,muted:true,playsInline:true,preload:'auto',
         className:'w-full h-full bg-black object-contain',style:{width:'100%',height:'100%',maxHeight:'100%'},
         onLoadedMetadata:()=>seekTo(edge==='start'?start:end),onTimeUpdate,
-        onPause:()=>{ if(playRef.current){ playRef.current=null;setPlaying(false); } }}))),
+        onPause:e=>{ rangeAudio.off(e.currentTarget); if(playRef.current||snippetRef.current){ playRef.current=null;setPlaying(false); } }}))),
     React.createElement('div',{className:'flex flex-col gap-2 bg-black/80 px-3 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]'},
       React.createElement('div',{className:'flex items-center justify-center gap-2'},
         ['start','end'].map(kind=>React.createElement('button',{key:kind,type:'button',onClick:()=>selectEdge(kind),'aria-pressed':edge===kind,
@@ -11814,6 +11892,11 @@ function App(){
   // Ambient Bed for cafe
   const [ambientBedVolume, setAmbientBedVolume] = useState(0.15);
   const [sourceAudioVolume, setSourceAudioVolume] = useState(1);
+  // 使う範囲の調整で、端を離したらその端を1秒音付きで聞く（端末に覚える。最初は ON）。
+  const [rangeAutoListen, setRangeAutoListen] = useState(()=>{ try{ return localStorage.getItem('vlogRangeAudition')!=='off'; }catch{ return true; } });
+  const rangeAudio = useVlogRangeAudio(sourceAudioVolume);
+  const rangeSnippetRef = useRef(null);
+  const rangeLastEdgeRef = useRef(null);
   const sourceAudioVolumeRef=useRef(sourceAudioVolume);
   sourceAudioVolumeRef.current=sourceAudioVolume;
   const quickPeekAudioRef=useRef(null);
@@ -24331,6 +24414,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     cutMode ? React.createElement(VlogMiddleCutControls,{clip,start,end,onChange:setDraftRange,plan:middleCutPlan,sourceAudioVolume,
                       previewSize:rangePreviewSize,onPreviewSizeChange:setRangePreviewSize}) : React.createElement('div',{className:'mt-2 flex flex-col gap-2'},
                       rangeFullscreen && React.createElement(VlogRangeFullscreen,{clip,start,end,min:bounds.min,max:bounds.max,minSpan:bounds.minSpan,mode:'keep',
+                        sourceAudioVolume,autoListen:rangeAutoListen,
                         onChange:(a,b)=>setDraftRange(a,b),onClose:()=>setRangeFullscreen(false)}),
                       React.createElement('div',{className:'sticky top-14 z-20 flex flex-col gap-2 bg-[#1a1a1c] py-1'},
                       React.createElement(VlogRangePreviewSizeButton,{size:rangePreviewSize,onChange:setRangePreviewSize,
@@ -24343,19 +24427,38 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                           if(Number.isFinite(sd) && sd>0) setGood3Adjust(prev=>prev?.clipId===clip.id && Math.abs((prev.sourceDuration||0)-sd)>0.001?{...prev,sourceDuration:sd}:prev);
                           try{ e.currentTarget.currentTime=start; }catch{}
                         },
-                        onPlay:e=>{ const v=e.currentTarget; setRangePreviewPlaying(true); if(v.currentTime<start-0.05||v.currentTime>=end) v.currentTime=start; },
-                        onPause:()=>setRangePreviewPlaying(false),
-                        onTimeUpdate:e=>{ const v=e.currentTarget; if(!v.paused && v.currentTime>=end-0.04){ v.pause(); v.currentTime=start; } }
+                        onPlay:e=>{ const v=e.currentTarget; setRangePreviewPlaying(true); if(!rangeSnippetRef.current && (v.currentTime<start-0.05||v.currentTime>=end)) v.currentTime=start; },
+                        onPause:e=>{ setRangePreviewPlaying(false); if(!rangeSnippetRef.current) rangeAudio.off(e.currentTarget); },
+                        onTimeUpdate:e=>{ const v=e.currentTarget; if(!rangeSnippetRef.current && !v.paused && v.currentTime>=end-0.04){ v.pause(); v.currentTime=start; } }
                       }),
-                      React.createElement('div', {className:'flex gap-2'},
-                        React.createElement('button', {type:'button',onClick:()=>{ const v=good3AdjustVideoRef.current; if(!v) return; try{ if(!v.paused){ v.pause(); return; } v.currentTime=start; v.play()?.catch?.(()=>{}); }catch{} }, className:'flex-1 h-7 rounded-full bg-white/10 text-[9px]'}, rangePreviewPlaying?'■ 止める':'▶ 選んだ範囲を再生')
-                      )),
+                      (()=>{
+                        // 音付きで聞く: 範囲全体／入り1秒／終わり1秒。
+                        const listen=(from,until,back)=>vlogPlayRangeSnippet(good3AdjustVideoRef.current,{from,until,back,runRef:rangeSnippetRef,audio:rangeAudio,clip});
+                        const stop=()=>{ const v=good3AdjustVideoRef.current; if(v && !v.paused) try{ v.pause(); }catch{} };
+                        const chip='h-7 rounded-full bg-white/10 text-[9px] px-2 whitespace-nowrap';
+                        return React.createElement('div', {className:'flex gap-1.5'},
+                          React.createElement('button', {type:'button',onClick:()=>rangePreviewPlaying?stop():listen(start,end,start), className:'flex-1 h-7 rounded-full bg-white/10 text-[9px]'}, rangePreviewPlaying?'■ 止める':'▶ 選んだ範囲を再生'),
+                          React.createElement('button', {type:'button',onClick:()=>listen(start,Math.min(end,start+1),start),className:chip,'aria-label':'開始から1秒を音付きで聞く'}, '▶ 入り'),
+                          React.createElement('button', {type:'button',onClick:()=>listen(Math.max(start,end-1),end,end),className:chip,'aria-label':'終了の1秒前から終了までを音付きで聞く'}, '▶ 終わり'),
+                          React.createElement('button', {type:'button','aria-pressed':rangeAutoListen,
+                            onClick:()=>{ const next=!rangeAutoListen; setRangeAutoListen(next); try{ localStorage.setItem('vlogRangeAudition',next?'on':'off'); }catch{} },
+                            className:`${chip} ${rangeAutoListen?'':'opacity-50'}`,'aria-label':'端を離したら1秒聞く'}, rangeAutoListen?'🔈 離したら聞く':'🔇 離したら聞く')
+                        );
+                      })()),
                       React.createElement(TimeRangeBand,{
                         scopeKey:`material-${clip.id}`,start,end,min:bounds.min,max:bounds.max,minSpan:bounds.minSpan,
                         getCurrentTime:()=>good3AdjustVideoRef.current?.currentTime,
                         onSelectEdge:kind=>{const v=good3AdjustVideoRef.current;if(v){if(!v.paused)v.pause();if(v.readyState>=1){try{v.currentTime=kind==='end'?end:start;}catch{}}}},
-                        label:'元動画から使う範囲',onChange:(a,b,kind)=>{setDraftRange(a,b);const v=good3AdjustVideoRef.current;if(v){if(!v.paused)v.pause();if(v.readyState>=1){try{v.currentTime=kind==='end'?b:a;}catch{}}}},
-                        onDragStart:()=>{const v=good3AdjustVideoRef.current;if(v&&!v.paused)v.pause();}
+                        label:'元動画から使う範囲',onChange:(a,b,kind)=>{rangeLastEdgeRef.current={kind,a,b};setDraftRange(a,b);const v=good3AdjustVideoRef.current;if(v){if(!v.paused)v.pause();if(v.readyState>=1){try{v.currentTime=kind==='end'?b:a;}catch{}}}},
+                        onDragStart:()=>{rangeLastEdgeRef.current=null;const v=good3AdjustVideoRef.current;if(v&&!v.paused)v.pause();},
+                        // 指を離した時・±ボタンの後に、動かした端を1秒だけ音付きで聞く（全体を動かした時は入り）。
+                        onDragEnd:()=>{
+                          const last=rangeLastEdgeRef.current;rangeLastEdgeRef.current=null;
+                          if(!rangeAutoListen || !last) return;
+                          const isEnd=last.kind==='end';
+                          vlogPlayRangeSnippet(good3AdjustVideoRef.current,{from:isEnd?Math.max(last.a,last.b-1):last.a,until:isEnd?last.b:Math.min(last.b,last.a+1),
+                            back:isEnd?last.b:last.a,runRef:rangeSnippetRef,audio:rangeAudio,clip});
+                        }
                       })
                   ),
                   cutMode
