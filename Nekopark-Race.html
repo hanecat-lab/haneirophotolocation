@@ -4830,6 +4830,7 @@ function setDriveMode(mode){
   if(!['nyanSapo','gachiTouge'].includes(mode)) return;
   if(driveMode!==mode)resetCornerDrive();
   driveMode = mode;
+  globalIsAssist=mode==='nyanSapo';
   try{ localStorage.setItem('driveMode', mode); }catch(e){}
   applyDriveModeUI();
   resetDrivingGuide();applyDrivingGuideSettings();
@@ -5726,7 +5727,7 @@ function prepareSteeredLine(mode){
   }
   return lineHoldTLat;
 }
-function stepSteeredLine(inputValue,rate,limit,dt,correction,response){
+function stepSteeredLine(inputValue,rate,limit,dt,correction,response,externalVelocity=0){
   const step=THREE.MathUtils.clamp(dt,0,.1);
   const input=Math.abs(inputValue)>.02?inputValue:0;
   const target=input*rate,tau=input ? .10 : .045;
@@ -5736,7 +5737,7 @@ function stepSteeredLine(inputValue,rate,limit,dt,correction,response){
   const lo=Math.min(-limit,lineHoldTLat),hi=Math.max(limit,lineHoldTLat);
   const next=THREE.MathUtils.clamp(lineHoldTLat+movement,lo,hi);
   if(Math.abs(next-(lineHoldTLat+movement))>1e-8)steeredLineVelocity=0;
-  lineHoldTLat=next;
+  lineHoldTLat=next+externalVelocity*step;
   // Keep the existing curvature offset separate from commanded steering.
   steeredLineOffset=THREE.MathUtils.lerp(steeredLineOffset,correction,Math.min(1,step*response));
   return lineHoldTLat+steeredLineOffset;
@@ -5744,6 +5745,24 @@ function stepSteeredLine(inputValue,rate,limit,dt,correction,response){
 function resetSlideExit(){slideDriveCorner=findDriveCorner();slideNeutralTime=0;slideExitActive=false;slideExitTime=0;slideLastKTech=1;window._prevSlideSpeed=undefined;}
 // A successful drift belongs to one corner, independently of its animation
 // and of the 1200 ms input-link window. Geometry is sampled once per curve.
+// Shared handling budget. Steering never removes sustained overspeed push.
+let activeGripLimit=55;
+function roadBendAt(distance){
+  const a=getTrackAtDist(Math.max(0,distance-3)).t,b=getTrackAtDist(Math.min(totalLength,distance+3)).t;
+  return Math.atan2(a.x*b.z-a.z*b.x,a.x*b.x+a.z*b.z)/6;
+}
+function cornerGripSpeed(curvature){return THREE.MathUtils.clamp(Math.sqrt(20/(Math.abs(curvature)+.001)),12,55);}
+const NORMAL_ACCEL_BANDS=[[0,8],[40,7],[60,6],[80,5],[100,3.6],[120,2.7],[140,1.8],[160,1.1],[180,.55],[198,.15]];
+function ordinaryAcceleration(velocity){
+  const kmh=Math.max(0,velocity*3.6),bands=NORMAL_ACCEL_BANDS;
+  let accel=.15;
+  for(let i=1;i<bands.length;i++)if(kmh<=bands[i][0]){
+    accel=THREE.MathUtils.lerp(bands[i-1][1],bands[i][1],(kmh-bands[i-1][0])/(bands[i][0]-bands[i-1][0]));break;
+  }
+  // Assist has a lower top speed, so its final approach tapers earlier too.
+  return accel*(globalIsAssist?1-.75*THREE.MathUtils.smoothstep(kmh,100,140):1);
+}
+
 const cornerDriveProfiles=new WeakMap();
 let cornerDrive=null,slideDriveCorner=null;
 function findDriveCorner(position=s){
@@ -5754,15 +5773,16 @@ function findDriveCorner(position=s){
 }
 function resetCornerDrive(){cornerDrive=null;slideDriveCorner=null;}
 function cancelCornerDrive(){if(cornerDrive){cornerDrive.blocked=true;cornerDrive.level=0;cornerDrive.blend=0;}}
-function awardCornerDrive(quality,link=0,corner=findDriveCorner()){
+function awardCornerDrive(quality,link=0,corner=findDriveCorner(),method='brake'){
   if(!corner||!['GOOD','GREAT','PERFECT'].includes(quality))return;
   if(s<corner.start-45||s>corner.end)return;
   if(!cornerDrive||cornerDrive.curve!==curve||cornerDrive.corner!==corner){
-    cornerDrive={curve,corner,level:0,link:0,blend:0,target:null,onsetSpeed:null,blocked:false};
+    cornerDrive={curve,corner,level:0,link:0,blend:0,target:null,onsetSpeed:null,blocked:false,method};
   }
   if(cornerDrive.blocked)return;
   cornerDrive.level=Math.max(cornerDrive.level,quality==='PERFECT'?1:.6);
   cornerDrive.link=Math.max(cornerDrive.link,link);
+  cornerDrive.method=method;
 }
 function getCornerDriveProfile(corner){
   let profiles=cornerDriveProfiles.get(curve);
@@ -5787,7 +5807,7 @@ function getCornerDriveProfile(corner){
   profile.apex=Number.isFinite(corner.apex)?THREE.MathUtils.clamp(corner.apex,corner.start,corner.end):THREE.MathUtils.lerp(samples[lo].d,samples[hi].d,mix);
   profiles.set(corner,profile);return profile;
 }
-function stepCornerDrive(dt,isBraking,envBase,factor,weight,gradient,assistFloor=0){
+function stepCornerDrive(dt,isBraking,envBase,factor,weight,gradient,assistFloor=0,rotationTarget=0){
   const receipt=cornerDrive;
   if(!receipt)return null;
   const c=receipt.corner;
@@ -5819,7 +5839,7 @@ function stepCornerDrive(dt,isBraking,envBase,factor,weight,gradient,assistFloor
   if(blend<.001)return null;
   const grade=receipt.level;
   const bonus=receipt.link===2?1.32:receipt.link===1?1.16:1;
-  const cornerTarget=Math.max(15,36*factor*(1+.20*grade)*weight*gradient,assistFloor);
+  const cornerTarget=Math.max(15,36*factor*(1+.20*grade)*weight*gradient,assistFloor,rotationTarget);
   const normalTarget=envBase*weight*gradient;
   const assistBonus=assistFloor>0?(receipt.link===2?2:receipt.link===1?.9:0)*blend*yawRoom:0;
   // Capture once, never add speed every frame. An overspeed entry still has
@@ -5832,7 +5852,7 @@ function stepCornerDrive(dt,isBraking,envBase,factor,weight,gradient,assistFloor
   receipt.target+=(desired-receipt.target)*(1-Math.exp(-dt/.10));
   const fade=1-THREE.MathUtils.smoothstep(s,c.end,c.end+18);
   return {target:THREE.MathUtils.lerp(receipt.target,normalTarget,1-fade),
-    acceleration:assistFloor>0?1+(bonus-1)*blend*yawRoom:(.22+.78*blend)*yawRoom*bonus*(.85+.15*grade),blend,bonus,fade};
+    acceleration:assistFloor>0?1+(bonus-1)*blend*yawRoom:(.22+.78*blend)*yawRoom*bonus*(.85+.15*grade),blend,bonus,fade,yawRoom,level:receipt.level,link:receipt.link};
 }
 
 let cornerEntryTime=0; let isInCorner=false; let cornerEntryS=0; let globalIsAssist=false;
@@ -5862,7 +5882,7 @@ function resetRace(){
   try{ resetIrohaBranch(); }catch(e){}
   try{ setupIrohaCurves(); }catch(e){}
   try{ setupIrohaAssist(); }catch(e){ console.warn('assist setup failed', e); }
-  s=2; lateral=0; bank=0; relYaw=0; speed=0; isSliding=false; slideTime=0; isBrakingActive=false; brakeTime=0; isBrakingDrift=false; brakeDriftTime=0; wallHitCooldown=0; elapsed=0; waterLevel=100; boostTimer=0; skidTimer=0; smokeTimer=0; weightTransferRatio=0; exitBoostTimer=0; exitBoostPower=0; wasBraking=false; lineHoldTLat=0; lineHoldInitialized=false; resetSteeredLine(); resetSlideExit(); resetCornerDrive();
+  s=2; lateral=0; bank=0; relYaw=0; speed=0; isSliding=false; slideTime=0; isBrakingActive=false; brakeTime=0; isBrakingDrift=false; brakeDriftTime=0; wallHitCooldown=0; elapsed=0; waterLevel=100; boostTimer=0; skidTimer=0; smokeTimer=0; weightTransferRatio=0; exitBoostTimer=0; exitBoostPower=0; wasBraking=false; lineHoldTLat=0; lineHoldInitialized=false; resetSteeredLine(); resetSlideExit(); resetCornerDrive(); activeGripLimit=55;
   t_opt=0; brakeChargeRatio=0; speedoSmoothedKmh=0; speedoNeedleAngle=Math.PI*0.78;
   gameState='ready';
   updateRaceProgress(0,false);
@@ -6915,12 +6935,10 @@ function tick(dt){
   // V155 肉球ドリフト難化: eff 0.15->0.38、速度18以上、左寄りが必要
   // V229 肉球ドリフト開始：進入速度記録
   if(input.driftJustPressed && Math.abs(eff)>0.22 && speed>2.5 && Math.abs(lateral)>0.3){
-    // 85km/h=23.6m/s以上でないとドリフト開始不許可（低速ダラドリ防止）
-    let minEntrySpeed = 18; // 65km/h = 18m/s
-    try{
-      let kappaTmp = (typeof kappaAbs!=='undefined'?kappaAbs:0);
-      if(kappaTmp<0.003){ minEntrySpeed = 22; } // 緩やかでは85km/h以上必要
-    }catch(e){}
+    // Entry thresholds follow the same corner budget as grip; a tight
+    // assisted corner must not slow below the speed needed to practise meat.
+    const entryCurvature=Math.max(Math.abs(roadBendAt(s)),Math.abs(roadBendAt(s+10)),Math.abs(roadBendAt(s+20)));
+    const minEntrySpeed=entryCurvature<.003?22:THREE.MathUtils.clamp(cornerGripSpeed(entryCurvature)*.85,10,18);
     if(speed >= minEntrySpeed){
       beginLinkFeedback();
       resetSlideExit();
@@ -7032,6 +7050,12 @@ function tick(dt){
   }catch(e){
     factor_curv=1.0; f_grad=1.0; f_weight=1.0;
   }
+
+  const handlingBend=roadBendAt(s);
+  const handlingCurvature=Math.abs(handlingBend);
+  activeGripLimit=cornerGripSpeed(handlingCurvature);
+  const previewGripLimit=cornerGripSpeed(Math.max(handlingCurvature,kappaAbs));
+  let outwardVelocity=0;
 
   // V216 k_tech計算：超タイトで+0.2秒恩恵 (PERFECT 1.50倍=0.75秒差)
   let k_tech = 1.0;
@@ -7151,75 +7175,10 @@ function tick(dt){
       let dtClamped = THREE.MathUtils.clamp(dt,0,.1);
       lineMode='grip';lineRate=sens;lineLimit=4.0;
       tLat=prepareSteeredLine(lineMode);
-      // V223 左右コーナー修正：右も左もアウトに膨らむように
-      try{
-        let kappaLocal = (typeof kappaAbs!=='undefined' ? kappaAbs : 0);
-        if(kappaLocal>0.002){
-          let R = 1 / kappaLocal;
-          let mu = 1.1;
-          let g = 9.81;
-          let v_limit = Math.sqrt(mu * g * R);
-          let gripRatio = speed / Math.max(v_limit, 1);
-          // V224 修正：トラック曲率からターン方向を取得、右も左もアウトに膨らむ
-          let turnDir = 0;
-          try{
-            if(typeof getTrackTurnDir==='function'){
-              turnDir = getTrackTurnDir(typeof s!=='undefined' ? s : 0);
-            }
-            if(turnDir===0 && typeof turnDirForNextCorner==='function'){
-              turnDir = turnDirForNextCorner();
-            }
-            if(turnDir===0 && typeof eff!=='undefined' && Math.abs(eff)>0.01){
-              turnDir = eff>0 ? 1 : -1;
-            }
-          }catch(e){}
-          // 外側はターン方向の逆：右コーナー(1)なら外は左(-1)、左コーナー(-1)なら外は右(1)
-          // 物理：アンダーステアで外に膨らむ
-          let outwardSign = 0;
-          if(turnDir!==0){
-            outwardSign = -turnDir;
-          } else {
-            // turnDir不明時は現在のlateralの外側へ：センターから遠ざかる方向ではなく、コーナー外側へ
-            // 仮に右にいるならさらに右ではなく、左に膨らむをデフォルトにして両方で外へ行くように
-            outwardSign = (lateral>=0 ? -1 : 1);
-          }
-          if(speed > v_limit*0.92){
-            let a_req = speed*speed * kappaLocal;
-            let excess = Math.max(0, a_req - 0.85*mu*g);
-            let kUnder = 0.28;
-            let driftOut = excess * kUnder * dtClamped;
-            tLat += outwardSign * driftOut * 8.0;
-          } else if(gripRatio < 0.85){
-            // 低速進入はイン側（ターン方向）に切り込める
-            let inFactor = (0.85 - gripRatio) * 0.6;
-            let inwardSign = (turnDir!==0 ? turnDir : (lateral>=0 ? 1 : -1));
-            tLat += inwardSign * inFactor * dtClamped * 1.2;
-          }
-        }
-      }catch(e){}
     }
     tBank=eff*0.6; tRel=eff*0.5;
-    // V221 縦：にゃんサポは自動減速、ガチ峠は直線で加速＆コーナーでは減速しない（ブレーキ必須）
-    if(isBraking){
-      if(isLinearAuto){
-        tSpd=base*0.22; k_tech=0.85;
-      } else {
-        tSpd=base*0.42; k_tech=0.92; // ガチはブレーキでも60km/h台までしか落ちない、ブレーキでクリップ可能に
-      }
-    } else {
-      if(isLinearAuto){
-        tSpd=base*1.08; k_tech=1.0; // にゃんサポは少し速く、頭打ち126→140km/hに
-      } else {
-        // ガチ峠は直線で50m/s=180km/hまで伸びる
-        let kappaForSpeed = (typeof kappaAbs!=='undefined' ? kappaAbs : 0);
-        let isStraight = kappaForSpeed < 0.003; // R>333m
-        if(isStraight){
-          tSpd=48*1.25; k_tech=1.0; // 60m/s=216km/h目標、実際は50m/s=180km/hに漸近
-        } else {
-          tSpd=48; k_tech=1.0; // コーナーでも48m/s=172km/h維持、物理的に曲がれないので壁に当たる
-        }
-      }
-    }
+    // Speed is resolved once below, with the shared grip/drift limits.
+    tSpd=base;
   }
   else {
     // V229 肉球ドリフト：速度維持・品質判定・減速ペナルティ
@@ -7268,7 +7227,8 @@ function tick(dt){
     if(!slideExitActive){
       // 速度維持判定（緩和：65%→55%に、最低65km/h→50km/hに）
       let retainRatio = speed / Math.max(slideEntrySpeed, 1);
-      let minSpeed = Math.max(14, slideEntrySpeed*0.55); // 50km/h or 55%
+      const speedFloor=Math.min(14,cornerGripSpeed(Math.max(handlingCurvature,kappaAbs))*.82);
+      let minSpeed = Math.max(speedFloor,slideEntrySpeed*.55);
       let isSpeedFail = speed < minSpeed;
       let isRapidDecel = false;
       try{
@@ -7327,7 +7287,7 @@ function tick(dt){
 
       slideLastQuality = quality;
       const linkedLevel=hasBrakingLink ? ((window._lastBrakeJustTypeOrig==='PERFECT'&&quality==='PERFECT')?2:1):0;
-      awardCornerDrive(quality,linkedLevel,slideDriveCorner);
+      awardCornerDrive(quality,linkedLevel,slideDriveCorner,'meat');
       // V237 C1：肉球品質確定後に最終的な連携結果を現在の判定に再表示（成功時の文字）
       try{
         if(hasBrakingLink && brakingLinkSince < 1200){
@@ -7457,18 +7417,6 @@ function tick(dt){
   if(!isSliding && !isBrakingDrift){
     tSpd = envBase * (globalIsAssist?nyanGripAssistScale(kappaAbs):1);
   }
-  // Only this course's four requested hairpins: a successful release retains
-  // the same assist speed reference as grip, without altering other routes.
-  if(globalIsAssist && isBrakingDrift && !isBraking && TRACKS[currentKey].brakeFocusAssist){
-    const focus=TRACKS[currentKey].cornerRanges.find(c=>c.brakeFocus&&s>=c.start-8&&s<=c.end+12);
-    const angle=Math.abs(relYaw)*180/Math.PI;
-    if(focus && lateral*focus.direction>.2 && Math.abs(lateral)<3.4 && angle>=10 && angle<=65 && (brakeJustType==='GOOD'||brakeJustType==='PERFECT')){
-      const support=TRACKS[currentKey].brakeFocusAssist;
-      const blend=THREE.MathUtils.smoothstep(s,focus.start-8,focus.start+3)*(1-THREE.MathUtils.smoothstep(s,focus.end+2,focus.end+12));
-      const target=envBaseAssist*(brakeJustType==='PERFECT'?support.perfect:support.good);
-      tSpd=THREE.MathUtils.lerp(tSpd,Math.max(tSpd,target),blend);
-    }
-  }
   // V221 分離：物理速度はenvBase、ドリフト判定用はmax(envBase,28)で28m/s保証
   let tSpd_driftGate = Math.max(envBase, 28);
   // f_grad, f_weightは物理なので両方に残す、ガチではf_gradは少し弱める（登りでも速い）
@@ -7489,14 +7437,39 @@ function tick(dt){
     tSpd = THREE.MathUtils.clamp(tSpd, 15, 62);
   }
 
-  // Use one longitudinal target through drift, settling and grip handoff.
-  // Entry/braking and failed attempts retain their existing speed rules.
-  const cornerLaunch=stepCornerDrive(dt,isBraking,envBase,factor_curv,f_weight,f_grad,globalIsAssist?envBase*nyanGripAssistScale(kappaAbs)*f_weight*f_grad:0);
+  const success=cornerDrive&&cornerDrive.curve===curve&&!cornerDrive.blocked&&cornerDrive.level>0&&findDriveCorner()===cornerDrive.corner;
+  let assistPreview=previewGripLimit;
+  if(globalIsAssist&&!isSliding&&!isBrakingDrift){
+    for(const seconds of [.6,1.2,1.8])assistPreview=Math.min(assistPreview,cornerGripSpeed(roadBendAt(s+THREE.MathUtils.clamp(speed*seconds,12,65))));
+  }
+  const gripGoal=Math.min(envBase,(globalIsAssist?assistPreview*1.04:previewGripLimit))*f_weight*f_grad;
+  const driftRatio=success?(cornerDrive.method==='meat'?1.12+.10*cornerDrive.level:1.08+.07*cornerDrive.level):1;
+  const rotationTarget=success?Math.min(envBase,previewGripLimit*driftRatio)*f_weight*f_grad:0;
+  if(!isSliding&&!isBrakingDrift)tSpd=gripGoal;
+  else if(success&&!isBraking)tSpd=Math.max(tSpd,rotationTarget);
+  // The right-side shortcut approach is a straight takeoff lane. Once the
+  // existing preparation and line conditions are met, assist must not brake
+  // for the hairpin that the jump is about to bypass. Entry ranks are unchanged.
+  const assistedTakeoffLane=globalIsAssist&&currentKey==='irohaLocal'&&!irohaJumpDone&&!irohaEntryClosed&&irohaHasPreBrake&&lateral>=IROHA_ENTRY.lineMin&&lateral<=IROHA_ENTRY.lineMax&&s>=branchS-60&&s<=branchS+5&&handlingCurvature<.004;
+  if(assistedTakeoffLane&&!isBraking)tSpd=Math.max(tSpd,IROHA_ENTRY.goodMaxSpeed/3.6);
+  if(isBraking)tSpd=0;
+  const cornerLaunch=stepCornerDrive(dt,isBraking,envBase,factor_curv,f_weight,f_grad,globalIsAssist?gripGoal:0,rotationTarget);
   if(cornerLaunch){
     tSpd=cornerLaunch.target;
     const unwind=cornerLaunch.blend*.65;
     if(isSliding){tRel*=1-unwind;tBank*=1-unwind;}
   }
+  // The handling limit opens with a successful exit; it never attracts to the
+  // inside. Nyansapo handles excess speed by braking, Gachi by user braking.
+  const handlingLimit=THREE.MathUtils.lerp(activeGripLimit*driftRatio,55,cornerLaunch?.blend||0);
+  const overspeed=Math.max(0,(speed/Math.max(handlingLimit,1))**2-1);
+  if(!globalIsAssist&&handlingCurvature>.004&&overspeed>0&&!irohaJumpReserved&&!irohaOnJumpCurve){
+    const severity=Math.min(3,overspeed);
+    const rateLoss=1/(1+severity*(success ? .8 : 1.8));
+    lineRate*=rateLoss;
+    outwardVelocity=-Math.sign(handlingBend)*Math.min(12,severity*(success?3.4:5));
+  }
+  const manualGripOverspeed=!globalIsAssist&&!isBraking&&!isSliding&&!isBrakingDrift&&!cornerLaunch&&speed>tSpd;
 
   let sharpLateral = 2.5;
   try{
@@ -7528,7 +7501,7 @@ function tick(dt){
   }catch(e){}
   if(isBrakingDrift){ yawLerpSpeed=6.0; bankLerpSpeed=7.0; }
   if(lineMode){
-    lateral=stepSteeredLine(eff,lineRate,lineLimit,dt,tLat-lineHoldTLat,sharpLateral);
+    lateral=stepSteeredLine(eff,lineRate,lineLimit,dt,tLat-lineHoldTLat,sharpLateral,outwardVelocity);
   } else {
     lateral=THREE.MathUtils.lerp(lateral,tLat,dt*sharpLateral);
     resetSteeredLine();
@@ -7536,9 +7509,8 @@ function tick(dt){
   bank=THREE.MathUtils.lerp(bank,tBank,dt*bankLerpSpeed);
   relYaw=THREE.MathUtils.lerp(relYaw,tRel,dt*yawLerpSpeed);
   if(!isFinite(lateral)){lateral=0;resetSteeredLine();}
-  // V216改良：勝手なコーナー加速を完全禁止
-  // 原則：グリップではtSpdはenvBase以下なので、speed<tSpdは直線復帰時のみ起きるはず
-  // コーナー中にspeed<tSpdになったらPERFECT以外の加速を抑制
+  // Normal acceleration tapers with speed. A successful corner launch
+  // has separate authority, which fades before the highest speed range.
   // V222 壁ヒット後リカバリー＆低速進入加速＆180km/h到達修正
   let isWallRecover = false;
   let wallRecoverTime = 0;
@@ -7551,85 +7523,43 @@ function tick(dt){
       if(sinceWall<2.5) isWallRecover = true;
     }
   }catch(e){}
-  if(cornerLaunch && speed<tSpd && !isBraking){
-    const normalAccel=THREE.MathUtils.clamp(globalIsAssist?12*(1-speed/60):14*(1-speed/62)+1.5,1.2,14);
-    // Explicit post-apex authority avoids the old friction-circle zero-accel
-    // deadlock. It changes speed only; lateral input and wall tests are shared.
-    const launchAccel=normalAccel*cornerLaunch.acceleration;
-    speed=Math.min(tSpd,speed+launchAccel*dt);
+  if(manualGripOverspeed){
+    // Coasting does not secretly brake for the player; sustained outward
+    // movement above is the consequence of entering too fast.
+    speed=Math.max(0,speed-.25*dt);
   } else if(speed<tSpd){
-    let isCorner = factor_curv < 0.90;
-    let isPerfectBoost = false;
-    try{ isPerfectBoost = (typeof exitBoostPower!=='undefined' && exitBoostPower>0.6); }catch(e){}
-    let isLowSpeedRecovery = (speed < tSpd*0.65) || (tSpd - speed > 8) || isWallRecover || (speed < 22);
-    // V222：低速リカバリーならコーナーでも加速許可、通常コーナーは維持ではなく摩擦円で加速
-    if(isCorner && !isPerfectBoost && !isBrakingDrift && !isLowSpeedRecovery){
-      // 適正速度付近(85-100%)は維持、ただし摩擦円余裕があれば少し加速
-      try{
-        let kappaTmp = (typeof kappaAbs!=='undefined' ? kappaAbs : 0);
-        if(kappaTmp>0.002){
-          let Rtmp = 1/kappaTmp;
-          let vLimTmp = Math.sqrt(1.1*9.81*Rtmp);
-          let gripRatioTmp = speed / Math.max(vLimTmp,1);
-          if(gripRatioTmp < 0.85){
-            // 低速なら加速許可
-            let axAvail = Math.sqrt(Math.max(0, 1.1*9.81*1.1*9.81 - (speed*speed*kappaTmp)*(speed*speed*kappaTmp)));
-            let accelLow = THREE.MathUtils.clamp(axAvail*0.35, 1.0, 6.0);
-            speed += accelLow*dt*0.6;
-          }
-        }
-      }catch(e){}
-    } else {
-      // 加速ロジック：180km/h到達用に改善
-      let accelBase = 12 * (1 - speed/60); // 8*(1-speed/50) → 12*(1-speed/60)で高速域でも加速残す
-      if(!globalIsAssist){
-        accelBase = 14 * (1 - speed/62) + 1.5; // ガチはさらに強く、最低1.5m/s²保証
-      }
-      let accel = THREE.MathUtils.clamp(accelBase, 1.2, 14);
-      if(isWallRecover){
-        accel *= 0.65; // 壁ヒット直後は60-65%に抑制、完全には取り返せない
-        if(wallRecoverTime>0 && wallRecoverTime<0.4){
-          accel *= 0.55; // 0.4秒以内はさらに抑制、ガツンと刺さった感
-        }
-      }
-      if(isPerfectBoost){
-        accel *= (isWallRecover ? 1.6 : 1.32); // 壁後PERFECTは1.6倍で救済
-      } else if(typeof exitBoostPower!=='undefined' && exitBoostPower>0.42){
-        accel *= (isWallRecover ? 1.45 : 1.18);
-      }
-      // 低速リカバリーは摩擦円で制限
-      if(isLowSpeedRecovery && !globalIsAssist){
-        try{
-          let kappaTmp = (typeof kappaAbs!=='undefined' ? kappaAbs : 0);
-          if(kappaTmp>0.002){
-            let a_lat = speed*speed*kappaTmp;
-            let mu_g = 1.1*9.81;
-            let axMax = Math.sqrt(Math.max(0, mu_g*mu_g - a_lat*a_lat));
-            accel = Math.min(accel, axMax*0.8);
-          }
-        }catch(e){}
-      }
-      if(!isFinite(accel)) accel=4;
-      speed += accel*dt;
+    let accel=ordinaryAcceleration(speed);
+    if(cornerLaunch&&!isBraking){
+      const highSpeedFade=1-THREE.MathUtils.smoothstep(speed*3.6,105,145);
+      const launchPeak=cornerLaunch.link===2?11.5:cornerLaunch.link===1?9:6.5;
+      const onset=.65+.35*THREE.MathUtils.smoothstep(cornerLaunch.blend,0,.4);
+      const authority=cornerLaunch.fade*highSpeedFade;
+      accel=THREE.MathUtils.lerp(accel,launchPeak*onset*cornerLaunch.yawRoom*(.85+.15*cornerLaunch.level),authority);
     }
+    if(isWallRecover){
+      accel*=.65;
+      if(speed<25)accel=Math.max(accel,3);
+      if(wallRecoverTime>0&&wallRecoverTime<.4)accel*=.55;
+    }
+    speed=Math.min(tSpd,speed+accel*dt);
   } else {
     let isStraight = factor_curv>0.92;
     // V234：ブレーキ中は直線でも必ず減速
-    if(isStraight && speed <= base*0.98 && globalIsAssist && !isBraking){
+    if(isStraight && speed <= tSpd && globalIsAssist && !isBraking){
       // にゃんサポは直線でbase以下なら減速しない、ただしブレーキ中は減速する
     } else {
       let decel=12;
       if(isSliding) decel=18;
       if(isBrakingDrift && isBraking) decel=24;
       if(speed > envBase*1.15) decel=60;
-      if(isBraking) decel = Math.max(decel, 55);
+      if(isBraking) decel = globalIsAssist?26:24;
       if(!globalIsAssist && speed>22){
         try{
           let kappaTmp = (typeof kappaAbs!=='undefined' ? kappaAbs : 0);
           if(kappaTmp>0.01){
             // V232：ブレーキ中は8制限を解除、オーバースピードでも止まれる
             if(typeof isBraking!=='undefined' && isBraking){
-              decel = Math.max(decel, 18); // ブレーキ中は最低18保証
+              decel = 24; // ガチのブレーキは速度にかかわらず一定
             } else {
               decel = Math.min(decel, 10); // 非ブレーキ時は10に緩和 8→10
             }
@@ -7643,8 +7573,8 @@ function tick(dt){
           if(!isBraking){
             decel = Math.min(decel, 20);
           } else {
-            // V234：ブレーキ中は18-22→28-35に上げて直線でも減速
-            decel = THREE.MathUtils.clamp(decel, 28, 35);
+            // Assist uses a consistent brake response in corners and straights
+            decel = 26;
           }
           if(speed < 16 && !isBraking){
             decel *= 0.6;
@@ -7656,12 +7586,12 @@ function tick(dt){
           }catch(e){}
         }
         // V234：目標速度近傍でもブレーキ中は減速休止しない
-        if(speed <= envBase*1.05 + 1.0 && !isBraking){
+        if(speed <= tSpd*1.05 + 1.0 && !isBraking){
           decel *= 0.5;
         }
       }
       if(!isFinite(decel)) decel=12;
-      speed -= decel*dt;
+      speed = Math.max(tSpd,speed-decel*dt);
     }
   }
   // V222 最終クランプ 45→55で180km/h到達可能に
@@ -7769,7 +7699,7 @@ function tick(dt){
     if(isOverSpeedWall) speed*=0.45;
     else speed*=0.32;
     // V232 最低速度保証：18→20m/sに上げてリカバリーしやすく
-    speed = Math.max(speed, 20, (typeof envBase!=='undefined'? envBase*0.45 : 20));
+    speed = Math.max(speed, Math.min(20,activeGripLimit*.9));
     try{ lastWallHitTime = performance.now()/1000; }catch(e){ try{ lastWallHitTime = Date.now()/1000; }catch(e2){} }
     lateral=THREE.MathUtils.clamp(lateral,-ROAD_HALF+0.35,ROAD_HALF-0.35); bank=-side*0.9;
     resetSteeredLine();
