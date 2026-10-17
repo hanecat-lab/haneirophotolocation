@@ -337,6 +337,34 @@ function ynPredict(track,time){
  const limit=Math.max(last.w,last.h)*0.8;
  return {...last,x:last.x+Math.max(-limit,Math.min(limit,(last.x-prev.x)*scale)),y:last.y+Math.max(-limit,Math.min(limit,(last.y-prev.y)*scale))};
 }
+// 注意区間を細かく探し直す: between two neighbouring detection samples whose faces differ (count, or a face moved by half its size or more),
+// the middle frame is detected, and again on each half that still differs, down to 1/15 s.
+function ynDenseSame(a,b){const sa=Math.max(a.w,a.h),sb=Math.max(b.w,b.h),r=sa/sb;return r>=.67&&r<=1.5&&Math.hypot(a.x+a.w/2-b.x-b.w/2,a.y+a.h/2-b.y-b.h/2)<.5*Math.max(sa,sb)}
+function ynDenseDiffer(A,B){A=A||[];B=B||[];return A.length!==B.length||A.some(a=>!B.some(b=>ynDenseSame(a,b)))}
+function ynDensePlan(runs,samples,dur){
+ const iv=[];for(const r of runs||[]){const a=Math.max(0,r.t0-.25),b=Math.min(dur,r.t1+.25),l=iv[iv.length-1];if(l&&a<=l[1])l[1]=Math.max(l[1],b);else iv.push([a,b])}
+ const ts=[...samples.keys()].sort((x,y)=>x-y),pairs=[];
+ for(let i=0;i+1<ts.length;i++){const a=ts[i],b=ts[i+1];if(b-a<=1/15+.001||!iv.some(v=>b>v[0]&&a<v[1]))continue;if(ynDenseDiffer(samples.get(a),samples.get(b)))pairs.push([a,b])}
+ return {iv,pairs};
+}
+// New detections join the ID whose box (from its samples within 0.6 s, not across a cut) they overlap; the rest become a new ID only when
+// seen on 3 or more frames in a row (within 0.2 s of each other).
+function ynDenseMerge(tracks,frames,cuts,nextId){
+ const cs=(cuts||[]).slice().sort((x,y)=>x-y),across=(t0,t1)=>cs.some(c=>c>Math.min(t0,t1)+1e-6&&c<=Math.max(t0,t1)+1e-6),sceneAt=t=>cs.filter(c=>c<=t+1e-6).length;
+ const out=tracks.map(tr=>({...tr,history:(tr.history||[]).slice().sort((a,b)=>(a.time||0)-(b.time||0)),union:{...tr.union}}));
+ const boxAt=(tr,t)=>{const h=tr.history;let lo=0,hi=h.length;while(lo<hi){const m=(lo+hi)>>1;if((h[m].time||0)<t)lo=m+1;else hi=m}const ok=x=>x&&Math.abs((x.time||0)-t)<=.6&&!across(x.time||0,t),a=h[lo-1],b=h[lo];if(b&&Math.abs((b.time||0)-t)<.01)return {dup:true};if(ok(a)&&ok(b)){const k=(t-a.time)/Math.max(1e-6,b.time-a.time);return {x:a.x+(b.x-a.x)*k,y:a.y+(b.y-a.y)*k,w:a.w+(b.w-a.w)*k,h:a.h+(b.h-a.h)*k}}const c=ok(a)?a:ok(b)?b:null;return c?{x:c.x,y:c.y,w:c.w,h:c.h}:null};
+ let attached=0;const loose=[];
+ for(const fr of frames.slice().sort((x,y)=>x.time-y.time)){
+  const cand=[];out.forEach((tr,ti)=>{const p=boxAt(tr,fr.time);if(!p||p.dup)return;fr.faces.forEach((f,fi)=>{const sp=Math.max(p.w,p.h),sf=Math.max(f.w,f.h),r=sf/sp,d=Math.hypot(f.x+f.w/2-p.x-p.w/2,f.y+f.h/2-p.y-p.h/2)/sp;if(r>=.5&&r<=2&&d<=.6)cand.push({ti,fi,d})})});
+  cand.sort((x,y)=>x.d-y.d);const ut=new Set(),uf=new Set();
+  for(const c of cand){if(ut.has(c.ti)||uf.has(c.fi))continue;ut.add(c.ti);uf.add(c.fi);const tr=out[c.ti],f={...fr.faces[c.fi],time:fr.time},h=tr.history;let k=0;while(k<h.length&&(h[k].time||0)<fr.time)k++;h.splice(k,0,f);
+   tr.union.x=Math.min(tr.union.x,f.x);tr.union.y=Math.min(tr.union.y,f.y);tr.union.x2=Math.max(tr.union.x2,f.x+f.w);tr.union.y2=Math.max(tr.union.y2,f.y+f.h);if(fr.time>(tr.lastSeen||0)){tr.lastSeen=fr.time;tr.last=f}attached++}
+  fr.faces.forEach((f,fi)=>{if(!uf.has(fi))loose.push({...f,time:fr.time})});
+ }
+ const chains=[];for(const f of loose){const c=chains.find(ch=>{const l=ch[ch.length-1];return f.time-l.time>1e-6&&f.time-l.time<=.2+1e-6&&!across(l.time,f.time)&&ynDenseSame(l,f)});if(c)c.push(f);else chains.push([f])}
+ let created=0;for(const ch of chains){if(ch.length<3)continue;const l=ch[ch.length-1];out.push({id:nextId++,scene:sceneAt(ch[0].time),last:l,union:{x:Math.min(...ch.map(f=>f.x)),y:Math.min(...ch.map(f=>f.y)),x2:Math.max(...ch.map(f=>f.x+f.w)),y2:Math.max(...ch.map(f=>f.y+f.h))},history:ch,lastSeen:l.time,framesMissed:0});created++}
+ return {tracks:out,attached,created,nextId};
+}
 function ynAssociate(tracks,faces,time,scene,step,nextID){
  const candidates=[];
  tracks.forEach((tr,ti)=>{
@@ -1987,7 +2015,7 @@ await new Promise(resolve=>setTimeout(resolve,0));
 Dl(Math.round((L+1)/_*100)),Co(O),Be(a.length)};
 const maxJump=ynAdaptive?Math.max(1,Math.floor(.5*ynFPS+1e-9)):1;
 const skipped=await ynAdaptiveRun(_,maxJump,(L)=>detectAt(times[L],L),commitAt,(p0,q0)=>ynStableDet(p0,q0,g,d),()=>{if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。前回の解析結果を維持しました。')});if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。前回の解析結果を維持しました。');
-c.current=z;ynCuts.current=cuts;ynStep.current=Math.max(v,maxGap/2.1+.001);ynSetIssues(issues);let I=f.current;if(I){ot();let L=I.getContext("2d");if(L){L.clearRect(0,0,I.width,I.height);for(let Q of a){let $=Q.union.x,Y=Q.union.y,tn=Q.union.x2-Q.union.x,F=Q.union.y2-Q.union.y,cn=tn*ynPadding,R=F*ynPadding,it=$+tn/2,ql=Y+F/2,oi=(tn+cn*2)/2,Le=(F+R*2)/2;L.fillStyle="white",L.beginPath(),L.ellipse(it,ql,Math.max(1,oi),Math.max(1,Le),0,0,Math.PI*2),L.fill()}}}ynDeletedStack.current=[],ynTruthDeleted.current=[],ynKeptIds.current=new Set();{const o={};for(const k of Object.keys(ynFaceFix.current))if(!k.startsWith('a:'))o[k]=ynFaceFix.current[k];ynFaceFix.current=o}ynSetUndoCount(0);je([...a]);Be(a.length);qe(a.length===0);Dl(100);b(count=>count+1);
+c.current=z;ynCuts.current=cuts;ynStep.current=Math.max(v,maxGap/2.1+.001);ynSetIssues(issues);let I=f.current;if(I){ot();let L=I.getContext("2d");if(L){L.clearRect(0,0,I.width,I.height);for(let Q of a){let $=Q.union.x,Y=Q.union.y,tn=Q.union.x2-Q.union.x,F=Q.union.y2-Q.union.y,cn=tn*ynPadding,R=F*ynPadding,it=$+tn/2,ql=Y+F/2,oi=(tn+cn*2)/2,Le=(F+R*2)/2;L.fillStyle="white",L.beginPath(),L.ellipse(it,ql,Math.max(1,oi),Math.max(1,Le),0,0,Math.PI*2),L.fill()}}}ynDeletedStack.current=[],ynTruthDeleted.current=[],ynKeptIds.current=new Set();{const o={};for(const k of Object.keys(ynFaceFix.current))if(!k.startsWith('a:'))o[k]=ynFaceFix.current[k];ynFaceFix.current=o}ynSetUndoCount(0);je([...a]);Be(a.length);qe(a.length===0);Dl(100);b(count=>count+1);ynDetPerFrame.current=(performance.now()-tAll)/Math.max(1,times.length-skipped);ynDenseUndo.current=null;ynSetDense(null);
 ynSetMessage(`自動で顔を探しました。「大きく確認」で映像を見て、抜けた顔は追加してください。 · ${times.length}フレーム / ${ynFPS}fps · 確認候補${issues.length}箇所 · 所要${((performance.now()-tAll)/1000).toFixed(1)}秒（動画の移動${Math.round(ynTm.seek/Math.max(1,ynTm.seek+ynTm.det)*100)}% / 顔検出${Math.round(ynTm.det/Math.max(1,ynTm.seek+ynTm.det)*100)}%）${skipped>0?` · 間引きで${skipped}/${_}フレームを省略`:''}${ynSeekStats.retry>0?` · 古い映像を${ynSeekStats.retry}回取り直しました`:''}`);ynSetExpandedView("review");
 }catch(error){Be(Ut.length);ynSetMessage(error.message)}finally{
  try{await ynSeek(i,originalTime)}catch{}
@@ -2587,7 +2615,7 @@ const ynFixSceneGo=dir=>{
 const ynStepTimer=E.useRef(null),ynStepHeld=E.useRef(false);
 const ynStepHold=(fn,dir,frame)=>{const stop=()=>{clearTimeout(ynStepTimer.current);ynStepTimer.current=null};return {onClick:()=>{if(ynStepHeld.current){ynStepHeld.current=false;return}fn(dir*.1)},onPointerDown:()=>{stop();ynStepHeld.current=false;ynStepTimer.current=setTimeout(function loop(){ynStepHeld.current=true;fn(dir*frame);ynStepTimer.current=setTimeout(loop,100)},400)},onPointerUp:stop,onPointerCancel:()=>{stop();ynStepHeld.current=false},onPointerLeave:stop,onContextMenu:e=>e.preventDefault(),style:{userSelect:'none',WebkitUserSelect:'none',WebkitTouchCallout:'none',touchAction:'manipulation'}}};
 const ynFixHold=(fn)=>({onPointerDown:e=>{e.preventDefault();fn();clearTimeout(ynFixTimer.current);ynFixTimer.current=setTimeout(function loop(){fn();ynFixTimer.current=setTimeout(loop,140)},380)},onPointerUp:()=>clearTimeout(ynFixTimer.current),onPointerCancel:()=>clearTimeout(ynFixTimer.current),onPointerLeave:()=>clearTimeout(ynFixTimer.current),onContextMenu:e=>e.preventDefault(),onKeyDown:e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();fn()}}});
-const ynTlRef1=E.useRef(null),ynTlRef2=E.useRef(null),ynTlRef3=E.useRef(null),ynTlDrag=E.useRef(null),[ynTlNavOn,ynSetTlNavOn]=E.useState(false),[ynTruthTick,ynSetTruthTick]=E.useState(0);
+const ynDetPerFrame=E.useRef(0),ynDenseUndo=E.useRef(null),ynDenseSeekBad=E.useRef(0),[ynDense,ynSetDense]=E.useState(null),ynTlRef1=E.useRef(null),ynTlRef2=E.useRef(null),ynTlRef3=E.useRef(null),ynTlDrag=E.useRef(null),[ynTlNavOn,ynSetTlNavOn]=E.useState(false),[ynTruthTick,ynSetTruthTick]=E.useState(0);
 const ynTlLabels={ok:'検出あり（検出の間は補間）',gap:'検出が抜けた区間を補間',hold:'予測だけで隠している区間',weak:'追従の枠が怪しい区間（顔の形から外れています）',lost:'追従を見失った区間',none:'顔が見つかっていない区間'};
 const ynTlColors={none:'#d6dfd7',ok:'#34a853',gap:'#f2c94c',hold:'#f2994a',weak:'#e4572e',lost:'#d9534f'};
 const ynStampRealMap=()=>{const st=ynStampRef.current,c=ynStampRealRef.current,strict=st.strict!==false;if(c.ut!==Ut||c.strict!==strict){const m=new Map();for(const tr of Ut){try{const ev=ynIdEvidence([tr]);m.set(tr.id,ev.cls==='high'&&(!strict||ev.dur>=1))}catch{m.set(tr.id,false)}}c.ut=Ut;c.strict=strict;c.map=m}return c.map};
@@ -2714,6 +2742,49 @@ const ynTimelineStrip=(ref,withNav)=>{
   ]});
 };
 // Attention-run navigator shown inside the big preview (edit view), next to the controls.
+// One frame, detected the same way as 「動画全体から顔を探す」 (copied from its detectAt; L only decides whether people are looked for on this frame).
+const ynDetectOne=async(Q,L)=>{const i=n.current,s=o.current,g=i.videoWidth,d=i.videoHeight,W=t=>ynSeekReal(i,t),ynTm={seek:0,det:0};let O=0;const tS=performance.now();const sk=await W(Q);if(typeof i.requestVideoFrameCallback==='function'&&(!sk||sk.exact===false)){if(++ynDenseSeekBad.current>=3)throw Error('動画の読み込みが止まり、正しい映像で顔を探せませんでした。ページを読み込み直してから、もう一度実行してください（実行前の結果はそのままです）。')}else ynDenseSeekBad.current=0;const tD=performance.now();ynTm.seek+=tD-tS;ot();let $=s.getContext("2d");if(!$)return null;$.clearRect(0,0,g,d),$.drawImage(i,0,0,g,d);const signature=ynSceneSignature(s);
+let Y=[],F=((j)=>{let C=0,x=0,wn=g,ln=d;if(j==="bottom60")x=d*0.4,ln=d*0.6;else if(j==="center80")C=g*0.1,x=d*0.1,wn=g*0.8,ln=d*0.8;else if(j==="center50")C=g*0.25,x=d*0.25,wn=g*0.5,ln=d*0.5;let zn=document.createElement("canvas");return zn.width=Math.max(64,Math.floor(wn)),zn.height=Math.max(64,Math.floor(ln)),zn.getContext("2d")?.drawImage(s,C,x,wn,ln,0,0,zn.width,zn.height),{canvas:zn,rx:C,ry:x,sx:zn.width/wn,sy:zn.height/ln}})(Js),cn=(j,C)=>{
+ const maximum=ynFPS===2?640:ynFPS===4?960:1280,scale=Math.min(C,maximum/Math.max(j.width,j.height));
+ if(Math.abs(scale-1)<0.0001)return {canvas:j,factor:1,sy:1};
+ const x=document.createElement('canvas');x.width=Math.max(32,Math.round(j.width*scale));x.height=Math.max(32,Math.round(j.height*scale));x.getContext('2d')?.drawImage(j,0,0,x.width,x.height);return {canvas:x,factor:x.width/j.width,sy:x.height/j.height};
+},R=cn(F.canvas,Mo),it=[],ql=Ro&&Fo.current,oi=L%2===0;if(ql&&oi)try{let j=await Fo.current?.detect(R.canvas);if(j){let C=j.filter((x)=>x.class==="person"&&x.score>0.55);O+=C.length,it=C.map((x)=>{let[wn,ln,zn,At]=x.bbox;return{x:wn/(R.factor*F.sx)+F.rx,y:ln/(R.sy*F.sy)+F.ry,w:zn/(R.factor*F.sx),h:At/(R.sy*F.sy)}})}}catch{}Y.push(...Kl(await Bl(R.canvas,Q,F.rx,F.ry,{sx:R.factor*F.sx,sy:R.sy*F.sy,x:F.rx,y:F.ry},'base'),g,d,R.canvas,s,ve));
+if(Ro&&it.length>0)for(let j of it){let C=document.createElement("canvas");C.width=Math.max(64,Math.floor(j.w)),C.height=Math.max(64,Math.floor(j.h)),C.getContext("2d")?.drawImage(s,j.x,j.y,j.w,j.h,0,0,C.width,C.height);let x=cn(C,Mo>1?1:2),wn=await Bl(x.canvas,Q,j.x,j.y,{sx:x.canvas.width/j.w,sy:x.canvas.height/j.h,x:j.x,y:j.y},"person"),ln=Kl(wn,g,d,x.canvas,C,ve);Y.push(...ln)}{let j=async(C,x,wn,ln,zn)=>{let At=await Bl(C,Q,x,wn,ln,zn);return Kl(At,g,d,C,s,ve)};if(Xs){let C=d,x=0,wn=g,ln=document.createElement("canvas");ln.width=Math.max(128,Math.floor(wn)),ln.height=Math.max(128,Math.floor(C)),ln.getContext("2d")?.drawImage(s,0,x,wn,C,0,0,ln.width,ln.height);let zn=wn*0.6,At=C*0.6,Ie=0.25,Fl=zn*(1-Ie),Pl=At*(1-Ie),ii=[{x:0,y:0},{x:Fl,y:0},{x:0,y:Pl},{x:Fl,y:Pl}];for(let au of ii){let Ht=document.createElement("canvas");Ht.width=640,Ht.height=Math.max(32,Math.round(640*At/zn));let gu=Math.max(0,Math.min(ln.width-zn,au.x)),hu=Math.max(0,Math.min(ln.height-At,au.y));Ht.getContext("2d")?.drawImage(ln,gu,hu,zn,At,0,0,Ht.width,Ht.height);let mu=640/zn,vu=await Bl(Ht,Q,gu,x+hu,{sx:Ht.width/zn,sy:Ht.height/At,x:gu,y:x+hu},"tile"),fi=Kl(vu,g,d,Ht,s,ve);Y.push(...fi)}}if(Ks){let C=[-15,15,-20,20];for(let x of C){let wn=x*Math.PI/180,ln=document.createElement("canvas");ln.width=R.canvas.width,ln.height=R.canvas.height;let zn=ln.getContext("2d");if(!zn)continue;zn.translate(ln.width/2,ln.height/2),zn.rotate(wn),zn.drawImage(R.canvas,-R.canvas.width/2,-R.canvas.height/2);let ii=await Bl(ln,Q,F.rx,F.ry,{sx:R.factor*F.sx,sy:R.sy*F.sy,x:F.rx,y:F.ry,angle:wn,cx:ln.width/2,cy:ln.height/2},`rot${x}`),au=Kl(ii,g,d,ln,s,ve);Y.push(...au)}}}Y.sort((j,C)=>C.score-j.score);let Le=[];for(let j of Y){let C=!1;for(let x of Le)if(Ds(x,j)>0.5||ks(x,j)<0.3){C=!0;break}if(!C)Le.push(j)}ynTm.det+=performance.now()-tD;return {Le,signature}};
+
+const ynDenseRun=async()=>{
+  const video=n.current,tl=ynTl;if(!Ln||!video||ynBusy.current||!tl)return;
+  if(!T.current&&!Hs.current){ynSetDense({msg:'顔検出AIがまだ使えません。上部の読込状態を確認してください。'});return}
+  const samples=c.current;if(!samples||!samples.size||!o.current){ynSetDense({msg:'先に「動画全体から顔を探す」を実行してください。'});return}
+  const dur=Number.isFinite(video.duration)?video.duration:Dn,plan=ynDensePlan(tl.runs,samples,dur);if(!plan.pairs.length){ynSetDense({msg:'細かく探し直す所はありません（前後のコマで顔の見え方が同じです）。'});return}
+  ynBusy.current=true;ynCancel.current=false;ynDenseSeekBad.current=0;const session=++ynSession.current,orig=video.currentTime,before=Ut,work=new Map(samples),queue=plan.pairs.slice(),added=[],budget=120,minDt=1/15+.001;
+  video.pause();xn(false);ynSetDense({run:true,msg:'細かく探し直しています… 0コマ'});let msg='',lostIds=[],merged=false;
+  try{
+    while(queue.length&&added.length<budget){
+      if(ynCancel.current||session!==ynSession.current)throw Error('中止しました。実行前の結果はそのままです。');
+      const [ta,tb]=queue.shift(),mid=Math.round((ta+tb)/2*1000)/1000;if(tb-ta<=minDt||work.has(mid))continue;
+      const det=await ynDetectOne(mid,added.length);if(!det)continue;
+      const faces=det.Le.map(f=>({...f,time:mid}));work.set(mid,faces);added.push(mid);
+      if(mid-ta>minDt&&ynDenseDiffer(work.get(ta),faces))queue.push([ta,mid]);if(tb-mid>minDt&&ynDenseDiffer(faces,work.get(tb)))queue.push([mid,tb]);
+      ynSetDense({run:true,msg:`細かく探し直しています… ${added.length}コマ`});await new Promise(r=>setTimeout(r,0));
+    }
+    const res=ynDenseMerge(before,added.map(t=>({time:t,faces:work.get(t)})),ynCuts.current,Math.max(0,...before.map(tr=>tr.id))+1);
+    c.current=work;ynDenseUndo.current={tracks:before,samples,after:res.tracks};je(res.tracks);Be(res.tracks.length);ynSetReviewed(false);b(v=>v+1);merged=true;
+    if(nn==='track')for(const g of ynGroups.current){if(added.some(t=>{try{const fr=ynMotionHeld(g,t,ynCuts.current,true);return fr&&!fr.ok}catch{return false}}))lostIds.push(g.id)}
+    msg=`${added.length}コマを調べて、${res.attached}個の顔を今あるIDにつなぎ${res.created?`、新しいIDを${res.created}個作りました`:'ました'}。`+(queue.length?'まだ調べきれていない所があります。もう一度押すと続きを調べます。':'');
+  }catch(error){msg=(error&&error.message)||'細かく探し直せませんでした。'}
+  finally{ynBusy.current=false;try{await ynSeek(video,orig);Lt(orig)}catch{}ynLastPreview.current=null;bn.current?.();ynSetDense({msg,lostIds,undo:merged})}
+};
+const ynDenseUndoRun=()=>{const u=ynDenseUndo.current;if(!u||ynBusy.current)return;if(Ut!==u.after){ynSetDense({msg:'このあとにIDを変更したので、元に戻せません。'});return}je(u.tracks);Be(u.tracks.length);c.current=u.samples;ynDenseUndo.current=null;ynSetReviewed(false);b(v=>v+1);ynSetDense({msg:'細かく探し直す前に戻しました。'})};
+const ynDenseRetrack=ids=>{if(ynBusy.current)return;for(const id of ids){const g=ynGroups.current.find(x=>x.id===id);if(!g)continue;const lost=(g.frames||[]).find(f=>!f.ok);ynInvalidate(g,lost?lost.time:g.start)}ynSetDense(null);ynMotionAnalyseAll()};
+const ynDenseRowEl=tl=>{
+  const d=ynDense,btn=(label,fn,extra={})=>D('button',{className:'yn-button',onClick:fn,...extra,children:label});
+  if(d&&d.run)return G('div',{className:'yn-dense-row',role:'status',children:[D('span',{children:d.msg}),btn('中止',()=>{ynCancel.current=true})]});
+  let pairs=0;try{if(c.current&&c.current.size&&tl&&tl.runs.length&&n.current)pairs=ynDensePlan(tl.runs,c.current,Number.isFinite(n.current.duration)?n.current.duration:Dn).pairs.length}catch{}
+  const est=Math.min(120,pairs*2),sec=ynDetPerFrame.current>0?Math.max(1,Math.round(est*ynDetPerFrame.current/1000)):0;
+  if(!pairs&&!d)return null;
+  return G('div',{className:'yn-dense-row',children:[pairs>0&&btn(`注意区間を細かく探し直す${sec?`（目安 約${sec}秒）`:''}`,ynDenseRun,{disabled:ynBusy.current}),d&&d.msg&&D('span',{className:'yn-stamp-fix-range',role:'status',children:d.msg}),
+    d&&d.undo&&btn('元に戻す',ynDenseUndoRun),d&&d.lostIds&&d.lostIds.length>0&&btn(`見失った対象${d.lostIds.join('・')}を追い直す`,()=>ynDenseRetrack(d.lostIds))]});
+};
 const ynTlNav=()=>{
   const tl=ynTl;if(!ynTlNavOn||!tl)return null;
   const list=ynTlList(tl),cur=ynCurrentFrameTime(),total=list.length,inside=list.findIndex(r=>cur>=r.t0-1e-6&&cur<r.t1),idx=Math.min(tl.N-1,Math.max(0,Math.floor(cur/tl.dur*tl.N))),st=tl.cells[idx];
@@ -2725,6 +2796,7 @@ const ynTlNav=()=>{
       G('div',{className:'yn-leaknav-text',children:[D('strong',{children:`${head}${range}`}),D('span',{children:`いまの位置 ${ynClockText(cur)}: ${ynTlLabels[st]}`})]}),
       D('button',{className:'yn-leaknav-step',onClick:()=>ynTlJump(1),disabled:!total,'aria-label':'次の注意区間',children:'次 ▶'})
     ]}),
+    ynDenseRowEl(tl),
     ynTlHoldRow(cur),
     ynTlStripEl(ynTlRef3),
     ynFixMsg&&D('span',{className:'yn-stamp-fix-range',children:ynFixMsg})
