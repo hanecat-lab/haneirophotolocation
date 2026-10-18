@@ -6822,6 +6822,8 @@ let vlogExportDrawProfiler=null;
 const VLOG_PREVIEW_BUILD='2026-10-14-heart-video';
 // 公開時に自動で日時へ書き換わる（.github/workflows/auto-version.yml の Stamp version）。手元では "dev"。
 const APP_VERSION="dev";
+// 実機で下のモードボタン・小窓の判定を読み出す診断表示（URL に ?navdiag=1）。
+const VLOG_NAV_DIAG=(()=>{ try{ return /[?&]navdiag=1/.test(location.search); }catch{ return false; } })();
 // プレビューの音の鳴らし方。通常は動画を消音のまま、音専用の audio 要素で鳴らす
 // （動画に音を出させると iOS で映像が約0.5秒止まるため）。?seam=legacy で従来の動画で鳴らす方式に戻す。
 const VLOG_SEAM_MODE=(()=>{try{return new URLSearchParams(location.search).get('seam')==='legacy'?'legacy':'normal';}
@@ -18706,21 +18708,42 @@ const recomputeStarts=(arr)=>{
   });
   // スクロールのたびに（1コマに1回まで）、ダイヤルとプレビューを通り過ぎたかを見る。
   // 一気に大きくスクロールしても取りこぼさないよう、交差の監視ではなく位置で判定する。
+  const [navDiag, setNavDiag] = useState(null);
+  const navDiagRef = useRef({scrolls:0,target:'-'});
   useEffect(()=>{
     let raf=0;
     const check=()=>{
       raf=0;
       const dial=modeDialElRef.current, frame=previewFrameRef.current;
-      setModeDialPast(!!dial && dial.getBoundingClientRect().bottom<=0);
-      const past=!!frame && frame.getBoundingClientRect().bottom<=0;
+      const dialRect=dial?.getBoundingClientRect(), frameRect=frame?.getBoundingClientRect();
+      setModeDialPast(!!dial && dialRect.bottom<=0);
+      const past=!!frame && frameRect.bottom<=0;
       setPreviewPast(past);
       if(!past) setMiniPreviewDismissed(false);
+      if(VLOG_NAV_DIAG){
+        const bar=document.querySelector('.vlog-mode-bar'), mini=document.querySelector('.vlog-mini-preview');
+        const r=el=>{ if(!el) return 'なし'; const b=el.getBoundingClientRect(), cs=getComputedStyle(el); return `${Math.round(b.top)}〜${Math.round(b.bottom)} ${cs.position}/${cs.display}/${cs.visibility}/op${cs.opacity}`; };
+        const root=document.getElementById('root'), se=document.scrollingElement;
+        setNavDiag({
+          scrolls:navDiagRef.current.scrolls, target:navDiagRef.current.target,
+          dial:dial?`${Math.round(dialRect.top)}〜${Math.round(dialRect.bottom)}`:'なし',
+          frame:frame?`${Math.round(frameRect.top)}〜${Math.round(frameRect.bottom)}`:'なし',
+          bar:r(bar), mini:r(mini),
+          scroll:`root ${Math.round(root?.scrollTop||0)} / doc ${Math.round(se?.scrollTop||0)} / win ${Math.round(window.scrollY)}`,
+          vh:`${window.innerHeight} / vv ${Math.round(window.visualViewport?.height||0)}`
+        });
+      }
     };
-    const onScroll=()=>{ if(!raf) raf=requestAnimationFrame(check); };
+    const onScroll=e=>{
+      if(VLOG_NAV_DIAG){ navDiagRef.current.scrolls++; const t=e?.target; navDiagRef.current.target=t===document?'document':`${t?.tagName||'?'}#${t?.id||''}.${String(t?.className||'').split(' ')[0]}`; }
+      if(!raf) raf=requestAnimationFrame(check);
+    };
     document.addEventListener('scroll',onScroll,{capture:true,passive:true});
     window.addEventListener('resize',onScroll);
+    // 診断中は、スクロールの知らせが来なくても0.5秒ごとに読む（知らせが届いているかも分かる）。
+    const timer=VLOG_NAV_DIAG?setInterval(()=>{ if(!raf) raf=requestAnimationFrame(check); },500):0;
     check();
-    return()=>{ document.removeEventListener('scroll',onScroll,{capture:true}); window.removeEventListener('resize',onScroll); if(raf) cancelAnimationFrame(raf); };
+    return()=>{ document.removeEventListener('scroll',onScroll,{capture:true}); window.removeEventListener('resize',onScroll); if(raf) cancelAnimationFrame(raf); if(timer) clearInterval(timer); };
   },[mode]);
   const miniPreviewShown = previewPast && !miniPreviewDismissed && (mode==='normal'||mode==='textEdit') && exportStatus==='idle';
   const modeBarShown = modeDialPast && (mode==='normal'||mode==='textEdit') && exportStatus==='idle';
@@ -27061,6 +27084,9 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       className:'fixed bottom-20 right-3 z-[45] px-3 py-2 rounded-full bg-[#111113] border border-white/25 shadow-lg text-[11px]',
       style:modeBarShown?{bottom:'calc(84px + env(safe-area-inset-bottom))'}:undefined
     },'編集へ戻る'),
+    // 下の帯・小窓・戻すの帯・診断は #root の外（body 直下）に出す。#root には transform（iOS のスクロール用）があり、
+    // その中の position:fixed は画面ではなく中身に貼り付いて、内容と一緒に流れてしまうため。
+    createPortal(React.createElement('div',{className:'camera-shell',style:{display:'contents'}},
     // 下の細いモードボタン（ダイヤルを通り過ぎた時だけ）。押すとそのモードにして、ダイヤルの所へ戻る。
     modeBarShown && React.createElement('nav',{className:'vlog-mode-bar','data-paper-preserve':true,'aria-label':'編集モード（下）'},
       VLOG_EDIT_MODES.map(t=>React.createElement('button',{key:t.k,type:'button','aria-pressed':activeTab===t.k,
@@ -27070,6 +27096,20 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
         React.createElement('span',null,t.l))),
       React.createElement('button',{type:'button',onClick:undoEdit,disabled:editHistoryCount===0,className:'vlog-mode-bar-undo',
         'aria-label':editHistoryCount>0?`直前の操作「${editHistoryRef.current[editHistoryRef.current.length-1]?.label||'編集'}」を戻す`:'戻せる操作はありません'},'↶ 戻す')),
+    VLOG_NAV_DIAG && navDiag && React.createElement('div',{'data-paper-preserve':true,
+      style:{position:'fixed',left:'4px',top:'calc(4px + env(safe-area-inset-top))',zIndex:99999,maxWidth:'62vw',padding:'6px 8px',borderRadius:'8px',
+        background:'rgba(0,0,0,.82)',color:'#9ef0c8',font:'10px/1.45 ui-monospace,Menlo,monospace',pointerEvents:'none',whiteSpace:'pre-wrap'}},
+      [`navdiag ver ${APP_VERSION}`,
+       `mode ${mode} / export ${exportStatus}`,
+       `dialPast ${modeDialPast} / previewPast ${previewPast} / 閉じた ${miniPreviewDismissed}`,
+       `barShown ${modeBarShown} / miniShown ${miniPreviewShown}`,
+       `scroll回数 ${navDiag.scrolls} 最後 ${navDiag.target}`,
+       `位置 ${navDiag.scroll}`,
+       `ダイヤル ${navDiag.dial}`,
+       `プレビュー ${navDiag.frame}`,
+       `下の帯 ${navDiag.bar}`,
+       `小窓 ${navDiag.mini}`,
+       `画面高 ${navDiag.vh}`].join('\n')),
     // 右上の小窓のプレビュー（プレビューを通り過ぎた時だけ）。押すとプレビューへ戻る。
     miniPreviewShown && React.createElement('div',{className:'vlog-mini-preview','data-paper-preserve':true},
       React.createElement('button',{type:'button',className:'vlog-mini-preview-view','aria-label':'プレビューへ戻る',
@@ -27085,7 +27125,8 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       style:modeBarShown?{bottom:'calc(84px + env(safe-area-inset-bottom))'}:undefined},
       React.createElement('span',{className:'vlog-undo-toast-text'},undoToast.message),
       undoToast.canUndo && editHistoryCount>0 && React.createElement('button',{type:'button',className:'vlog-undo-toast-btn',
-        onClick:()=>{ setUndoToast(null); undoEdit(); }},'↶ 戻す')),
+        onClick:()=>{ setUndoToast(null); undoEdit(); }},'↶ 戻す'))
+    ),document.body),
     materialCheck && createPortal(React.createElement('div', {className:'soft-editorial-ui fixed inset-0 z-[10001] flex items-center justify-center bg-black/70 backdrop-blur-sm',
         role:'dialog','aria-modal':true,'aria-label':`${materialCheck.name}を確認`,onClick:closeMaterialCheck,
         style:{position:'fixed',inset:0,zIndex:10001,display:'flex',alignItems:'center',justifyContent:'center',background:'rgba(0,0,0,0.7)',
