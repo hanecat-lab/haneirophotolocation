@@ -555,7 +555,10 @@ async function ynFrameSeek(video,time,nudge=false){
 // A plain seek can resolve while the element still presents the previous frame (seen when analysis starts with the playhead at the end).
 // Confirm with the presented frame's own timestamp and come back once if it is far from the requested time.
 const ynSeekStats={ok:0,retry:0,stale:0,unverified:0};
-async function ynSeekReal(video,time){
+// Seeks made by ynSeekReal (auto detection, the stale-frame fix below) are in flight while this is above 0.
+let ynSeekRealBusy=0;
+async function ynSeekReal(video,time){ynSeekRealBusy++;try{return await ynSeekRealRun(video,time)}finally{ynSeekRealBusy--}}
+async function ynSeekRealRun(video,time){
  const dur=Number.isFinite(video.duration)?video.duration:0,target=Math.max(0,Math.min(Math.max(0,dur-.001),time)),rvfc=typeof video.requestVideoFrameCallback==='function';
  const once=async t=>{
   let id=null,timer=null;
@@ -878,13 +881,13 @@ function ynLoadFailText(stage,err){const m=err&&err.message?err.message:String(e
 if(YN_DIAG){const ynDiagToggleSetup=()=>{if(document.getElementById('yn-diag-toggle'))return;const st=document.createElement('style');st.textContent='body.yn-diag-off #yn-diag,body.yn-diag-off #yn-playdiag{display:none!important}';document.head.appendChild(st);let off=false;try{off=localStorage.getItem('yn-diag-off')==='1'}catch{}const bt=document.createElement('button');bt.id='yn-diag-toggle';bt.type='button';Object.assign(bt.style,{position:'fixed',right:'4px',top:'45vh',zIndex:'2147483647',padding:'6px 8px',font:'11px/1.2 ui-monospace,monospace',background:'rgba(0,0,0,.6)',color:'#9ff',border:'1px solid #9ff6',borderRadius:'6px'});const set=v=>{off=v;document.body.classList.toggle('yn-diag-off',off);bt.textContent=off?'診断を表示':'診断を隠す';bt.setAttribute('aria-label',bt.textContent);try{localStorage.setItem('yn-diag-off',off?'1':'0')}catch{}};bt.addEventListener('click',()=>set(!off));document.body.appendChild(bt);set(off)};if(document.body)ynDiagToggleSetup();else document.addEventListener('DOMContentLoaded',ynDiagToggleSetup)}
 const ynDiagStats=new Map();
 const YN_BUILD='2026-10-06-edit-diag';
-let ynDiagText='';
+let ynDiagText='',ynStaleText='';
 function ynDiagNote(text){if(text===ynDiagText)return;ynDiagText=text;ynDiagRender()}
 function ynDiagRender(){
  let el=document.getElementById('yn-diag');
  if(!el){el=document.createElement('pre');el.id='yn-diag';el.style.cssText='position:fixed;left:4px;bottom:4px;z-index:2147483647;max-width:96vw;margin:0;padding:6px 8px;background:rgba(0,0,0,.82);color:#9ff;font:10px/1.4 monospace;white-space:pre-wrap;pointer-events:none;border-radius:6px';document.body.appendChild(el)}
  const f=v=>v?v.map(x=>x.toFixed(3)).join('→'):'-';
- el.textContent='diag build='+YN_BUILD+' filter対応='+ynFilterWorks()+' dpr='+devicePixelRatio+'\n'+(ynDiagText?ynDiagText+'\n':'')+[...ynDiagStats.entries()].sort((a,b)=>b[1].t-a[1].t).slice(0,4).map(([k,v])=>`${k} ${v.mode} Lv${v.level} 顔=${v.ref.toFixed(0)}px 半径/ブロック=${v.px.toFixed(1)}px(${(v.px/v.ref*100).toFixed(1)}%) 輝度${f(v.luma)} 彩度${f(v.sat)} 範囲${v.n} 縁${v.edge}`).join('\n');
+ el.textContent='diag build='+YN_BUILD+' filter対応='+ynFilterWorks()+' dpr='+devicePixelRatio+'\n'+(ynStaleText?ynStaleText+'\n':'')+(ynDiagText?ynDiagText+'\n':'')+[...ynDiagStats.entries()].sort((a,b)=>b[1].t-a[1].t).slice(0,4).map(([k,v])=>`${k} ${v.mode} Lv${v.level} 顔=${v.ref.toFixed(0)}px 半径/ブロック=${v.px.toFixed(1)}px(${(v.px/v.ref*100).toFixed(1)}%) 輝度${f(v.luma)} 彩度${f(v.sat)} 範囲${v.n} 縁${v.edge}`).join('\n');
 }
 function ynDiagSample(key,src,mask,out,info){
  try{
@@ -1894,7 +1897,19 @@ const ynEditorToolbar=()=>{
  ]});
 };
 
-E.useEffect(()=>{const video=n.current;if(!Ln||!video?.requestVideoFrameCallback)return;let stopped=false,id;const observe=(_,metadata)=>{if(stopped)return;ynPTS.current={time:metadata.mediaTime,requested:video.currentTime};ynPD(video,'vfc',metadata.mediaTime);if(!ynExporting.current){if(video.paused){du();ynMiniRedraw.current?.()}else bn.current?.();}id=video.requestVideoFrameCallback(observe)};id=video.requestVideoFrameCallback(observe);return()=>{stopped=true;try{if(id!=null)video.cancelVideoFrameCallback(id)}catch{}ynPTS.current=null}},[Ln]);
+E.useEffect(()=>{const video=n.current;if(!Ln||!video?.requestVideoFrameCallback)return;let stopped=false,id;const observe=(_,metadata)=>{if(stopped)return;ynPTS.current={time:metadata.mediaTime,requested:video.currentTime};ynPD(video,'vfc',metadata.mediaTime);if(!ynExporting.current){if(video.paused){du();ynMiniRedraw.current?.()}else bn.current?.();}id=video.requestVideoFrameCallback(observe)};id=video.requestVideoFrameCallback(observe);
+  // iPhone: after a seek while paused the picture can stay on an old frame (the presented frame time stays e.g. 0.000 while the time is 1.25),
+  // so covers for the new time sit on the old picture. If it stays 0.1 s+ apart for 0.3 s, seek there again (at most twice per time).
+  let st={t:-1,since:0,tries:0,run:false};
+  const dog=setInterval(()=>{const pts=ynPTS.current;if(stopped||st.run)return;if(!pts||!video.paused||video.seeking||video.readyState<2||ynExporting.current||ynBusy.current||ynSeekRealBusy>0){st.since=0;return}
+   const ct=video.currentTime;if(Math.abs(ct-st.t)>1e-4)st={t:ct,since:0,tries:0,run:false};
+   if(Math.abs(pts.time-ct)<=.1){st.since=0;return}
+   const now=performance.now();if(!st.since){st.since=now;return}if(now-st.since<300||st.tries>=2)return;
+   st.tries++;st.run=true;const shown=pts.time,k=st.tries;ynPD(video,'reseek'+k,ct);
+   // A seek to the same time is skipped (ynSeek), so step away 1 s and come back, as ynSeekReal's own retry does.
+   const dur=Number.isFinite(video.duration)?video.duration:0;
+   ynSeekRealBusy++;ynSeek(video,ct+1<dur?ct+1:Math.max(0,ct-1)).finally(()=>ynSeekRealBusy--).then(()=>ynSeekReal(video,ct)).then(()=>new Promise(r=>setTimeout(r,500))).then(()=>{const now=ynPTS.current;if(YN_DIAG){ynStaleText=`古いコマの出し直し ${k}回目（${new Date().toLocaleTimeString('ja-JP')}）：表示${shown.toFixed(3)} 時刻${ct.toFixed(3)} → ${now&&Math.abs(now.time-ct)<=.1?'出た '+now.time.toFixed(3):'出ない（表示'+(now?now.time.toFixed(3):'-')+'）'}`;ynDiagRender()}}).catch(()=>{}).finally(()=>{st.run=false;st.since=0;st.t=video.currentTime})},150);
+  return()=>{stopped=true;clearInterval(dog);try{if(id!=null)video.cancelVideoFrameCallback(id)}catch{}ynPTS.current=null}},[Ln]);
 
 const ynMotionPolicy=(setter,value)=>{for(const group of ynGroups.current)ynInvalidate(group,n.current?.currentTime||0,true);setter(value);if(ynGroups.current.length)ynSetMessage('追従の条件を変更しました。指定対象を再解析してください。');ynRefresh()};
 const ynPaddingChange=value=>{if(value<ynPadding&&ynGroups.current.length)ynMotionPolicy(ynSetPadding,value);else ynSetPadding(value)};
