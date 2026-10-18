@@ -3350,7 +3350,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
   <div class="whiteOut" id="whiteOut"></div>
   <div class="topbar" id="topbar">
     <div class="leftBlock startup" id="leftBlock">
-      <b><span class="kanji-gona">猫</span><span class="d-linelogo">D<span class="d-line"></span></span><small id="versionBadge" aria-label="バージョン276">v276</small></b>
+      <b><span class="kanji-gona">猫</span><span class="d-linelogo">D<span class="d-line"></span></span><small id="versionBadge" aria-label="バージョン277">v277</small></b>
       <span class="sub-theory">NEKO最速理論</span>
       <span id="currentCourseDisplay">榛名 下り</span>
       
@@ -5831,7 +5831,7 @@ function applyDriveModeUI(){
 function setDriveMode(mode){
   if(gameState==='racing' && mode==='nyanSapo')raceRecordScope='nyanV2';
   if(!['nyanSapo','gachiTouge'].includes(mode)) return;
-  if(driveMode!==mode){resetCornerPace();resetCornerRescue();resetPathHandling();resetCornerDrive();resetSoloSlide();resetMeatAssessment();resetDriftFeedback();}
+  if(driveMode!==mode){resetExitCoach();resetCornerPace();resetCornerRescue();resetPathHandling();resetCornerDrive();resetSoloSlide();resetMeatAssessment();resetDriftFeedback();}
   const oldMode=driveMode;
   driveMode = mode;
   if(oldMode!==mode)resetBrakeCoach();
@@ -5899,7 +5899,7 @@ function updateDrivingGuide(){
   const baseHint=!selected.method?'速度を落として進入':selected.lowSpeed?'速度不足：グリップで通過':
     approachHint+(selected.method==='link'?'減速→離す→肉球で出口へ':selected.method==='grip'?(selected.line==='aia'?'外→内→外をなめらかに':selected.tie?'グリップで安定通過':dir+'キーでライン調整'):selected.method==='meat'?dir+'キー＋肉球で速度を保つ':selected.repeated?'減速・ためて離すを反復':'減速＋'+dir+'→離す');
   const actionHint=drivingActionHint(selected);
-  const hint=assistBonusBlocked(selected.corner)?'補助減速あり・加速ボーナスなし':actionHint||(currentKey==='haruna'&&selected.uncertain?'参考：':'')+baseHint;
+  const hint=actionHint||(assistBonusBlocked(selected.corner)?'補助減速あり・加速ボーナスなし':(currentKey==='haruna'&&selected.uncertain?'参考：':'')+baseHint);
   const stamp=direction+'|'+method+'|'+reference+'|'+hint;
   if(stamp!==drivingGuideStamp){
     document.getElementById('drivingGuideDirection').textContent=direction;
@@ -7166,20 +7166,119 @@ function recordExitAcceleration(){
   cornerDrive.exitReleased=true;linkAccelerationCaption();
   if(linkPractice.active&&cornerDrive.corner===linkPractice.corner)linkPractice.record.exitAcceleration=true;
 }
+// Read-only exit coaching. Predictions never advance, steer, brake or score the cat.
+let exitCoachStates=new Map(),exitCoachCurve=null;
+const exitCoachRoads=new WeakMap();
+function resetExitCoach(){exitCoachStates.clear();exitCoachCurve=curve;}
+function exitCoachRoad(){
+  let table=exitCoachRoads.get(curve);
+  if(!table){table=[];for(let d=0;d<=totalLength+2;d+=2){const t=getTrackAtDist(Math.min(d,totalLength)).t;table.push(Math.atan2(t.z,t.x));}exitCoachRoads.set(curve,table);}
+  return distance=>{const x=THREE.MathUtils.clamp(distance/2,0,table.length-1),i=Math.floor(x),j=Math.min(i+1,table.length-1);return table[i]+pathAngle(table[i],table[j])*(x-i);};
+}
+function predictExitLine(corner,releaseAfter=0,horizon=.9){
+  const road=exitCoachRoad(),step=.06,velocity=Math.max(2,speed),travel=velocity*.62;
+  let d=s,l=lateral,heading=pathHandling.ready?pathHandling.heading:road(s),command=steeredLineVelocity;
+  let clearance=ROAD_HALF-.12-Math.abs(l),outer=ROAD_HALF-.12+corner.dir*l,inside=corner.dir*l;
+  for(let time=0;time<horizon;time+=step){
+    const held=time<releaseAfter?steerInput:0,room=Math.max(0,3.05-Math.sign(held)*l);
+    const target=held*consistentSteeringRate()*THREE.MathUtils.smoothstep(room,0,.9),tau=Math.abs(held)>.02?.10:.045,gain=1-Math.exp(-step/tau);
+    const wanted=target+(command-target)*tau*gain/step;command+=(target-command)*gain;
+    const k=pathAngle(road(d),road(d+2))/2,metric=THREE.MathUtils.clamp(1-k*l,.3,1.8),middle=road(d+travel*step/(2*metric));
+    const lateralVelocity=THREE.MathUtils.clamp(wanted,-travel*.82,travel*.82),desired=middle+Math.atan2(lateralVelocity,Math.sqrt(Math.max(.01,travel*travel-lateralVelocity*lateralVelocity)));
+    const turn=20*.62/Math.max(velocity,3)*step;heading+=THREE.MathUtils.clamp(pathAngle(heading,desired),-turn,turn);
+    const relative=pathAngle(middle,heading);l+=travel*Math.sin(relative)*step;d+=travel*Math.max(.1,Math.cos(relative))*step/metric;
+    clearance=Math.min(clearance,ROAD_HALF-.12-Math.abs(l));outer=Math.min(outer,ROAD_HALF-.12+corner.dir*l);inside=Math.max(inside,corner.dir*l);
+  }
+  return {clearance,outer,inside,end:l,s:d};
+}
+function exitCoachFor(corner){
+  if(exitCoachCurve!==curve){exitCoachStates.clear();exitCoachCurve=curve;}
+  if(!exitCoachStates.has(corner))exitCoachStates.set(corner,{corner,stage:0,entered:false,meatAt:null,hadSteer:false,wasSteering:false,release:null,contacts:[],lastContact:-Infinity,nextSample:0,risk:null,slow:false,last:null,boost:false});
+  return exitCoachStates.get(corner);
+}
+function observeExitCoach(){
+  if(gameState!=='racing'||pathHandlingExcluded())return;
+  const corner=linkPractice.active?linkPractice.corner:findDriveCorner();if(!corner)return;
+  const state=exitCoachFor(corner),receipt=cornerDrive?.corner===corner?cornerDrive:null;
+  const active=isSliding||isBrakingDrift||Boolean(receipt);if(!active&&!state.entered)return;
+  state.entered=true;
+  if(isSliding&&state.meatAt===null){
+    state.meatAt=simulationElapsed;state.entrySpeed=speed;
+    state.entryLimit=Math.min(pathGripSpeed(corner.start+5),pathGripSpeed(corner.start+14));
+    state.stage=0;state.returnCue=false;state.hadSteer=false;state.wasSteering=false;state.release=null;state.nextSample=0;
+  }
+  const steering=Math.abs(steerInput)>.15,trackingExit=state.meatAt!==null||(!linkPractice.active&&Boolean(receipt)&&!input.brake&&!input.brakePressed);
+  if(trackingExit){
+    state.hadSteer ||= corner.dir*steerInput>.15;
+    if(state.wasSteering&&!steering&&!state.release)state.release={at:simulationElapsed,s,speed,stage:state.stage,neutralClearance:state.risk?.neutral.clearance??null};
+    state.wasSteering=steering;
+  }
+  if(wallContactEpisode&&lastWallContact>state.lastContact&&lastWallContact>=simulationElapsed-.11){
+    state.lastContact=lastWallContact;
+    if(state.contacts.length<4)state.contacts.push({side:wallContactEpisode.side,inside:wallContactEpisode.side*corner.dir>0,s,at:lastWallContact,before:state.last,release:state.release?{...state.release}:null,entrySpeed:state.entrySpeed,entryLimit:state.entryLimit});
+  }
+  if(simulationElapsed>=state.nextSample||!state.risk){
+    const neutral=predictExitLine(corner,0),delayed=predictExitLine(corner,.4),held=predictExitLine(corner,Infinity);
+    const aheadNeutral=predictExitLine(corner,0,2.0),aheadDelayed=predictExitLine(corner,.4,2.0);
+    const safeSpeed=Math.min(pathGripSpeed(s+8),pathGripSpeed(s+18));
+    state.risk={neutral,delayed,held,safeSpeed};state.nextSample=simulationElapsed+.075;
+    if(aheadNeutral.outer<.85&&aheadDelayed.clearance<.85&&speed>safeSpeed*1.03){state.slow=true;state.slowClearAt=null;}
+    else if(state.slow){
+      if(speed<safeSpeed*.94)state.slow=false;
+      else if(neutral.clearance>.9&&held.clearance>.9){state.slowClearAt??=simulationElapsed;if(simulationElapsed-state.slowClearAt>=.25)state.slow=false;}
+      else state.slowClearAt=null;
+    }
+  }
+  const {neutral,delayed,held}=state.risk,profile=getCornerDriveProfile(corner);
+  const settled=Boolean(receipt?.level>0&&!receipt.blocked),qualityReady=isSliding?(slideTime>=.08&&['GOOD','PERFECT'].includes(slideLastQuality)):settled;
+  const nearExit=s+speed*.62*.15>=profile.apex-2,nearExitSoon=s+speed*.62*.55>=profile.apex-2;
+  const inward=Math.max(0,corner.dir*pathHandling.lateralVelocity),innerThreat=corner.dir*lateral+inward*.35>1.35,innerPreview=corner.dir*lateral+inward*.75>1.35,innerUrgent=corner.dir*lateral>2.2;
+  const mayRelease=neutral.clearance>=.55&&(qualityReady||innerUrgent)&&(innerThreat||nearExit);
+  const prepare=neutral.clearance>=.55&&(qualityReady||(isSliding&&slideTime>.08))&&(innerPreview||nearExitSoon);
+  if(mayRelease){state.returnCue=true;state.stage=Math.max(state.stage,2);}else if(prepare)state.stage=Math.max(state.stage,1);
+  if(state.hadSteer&&!steering)state.stage=Math.max(state.stage,3);
+  if(state.meatAt!==null&&state.stage>=3&&(input.brake||input.brakePressed))state.brakedExit=true;
+  if(receipt?.exitReleased&&!receipt.blocked){state.boost=true;state.stage=4;}
+  state.last={s,speed,steer:steerInput,neutralClearance:neutral.clearance,heldClearance:held.clearance,safeSpeed:state.risk.safeSpeed,stage:state.stage};
+  if(linkPractice.active&&linkPractice.record)linkPractice.record.exitReview=state;
+}
+function exitCoachAction(corner,full=true){
+  const state=exitCoachStates.get(corner);if(!state?.entered)return null;
+  const holding=Boolean(input.brake||input.brakePressed),steering=Math.abs(steerInput)>.15;
+  if(state.slow)return {kind:'slow',title:'出口まで、もうひと減速',sub:'左右キーと肉球を離して、ブレーキ',button:'brake'};
+  if(holding&&state.stage>=2)return {kind:'brake-release',title:'ブレーキを離して、出口へ',sub:'左右キーも離して、向きとラインを整えよう'};
+  if(holding)return null;
+  if(state.risk.neutral.clearance<.4&&state.risk.held.clearance>.65)return {kind:'hold',title:'曲がる向きをキープ',sub:'まだ旋回が必要。出口の合図を待とう',fullOnly:true};
+  if(state.returnCue&&steering)return {kind:'release',title:'左右キーを離す',sub:'向きを整えて、出口へ'};
+  if(state.boost)return {kind:'boost',title:'加速ボーナス！',sub:'向きとラインが整って、出口の加速が発動'};
+  if(state.stage>=3&&!steering)return {kind:'coast',title:'そのまま、出口へ',sub:'キーを離したまま、出口のラインへ',fullOnly:true};
+  if(state.stage>=2)return {kind:'release',title:'左右キーを離す',sub:'向きを整えて、出口へ'};
+  if(state.stage===1)return {kind:'prepare',title:'そろそろキーを離す',sub:'今は向きを保ち、次の合図で離そう',fullOnly:true};
+  return {kind:'hold',title:'曲がる向きをキープ',sub:'次は、左右キーを離して出口へ',fullOnly:true};
+}
+function exitReviewAdvice(r){
+  const review=r.exitReview,contact=review?.contacts?.[0];
+  if(!r.contact)return '';
+  if(contact?.inside&&contact.before?.steer*review.corner.dir>.15)return '次は、左右キーを少し早く離して内側の壁から離れよう。';
+  if(contact&&!contact.inside){
+    const before=contact.before,over=contact.entrySpeed>contact.entryLimit*1.1;
+    if(over&&before?.neutralClearance<.45&&before?.heldClearance<.45)return '次は、コーナー手前で速度を落として進入しよう。';
+    if(!over&&contact.release?.stage<2&&before&&Math.abs(before.steer)<.12)return '次は、曲がる向きをもう少し保ってから左右キーを離そう。';
+  }
+  return '次は、速度を少し抑えて壁との間隔を確かめよう。';
+}
+function exitReviewSnapshot(review){
+  if(!review)return null;
+  return {corner:review.corner,stage:review.stage,release:review.release?{...review.release}:null,hadSteer:review.hadSteer,boost:review.boost,brakedExit:Boolean(review.brakedExit),contacts:review.contacts.map(c=>({...c,before:c.before?{...c.before}:null})),entrySpeed:review.entrySpeed,entryLimit:review.entryLimit};
+}
+
 function drivingActionHint(selected){
   if(!selected||pathHandlingExcluded())return '';
   const c=selected.corner,entry=isSliding||isBrakingDrift||cornerDrive?.corner===c;
-  if(entry){
-    const velocity=pathHandling.lateralVelocity*c.dir;
-    if(c.dir*lateral+Math.max(0,velocity)*.45>1.25)selected.returnCue=true;
-    if(Math.abs(steerInput)<.08&&s>=c.start)selected.returnCue=true;
-    if(cornerDrive?.corner===c&&cornerDrive.exitReleased)return '出口へ・加速ボーナス';
-    if(selected.returnCue||slideExitActive)return Math.abs(steerInput)>.12?'方向キーを戻して出口へ':'向きを整えて出口へ';
-    if(isSliding)return '肉球で速度を保つ・出口で戻す';
-    if(isBrakingDrift&&(input.brake||input.brakePressed))return '減速して向きを作る';
-    return '向きを作る・次はキーを戻す';
-  }
-  return '';
+  if(!entry&&!exitCoachStates.get(c)?.entered)return '';
+  const action=exitCoachAction(c,true);if(action)return action.title;
+  if(isBrakingDrift&&(input.brake||input.brakePressed))return '減速して向きを作る';
+  return '曲がる向きをキープ';
 }
 
 function resetSteeredLine(){
@@ -7390,6 +7489,7 @@ function updateReadyCourse(){
   document.getElementById('btnStart').textContent=isPracticeActive()?'▶ 練習を始める':'▶ 走り出す';
 }
 function resetRace(){
+  resetExitCoach();
   resetExitBonusVisual();
   resetCornerPace();
   resetCornerRescue();
@@ -10319,6 +10419,7 @@ function tick(dt){
     }
   }
   updateShortcutPractice(dt);
+  observeExitCoach();
   updateLinkPractice(dt);
 }
 
@@ -10684,18 +10785,9 @@ function updateLinkPractice(dt){
     if(!holding&&!r.mainStarted&&s<pressS){showLinkPracticeCue('そのまま、合図を待つ','方向キーを離して、オレンジの区間へ');return;}
     if(!holding&&!r.mainStarted){showLinkPracticeCue('ブレーキ＋'+dir,'アウトから向きを作る → 離して肉球へ','brake');return;}
   }
-  if(entry&&simulationElapsed-entry.at>profile.keep+.35){
-    const safe=Math.min(pathGripSpeed(s+8,lateral),pathGripSpeed(s+18,lateral));
-    if(speed>safe*1.03)r.exitSlow=true;
-    else if(speed<safe*.9)r.exitSlow=false;
-    if(r.exitSlow){showLinkPracticeCue('出口まで、もうひと減速','方向キーと肉球を離して、ブレーキ','brake');return;}
-    if(holding){showLinkPracticeCue('減速おわり · 離す','方向キーも離して、出口へ');return;}
-  }
   if(entry){
-    const innerSoon=c.dir*lateral+Math.max(0,c.dir*pathHandling.lateralVelocity)*.4>1.4;
-    if(innerSoon||simulationElapsed-entry.at>=profile.keep)r.directionReleased=true;
-    if(!r.directionReleased&&simulationElapsed-entry.at<profile.keep&&isSliding)showLinkPracticeCue('その向きをキープ','肉球で速度を保つ。次は方向キーを戻す','','meat');
-    else if(full||Math.abs(steerInput)>.15)showLinkPracticeCue(Math.abs(steerInput)>.15?'方向キーを戻して、出口へ':'そのまま、出口へ','通過後に、今回の記録を確認');
+    const action=exitCoachAction(c,full);
+    if(action&&(!action.fullOnly||full))showLinkPracticeCue(action.title,action.sub,action.button||'',action.button==='brake'?'brake':action.kind==='hold'?'meat':'neutral');
     else clearLinkPracticeCue();
   }else if(brake){
     if(Date.now()-brake.time<1200)showLinkPracticeCue('肉球を押す！',dir+'はそのまま。離したらすぐ肉球へ','meat');
@@ -10725,8 +10817,12 @@ function setPracticeReviewKind(kind){
 }
 function linkPracticeAdvice(r,entry){
   if(r.assistBraked)return '今回は補助減速が入ったため、加速ボーナスは対象外。次は手前で自分で減速してみよう。';
-  if(r.contact)return '次は、方向キーを少し早く戻して壁から離れよう。';
-  if(r.winner)return r.winner.level===2?'つなぎも完璧！ 加速ボーナス':'ブレーキから肉球へ、きれいにつながった！';
+  if(r.contact)return exitReviewAdvice(r);
+  if(r.winner){
+    if(r.exitAcceleration)return r.winner.level===2?'つなぎも完璧！ 加速ボーナス':r.exitReview?.release?'左右キーを離して、出口の加速につながった！':'連携から出口の加速まで、きれいにつながった！';
+    if(r.exitReview?.brakedExit)return '連携は成立！ 次は、手前で減速して出口のブレーキを減らそう。';
+    return r.exitReview?.hadSteer&&!r.exitReview.release?'連携は成立！ 次は、出口で左右キーを離して向きを整えよう。':'連携は成立！ 次は、出口のラインを整えて加速につなげよう。';
+  }
   const b=entry?.brake||r.brakes.at(-1);
   if(r.earlyMeat&&!b)return '次は、ブレーキを離してから肉球を押そう。';
   if(!b)return r.brakeHeld?'次は、ブレーキと曲がる側のキーを一緒に押してから離そう。':'次は、コーナー手前でブレーキと曲がる側のキーを一緒に押そう。';
@@ -10741,7 +10837,7 @@ function linkPracticeAdvice(r,entry){
   }
   if(entry.since===null||entry.since>=1200)return '次は、ブレーキを離してから肉球を押すまでを短くしよう。';
   if(entry.issue?.speedFail||entry.issue?.rapidDecel)return '次は、ブレーキを少し短くして肉球に入る速度を残そう。';
-  if(entry.issue?.slip>50)return '次は、方向キーを少し早く戻して向きを浅くしよう。';
+  if(entry.issue?.slip>50)return '次は、左右キーを少し早く離して向きを浅くしよう。';
   if(!entry.quality||entry.quality==='OK')return '次は、肉球を押した後も曲がる向きを少し保とう。';
   return '次は、同じコーナーの手前でブレーキから肉球へつなごう。';
 }
@@ -10750,6 +10846,7 @@ function finishLinkPractice(){
   linkPractice.finished=true;gameState='practiceResult';resetExitBonusVisual();resetMeatDriftFeedback();resetControlInput();clearLinkPracticeCue();syncLinkPracticeGuide();
   // Capture once. Later UI timers cannot alter this review.
   const r=linkPractice.record,entry=r.winner||r.activeEntry,b=entry?.brake||r.brakes.at(-1),success=Boolean(r.winner);
+  r.exitReview=exitReviewSnapshot(r.exitReview);
   r.guideMode=irohaAssistMode;
   setPracticeReviewKind('link');
   document.getElementById('practiceResultTitle').textContent=r.assistBraked?'今回は補助減速あり':success?'連携成功！':'次は、つなげてみよう';
@@ -10760,8 +10857,9 @@ function finishLinkPractice(){
     ['ブレーキ',success?entry.awardBrake:b?.rank||'未記録','ため・向き・離す位置'],
     ['離してから肉球まで',entry?.since!==null&&entry?.since!==undefined?(entry.since/1000).toFixed(2)+'秒':'未記録','1.20秒未満 ＋ 各走行条件'],
     ['肉球',success?entry.awardQuality:entry?.quality||'未成立','速度・向き・安定を評価'],
-    ['連携',r.assistBraked?'対象外':success?(entry.level===2?'成立！ PERFECT':'成立！'):'未成立',r.assistBraked?'補助減速あり':'本走と同じ加速判定'],
-    ['出口の加速',r.assistBraked?'対象外':r.exitAcceleration?'使用':'未使用','向きが整った出口で発動'],
+    ['連携',r.assistBraked?'対象外':success?(entry.level===2?'成立！ PERFECT':'成立！'):'未成立',r.assistBraked?'補助減速あり':'同じコーナーでブレーキ→肉球'],
+    ['出口の操作',r.exitReview?.release?'左右キーを離した':r.exitReview?.hadSteer?'キーを維持':'記録なし','連携と加速は別に確認'],
+    ['出口の加速',r.assistBraked?'対象外':r.exitAcceleration?'発動':'未発動','向きが整った出口で発動'],
     ['壁への接触',r.contact?'あり':'なし','連携後も含む']
   ];
   const body=document.getElementById('practiceComparisonBody');body.replaceChildren();
