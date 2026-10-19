@@ -8179,10 +8179,14 @@ const GUTTER={offset:3.02,width:.62,tolerance:.44,maxEntry:85/3.6,cruise:80/3.6,
 const gutterRun={curve:null,routes:[],active:null,departure:null,used:new Set(),feedback:0,dust:0,history:[]};
 // ?gutterdbg=1 のときだけ出る診断表示：頂点時点の速度・向き・溝との横ずれと、入口が弾かれた条件。
 const gutterDebug=(()=>{try{return new URLSearchParams(location.search).get('gutterdbg')==='1';}catch(e){return false;}})();
-const gutterDiag={el:null,lines:[],passed:new Set()};
-function gutterDiagLog(text){gutterDiag.lines.push(text);if(gutterDiag.lines.length>7)gutterDiag.lines.shift();}
+const gutterDiag={el:null,rows:new Map(),prevSliding:false};
+function gutterDiagInit(){
+  gutterDiag.rows=new Map(gutterRun.routes.map(r=>[r.corner.number,{route:r,slide:null,apex:null,entry:null,exit:null}]));
+  gutterDiag.prevSliding=false;
+}
+function gutterDiagSet(route,key,value){const row=gutterDiag.rows.get(route.corner.number);if(row&&gutterDebug)row[key]=value;}
 function resetGutterRun(){
-  gutterDiag.lines.length=0;gutterDiag.passed.clear();
+  gutterDiagInit();
   gutterRun.active=null;gutterRun.departure=null;gutterRun.used.clear();gutterRun.feedback=0;gutterRun.dust=0;gutterRun.history=[];
   clearGutterFeedback();
 }
@@ -8194,16 +8198,17 @@ function rebuildGutters(){
     const apex=getCornerDriveProfile(c).apex;
     const finish=c.end-Math.min(6,(c.end-apex)*.16);
     const success=apex+(finish-apex)*.55;
-    // 上りは頂点付近から入る立ち上がり溝。ドリフト中だけ頂点の先まで入口を延ばす。
-    gutterRun.routes.push(up?{corner:c,side:c.dir,start:apex-10,entryEnd:apex+3,driftEntryEnd:Math.min(apex+10,success-4),
+    // 上りは頂点付近から入る立ち上がり溝。入口の上限は頂点の4m先で、報酬の条件と同じ。
+    gutterRun.routes.push(up?{corner:c,side:c.dir,start:apex-10,entryEnd:apex+4,
       apex,success,finish}:{corner:c,side:c.dir,start:c.start-8,entryEnd:Math.min(c.start+2,apex-8),
       apex,success,finish});
   }
+  gutterDiagInit();
 }
 function gutterOffset(route,distance){
   return route.side*(GUTTER.offset-.24+.24*THREE.MathUtils.smoothstep(distance,route.start,route.start+7));
 }
-// 上りのドリフト中だけ、膨らみを止めるために入口条件を緩める(向き45°・速度上限なし・横ずれ1.2m)。
+// 上りの肉球ドリフト中だけ、膨らみを止めるために入口条件を緩める(向き45°・速度上限なし・横ずれ1.2m)。
 const GUTTER_DRIFT={tolerance:1.2,angle:45*Math.PI/180};
 function gutterEntryAt(distance,offset,velocity,heading,approach=0,drifting=false){
   if(!isHarunaMapKey(currentKey)||gutterRun.curve!==curve||velocity<1)return null;
@@ -8212,7 +8217,7 @@ function gutterEntryAt(distance,offset,velocity,heading,approach=0,drifting=fals
   const loose=drifting&&currentKey==='harunaUp';
   if(velocity>GUTTER.maxEntry&&!loose)return null;
   const tolerance=loose?GUTTER_DRIFT.tolerance:GUTTER.tolerance,angle=loose?GUTTER_DRIFT.angle:GUTTER.angle;
-  return gutterRun.routes.find(r=>!gutterRun.used.has(r.corner.number)&&distance>=r.start-approach&&distance<=(loose?r.driftEntryEnd:r.entryEnd)&&
+  return gutterRun.routes.find(r=>!gutterRun.used.has(r.corner.number)&&distance>=r.start-approach&&distance<=r.entryEnd&&
     Math.abs(offset-gutterOffset(r,distance))<=tolerance&&
     Math.abs(pathAngle(Math.atan2(getTrackAtDist(distance).t.z,getTrackAtDist(distance).t.x),heading))<=angle)||null;
 }
@@ -8260,7 +8265,7 @@ function enterGutter(route){
   gutterRun.history.push({number:route.corner.number,event:'entry',s,speed:speed*3.6});
   if(gutterDebug){
     const tr=getTrackAtDist(s),heading=pathHandling.ready&&pathHandling.curve===curve?pathHandling.heading:Math.atan2(tr.t.z,tr.t.x);
-    gutterDiagLog('入 '+route.corner.number+'番 '+(speed*3.6).toFixed(0)+'km/h 向き'+(Math.abs(pathAngle(Math.atan2(tr.t.z,tr.t.x),heading))*180/Math.PI).toFixed(0)+'° 横'+(lateral-gutterOffset(route,s)).toFixed(2)+'m 頂点'+(s-route.apex>=0?'+':'')+(s-route.apex).toFixed(0)+'m '+(isSliding?'D':'-'));
+    gutterDiagSet(route,'entry',{rel:s-route.apex,kmh:speed*3.6,ang:Math.abs(pathAngle(Math.atan2(tr.t.z,tr.t.x),heading))*180/Math.PI,err:lateral-gutterOffset(route,s),d:isSliding});
   }
   // Gutter contact takes ownership; it cannot manufacture brake/meat judgments.
   isSliding=false;isBrakingDrift=false;resetSoloSlide();resetSlideExit();resetMeatAssessment();resetCornerDrive();
@@ -8274,7 +8279,7 @@ function leaveGutter(reason){
   const success=run.clean&&s>=r.success&&run.entered<=r.entryEnd&&wallHitCooldown<=0&&!assistBonusBlocked(r.corner);
   gutterRun.active=null;gutterRun.departure=r;resetSteeredLine();
   gutterRun.history.push({number:r.corner.number,event:'exit',s,speed:speed*3.6,success,reason});
-  if(gutterDebug)gutterDiagLog('出 '+r.corner.number+'番 '+(success?'成功':'離脱:'+reason)+' '+(speed*3.6).toFixed(0)+'km/h');
+  gutterDiagSet(r,'exit',{rel:s-r.apex,ok:success,reason,kmh:speed*3.6});
   if(success){
     const receipt=awardCornerDrive('PERFECT',2,r.corner,'gutter');
     if(receipt){receipt.gutter=true;receipt.linkQuality=null;receipt.linkBrakeType=null;
@@ -8291,9 +8296,7 @@ function stepGutterRun(dt,steering){
     const gutterErr=Math.abs(lateral-gutterOffset(r,s));
     if(run.catching>0){run.catching-=dt;if(gutterErr<=.8)run.catching=0;}
     if(wallHitCooldown>0||pathHandlingExcluded()||s<r.start-1||s>r.finish+3||(run.catching<=0&&gutterErr>.8)){run.clean=false;leaveGutter('lost');return;}
-    if(gutterDebug&&s>=r.apex&&!gutterDiag.passed.has(r.corner.number)){
-      gutterDiag.passed.add(r.corner.number);gutterDiagLog('頂点 '+r.corner.number+'番 溝内 '+(speed*3.6).toFixed(0)+'km/h 横'+(lateral-gutterOffset(r,s)).toFixed(2)+'m');
-    }
+    if(gutterDebug&&s>=r.apex&&!gutterDiag.rows.get(r.corner.number)?.apex)gutterDiagSet(r,'apex',{in:true,kmh:speed*3.6,err:lateral-gutterOffset(r,s)});
     if(steering*r.side<-.35)run.outward+=dt;else run.outward=0;
     if(run.outward>=.09){leaveGutter('steering');return;}
     if(s>=r.finish){leaveGutter('end');return;}
@@ -8309,32 +8312,45 @@ function stepGutterRun(dt,steering){
   const entry=gutterEntryAt(s,lateral,speed,heading,0,drifting);
   if(entry&&steering*entry.side>=-.35)enterGutter(entry);
 }
+function gutterDiagText(row,live){
+  const rel=d=>(d>=0?'+':'')+d.toFixed(0)+'m',n=row.route.corner.number,sl=row.slide,e=row.entry,a=row.apex,x=row.exit;
+  const l1=n+'番 肉'+(sl?rel(sl.rel)+' '+sl.kmh.toFixed(0)+'km/h':'—')+' 入'+(e?rel(e.rel)+' '+e.kmh.toFixed(0)+'km/h 向'+e.ang.toFixed(0)+'° 横'+e.err.toFixed(2):'—');
+  const l2='  頂'+(a?(a.in?'溝内 '+a.kmh.toFixed(0)+'km/h 横'+a.err.toFixed(2):a.kmh.toFixed(0)+'km/h 向'+a.ang.toFixed(0)+'° 横'+a.err.toFixed(2)+' '+(a.why.length?'×'+a.why.join(','):'○')):'—')+' 出'+(x?(x.ok?'成功':'離脱:'+x.reason)+' '+x.kmh.toFixed(0)+'km/h':'—');
+  return l1+'\n'+l2;
+}
 function gutterDiagFrame(heading,drifting,steering){
   if(!gutterDiag.el){
     const el=document.createElement('pre');el.id='gutterDiag';
-    el.style.cssText='position:fixed;left:4px;top:4px;z-index:99999;margin:0;padding:4px 6px;font:10px/1.35 monospace;color:#fff;background:rgba(0,0,0,.68);border-radius:4px;pointer-events:none;white-space:pre;max-width:96vw;overflow:hidden';
+    el.style.cssText='position:fixed;left:4px;top:4px;z-index:99999;margin:0;padding:4px 6px;font:10px/1.35 monospace;color:#fff;background:rgba(0,0,0,.68);border-radius:4px;pointer-events:none;white-space:pre;max-width:96vw;max-height:70vh;overflow:hidden';
     document.body.appendChild(el);gutterDiag.el=el;
   }
   const el=gutterDiag.el;
   if(!gutterRun.routes.length){el.style.display='none';return;}
   el.style.display='block';
-  const route=gutterRun.routes.find(r=>s>=r.start-2&&s<=r.finish);
-  if(!route){el.textContent=gutterDiag.lines.join('\n')||'溝診断: 待機中';return;}
-  const tr=getTrackAtDist(s),angle=Math.abs(pathAngle(Math.atan2(tr.t.z,tr.t.x),heading))*180/Math.PI;
-  const err=lateral-gutterOffset(route,s),kmh=speed*3.6,loose=drifting&&currentKey==='harunaUp';
-  const end=loose?route.driftEntryEnd:route.entryEnd,why=[];
-  if(gutterRun.used.has(route.corner.number))why.push('使用済');
-  if(s>end)why.push('範囲外+'+(s-end).toFixed(0)+'m');
-  if(kmh>GUTTER.maxEntry*3.6&&!loose)why.push('速度');
-  if(angle>(loose?45:GUTTER.angle*180/Math.PI))why.push('向き');
-  if(Math.abs(err)>(loose?GUTTER_DRIFT.tolerance:GUTTER.tolerance))why.push('横ずれ');
-  if(steering*route.side<-.35)why.push('外舵');
-  if(currentKey==='harunaUp'&&!drifting)why.push('肉球なし');
-  const row=route.corner.number+'番 '+kmh.toFixed(0)+'km/h 向き'+angle.toFixed(0)+'° 横'+err.toFixed(2)+'m '+(drifting?'D':'-');
-  if(s>=route.apex&&!gutterDiag.passed.has(route.corner.number)){
-    gutterDiag.passed.add(route.corner.number);gutterDiagLog('頂点 '+row+' '+(why.length?'×'+why.join(','):'○'));
+  // 肉球ドリフトの開始位置(頂点との差)を、いちばん近い溝コーナーに記録する。
+  if(drifting&&!gutterDiag.prevSliding){
+    let near=null;
+    for(const row of gutterDiag.rows.values()){const d=s-row.route.apex;if(d>=-45&&d<=25&&(!near||Math.abs(d)<Math.abs(s-near.route.apex)))near=row;}
+    if(near&&!near.slide)near.slide={rel:s-near.route.apex,kmh:speed*3.6};
   }
-  el.textContent=gutterDiag.lines.join('\n')+(gutterDiag.lines.length?'\n':'')+'今 '+row+' 頂点'+(s-route.apex>=0?'+':'')+(s-route.apex).toFixed(0)+'m '+(why.length?'×'+why.join(','):'○');
+  gutterDiag.prevSliding=drifting;
+  const route=gutterRun.routes.find(r=>s>=r.start-2&&s<=r.finish);
+  let live='今: 溝の手前';
+  if(route){
+    const tr=getTrackAtDist(s),angle=Math.abs(pathAngle(Math.atan2(tr.t.z,tr.t.x),heading))*180/Math.PI;
+    const err=lateral-gutterOffset(route,s),kmh=speed*3.6,loose=drifting&&currentKey==='harunaUp',why=[];
+    if(gutterRun.used.has(route.corner.number))why.push('使用済');
+    if(s>route.entryEnd)why.push('範囲外+'+(s-route.entryEnd).toFixed(0)+'m');
+    if(kmh>GUTTER.maxEntry*3.6&&!loose)why.push('速度');
+    if(angle>(loose?45:GUTTER.angle*180/Math.PI))why.push('向き');
+    if(Math.abs(err)>(loose?GUTTER_DRIFT.tolerance:GUTTER.tolerance))why.push('横ずれ');
+    if(steering*route.side<-.35)why.push('外舵');
+    if(currentKey==='harunaUp'&&!drifting)why.push('肉球なし');
+    const row=gutterDiag.rows.get(route.corner.number);
+    if(row&&s>=route.apex&&!row.apex)row.apex={in:false,kmh,ang:angle,err,why};
+    live='今 '+route.corner.number+'番 '+kmh.toFixed(0)+'km/h 向'+angle.toFixed(0)+'° 横'+err.toFixed(2)+' 頂点'+(s-route.apex>=0?'+':'')+(s-route.apex).toFixed(0)+'m '+(drifting?'D ':'')+(why.length?'×'+why.join(','):'○');
+  }
+  el.textContent='肉=肉球開始 入=溝入口 頂=頂点 出=出口 (頂点との差)\n'+[...gutterDiag.rows.values()].map(r=>gutterDiagText(r)).join('\n')+'\n'+live;
 }
 function stepGutterSteering(dt,oldLateral){
   const r=gutterRun.active.route,target=gutterOffset(r,s),delta=THREE.MathUtils.clamp((target-oldLateral)*(1-Math.exp(-dt/.12)),-2.4*dt,2.4*dt);
