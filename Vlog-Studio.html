@@ -5163,6 +5163,12 @@ body:has([data-range-fullscreen]) #moodSelector{
   }
 }
 
+.vlog-text-editor-head{
+  position:sticky; top:0; z-index:30;
+  background-color:inherit;
+  margin:-16px -16px 0; padding:16px 16px 8px;
+  border-radius:16px 16px 0 0;
+}
 .preview-wrap .text-selection-outline{
   position:absolute;
   z-index:9;
@@ -9074,8 +9080,14 @@ async function captureTextPlacementFrame(clip,time,caption,texts,filter,signal){
   return canvas.toDataURL('image/jpeg',0.82);
 }
 
-function TextStylePreview({item,backdrop,onFontReady}){
+// 見本で動きを見せる長さ。出る→止まる→消える を VLOG_SAMPLE_ANIM_LEN 秒で、間を0.5秒あけて2回。
+const VLOG_TEXT_ANIMS=[{k:'none',l:'なし',e:'→'},{k:'fade',l:'ふわっと',e:'✨'},{k:'bounce',l:'ポンッ',e:'⚡️'},{k:'slide',l:'スッと',e:'➡️'},{k:'blur',l:'ピント',e:'🔍'},
+  {k:'type',l:'カタカタ',e:'⌨️'},{k:'spread',l:'ひろがる',e:'↔️'},{k:'reveal',l:'なぞる',e:'✍️'},{k:'float',l:'ゆらゆら',e:'🎈'}];
+const VLOG_SAMPLE_ANIM_LEN=2.5, VLOG_SAMPLE_ANIM_GAP=0.5, VLOG_SAMPLE_ANIM_LOOPS=2;
+function TextStylePreview({item,backdrop,onFontReady,playToken=0}){
   const canvasRef=useRef(null);
+  const itemRef=useRef(item); itemRef.current=item;
+  const playingRef=useRef(false);
   const fontSpecRef=useRef('');
   const [fontStatus,setFontStatus]=useState('loading');
   const [overflows,setOverflows]=useState(false);
@@ -9094,19 +9106,40 @@ function TextStylePreview({item,backdrop,onFontReady}){
     }).catch(()=>{if(active){clearTimeout(timeout);setFontStatus('fallback');}});
     return()=>{active=false;clearTimeout(timeout);};
   },[item.id,item.fontFamily,item.bold,item.text]);
-  useEffect(()=>{
+  // timing を渡すと、その瞬間の動きの形で描く（書き出しと同じ関数）。
+  const paint=(timing)=>{
     const canvas=canvasRef.current,ctx=canvas?.getContext('2d');
-    if(!ctx)return;
+    if(!ctx)return 0;
+    const it=itemRef.current;
     const width=canvas.width,height=canvas.height;
     ctx.fillStyle=backdrop==='white'?'#fff':'#000';
     ctx.fillRect(0,0,width,height);
-    const size=Math.max(30,Math.min(56,(item.fontSize||0.06)*600));
-    const measured=drawVlogCaption(ctx,item,width,height,{x:width/2,y:height/2,
-      fontSizePx:size,sampleText:item.text||'あア Aa 123'});
-    setOverflows(measured>width-36);
+    if(timing==='gap') return 0;
+    const size=Math.max(30,Math.min(56,(it.fontSize||0.06)*600));
+    return drawVlogCaption(ctx,it,width,height,{x:width/2,y:height/2,
+      fontSizePx:size,sampleText:it.text||'あア Aa 123',...(timing||{})});
+  };
+  useEffect(()=>{
+    if(playingRef.current) return;
+    setOverflows(paint(null)>canvasRef.current.width-36);
   },[item,backdrop,fontStatus]);
+  useEffect(()=>{
+    if(!playToken) return;
+    let raf=0;const start=performance.now();
+    const cycle=VLOG_SAMPLE_ANIM_LEN+VLOG_SAMPLE_ANIM_GAP;
+    playingRef.current=true;
+    const step=now=>{
+      const t=(now-start)/1000;
+      if(t>=cycle*VLOG_SAMPLE_ANIM_LOOPS){ playingRef.current=false; paint(null); return; }
+      const local=t%cycle;
+      paint(local<VLOG_SAMPLE_ANIM_LEN ? {elapsed:local,remaining:VLOG_SAMPLE_ANIM_LEN-local} : 'gap');
+      raf=requestAnimationFrame(step);
+    };
+    raf=requestAnimationFrame(step);
+    return()=>{ cancelAnimationFrame(raf); playingRef.current=false; paint(null); };
+  },[playToken]);
   return React.createElement('div',null,
-    React.createElement('canvas',{ref:canvasRef,width:600,height:180,'data-paper-preserve':true,
+    React.createElement('canvas',{ref:canvasRef,width:600,height:120,'data-paper-preserve':true,
       className:'block w-full max-w-[480px] mx-auto h-auto rounded-xl border border-white/25',
       role:'img','aria-label':`テキストと帯の見本。${backdrop==='white'?'白':'黒'}背景`}),
     (fontStatus!=='ready'||overflows) && React.createElement('div',{className:'text-[10px] text-amber-200 mt-1',role:'status'},
@@ -12221,6 +12254,16 @@ function App(){
   const endTextListTimingEdit=()=>setTextListFrozenIds(null);
   const [textFontPickerOpen,setTextFontPickerOpen] = useState(false);
   const [textPreviewBackdrop,setTextPreviewBackdrop] = useState('black');
+  // テキスト編集の見本：畳んだかどうか（端末に覚える）と、動きを再生する合図。
+  const [textSampleFolded,setTextSampleFolded] = useState(()=>{ try{ return localStorage.getItem('vlogTextSampleFolded')==='1'; }catch{ return false; } });
+  const [textSamplePlay,setTextSamplePlay] = useState(0);
+  const setTextAnim=(k,applyAll=false)=>{
+    if(!applyAll && selectedTextId) setTexts(prev=> prev.map(t=> t.id===selectedTextId ? {...t, anim:k} : t));
+    else setTexts(prev=> prev.map(t=> ({...t, anim:k})));
+    setTimeout(()=> drawFrameRef.current(timeRef.current),20);
+    // 動きを選んだら見本で1回見せる。画面の動きを減らす設定の時は ▶ を押した時だけ。
+    if(selectedTextId && k!=='none' && vlogUiMotionOn()) setTextSamplePlay(v=>v+1);
+  };
   useEffect(()=>setTextFontPickerOpen(false),[selectedTextId]);
   const [textMoveTarget, setTextMoveTarget] = useState(null); // {textId, start}: preview seeking must not change the destination
   const textMoveTargetRef = useRef(null);
@@ -18808,13 +18851,14 @@ const recomputeStarts=(arr)=>{
       if(VLOG_NAV_DIAG){
         const bar=document.querySelector('.vlog-mode-bar'), mini=document.querySelector('.vlog-mini-preview');
         const retText=document.querySelector('.vlog-return-text'), retEdit=document.querySelector('.vlog-return-edit');
+        const textHead=document.querySelector('.vlog-text-editor-head');
         const r=el=>{ if(!el) return 'なし'; const b=el.getBoundingClientRect(), cs=getComputedStyle(el); return `${Math.round(b.top)}〜${Math.round(b.bottom)} ${cs.position}/${cs.display}/${cs.visibility}/op${cs.opacity}`; };
         const root=document.getElementById('root'), se=document.scrollingElement;
         setNavDiag({
           scrolls:navDiagRef.current.scrolls, target:navDiagRef.current.target,
           dial:dial?`${Math.round(dialRect.top)}〜${Math.round(dialRect.bottom)}`:'なし',
           frame:frame?`${Math.round(frameRect.top)}〜${Math.round(frameRect.bottom)}`:'なし',
-          bar:r(bar), mini:r(mini), retText:r(retText), retEdit:r(retEdit),
+          bar:r(bar), mini:r(mini), retText:r(retText), retEdit:r(retEdit), textHead:r(textHead),
           scroll:`root ${Math.round(root?.scrollTop||0)} / doc ${Math.round(se?.scrollTop||0)} / win ${Math.round(window.scrollY)}`,
           vh:`${window.innerHeight} / vv ${Math.round(window.visualViewport?.height||0)}`
         });
@@ -18835,6 +18879,7 @@ const recomputeStarts=(arr)=>{
   const miniPreviewHideReason = good3Adjust ? '使う範囲の調整'
     : selectedTimelineItem?.type==='text' ? '文字の時間編集'
     : (activeTab==='text' && showAdvancedTextTime) ? '表示時間の仕上げ'
+    : (activeTab==='text' && selectedTextId) ? '文字の編集（見本あり）'
     : connectionEditor ? 'つながりの調整'
     : materialCheck ? 'この場で確認' : '';
   const miniPreviewAvailable = previewPast && !miniPreviewHideReason && (mode==='normal'||mode==='textEdit') && exportStatus==='idle';
@@ -25651,20 +25696,12 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
 
 React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニメーション'),
         React.createElement('div', {className:'grid grid-cols-3 gap-2 mb-4'},
-          [{k:'none',l:'なし',e:'→'},{k:'fade',l:'ふわっと',e:'✨'},{k:'bounce',l:'ポンッ',e:'⚡️'},{k:'slide',l:'スッと',e:'➡️'},{k:'blur',l:'ピント',e:'🔍'},
-           {k:'type',l:'カタカタ',e:'⌨️'},{k:'spread',l:'ひろがる',e:'↔️'},{k:'reveal',l:'なぞる',e:'✍️'},{k:'float',l:'ゆらゆら',e:'🎈'}].map(a=>
+          VLOG_TEXT_ANIMS.map(a=>
             React.createElement('button', {
               key:a.k,
               // ゆらゆらは帯・背景付きの文字では揺らさない（読みにくくなるため）。
               title:a.k==='float'?'帯・背景付きの文字は揺れません':undefined,
-              onClick:()=>{
-                if(selectedTextId){
-                  setTexts(prev=> prev.map(t=> t.id===selectedTextId ? {...t, anim:a.k} : t));
-                } else {
-                  setTexts(prev=> prev.map(t=> ({...t, anim:a.k})));
-                }
-                setTimeout(()=> drawFrameRef.current(timeRef.current),20);
-              },
+              onClick:()=>setTextAnim(a.k),
               className:`h-12 rounded-xl border text-[11px] font-bold flex flex-col items-center justify-center gap-1 ${ (texts.find(t=>t.id===selectedTextId)?.anim===a.k) ? 'bg-violet-600 border-violet-500' : 'bg-white/10 border-white/10'}`
             },
               React.createElement('div', {className:'text-[14px]'}, a.e),
@@ -25758,6 +25795,8 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           )
         ),
         selectedTextId && texts.find(t=>t.id===selectedTextId) && React.createElement('div', {ref:textEditorRef,className:'camera-detail-panel bg-[#1a1a1d] rounded-2xl border border-yellow-500/30 p-4 mb-4'},
+          // 題・区分・見本は上に貼り付け、どの区分でも、下へ進んでも見本が見えるようにする。
+          React.createElement('div', {className:'vlog-text-editor-head'},
           React.createElement('div', {className:'flex items-center justify-between mb-3'},
             React.createElement('div', {className:'text-[12px] font-bold'}, 'テキスト編集'),
             React.createElement('div',{className:'flex items-center gap-2'},
@@ -25785,31 +25824,48 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
               className:`min-h-11 rounded-xl border px-1 text-[11px] ${textEditorSection===section.key?'bg-violet-500 border-violet-300 text-white font-bold':'bg-white/5 border-white/10 text-white/60'}`
             },section.label))
           ),
-          textEditorSection==='style' && React.createElement(React.Fragment,null,
-          // 見た目の編集は縦に長いので、上に行き先の見出しを並べ、押すとその項目へ移る。
-          React.createElement('div',{className:'flex gap-1.5 mb-3 overflow-x-auto','aria-label':'見た目の項目へ移る'},
-            [['font','書体'],['layout','向き・流れ'],['color','色'],['bg','背景'],['size','サイズ']].map(([k,l])=>
-              React.createElement('button',{key:k,type:'button',
-                onClick:e=>{ const el=e.currentTarget.closest('.camera-detail-panel')?.querySelector(`[data-style-section="${k}"]`);
-                  try{ el?.scrollIntoView({block:'start',behavior:vlogUiMotionOn()?'smooth':'auto'}); }catch{} },
-                className:'shrink-0 h-8 px-3 rounded-full bg-white/10 border border-white/10 text-[11px] text-white/75'},l))
-          ),
-          React.createElement('div',{className:'mb-3'},
-            React.createElement('div',{className:'flex items-center justify-between gap-2 mb-2'},
+          React.createElement('div',{className:'mb-2'},
+            React.createElement('div',{className:'flex items-center justify-between gap-2 mb-1'},
               React.createElement('span',{className:'text-[11px] font-bold'},'文字と背景の見本'),
-              React.createElement('div',{className:'flex gap-1','aria-label':'見本の背景色'},
-                [{key:'white',label:'白'},{key:'black',label:'黒'}].map(option=>
+              React.createElement('div',{className:'flex items-center gap-1'},
+                !textSampleFolded && React.createElement('button',{type:'button',
+                  disabled:(texts.find(t=>t.id===selectedTextId)?.anim||'none')==='none',
+                  onClick:()=>setTextSamplePlay(v=>v+1),
+                  className:'min-h-9 rounded-full border border-white/25 px-2.5 text-[11px] text-white/80 disabled:opacity-30',
+                  'aria-label':'見本で動きを再生'},'▶ 動き'),
+                !textSampleFolded && [{key:'white',label:'白'},{key:'black',label:'黒'}].map(option=>
                   React.createElement('button',{key:option.key,type:'button',
                     onClick:()=>setTextPreviewBackdrop(option.key),
                     'aria-pressed':textPreviewBackdrop===option.key,
-                    className:`min-w-10 min-h-9 rounded-full border px-2 text-[11px] ${textPreviewBackdrop===option.key?'bg-white text-black border-white font-bold':'border-white/25 text-white/70'}`},option.label))
+                    'aria-label':`見本の背景を${option.label}に`,
+                    className:`min-w-9 min-h-9 rounded-full border px-2 text-[11px] ${textPreviewBackdrop===option.key?'bg-white text-black border-white font-bold':'border-white/25 text-white/70'}`},option.label)),
+                React.createElement('button',{type:'button',
+                  onClick:()=>{ const next=!textSampleFolded; setTextSampleFolded(next); try{ localStorage.setItem('vlogTextSampleFolded',next?'1':'0'); }catch{} },
+                  'aria-expanded':!textSampleFolded,
+                  className:'min-h-9 rounded-full border border-white/25 px-2.5 text-[11px] text-white/70'},textSampleFolded?'ひらく ▾':'たたむ ▴')
               )
             ),
-            React.createElement(TextStylePreview,{item:texts.find(t=>t.id===selectedTextId),
-              backdrop:textPreviewBackdrop,
-              onFontReady:()=>requestAnimationFrame(()=>drawFrameRef.current(timeRef.current))}),
-            React.createElement('div',{className:'text-[9px] text-white/40 mt-1'},'白・黒は見本の映像代わりです。動画内の帯は下で設定します。')
+            !textSampleFolded && React.createElement(TextStylePreview,{item:texts.find(t=>t.id===selectedTextId),
+              backdrop:textPreviewBackdrop, playToken:textSamplePlay,
+              onFontReady:()=>requestAnimationFrame(()=>drawFrameRef.current(timeRef.current))})
           ),
+          // 見た目の編集は縦に長いので、上に行き先の見出しを並べ、押すとその項目へ移る。
+          textEditorSection==='style' && React.createElement('div',{className:'flex gap-1.5 mb-1 overflow-x-auto','aria-label':'見た目の項目へ移る'},
+            [['font','書体'],['layout','向き・流れ'],['color','色'],['bg','背景'],['size','サイズ'],['anim','動き']].map(([k,l])=>
+              React.createElement('button',{key:k,type:'button',
+                onClick:e=>{
+                  // 貼り付いた見本（移った後は画面の一番上に貼り付く）の下に、その項目の頭が来るようにページ（#root）を動かす。
+                  const panel=e.currentTarget.closest('.camera-detail-panel');
+                  const el=panel?.querySelector(`[data-style-section="${k}"]`), head=panel?.querySelector('.vlog-text-editor-head');
+                  const root=document.getElementById('root');
+                  if(!el || !root) return;
+                  const dy=el.getBoundingClientRect().top-(head?head.offsetHeight:0)-8;
+                  try{ root.scrollBy({top:dy,behavior:vlogUiMotionOn()?'smooth':'auto'}); }catch{ root.scrollTop+=dy; } },
+                className:'shrink-0 h-8 px-3 rounded-full bg-white/10 border border-white/10 text-[11px] text-white/75'},l))
+          ),
+          ),
+          textEditorSection==='style' && React.createElement(React.Fragment,null,
+          React.createElement('div',{className:'text-[9px] text-white/40 mb-3'},'白・黒は見本の映像代わりです。動画内の帯は下で設定します。'),
           React.createElement('div', {className:'mb-3'},
             React.createElement('div', {className:'text-[10px] text-white/50 mb-1'}, '内容'),
             React.createElement('input', {
@@ -26074,6 +26130,16 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                   }, al.l)
                 )
               )
+            )
+          ),
+          React.createElement('div', {className:'mb-3','data-style-section':'anim'},
+            React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '動き（選ぶと上の見本で再生）'),
+            React.createElement('div', {className:'grid grid-cols-3 gap-2'},
+              VLOG_TEXT_ANIMS.map(a=>React.createElement('button', {key:a.k, type:'button',
+                'aria-pressed':texts.find(t=>t.id===selectedTextId)?.anim===a.k,
+                onClick:()=>setTextAnim(a.k),
+                className:`h-11 rounded-xl border text-[11px] font-bold flex items-center justify-center gap-1 ${texts.find(t=>t.id===selectedTextId)?.anim===a.k ? 'bg-violet-600 border-violet-500 text-white' : 'bg-white/10 border-white/10'}`
+              }, React.createElement('span', {'aria-hidden':true}, a.e), a.l))
             )
           )),
           textEditorSection==='time' && React.createElement('div',{
@@ -27288,6 +27354,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
        `小窓 ${navDiag.mini}`,
        `文字バーへ戻る ${navDiag.retText}`,
        `編集へ戻る ${navDiag.retEdit}`,
+       `文字の見本 ${navDiag.textHead}`,
        `画面高 ${navDiag.vh}`].join('\n')),
     // 畳んだ札（右端）。▶ で再生／停止、⤢ で小窓に広げる。
     miniPreviewAvailable && !miniPreviewOpen && React.createElement('div',{className:'vlog-mini-tab','data-paper-preserve':true},
