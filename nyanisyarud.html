@@ -11505,7 +11505,6 @@ let miniMode = (()=>{
   return 1; // デフォルト追従モード（峠ゲーマー推奨）
 })();
 let miniAABB=null;
-const miniFollow={key:'',s:0,t:0,target:100,look:100,scale:1.6}; // 追従モードの先読み距離と倍率（滑らかに動かす状態）
 let miniFullCache=null;
 let miniCacheKey='';
 
@@ -11591,7 +11590,7 @@ function updateMini(){
     const py=mapY(p.z);
     ctx.fillStyle='#e89b4c'; ctx.beginPath(); ctx.arc(px,py,5,0,Math.PI*2); ctx.fill();
   } else {
-    // === 追従モード: 自車中心。後方30m、前方は次のコーナーの出口まで(100〜250m)。倍率は前方が枠に収まるよう自動調整 ===
+    // === 追従モード: 自車中心。後方30m・前方100mで固定、倍率は常に1.6倍(1m=1.6px) ===
     const BEHIND=30, STEP=5;
     const cur=getTrackAtDist(s);
     const yaw=Math.atan2(cur.t.x, cur.t.z);
@@ -11599,21 +11598,11 @@ function updateMini(){
     const cosY=Math.cos(yaw), sinY=Math.sin(yaw);
     const centerX=w*0.5, centerY=h*0.70; // 自車を下30%に
     const goalS=totalLength*(TRACKS[currentKey].finishRatio??0.985);
-    // 先読み距離: コーナー情報の無いコース・ジャンプ分岐中は100m固定
+    // 映す距離は前方100m・後方30mで固定。コーナーは色で示す(次のコーナーだけ濃く)。
     const course=DRIVING_GUIDE_DATA.tracks[currentKey];
     const corners=(course&&!course.noGuide&&Array.isArray(course.corners)&&!irohaOnJumpCurve)?course.corners:[];
     const nextC=corners.find(c=>c.end>=s)||null;
-    const wantAhead=THREE.MathUtils.clamp(corners.length?(nextC?nextC.end+20:goalS)-s:100,100,250);
-    const nowMs=performance.now(), mf=miniFollow;
-    const snap=mf.key!==currentKey||Math.abs(s-mf.s)>40;
-    const dtSec=Math.min(.1,(nowMs-mf.t)/1000);
-    mf.key=currentKey; mf.s=s; mf.t=nowMs;
-    if(snap){ mf.target=wantAhead; mf.look=wantAhead; }
-    else {
-      if(wantAhead>mf.target||wantAhead<mf.target*0.9) mf.target=wantAhead; // 10%未満の変化では動かさない
-      mf.look+=(mf.target-mf.look)*(1-Math.exp(-dtSec/(mf.target>mf.look?.3:.8)));
-    }
-    const lookAhead=mf.look;
+    const lookAhead=100;
     // 進行方向の軌跡を収集（回転後の座標。倍率は後で決める）
     const raw=[], n=Math.ceil((BEHIND+lookAhead)/STEP);
     for(let i=0;i<=n;i++){
@@ -11622,12 +11611,7 @@ function updateMini(){
       const dx=tr.p.x - cur.p.x, dz=tr.p.z - cur.p.z;
       raw.push({rx:dx*cosY - dz*sinY, rz:dx*sinY + dz*cosY, t:tr.t, ds:ds-s});
     }
-    // 前方・後方・左右が枠に収まる倍率（0.55〜1.6）。縮小は即座、拡大はゆっくり。
-    let maxUp=1,maxDown=1,maxSide=1;
-    for(const q of raw){ maxUp=Math.max(maxUp,q.rz); maxDown=Math.max(maxDown,-q.rz); maxSide=Math.max(maxSide,Math.abs(q.rx)); }
-    const fit=THREE.MathUtils.clamp(Math.min((centerY-8)/maxUp,(w*0.5-12)/maxSide,(h-8-centerY)/maxDown),0.55,3);
-    if(snap||fit<mf.scale) mf.scale=fit; else mf.scale+=(fit-mf.scale)*(1-Math.exp(-dtSec/.8));
-    const SCALE=mf.scale;
+    const SCALE=1.6; // 常に1.6倍(1m=1.6px)で固定
     // 左右反転修正で -rx
     const P=(rx,rz)=>({x:centerX - rx*SCALE, y:centerY - rz*SCALE});
     const pts=raw.map(q=>({...P(q.rx,q.rz), t:q.t, ds:q.ds}));
@@ -11638,8 +11622,7 @@ function updateMini(){
     const line=(list,style,width)=>{ if(list.length<2) return; ctx.strokeStyle=style; ctx.lineWidth=width; ctx.beginPath();
       list.forEach((q,i)=>{ if(i===0) ctx.moveTo(q.x,q.y); else ctx.lineTo(q.x,q.y); }); ctx.stroke(); };
     // 道は実際の幅(ROAD_HALF×2)に合わせて広めに描き、横位置の表示も同じ縮尺にする。
-    // 倍率が小さいときは、ヘアピンがつぶれないよう8pxまで細くする。
-    const ROAD_PX=THREE.MathUtils.clamp(2*ROAD_HALF*SCALE*1.15,8,20),latPx=ROAD_PX/(2*ROAD_HALF);
+    const ROAD_PX=14,latPx=ROAD_PX/(2*ROAD_HALF);
     line(back,'rgba(58,63,69,0.35)',Math.max(5,ROAD_PX*.57));
     line(ahead,'#3a3f45',ROAD_PX);
     line(ahead,'rgba(255,255,255,0.95)',3);
@@ -11674,15 +11657,6 @@ function updateMini(){
     // ラテラル表示 左右反転修正
     const latOff=lateral*latPx;
     ctx.fillStyle='rgba(232,155,76,0.8)'; ctx.fillRect(centerX+latOff-1, centerY-2, 2, 4);
-    // 次のコーナーの方向と距離（ハルナは番号も）
-    if(nextC && nextC.start-s<=lookAhead){
-      const inC=s>=nextC.start, q=projD(inC?s+8:nextC.start);
-      const txt=(currentKey==='haruna'?nextC.number+'番 ':'')+(nextC.dir>0?'→右':'←左')+(inC?'':' '+Math.max(0,Math.round(nextC.start-s))+'m');
-      ctx.font='bold 11px sans-serif'; const tw=ctx.measureText(txt).width;
-      const lx=q.x+10+tw>w-4?q.x-10-tw:q.x+10, ly=Math.max(14,Math.min(h-6,q.y+4));
-      ctx.lineWidth=3; ctx.strokeStyle='rgba(255,255,255,0.95)'; ctx.strokeText(txt,lx,ly);
-      ctx.fillStyle='#222'; ctx.fillText(txt,lx,ly);
-    }
     // 距離目盛
     ctx.strokeStyle='rgba(0,0,0,0.25)'; ctx.lineWidth=1; ctx.setLineDash([3,3]);
     // 目盛りは左端に置く（前方の道は自車の真上を通るので、重ならないように）。
