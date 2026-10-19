@@ -8176,7 +8176,7 @@ function ordinaryAcceleration(velocity){
 
 // Gutter running is a visible road constraint, never a change to normal tires.
 const GUTTER={offset:3.02,width:.62,tolerance:.44,maxEntry:85/3.6,cruise:80/3.6,angle:18*Math.PI/180};
-const gutterRun={curve:null,routes:[],active:null,departure:null,used:new Set(),lowSpeed:new Set(),speedJudged:new Set(),feedback:0,dust:0,history:[]};
+const gutterRun={curve:null,routes:[],active:null,departure:null,used:new Set(),lowSpeed:new Set(),speedJudged:new Set(),pendingAward:null,feedback:0,dust:0,history:[]};
 // ?gutterdbg=1 のときだけ出る診断表示：頂点時点の速度・向き・溝との横ずれと、入口が弾かれた条件。
 const gutterDebug=(()=>{try{return new URLSearchParams(location.search).get('gutterdbg')==='1';}catch(e){return false;}})();
 const gutterDiag={el:null,rows:new Map(),prevSliding:false};
@@ -8187,7 +8187,7 @@ function gutterDiagInit(){
 function gutterDiagSet(route,key,value){const row=gutterDiag.rows.get(route.corner.number);if(row&&gutterDebug)row[key]=value;}
 function resetGutterRun(){
   gutterDiagInit();
-  gutterRun.active=null;gutterRun.departure=null;gutterRun.used.clear();gutterRun.lowSpeed.clear();gutterRun.speedJudged.clear();gutterRun.feedback=0;gutterRun.dust=0;gutterRun.history=[];
+  gutterRun.active=null;gutterRun.departure=null;gutterRun.used.clear();gutterRun.lowSpeed.clear();gutterRun.speedJudged.clear();gutterRun.pendingAward=null;gutterRun.feedback=0;gutterRun.dust=0;gutterRun.history=[];
   clearGutterFeedback();
 }
 function rebuildGutters(){
@@ -8264,7 +8264,8 @@ function enterGutter(route){
   gutterRun.departure=null;
   gutterRun.used.add(route.corner.number);
   // ドリフト中の緩い入口で溝から離れていても、溝へ寄せる間(最長1秒)は逸脱扱いにしない。
-  gutterRun.active={route,entered:s,clean:true,outward:0,catching:Math.abs(lateral-gutterOffset(route,s))>.8?1:0};
+  gutterRun.pendingAward=null;
+  gutterRun.active={route,entered:s,v0:speed,clean:true,outward:0,catching:Math.abs(lateral-gutterOffset(route,s))>.8?1:0};
   gutterRun.history.push({number:route.corner.number,event:'entry',s,speed:speed*3.6});
   if(gutterDebug){
     const tr=getTrackAtDist(s),heading=pathHandling.ready&&pathHandling.curve===curve?pathHandling.heading:Math.atan2(tr.t.z,tr.t.x);
@@ -8284,6 +8285,11 @@ function leaveGutter(reason){
   gutterRun.history.push({number:r.corner.number,event:'exit',s,speed:speed*3.6,success,reason});
   gutterDiagSet(r,'exit',{rel:s-r.apex,ok:success,reason,kmh:speed*3.6});
   if(success){
+    if(currentKey==='haruna'){
+      // 下りは、曲がりが開くまで加速ボーナスを遅らせる(曲がりの途中で加速して外へ出ないように)。
+      gutterRun.pendingAward={corner:r.corner,openS:Math.min(r.apex+16,r.corner.end-2)};
+      showGutterFeedback('溝走り成功！','出口へ向きを整えよう');return;
+    }
     const receipt=awardCornerDrive('PERFECT',2,r.corner,'gutter');
     if(receipt){receipt.gutter=true;receipt.linkQuality=null;receipt.linkBrakeType=null;
       showGutterFeedback(currentKey==='harunaUp'?'立ち上がり溝 成功！':'溝走り成功！','出口へ向きを整えよう');return;}
@@ -8312,6 +8318,11 @@ function stepGutterRun(dt,steering){
   const tr=getTrackAtDist(s),heading=pathHandling.ready&&pathHandling.curve===curve?pathHandling.heading:Math.atan2(tr.t.z,tr.t.x);
   const drifting=isSliding; // 肉球ドリフト(ブレーキ→肉球の連携後を含む)のみ。ブレーキだけの減速は含めない
   if(gutterDebug)gutterDiagFrame(heading,drifting,steering);
+  if(gutterRun.pendingAward&&s>=gutterRun.pendingAward.openS){
+    const pending=gutterRun.pendingAward;gutterRun.pendingAward=null;
+    const receipt=awardCornerDrive('PERFECT',2,pending.corner,'gutter');
+    if(receipt){receipt.gutter=true;receipt.linkQuality=null;receipt.linkBrakeType=null;}
+  }
   let entry=gutterEntryAt(s,lateral,speed,heading,0,drifting);
   // 11〜14番の入口速度の下限は、入口の条件が最初に揃ったフレームの速度で1回だけ判定する。
   // 不合格のコーナーは、その後に加速しても入れない。
@@ -10549,8 +10560,17 @@ function tick(dt){
   }catch(e){}
   const beforeControllerSpeed=speed;
   if(gutterRun.active&&!isBraking){
-    const cruise=GUTTER.cruise;
-    speed=speed<cruise?Math.min(cruise,speed+ordinaryAcceleration(speed)*dt):Math.max(cruise,speed-.9*dt);
+    const gr=gutterRun.active.route;
+    if(currentKey==='haruna'){
+      // 下りは、溝の終端でその先のグリップ速度(×1.05)になるように、入口速度から自動で減速する。
+      const run=gutterRun.active,progress=THREE.MathUtils.clamp((s-run.entered)/Math.max(1,gr.finish-run.entered),0,1);
+      const kEnd=roadBendAt(gr.finish),releaseSpeed=1.05*cornerGripSpeed(Math.abs(kEnd/Math.max(.3,1-kEnd*gr.side*GUTTER.offset)));
+      const target=run.v0+(releaseSpeed-run.v0)*progress;
+      speed=speed>target?Math.max(target,speed-6*dt):Math.min(target,speed+ordinaryAcceleration(speed)*dt);
+    }else{
+      const cruise=GUTTER.cruise;
+      speed=speed<cruise?Math.min(cruise,speed+ordinaryAcceleration(speed)*dt):Math.max(cruise,speed-.9*dt);
+    }
   }else if(rescueDecel>0&&!isBraking){
     speed=Math.max(2,speed-rescueDecel*dt);
   }else if(manualGripOverspeed){
