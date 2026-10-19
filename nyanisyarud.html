@@ -8176,7 +8176,7 @@ function ordinaryAcceleration(velocity){
 
 // Gutter running is a visible road constraint, never a change to normal tires.
 const GUTTER={offset:3.02,width:.62,tolerance:.44,maxEntry:85/3.6,cruise:80/3.6,angle:18*Math.PI/180};
-const gutterRun={curve:null,routes:[],active:null,departure:null,used:new Set(),feedback:0,dust:0,history:[]};
+const gutterRun={curve:null,routes:[],active:null,departure:null,used:new Set(),lowSpeed:new Set(),speedJudged:new Set(),feedback:0,dust:0,history:[]};
 // ?gutterdbg=1 のときだけ出る診断表示：頂点時点の速度・向き・溝との横ずれと、入口が弾かれた条件。
 const gutterDebug=(()=>{try{return new URLSearchParams(location.search).get('gutterdbg')==='1';}catch(e){return false;}})();
 const gutterDiag={el:null,rows:new Map(),prevSliding:false};
@@ -8187,7 +8187,7 @@ function gutterDiagInit(){
 function gutterDiagSet(route,key,value){const row=gutterDiag.rows.get(route.corner.number);if(row&&gutterDebug)row[key]=value;}
 function resetGutterRun(){
   gutterDiagInit();
-  gutterRun.active=null;gutterRun.departure=null;gutterRun.used.clear();gutterRun.feedback=0;gutterRun.dust=0;gutterRun.history=[];
+  gutterRun.active=null;gutterRun.departure=null;gutterRun.used.clear();gutterRun.lowSpeed.clear();gutterRun.speedJudged.clear();gutterRun.feedback=0;gutterRun.dust=0;gutterRun.history=[];
   clearGutterFeedback();
 }
 function rebuildGutters(){
@@ -8209,7 +8209,7 @@ function gutterOffset(route,distance){
   return route.side*(GUTTER.offset-.24+.24*THREE.MathUtils.smoothstep(distance,route.start,route.start+7));
 }
 // 上りの肉球ドリフト中は速度上限なし。向き45°・横ずれ0.9mの緩い入口は、高速コーナーの7番だけ。
-// 11〜14番は下りと同じ標準値(向き18°・横ずれ0.44m)で、ラインが外れた車は入れない。入口速度の下限は55km/h。
+// 11〜14番は下りと同じ標準値(向き18°・横ずれ0.44m)で、ラインが外れた車は入れない。入口速度の下限は55km/h(最初に条件が揃ったフレームで1回だけ判定)。
 const GUTTER_DRIFT={tolerance:.9,angle:45*Math.PI/180,wideCorner:7,minEntry:55/3.6};
 function gutterEntryAt(distance,offset,velocity,heading,approach=0,drifting=false){
   if(!isHarunaMapKey(currentKey)||gutterRun.curve!==curve||velocity<1)return null;
@@ -8220,7 +8220,7 @@ function gutterEntryAt(distance,offset,velocity,heading,approach=0,drifting=fals
   return gutterRun.routes.find(r=>{
     const wide=loose&&r.corner.number===GUTTER_DRIFT.wideCorner;
     const tolerance=wide?GUTTER_DRIFT.tolerance:GUTTER.tolerance,angle=wide?GUTTER_DRIFT.angle:GUTTER.angle;
-    if(loose&&!wide&&velocity<GUTTER_DRIFT.minEntry)return false;
+    if(gutterRun.lowSpeed.has(r.corner.number))return false;
     return !gutterRun.used.has(r.corner.number)&&distance>=r.start-approach&&distance<=r.entryEnd&&
       Math.abs(offset-gutterOffset(r,distance))<=tolerance&&
       Math.abs(pathAngle(Math.atan2(getTrackAtDist(distance).t.z,getTrackAtDist(distance).t.x),heading))<=angle;
@@ -8314,7 +8314,13 @@ function stepGutterRun(dt,steering){
   const tr=getTrackAtDist(s),heading=pathHandling.ready&&pathHandling.curve===curve?pathHandling.heading:Math.atan2(tr.t.z,tr.t.x);
   const drifting=isSliding; // 肉球ドリフト(ブレーキ→肉球の連携後を含む)のみ。ブレーキだけの減速は含めない
   if(gutterDebug)gutterDiagFrame(heading,drifting,steering);
-  const entry=gutterEntryAt(s,lateral,speed,heading,0,drifting);
+  let entry=gutterEntryAt(s,lateral,speed,heading,0,drifting);
+  // 11〜14番の入口速度の下限は、入口の条件が最初に揃ったフレームの速度で1回だけ判定する。
+  // 不合格のコーナーは、その後に加速しても入れない。
+  if(entry&&currentKey==='harunaUp'&&entry.corner.number!==GUTTER_DRIFT.wideCorner&&!gutterRun.speedJudged.has(entry.corner.number)){
+    gutterRun.speedJudged.add(entry.corner.number);
+    if(speed<GUTTER_DRIFT.minEntry){gutterRun.lowSpeed.add(entry.corner.number);entry=null;}
+  }
   if(entry&&steering*entry.side>=-.35)enterGutter(entry);
 }
 function gutterDiagText(row,live){
@@ -8349,7 +8355,7 @@ function gutterDiagFrame(heading,drifting,steering){
     if(kmh>GUTTER.maxEntry*3.6&&!loose)why.push('速度');
     if(angle>(wide?45:GUTTER.angle*180/Math.PI))why.push('向き');
     if(Math.abs(err)>(wide?GUTTER_DRIFT.tolerance:GUTTER.tolerance))why.push('横ずれ');
-    if(loose&&!wide&&speed<GUTTER_DRIFT.minEntry)why.push('低速');
+    if(loose&&!wide&&(gutterRun.lowSpeed.has(route.corner.number)||(!gutterRun.speedJudged.has(route.corner.number)&&speed<GUTTER_DRIFT.minEntry)))why.push('低速');
     if(steering*route.side<-.35)why.push('外舵');
     if(currentKey==='harunaUp'&&!drifting)why.push('肉球なし');
     const row=gutterDiag.rows.get(route.corner.number);
