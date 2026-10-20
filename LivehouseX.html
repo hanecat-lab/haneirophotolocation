@@ -762,7 +762,7 @@
     <!-- かんたんモード（?mode=easy のときだけ出る）。卓を隠し、1問ずつ選ばせる。 -->
     <section class="easy" id="easyPanel" hidden aria-live="polite">
       <div class="easy-head">
-        <b id="easyStepNo">1 / 4</b><span id="easyTitle"></span>
+        <b id="easyStepNo">1 / 5</b><span id="easyTitle"></span>
         <button class="mode" id="easyExit" type="button">卓で見る</button>
       </div>
       <div class="easy-opts" id="easyOpts"></div>
@@ -12775,6 +12775,14 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       half:      {label:'半分影',      note:'フロントを半分に。立体感が出ます',          lv:[45,100]},
       silhouette:{label:'シルエット',  note:'フロントを消してバックだけ。輪郭が残ります',lv:[0,100]}
     };
+    /* 光の強さ。グランドマスター(board.bright)に掛ける。
+       ここで露出を測り直すとカメラが追いかけてしまい、写真の明るさが変わらない。
+       だから「ふつう」で測った値にカメラを置いたまま、光だけを強弱する。 */
+    const EASY_POWER={
+      soft:  {label:'控えめ',note:'光を半分に。顔の白飛びを抑えます',        mul:.5},
+      normal:{label:'ふつう',note:'シーンのままの明るさ',                    mul:1},
+      hard:  {label:'強め',  note:'1.4倍。派手になりますが飛びやすくなります',mul:1.4}
+    };
     const EASY_AIR={
       none: {label:'なし',             note:'光の筋は出ません'},
       smoke:{label:'スモーク',         note:'空気に粒が入り、ビームの筋が見えます'},
@@ -12782,12 +12790,14 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     };
     const easyPanel=q('#easyPanel');
     let easyStep=0, easyBackup=null;
-    const easyPick={scene:null,look:null,air:null};
+    const easyPick={scene:null,look:null,power:null,air:null};
     const easySteps=[
       {key:'scene',title:'どんな曲？',
        opts:()=>SCENES.map(s=>({id:s.id,label:s.name,note:s.desc}))},
       {key:'look', title:'顔を見せる？ 影を出す？',
        opts:()=>Object.entries(EASY_LOOK).map(([id,v])=>({id,label:v.label,note:v.note}))},
+      {key:'power',title:'光の強さは？',
+       opts:()=>Object.entries(EASY_POWER).map(([id,v])=>({id,label:v.label,note:v.note}))},
       {key:'air',  title:'空気を足す？',
        opts:()=>Object.entries(EASY_AIR).map(([id,v])=>({id,label:v.label,note:v.note}))},
       {key:'shot', title:'撮る', opts:()=>[]}
@@ -12795,12 +12805,13 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     /* 露出を合わせる。シャッターは EASY_SHUTTER に固定し、ISOと絞りの2軸で
        いちばん適正に近いものを選ぶ。同じ精度なら低いISOを採る。
        既存の nearestIsoForExposureTarget はISOしか動かさないので使えない。 */
-    function easyAutoExposure(){
+    const easySceneEV=()=>Number.isFinite(expo.evScene)?expo.evScene:evSceneOf(stageLux(clock));
+    function easyAutoExposure(targetEv){
       const si=SHUTTER_STOPS.indexOf(EASY_SHUTTER);
       if(si>=0)q('#shutterR').value=si;
       refresh();                                  // いまの光で evScene を出し直す
       const before=expo.evCam;
-      const ev=Number.isFinite(expo.evScene)?expo.evScene:evSceneOf(stageLux(clock));
+      const ev=Number.isFinite(targetEv)?targetEv:easySceneEV();
       let best=null;
       ISO_STOPS.forEach((iso,ii)=>F_STOPS.forEach((f,fi)=>{
         const err=Math.abs(ev-evCamOf(iso,f,EASY_SHUTTER));
@@ -12809,7 +12820,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       }));
       q('#isoR').value=best.ii;q('#fstopR').value=best.fi;
       refresh();
-      return {iso:best.iso,f:best.f,err:best.err,
+      return {iso:best.iso,f:best.f,err:best.err,over:Number(expo.over)||0,
               delta:Number.isFinite(before)?before-expo.evCam:0};
     }
     /* 手は必ず1から順に当て直す。シーンは paintFixtures と applySceneFx で
@@ -12825,7 +12836,20 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       if(easyPick.look)easyApplyLook(easyPick.look);
       if(easyPick.air){board.smoke=easyPick.air!=='none';board.laserSheet.on=easyPick.air==='laser'}
       syncBoardUI();refresh();
-      return easyAutoExposure();
+      /* 「ふつう」の明るさで測った顔のEVを基準にする。強弱したあとで測り直すと
+         カメラが追いかけ、光を半分にしても写真の明るさが変わらない。 */
+      const ref=easySceneEV();
+      const p=easyPick.power&&EASY_POWER[easyPick.power];
+      let clamped=false;
+      if(p&&p.mul!==1){
+        const want=Math.round(board.bright*p.mul);
+        board.bright=THREE.MathUtils.clamp(want,0,100);
+        clamped=want!==board.bright;
+        syncBoardUI();refresh();
+      }
+      const r=easyAutoExposure(ref);
+      r.clamped=clamped;r.bright=board.bright;
+      return r;
     }
     function easyShowExposure(r,extra){
       const el=q('#easyNote');if(!el||!r)return;
@@ -12835,7 +12859,12 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
       const set='（ISO'+r.iso+' · F'+r.f+' · 1/'+Math.round(1/EASY_SHUTTER)+'）';
       const miss=r.err>.5?'<br><span class="warn">この明るさでは ISO と絞りでも '
         +r.err.toFixed(1)+'段 足りません。光を足すか、シルエットをやめると合います。</span>':'';
-      el.innerHTML=(extra?extra+'<br>':'')+move+set+miss;
+      /* 光を強弱したぶんは、そのまま写真の明るさの差として出る */
+      const o=Number(r.over)||0;
+      const lit=Math.abs(o)<.15?'':'<br>写真は <b>'+Math.abs(o).toFixed(1)+'段</b> '
+        +(o>0?'明るく':'暗く')+'なります（グランドマスター '+r.bright+'）';
+      const cl=r.clamped?'<br><span class="warn">グランドマスターが上限なので、これ以上は強くなりません。</span>':'';
+      el.innerHTML=(extra?extra+'<br>':'')+move+set+lit+cl+miss;
     }
     function easyRender(){
       const st=easySteps[easyStep];if(!st)return;
@@ -12879,7 +12908,7 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     q('#easyReset').onclick=()=>{
       if(!easyBackup)return;
       applyBoard(easyBackup);
-      easyPick.scene=easyPick.look=easyPick.air=null;easyStep=0;easyRender();
+      easyPick.scene=easyPick.look=easyPick.power=easyPick.air=null;easyStep=0;easyRender();
       q('#easyNote').textContent='入る前の状態に戻しました。';
     };
     try{if(new URLSearchParams(location.search).get('mode')==='easy')easyEnter()}
