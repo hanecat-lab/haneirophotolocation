@@ -7930,6 +7930,11 @@ const createVlogProject=(id,name,snapshot=null)=>vlogDbTask(['projects'],'readwr
   tx.objectStore('projects').add({id,name,revision:0,snapshot,previousSnapshot:null,updatedAt:Date.now()});
 });
 const deleteVlogProject=id=>vlogDbTask(['projects'],'readwrite',(tx)=>{tx.objectStore('projects').delete(id);});
+// 名前だけを変える。版（revision）は変えないので、保存の衝突判定には影響しない。
+const renameVlogProject=(id,name)=>vlogDbTask(['projects'],'readwrite',(tx)=>{
+  const store=tx.objectStore('projects');
+  store.get(id).onsuccess=e=>{ const old=e.target.result; if(old) store.put({...old,name}); };
+});
 const writeVlogAsset=asset=>vlogDbTask(['assets'],'readwrite',tx=>{tx.objectStore('assets').put(asset);});
 const readVlogAssets=ids=>vlogDbTask(['assets'],'readonly',(tx,set)=>{
   const records=new Map();
@@ -8295,6 +8300,21 @@ function drawVlogCaptionFocus(ctx,txt,width,height,options,st){
   ctx.restore();
 }
 
+// 文字の「見た目」として写す項目。位置（x・y）・時間・中身・くっつく素材は写さない。
+const VLOG_TEXT_STYLE_KEYS=['fontFamily','bold','color','outline','strokeColor','fontSize','bgColor','backgroundMode','bandColor',
+  'bandOpacity','textOpacity','letterSpacing','verticalSpacing','vertical','align','anim','flow','flowAmount'];
+const vlogTextStyleOf=t=>Object.fromEntries(VLOG_TEXT_STYLE_KEYS.map(k=>[k,t?.[k]]));
+// マイスタイル：端末に5個まで。
+const VLOG_MY_STYLES_KEY='vlogMyTextStyles', VLOG_MY_STYLES_MAX=5;
+const readVlogMyStyles=()=>{
+  try{ const v=JSON.parse(localStorage.getItem(VLOG_MY_STYLES_KEY)||'[]');
+    return Array.isArray(v)?v.filter(x=>x&&x.id&&x.style&&typeof x.style==='object').slice(0,VLOG_MY_STYLES_MAX):[]; }catch{ return []; }
+};
+// 作業一覧の表紙：保存した小さな JPEG だけを表示する。
+const vlogProjectCover=record=>{
+  const c=record?.snapshot?.cover;
+  return typeof c==='string' && c.length<=70000 && c.startsWith('data:image/jpeg;base64,') ? c : null;
+};
 // 文字の流れ（右上がり・アーチ・なみ・ドドン）。横書きで帯でない時だけ。描く処理と押した位置の判定で同じ配置を使う。
 const VLOG_TEXT_FLOWS=[
   {k:'none',icon:'―',l:'まっすぐ'},{k:'rise',icon:'／',l:'右上がり'},{k:'arch',icon:'⌒',l:'アーチ'},
@@ -10994,6 +11014,8 @@ function App(){
   const [texts, setTexts] = useState([]);
   const [projectGate,setProjectGate]=useState(true);
   const [projectList,setProjectList]=useState([]);
+  // 作業一覧の「選んで削除」：null＝ふだん、Set＝選んでいる作業の id。
+  const [projectBulkIds,setProjectBulkIds]=useState(null);
   const [projectBusy,setProjectBusy]=useState(false);
   const [projectStatus,setProjectStatus]=useState('確認中');
   const [projectError,setProjectError]=useState('');
@@ -11074,8 +11096,9 @@ function App(){
   const [previewDiagnosticText,setPreviewDiagnosticText] = useState('');
   const [previewDiagnosticNotice,setPreviewDiagnosticNotice] = useState('');
   const [activeTab, setActiveTab] = useState('material');
+  const [myTextStyles,setMyTextStyles] = useState(readVlogMyStyles);
   const [textPresetScene, setTextPresetScene] = useState(()=>{
-    try{ const saved=localStorage.getItem('vlogTextPresetScene'); if(VLOG_TEXT_PRESET_SCENES.some(s=>s.key===saved)) return saved; }catch{}
+    try{ const saved=localStorage.getItem('vlogTextPresetScene'); if(saved==='mine' || VLOG_TEXT_PRESET_SCENES.some(s=>s.key===saved)) return saved; }catch{}
     return 'basic';
   });
   const [mode, setMode] = useState('normal');
@@ -18395,12 +18418,33 @@ const recomputeStarts=(arr)=>{
     ...vlogMediaClips(snapshot?.clips||[]).map(c=>c.assetId).filter(Boolean),
     ...(snapshot?.customBgms||[]).map(b=>b.assetId).filter(Boolean)
   ])];
+  // 作業一覧の表紙。1枚目の素材から作る（動画は素材の小さな絵、写真は 96px に縮めて1回だけ作る）。
+  const projectCoverRef=useRef({key:'',url:null});
+  const projectCover=()=>{
+    const first=vlogMediaClips(clipsRef.current)[0];
+    if(!first) return null;
+    if(first.type==='video'){ const v=materialThumbnailsRef.current[first.id]; return typeof v==='string'?v:null; }
+    const key=`${first.id}|${first.url}`;
+    if(projectCoverRef.current.key===key) return projectCoverRef.current.url;
+    const img=photoRefs.current.get(first.id);
+    if(!img?.naturalWidth) return null; // まだ読み込み中。次の保存で作る。
+    let url=null;
+    try{
+      const c=document.createElement('canvas');c.width=c.height=96;const g=c.getContext('2d');
+      const k=Math.max(96/img.naturalWidth,96/img.naturalHeight), w=img.naturalWidth*k, h=img.naturalHeight*k;
+      g.drawImage(img,(96-w)/2,(96-h)/2,w,h);
+      url=c.toDataURL('image/jpeg',0.7);
+    }catch{}
+    projectCoverRef.current={key,url};
+    return url;
+  };
   const projectSnapshot=()=>{
     const savedClips=clipsRef.current.map(serializeVlogClip);
     const savedBgms=customBgms.map(({url,file,...bgm})=>({...bgm,assetId:bgm.assetId||bgm.id}));
     const ids=[...new Set([...vlogMediaClips(savedClips).map(c=>c.assetId),...savedBgms.map(b=>b.assetId)])];
     return {version:1,clips:savedClips,texts:textsRef.current.map(t=>({...t})),customBgms:savedBgms,
       materialThumbnails:{version:1,images:vlogSavedMaterialThumbnails(savedClips,{version:1,images:materialThumbnailsRef.current})},
+      cover:projectCover(),
       assets:ids.map(id=>projectAssetMetaRef.current.get(id)||(()=>{
         const file=projectFailedAssetsRef.current.get(id);
         return file&&{id,name:file.name,type:file.type,size:file.size,lastModified:file.lastModified||0};
@@ -18812,6 +18856,41 @@ const recomputeStarts=(arr)=>{
     catch(error){setProjectError(error?.message||'削除できませんでした。');}
     finally{setProjectBusy(false);}
   };
+  const renameSavedVlogProject=async(record)=>{
+    const input=prompt('作業の名前',record.name||'');
+    if(input==null) return;
+    const name=input.trim().slice(0,40);
+    if(!name || name===record.name) return;
+    setProjectBusy(true);setProjectError('');
+    try{
+      await renameVlogProject(record.id,name);
+      if(record.id===projectIdRef.current) setProjectName(name);
+      await refreshProjectList();
+    }
+    catch(error){setProjectError(error?.message||'名前を変えられませんでした。');}
+    finally{setProjectBusy(false);}
+  };
+  // 選んだ作業をまとめて削除する。素材の片付けは最後に1回（ほかの作業が使う素材は残る）。
+  const removeSavedVlogProjects=async(ids)=>{
+    const targets=[...ids].filter(id=>id!==projectIdRef.current);
+    if(!targets.length)return;
+    if(!confirm(`選んだ ${targets.length} 件の作業の編集情報を削除しますか？元の写真・動画は端末に残ります。`))return;
+    setProjectBusy(true);setProjectError('');
+    const assetIds=[];
+    try{
+      for(const id of targets){
+        const old=await readVlogProject(id);
+        await deleteVlogProject(id);
+        assetIds.push(...projectAssetIds(old?.snapshot),...projectAssetIds(old?.previousSnapshot));
+      }
+      setProjectBulkIds(null);
+    }
+    catch(error){setProjectError(error?.message||'削除できませんでした。');}
+    finally{
+      try{ await cleanupVlogAssetIds(assetIds); await refreshProjectList(); }catch{}
+      setProjectBusy(false);
+    }
+  };
   useEffect(()=>{
     let active=true;
     listVlogProjects().then(list=>{
@@ -18987,6 +19066,37 @@ const recomputeStarts=(arr)=>{
     textsRef.current=next;setTexts(next);
     recordEdit(before,{allowIdentityChange:true,label});
     setTimeout(()=>drawFrameRef.current(timeRef.current),10);
+  };
+  // 選んだ文字の見た目を、ほかの文字にもそろえる（位置・時間・中身は変えない）。「戻す」1回分。
+  const matchTextStyle=(scope)=>{
+    const cur=textsRef.current.find(t=>t.id===selectedTextId);
+    if(!cur) return;
+    const style=vlogTextStyleOf(cur);
+    const isTarget=t=>t.id!==cur.id && (scope==='all' || (!!cur._clipId && t._clipId===cur._clipId));
+    const count=textsRef.current.filter(isTarget).length;
+    if(!count){ setEditNotice(scope==='all'?'ほかの文字がありません。':'同じ素材にくっついた、ほかの文字がありません。'); return; }
+    commitTextsEdit(textsRef.current.map(t=>isTarget(t)?{...t,...style}:t),'見た目をそろえる');
+    setEditNotice(`${count}件の文字を、同じ見た目にそろえました。`);
+  };
+  const saveMyTextStyle=()=>{
+    const cur=textsRef.current.find(t=>t.id===selectedTextId);
+    if(!cur) return;
+    let list=readVlogMyStyles();
+    if(list.length>=VLOG_MY_STYLES_MAX &&
+       !confirm(`マイスタイルは${VLOG_MY_STYLES_MAX}個までです。いちばん古い「${list[list.length-1].name}」と入れ替えますか？`)) return;
+    const input=prompt('マイスタイルの名前',(cur.text||'マイ').slice(0,8));
+    if(input==null) return;
+    const name=input.trim().slice(0,12)||'マイ';
+    const entry={id:`my-${Date.now()}`,name,text:(cur.text||name).slice(0,20),style:vlogTextStyleOf(cur)};
+    list=[entry,...list].slice(0,VLOG_MY_STYLES_MAX);
+    try{ localStorage.setItem(VLOG_MY_STYLES_KEY,JSON.stringify(list)); }catch{ setEditNotice('端末に保存できませんでした。'); return; }
+    setMyTextStyles(list);
+    setEditNotice(`マイスタイル「${name}」を保存しました。テキストの「マイ」から入れられます。`);
+  };
+  const removeMyTextStyle=(id)=>{
+    const list=readVlogMyStyles().filter(x=>x.id!==id);
+    try{ localStorage.setItem(VLOG_MY_STYLES_KEY,JSON.stringify(list)); }catch{}
+    setMyTextStyles(list);
   };
   // テキスト編集の「完了」やモードの切り替えで、開いた時からの変化（中身・見た目・追加）を1回分として記録する。
   const recordTextEditSession=()=>{
@@ -22679,7 +22789,7 @@ const recomputeStarts=(arr)=>{
     return ()=>cancelAnimationFrame(frame);
   },[selectedTextId,selectedTextListPosition,textListFrozenIds,activeTab]);
 
-  const openProjectList=()=>{handleStop();refreshProjectList().catch(error=>setProjectError(error?.message||'作業一覧を開けません。'));setProjectGate(true);};
+  const openProjectList=()=>{handleStop();setProjectBulkIds(null);refreshProjectList().catch(error=>setProjectError(error?.message||'作業一覧を開けません。'));setProjectGate(true);};
   return React.createElement('div', {className:'soft-editorial-ui camera-shell min-h-[100vh] bg-[#0a0a0b] text-white flex flex-col select-none', style:{fontFamily:'-apple-system,BlinkMacSystemFont,sans-serif'}},
     // 1段目「この作品」: 作品名（押すと作業一覧）と保存の状態（押すと今すぐ保存）、おまかせ・書き出し。
     React.createElement('header', {className:'app-top-header h-14 bg-[#0a0a0b] border-b border-white/10 flex items-center px-3 gap-2 shrink-0'},
@@ -22757,12 +22867,43 @@ const recomputeStarts=(arr)=>{
             `端末内の使用量（推定）：${(projectStorage.usage/1073741824).toFixed(1)}GB / 上限目安 ${(projectStorage.quota/1073741824).toFixed(1)}GB`),
           projectList.length===0 && React.createElement('div',{className:'text-xs text-white/55 rounded-xl bg-white/5 p-4 mb-3'},
             '素材のある保存済み作業はありません。素材0件の下書きは再開候補に含めません。'),
-          projectList.map(record=>React.createElement('div',{key:record.id,className:'rounded-xl border border-white/15 bg-[#17171a] p-3 mb-2'},
-            React.createElement('button',{onClick:()=>activateVlogProject(record),disabled:projectBusy,className:'text-left w-full disabled:opacity-40'},
-              React.createElement('div',{className:'font-bold text-sm truncate'},`${record.id===projectIdRef.current?'編集中 · ':''}${record.name}`),
-              React.createElement('div',{className:'text-xs text-white/50 mt-1'},`${new Date(record.updatedAt).toLocaleString('ja-JP')} · ${record.snapshot?.clips?.length||0}件の素材`)),
-            record.id!==projectIdRef.current && React.createElement('button',{onClick:()=>removeSavedVlogProject(record.id),disabled:projectBusy,
-              className:'text-[10px] text-red-300 mt-2 underline'},'この作業の編集情報を削除'))),
+          // 選んで削除：開いている作業は選べない。
+          (()=>{
+            const deletable=projectList.filter(r=>r.id!==projectIdRef.current);
+            if(!deletable.length) return null;
+            if(!projectBulkIds) return React.createElement('div',{className:'flex justify-end mb-2'},
+              React.createElement('button',{type:'button',onClick:()=>setProjectBulkIds(new Set()),disabled:projectBusy,
+                className:'text-xs rounded-full border border-white/20 px-3 py-2 disabled:opacity-40'},'選んで削除'));
+            const allOn=deletable.every(r=>projectBulkIds.has(r.id));
+            return React.createElement('div',{className:'flex items-center gap-2 mb-2 flex-wrap','aria-label':'まとめて削除'},
+              React.createElement('button',{type:'button',onClick:()=>setProjectBulkIds(allOn?new Set():new Set(deletable.map(r=>r.id))),disabled:projectBusy,
+                className:'text-xs rounded-full bg-white/10 px-3 py-2 disabled:opacity-40'},allOn?'すべて外す':'すべて選ぶ'),
+              React.createElement('button',{type:'button',onClick:()=>removeSavedVlogProjects(projectBulkIds),disabled:projectBusy||projectBulkIds.size===0,
+                className:'text-xs rounded-full bg-red-500/80 text-white font-bold px-3 py-2 disabled:opacity-35'},`選んだ ${projectBulkIds.size} 件を削除`),
+              React.createElement('button',{type:'button',onClick:()=>setProjectBulkIds(null),disabled:projectBusy,
+                className:'text-xs text-white/60 px-2 py-2 ml-auto'},'やめる'));
+          })(),
+          projectList.map(record=>{
+            const isOpen=record.id===projectIdRef.current;
+            const picking=!!projectBulkIds;
+            const picked=picking && projectBulkIds.has(record.id);
+            const toggle=()=>setProjectBulkIds(prev=>{ const next=new Set(prev); next.has(record.id)?next.delete(record.id):next.add(record.id); return next; });
+            return React.createElement('div',{key:record.id,className:`rounded-xl border p-3 mb-2 ${picked?'border-red-400/70 bg-red-500/10':'border-white/15 bg-[#17171a]'} ${picking&&isOpen?'opacity-45':''}`},
+            React.createElement('button',{onClick:()=>picking?(!isOpen&&toggle()):activateVlogProject(record),disabled:projectBusy||(picking&&isOpen),
+              'aria-pressed':picking&&!isOpen?picked:undefined,
+              className:'text-left w-full disabled:opacity-40 flex items-start gap-2'},
+              picking && !isOpen && React.createElement('span',{className:'text-base leading-none mt-0.5','aria-hidden':true},picked?'☑':'□'),
+              React.createElement('span',{className:'shrink-0 w-11 h-11 rounded-lg overflow-hidden bg-white/10','aria-hidden':true},
+                vlogProjectCover(record) && React.createElement('img',{src:vlogProjectCover(record),alt:'',className:'w-full h-full object-cover',style:{width:'44px',height:'44px',objectFit:'cover',display:'block'}})),
+              React.createElement('span',{className:'min-w-0 flex-1'},
+                React.createElement('div',{className:'font-bold text-sm truncate'},`${isOpen?'編集中 · ':''}${record.name}`),
+                React.createElement('div',{className:'text-xs text-white/50 mt-1'},`${new Date(record.updatedAt).toLocaleString('ja-JP')} · ${record.snapshot?.clips?.length||0}件の素材`))),
+            !picking && React.createElement('div',{className:'flex items-center gap-4 mt-2'},
+              React.createElement('button',{type:'button',onClick:()=>renameSavedVlogProject(record),disabled:projectBusy,
+                className:'text-[10px] text-white/70 underline'},'名前を変える'),
+              !isOpen && React.createElement('button',{onClick:()=>removeSavedVlogProject(record.id),disabled:projectBusy,
+                className:'text-[10px] text-red-300 underline'},'この作業の編集情報を削除')));
+          }),
           React.createElement('button',{onClick:()=>createNewVlogProject(),disabled:projectBusy,
             className:'w-full h-11 mt-3 rounded-full bg-white text-black font-bold disabled:opacity-40'},'新しく作る'),
           projectIdRef.current && React.createElement('div',{className:'rounded-xl border border-white/15 p-3 mt-5'},
@@ -25622,7 +25763,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
       ),
       activeTab==='text' && React.createElement(React.Fragment, null,
         React.createElement('div', {className:'flex gap-1.5 mb-2 overflow-x-auto','aria-label':'出先を選ぶ'},
-          VLOG_TEXT_PRESET_SCENES.map(scene=>React.createElement('button', {
+          [...VLOG_TEXT_PRESET_SCENES,{key:'mine',label:'マイ'}].map(scene=>React.createElement('button', {
             key:scene.key, type:'button',
             onClick:()=>{ setTextPresetScene(scene.key); try{ localStorage.setItem('vlogTextPresetScene',scene.key); }catch{} },
             'aria-pressed':textPresetScene===scene.key,
@@ -25630,13 +25771,19 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
           }, scene.label))
         ),
         React.createElement('div', {className:'grid grid-cols-3 gap-2 mb-3'},
-          (VLOG_TEXT_PRESET_SCENES.find(s=>s.key===textPresetScene)||VLOG_TEXT_PRESET_SCENES[0]).presets.map(p=>
+          textPresetScene==='mine' && myTextStyles.length===0 && React.createElement('div',{className:'col-span-3 text-[11px] text-white/55 rounded-xl bg-white/5 p-3'},
+            '文字の「見た目」で「マイスタイルに保存」すると、ここに並びます。'),
+          (textPresetScene==='mine'
+            ? myTextStyles.map(m=>({id:m.id,name:m.name,text:m.text,style:m.style,mine:true}))
+            : (VLOG_TEXT_PRESET_SCENES.find(s=>s.key===textPresetScene)||VLOG_TEXT_PRESET_SCENES[0]).presets).map(p=>
             React.createElement('button', {
               key:p.id,
               onClick:()=>{
                 const id=`${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
                 const t=timeRef.current;
-                const newItem=textForActiveClip({ id, text:p.text, start:Math.max(0,t), end:Math.max(0.2,t+2), x:50, y:50, anim:'fade', ...p.style, strokeColor:'rgba(0,0,0,0.8)', align:'center', vertical:false, verticalSpacing:0.15, letterSpacing:p.style.letterSpacing??0 });
+                const newItem=textForActiveClip({ id, text:p.text, start:Math.max(0,t), end:Math.max(0.2,t+2), x:50, y:50, anim:'fade', ...p.style, strokeColor:'rgba(0,0,0,0.8)', align:'center', vertical:false, verticalSpacing:0.15, letterSpacing:p.style.letterSpacing??0,
+                  // マイスタイルは保存した見た目をそのまま使う（縁の色・組み方向・揃えも含む）。
+                  ...(p.mine?Object.fromEntries(Object.entries(p.style).filter(([,v])=>v!==undefined)):{}) });
                 setTexts(prev=> [...prev, newItem]);
                 requestTextEditorScroll(id);
                 textEditOriginalRef.current={id,text:null};
@@ -25657,6 +25804,12 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
             )
           )
         ),
+        textPresetScene==='mine' && myTextStyles.length>0 && React.createElement('div',{className:'flex flex-wrap items-center gap-1.5 -mt-1 mb-3','aria-label':'マイスタイルを消す'},
+          React.createElement('span',{className:'text-[10px] text-white/45'},'消す：'),
+          myTextStyles.map(m=>React.createElement('button',{key:m.id,type:'button',
+            onClick:()=>{ if(confirm(`マイスタイル「${m.name}」を消しますか？`)) removeMyTextStyle(m.id); },
+            'aria-label':`マイスタイル「${m.name}」を消す`,
+            className:'h-7 px-2 rounded-full bg-white/5 border border-white/10 text-[10px] text-white/60'},`${m.name} ×`))),
         React.createElement('div', {className:'mb-4 p-3 rounded-[18px] bg-[#111113] border border-white/10'},
           React.createElement('div', {className:'text-[11px] font-bold mb-2'}, '📅 撮影日を入れる'),
           React.createElement('div', {className:'flex gap-1.5 mb-2 overflow-x-auto'},
@@ -25883,7 +26036,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
           ),
           // 見た目の編集は縦に長いので、上に行き先の見出しを並べ、押すとその項目へ移る。
           textEditorSection==='style' && React.createElement('div',{className:'flex gap-1.5 mb-1 overflow-x-auto','aria-label':'見た目の項目へ移る'},
-            [['font','書体'],['layout','向き・流れ'],['color','色'],['bg','背景'],['size','サイズ'],['anim','動き']].map(([k,l])=>
+            [['font','書体'],['layout','向き・流れ'],['color','色'],['bg','背景'],['size','サイズ'],['share','そろえる'],['anim','動き']].map(([k,l])=>
               React.createElement('button',{key:k,type:'button',
                 onClick:e=>{
                   // 貼り付いた見本（移った後は画面の一番上に貼り付く）の下に、その項目の頭が来るようにページ（#root）を動かす。
@@ -26163,6 +26316,17 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                 )
               )
             )
+          ),
+          React.createElement('div', {className:'mb-3','data-style-section':'share'},
+            React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, 'この見た目を（位置と時間はそのまま）'),
+            React.createElement('div', {className:'grid grid-cols-3 gap-2'},
+              React.createElement('button',{type:'button',onClick:()=>matchTextStyle('all'),
+                className:'min-h-11 rounded-xl border border-white/10 bg-white/10 text-[11px] font-bold px-1'},'全部の文字にそろえる'),
+              React.createElement('button',{type:'button',onClick:()=>matchTextStyle('clip'),
+                disabled:!texts.find(t=>t.id===selectedTextId)?._clipId,
+                className:'min-h-11 rounded-xl border border-white/10 bg-white/10 text-[11px] font-bold px-1 disabled:opacity-35'},'同じ素材の文字にそろえる'),
+              React.createElement('button',{type:'button',onClick:saveMyTextStyle,
+                className:'min-h-11 rounded-xl border border-violet-400/40 bg-violet-500/15 text-[11px] font-bold px-1'},'マイスタイルに保存'))
           ),
           React.createElement('div', {className:'mb-3','data-style-section':'anim'},
             React.createElement('div', {className:'text-[10px] text-white/50 mb-2'}, '動き（選ぶと上の見本で再生）'),
