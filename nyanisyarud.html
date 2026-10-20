@@ -5355,13 +5355,31 @@ function buildShortcutScenery(){
 let komorebiScenery=null,harunaScenery=null;
 let roadMesh, ground, gateGroup, trees=[], wallMeshes=[], finishLineMesh, lanterns=[], arrowMarkers=[];
 // ゴールの鳥居(GLB)。読み込めるまでと読み込めなかった時は、これまでの組み立ての鳥居を出す
-const GOAL_TORII={url:'nyanisyarud-torii-gate.glb',scale:17,ahead:6};
+const GOAL_TORII={url:'nyanisyarud-torii-gate.glb',scale:17};
+// 「GOAL」の布(中央・柱より手前・高さ0.48より下)は別の部品にし、猫の鼻先が触れたら上端を軸に進む方向へ跳ね上げる
+const goalBanner={state:'idle',angle:0,velocity:0,time:0,pivot:[0,.48,.036]};
 let goalToriiModel=null,goalToriiLoading=null;
+function goalToriiBannerPart(x,y,z){return Math.abs(x)<.085&&z>.018&&y<.48;}
 function loadGoalTorii(){
   if(!goalToriiLoading)goalToriiLoading=import('three/addons/loaders/GLTFLoader.js')
     .then(({GLTFLoader})=>new GLTFLoader().loadAsync(GOAL_TORII.url)).then(gltf=>{
-      const model=gltf.scene;
-      model.traverse(o=>{if(o.isMesh){o.material=new THREE.MeshLambertMaterial({map:o.material.map});o.castShadow=true;o.userData.sharedAsset=true;}});
+      let source=null;gltf.scene.traverse(o=>{if(o.isMesh&&!source)source=o;});
+      const geometry=source.geometry,position=geometry.getAttribute('position');
+      const index=geometry.index?geometry.index.array:Array.from({length:position.count},(_,i)=>i),lists={body:[],banner:[]};
+      for(let i=0;i<index.length;i+=3){
+        const a=index[i],b=index[i+1],c=index[i+2];
+        lists[goalToriiBannerPart((position.getX(a)+position.getX(b)+position.getX(c))/3,(position.getY(a)+position.getY(b)+position.getY(c))/3,(position.getZ(a)+position.getZ(b)+position.getZ(c))/3)?'banner':'body'].push(a,b,c);
+      }
+      const material=new THREE.MeshLambertMaterial({map:source.material.map}),model=new THREE.Group();
+      const part=list=>{
+        const piece=new THREE.BufferGeometry();
+        for(const name of ['position','normal','uv'])if(geometry.getAttribute(name))piece.setAttribute(name,geometry.getAttribute(name));
+        piece.setIndex(list);piece.computeBoundingSphere();
+        const mesh=new THREE.Mesh(piece,material);mesh.castShadow=true;mesh.userData.sharedAsset=true;return mesh;
+      };
+      model.add(part(lists.body));
+      const holder=new THREE.Group(),banner=part(lists.banner);holder.name='goalBanner';holder.position.set(...goalBanner.pivot);
+      banner.position.set(-goalBanner.pivot[0],-goalBanner.pivot[1],-goalBanner.pivot[2]);holder.add(banner);model.add(holder);
       // 柱の内側が壁の外に来る大きさ。「GOAL」の布を走ってくる側へ向ける
       model.scale.setScalar(GOAL_TORII.scale);model.rotation.y=Math.PI;
       goalToriiModel=model;attachGoalTorii();
@@ -5370,9 +5388,13 @@ function loadGoalTorii(){
 }
 function attachGoalTorii(){
   if(!gateGroup||!goalToriiModel||gateGroup.getObjectByName('goalTorii'))return;
-  // 「GOAL」の布は路面から約1.4mまで垂れるので、ゴールで止まった猫に重ならないようゴールラインの6m先に置く
-  const torii=goalToriiModel.clone();torii.name='goalTorii';torii.position.z=GOAL_TORII.ahead;gateGroup.add(torii);
+  const torii=goalToriiModel.clone();torii.name='goalTorii';gateGroup.add(torii);
   const fallback=gateGroup.getObjectByName('fallbackGate');if(fallback)fallback.visible=false;
+  resetGoalBanner();
+}
+function resetGoalBanner(){
+  Object.assign(goalBanner,{state:'idle',angle:0,velocity:0,time:0});
+  const holder=gateGroup?.getObjectByName('goalBanner');if(holder)holder.rotation.x=0;
 }
 loadGoalTorii();
 function buildHarunaMarkers(def){
@@ -5561,7 +5583,7 @@ function rebuildTrack(key){
   const finishMat=new THREE.MeshLambertMaterial({map:checkeredTex, side:THREE.DoubleSide});
   finishLineMesh=new THREE.Mesh(finishGeo, finishMat);
   finishLineMesh.position.copy(goalTrack.p); finishLineMesh.position.y+=ROAD_Y+0.03;
-  finishLineMesh.rotation.x=-Math.PI/2; finishLineMesh.rotation.z=-Math.atan2(goalTrack.t.x,goalTrack.t.z);
+  finishLineMesh.rotation.x=-Math.PI/2; finishLineMesh.rotation.z=Math.atan2(goalTrack.t.x,goalTrack.t.z); // 鳥居と平行(以前は符号が逆で斜めになっていた)
   finishLineMesh.receiveShadow=true; scene.add(finishLineMesh);
 
   gateGroup=new THREE.Group(); gateGroup.position.copy(goalTrack.p); gateGroup.position.y+=ROAD_Y; gateGroup.rotation.y=Math.atan2(goalTrack.t.x,goalTrack.t.z); scene.add(gateGroup);
@@ -8736,6 +8758,7 @@ function updateReadyCourse(){
 function resetRace(){
   resetExitCoach();
   resetExitBonusVisual();
+  resetGoalBanner();
   resetCornerPace();
   resetCornerRescue();
   resetPathHandling();lastWallHitTime=-Infinity;lateralG=0;yawHoldTimer=0;
@@ -12182,7 +12205,7 @@ function advanceGameFrame(realDelta){
     tick(step);
   }
 }
-function animate(){requestAnimationFrame(animate);const frameDelta=clock.getDelta();advanceGameFrame(frameDelta);updateGhostPlayback(Math.min(frameDelta,.1));renderGhostSplitHUD();updateMini();if(debugEnabled)updateDebugPanel();updateRoadsideVisibility();syncCardboardCat();syncRoboCat(Math.min(frameDelta,.1));updateBonusStreaks();renderer.render(scene,camera);}
+function animate(){requestAnimationFrame(animate);const frameDelta=clock.getDelta();advanceGameFrame(frameDelta);updateGhostPlayback(Math.min(frameDelta,.1));renderGhostSplitHUD();updateMini();if(debugEnabled)updateDebugPanel();updateRoadsideVisibility();syncCardboardCat();syncRoboCat(Math.min(frameDelta,.1));updateGoalBanner(Math.min(frameDelta,.033));updateBonusStreaks();renderer.render(scene,camera);}
 
 
 // === スマホ向けトップバー修正 - startupクラスを確実に解除 ===
@@ -12850,6 +12873,19 @@ function syncCardboardCat(){
 }
 // 加速ボーナスの集中線：進む先(30m先の道)から外へ、加速しながら曲線で飛び出す光の筋。
 // 位置は受け取ってからの時間だけで決まる。猫目線ははっきり、追従カメラは本数と濃さを控えめにする。
+// ゴールの鳥居の布の跳ね上げ(設定と部品の切り分けは鳥居の読み込みの所)
+function updateGoalBanner(dt){
+  const holder=gateGroup?.getObjectByName('goalBanner');if(!holder)return;
+  // 猫の中心より約1.2m前の鼻先がゴールライン(=布)に届いたら跳ね上げ始める
+  if(goalBanner.state==='idle'&&gameState==='racing'&&!isPracticeActive()&&totalLength*(TRACKS[currentKey].finishRatio??0.985)-s<=1.2)goalBanner.state='flip';
+  if(goalBanner.state!=='flip')return;
+  // 約0.25秒で110°まで跳ね上がって少し揺れ、約2秒後にゆっくり戻る
+  goalBanner.time+=dt;
+  const up=goalBanner.time<2.2,target=up?110*Math.PI/180:0,stiffness=up?120:12,damping=up?11:6;
+  goalBanner.velocity+=((target-goalBanner.angle)*stiffness-goalBanner.velocity*damping)*dt;goalBanner.angle+=goalBanner.velocity*dt;
+  if(!up&&goalBanner.angle<.002&&Math.abs(goalBanner.velocity)<.01){goalBanner.angle=0;goalBanner.velocity=0;goalBanner.state='done';}
+  holder.rotation.x=goalBanner.angle;
+}
 // 猫目線では猫の後ろに流れる3Dの風は見せない
 function hideCatViewBonusAir(){if(cameraMode==='cat')exitBonusAir.visible=false;}
 const bonusStreakView={drawn:false},bonusStreakCorner=new THREE.Vector3();
