@@ -48,6 +48,33 @@
     #bodies{grid-template-columns:repeat(5,1fr)}
     #smallModels{grid-template-columns:repeat(3,1fr)}
     #frameModes{grid-template-columns:repeat(3,1fr)}
+    /* かんたんモード。卓を隠し、画面の下半分に1問だけ出す。上半分は3Dが
+       そのまま見えるので、選んだ結果がその場で分かる。 */
+    .shell.easy-mode .drawer,.shell.easy-mode .drawer-toggle{display:none}
+    .easy{position:absolute;z-index:4;left:0;right:0;bottom:0;padding:14px 16px 18px;
+      background:linear-gradient(180deg,rgba(10,12,12,0) 0,rgba(10,12,12,.92) 14px,rgba(10,12,12,.97) 100%);
+      border-top:1px solid rgba(224,168,58,.4);color:#f6f5f0}
+    .easy[hidden]{display:none}
+    .easy-head{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+    .easy-head b{padding:3px 8px;background:rgba(224,168,58,.18);border:1px solid rgba(224,168,58,.5);
+      color:#ffd784;font:700 11px ui-monospace,SFMono-Regular,monospace}
+    .easy-head span{flex:1;font-size:16px;font-weight:700}
+    .easy-head .mode{min-height:34px;padding:0 12px;flex:none}
+    .easy-opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+    .easy-opts button{min-height:62px;padding:8px 10px;background:#111616;border:1px solid var(--line);
+      color:#dfe4df;font-size:13px;font-weight:700;text-align:left;line-height:1.35}
+    .easy-opts button small{display:block;margin-top:3px;color:#9ba2a1;font-size:10px;font-weight:500}
+    .easy-opts button.active{border-color:rgba(224,168,58,.75);background:rgba(224,168,58,.12);color:#ffe3a8;
+      box-shadow:inset 0 -2px var(--sun)}
+    .easy-opts button.shoot{min-height:74px;text-align:center;font-size:17px;border-color:rgba(224,168,58,.6);color:#ffd784}
+    .easy-note{margin:10px 0 0;min-height:30px;padding:8px 10px;border-left:2px solid var(--sun);
+      background:rgba(0,0,0,.3);color:#d8dcd6;font-size:11px;line-height:1.6}
+    .easy-note b{color:#ffe3a8}
+    .easy-note .warn{color:#ffb4a8}
+    .easy-nav{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:10px}
+    .easy-nav .mode{min-height:40px}
+    @media(max-width:720px){.easy{padding:10px 12px 14px}.easy-head span{font-size:14px}
+      .easy-opts{grid-template-columns:1fr 1fr;gap:6px}.easy-opts button{min-height:56px;font-size:12px}}
     /* 枠の外は .92 まで落とす。完全に潰さないのは、構図の外から人が入ってくるのが
        読めるようにするため。frameOverlay は .scene の子で z-index:2 なので、
        DOM順で後に来る .bar / .readout / .shutter / .shot-review はマスクの上に残る。 */
@@ -732,6 +759,20 @@
         </details></section>
       </div>
     </aside>
+    <!-- かんたんモード（?mode=easy のときだけ出る）。卓を隠し、1問ずつ選ばせる。 -->
+    <section class="easy" id="easyPanel" hidden aria-live="polite">
+      <div class="easy-head">
+        <b id="easyStepNo">1 / 4</b><span id="easyTitle"></span>
+        <button class="mode" id="easyExit" type="button">卓で見る</button>
+      </div>
+      <div class="easy-opts" id="easyOpts"></div>
+      <p class="easy-note" id="easyNote"></p>
+      <div class="easy-nav">
+        <button class="mode" id="easyBack" type="button">← 戻る</button>
+        <button class="mode" id="easyReset" type="button">入る前に戻す</button>
+        <button class="mode" id="easyNext" type="button">次へ →</button>
+      </div>
+    </section>
   </main>
   <!-- 例外を画面に出す。module の評価が途中で止まると、端末では「真っ黒」以外の
        手がかりが何も残らない。実際に2回起きた（?diag=contour の TDZ、光の雨の TDZ）。
@@ -12720,8 +12761,134 @@ const _rmA=new THREE.Vector3(),_rmB=new THREE.Vector3(),_rmDir=new THREE.Vector3
     }
     requestAnimationFrame(loop);
 
+    /* ======================================================================
+       かんたんモード（?mode=easy）
+       卓は32セクションあり、初めての人はどこを触るか分からない。その下に
+       もう一段あって、光を変えると写真の明るさも変わるため「いまの絵が悪いのは
+       光のせいか露出のせいか」を切り分けられない。だから手を減らすだけでなく、
+       順番を与え、露出はこちらで合わせて、何段動かしたかを毎回見せる。
+       照明のロジックは作らない。既存の applyScene / GROUPS / board の上に乗せる。
+       ====================================================================== */
+    const EASY_SHUTTER=1/250;   // 動きを止める側で固定し、ISOと絞りで合わせる
+    const EASY_LOOK={                    // [フロントの明るさ, バックの明るさ]
+      face:      {label:'顔くっきり',  note:'フロントを強く。表情が撮れます',            lv:[100,70]},
+      half:      {label:'半分影',      note:'フロントを半分に。立体感が出ます',          lv:[45,100]},
+      silhouette:{label:'シルエット',  note:'フロントを消してバックだけ。輪郭が残ります',lv:[0,100]}
+    };
+    const EASY_AIR={
+      none: {label:'なし',             note:'光の筋は出ません'},
+      smoke:{label:'スモーク',         note:'空気に粒が入り、ビームの筋が見えます'},
+      laser:{label:'スモーク＋レーザー',note:'さらに派手に。描く量が増えるぶん重くなります'}
+    };
+    const easyPanel=q('#easyPanel');
+    let easyStep=0, easyBackup=null;
+    const easyPick={scene:null,look:null,air:null};
+    const easySteps=[
+      {key:'scene',title:'どんな曲？',
+       opts:()=>SCENES.map(s=>({id:s.id,label:s.name,note:s.desc}))},
+      {key:'look', title:'顔を見せる？ 影を出す？',
+       opts:()=>Object.entries(EASY_LOOK).map(([id,v])=>({id,label:v.label,note:v.note}))},
+      {key:'air',  title:'空気を足す？',
+       opts:()=>Object.entries(EASY_AIR).map(([id,v])=>({id,label:v.label,note:v.note}))},
+      {key:'shot', title:'撮る', opts:()=>[]}
+    ];
+    /* 露出を合わせる。シャッターは EASY_SHUTTER に固定し、ISOと絞りの2軸で
+       いちばん適正に近いものを選ぶ。同じ精度なら低いISOを採る。
+       既存の nearestIsoForExposureTarget はISOしか動かさないので使えない。 */
+    function easyAutoExposure(){
+      const si=SHUTTER_STOPS.indexOf(EASY_SHUTTER);
+      if(si>=0)q('#shutterR').value=si;
+      refresh();                                  // いまの光で evScene を出し直す
+      const before=expo.evCam;
+      const ev=Number.isFinite(expo.evScene)?expo.evScene:evSceneOf(stageLux(clock));
+      let best=null;
+      ISO_STOPS.forEach((iso,ii)=>F_STOPS.forEach((f,fi)=>{
+        const err=Math.abs(ev-evCamOf(iso,f,EASY_SHUTTER));
+        if(!best||err<best.err-1e-9||(Math.abs(err-best.err)<1e-9&&iso<best.iso))
+          best={ii,fi,iso,f,err};
+      }));
+      q('#isoR').value=best.ii;q('#fstopR').value=best.fi;
+      refresh();
+      return {iso:best.iso,f:best.f,err:best.err,
+              delta:Number.isFinite(before)?before-expo.evCam:0};
+    }
+    /* 手は必ず1から順に当て直す。シーンは paintFixtures と applySceneFx で
+       灯体・スモーク・レーザーまで上書きするので、部分適用すると後の手が消える。 */
+    function easyApplyLook(id){
+      const v=EASY_LOOK[id];if(!v)return;
+      // back を先に、front を後に。FOH と back が重なっても front の指定が残る
+      GROUPS.back().forEach(i=>{board.fixtures[i].on=true;board.fixtures[i].level=v.lv[1]});
+      GROUPS.front().forEach(i=>{board.fixtures[i].on=v.lv[0]>0;board.fixtures[i].level=v.lv[0]});
+    }
+    function easyApply(){
+      if(easyPick.scene)applyScene(easyPick.scene);
+      if(easyPick.look)easyApplyLook(easyPick.look);
+      if(easyPick.air){board.smoke=easyPick.air!=='none';board.laserSheet.on=easyPick.air==='laser'}
+      syncBoardUI();refresh();
+      return easyAutoExposure();
+    }
+    function easyShowExposure(r,extra){
+      const el=q('#easyNote');if(!el||!r)return;
+      const d=r.delta;
+      const move=Math.abs(d)<.15?'露出はそのままで足りました'
+        :'露出を <b>'+(d>0?'+':'')+d.toFixed(1)+'段</b> '+(d>0?'上げました':'下げました');
+      const set='（ISO'+r.iso+' · F'+r.f+' · 1/'+Math.round(1/EASY_SHUTTER)+'）';
+      const miss=r.err>.5?'<br><span class="warn">この明るさでは ISO と絞りでも '
+        +r.err.toFixed(1)+'段 足りません。光を足すか、シルエットをやめると合います。</span>':'';
+      el.innerHTML=(extra?extra+'<br>':'')+move+set+miss;
+    }
+    function easyRender(){
+      const st=easySteps[easyStep];if(!st)return;
+      q('#easyStepNo').textContent=(easyStep+1)+' / '+easySteps.length;
+      q('#easyTitle').textContent=st.title;
+      const box=q('#easyOpts');box.textContent='';
+      if(st.key==='shot'){
+        const b=document.createElement('button');b.type='button';b.className='shoot';
+        b.textContent='● この光で1枚撮る';
+        b.onclick=()=>{requestShot();q('#easyNote').textContent='撮りました。卓の「撮ったもの」に残ります。'};
+        box.append(b);
+      }else{
+        st.opts().forEach(o=>{
+          const b=document.createElement('button');b.type='button';
+          const t=document.createTextNode(o.label),s=document.createElement('small');
+          s.textContent=o.note;b.append(t,s);
+          b.classList.toggle('active',easyPick[st.key]===o.id);
+          b.onclick=()=>{easyPick[st.key]=o.id;easyShowExposure(easyApply(),o.note);easyRender()};
+          box.append(b);
+        });
+      }
+      q('#easyBack').disabled=easyStep===0;
+      q('#easyNext').disabled=easyStep>=easySteps.length-1||(st.key!=='shot'&&!easyPick[st.key]);
+    }
+    function easyEnter(){
+      // applyScene は board を広く書き換えるので、入る前の状態を丸ごと退避する
+      easyBackup=JSON.parse(JSON.stringify(board));
+      shell.classList.add('easy-mode');easyPanel.hidden=false;
+      easyStep=0;easyRender();
+      q('#easyNote').textContent='曲の雰囲気を選ぶところから始めます。露出はこちらで合わせます。';
+    }
+    function easyExit(){
+      shell.classList.remove('easy-mode');easyPanel.hidden=true;
+      try{const u=new URL(location.href);u.searchParams.delete('mode');
+        history.replaceState(null,'',u.toString())}catch(e){}
+      saveSettings();
+    }
+    q('#easyExit').onclick=easyExit;
+    q('#easyBack').onclick=()=>{if(easyStep>0){easyStep--;easyRender()}};
+    q('#easyNext').onclick=()=>{if(easyStep<easySteps.length-1){easyStep++;easyRender()}};
+    q('#easyReset').onclick=()=>{
+      if(!easyBackup)return;
+      applyBoard(easyBackup);
+      easyPick.scene=easyPick.look=easyPick.air=null;easyStep=0;easyRender();
+      q('#easyNote').textContent='入る前の状態に戻しました。';
+    };
+    try{if(new URLSearchParams(location.search).get('mode')==='easy')easyEnter()}
+    catch(e){console.warn('かんたんモードを開始できませんでした',e)}
+
     // 数値検証用。表示に依存せずチェイス／露出／照度を読み出せる
-    window.__livehouse={RIG,board,smallModel:{get state(){return activeSmallModelState()},slots:smallModelSlots,get activeSlot(){return activeSmallModelSlot},setActive(slot){activeSmallModelSlot=smallSlotKey(slot);syncSmallModelUI();return activeSmallModelSlot},get displayed(){return smallModelDisplayed[activeSmallModelSlot]},displayedBySlot:smallModelDisplayed,show:showSmallModel,apply:applySmallModelAdjustment},laserSheet:{meshes:laserSheetMeshes.map(v=>v.mesh),materials:laserSheetMeshes.map(v=>v.mat),update:updateLaserSheet},composeLightingFrame,activeShowSlots,showRunComplete,levelAt,luxOf,stageLux,subjectSpotLux,faceFillLux,showLevelAt,showAimOf,showBlinderPulse,showWhitePulse,showBlackoutPulse,evCamOf,evSceneOf,getExpo:()=>expo,CHALLENGES,updateScene,
+    window.__livehouse={RIG,board,
+      easy:{enter:easyEnter,exit:easyExit,picks:easyPick,step:()=>easyStep,SHUTTER:EASY_SHUTTER,GROUPS},
+      smallModel:{get state(){return activeSmallModelState()},slots:smallModelSlots,get activeSlot(){return activeSmallModelSlot},setActive(slot){activeSmallModelSlot=smallSlotKey(slot);syncSmallModelUI();return activeSmallModelSlot},get displayed(){return smallModelDisplayed[activeSmallModelSlot]},displayedBySlot:smallModelDisplayed,show:showSmallModel,apply:applySmallModelAdjustment},laserSheet:{meshes:laserSheetMeshes.map(v=>v.mesh),materials:laserSheetMeshes.map(v=>v.mat),update:updateLaserSheet},composeLightingFrame,activeShowSlots,showRunComplete,levelAt,luxOf,stageLux,subjectSpotLux,faceFillLux,showLevelAt,showAimOf,showBlinderPulse,showWhitePulse,showBlackoutPulse,evCamOf,evSceneOf,getExpo:()=>expo,CHALLENGES,updateScene,
       setClock(t){clock=t;updateScene(t)},setBody:(id)=>setBody(id),getBodyId:()=>bodyId,BODIES,validateLowPolyModel,camera,CAMERA_PRESETS,
       stage:{height:STAGE_HEIGHT,width:STAGE_W,depth:STAGE_D},setCameraPreset:applyCameraPreset,setFocalLength:applyFocalLength,focalLengths:FOCAL_LENGTHS,panCameraView,moveCameraFree,moveCameraAroundSubject,enterPositionMap,exitPositionMap,getCameraMode:()=>cameraMode,getSubjectDistance:subjectDistanceMeters,syncMapShootingMarker,moveMapShootingPosition,rotateMapShootingYaw,updateVenueCutaway,faceExposureOf,selectRenderLights,applyExposureCompareTarget,resetExposureCompareBaseline,getExposureCompare:()=>({target:exposureCompareTarget,baseline:exposureCompareBaseline?{...exposureCompareBaseline}:null,expo:{...expo}}),applyToneMapMode,getToneMapMode:()=>toneMapMode,highlightWarning:{sample:()=>sampleSubjectHighlights(performance.now(),true),get:()=>({...highlightReading}),classify:classifyHighlightPixels},
       roll:{request:requestShot,take:takePendingShot,pending:()=>rollPendingShot,shots:()=>rollShots.slice(),fullOf:id=>rollFullImages.get(id),meta:rollMeta,warnings:shotWarnings,line:shotLine,restore:restoreShotSettings,sourceRect:shotSourceRect,select(id){rollSelectedId=id;renderContactSheet();return rollSelectedId},clear(){rollShots=[];rollFullImages.clear();rollSelectedId='';try{localStorage.removeItem(ROLL_STORAGE_KEY)}catch(e){}renderContactSheet()},MAX:ROLL_MAX},
