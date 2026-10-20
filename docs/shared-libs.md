@@ -41,9 +41,16 @@ const {blob,stats}=await w.finish();
 |---|---|
 | `sw-diag.html` | このサイトに登録された Service Worker（受け持つ範囲・状態）、保存領域の使用量、キャッシュごとの件数・合計・URLと大きさ。読むだけで、消したり変えたりはしない。「結果をコピー」で JSON をコピーできる |
 
-### 調べたいこと（sw.js）
+### sw.js の保存の方針
 
-`index.html` と `event.html`（Event Flow）が、`sw.js` をサイト全体（`./`）を受け持つ形で登録している。`sw.js` は、同じサイトから読み込む GET をすべて `event-flow-shell-v1` に保存する。
+実機（iPhone）で `sw-diag.html` を開くと、Event Flow 用のキャッシュ `event-flow-shell-v1` に、ほかのアプリのページ・GLB・`?diag` などのURL違い・今はないページが 71件・約127MB 入っていた。サイト全体を受け持つ `sw.js` が、読み込んだものを全部保存していたため。これを `v2` で次のように変えた（`v1` は自動で消える）。
 
-- headless Chromium での確認: Event Flow を開いた後に、別のアプリの GLB（`nyanisyarud-tree-blue.glb`）を読み込むと、`event-flow-shell-v1` に保存されていた。
-- 実機で `sw-diag.html` を開き、キャッシュに他のアプリのファイルや大きな GLB が入っていないか、使用量がどれくらいかを確かめてから、直し方を決める。
+| 対象 | 保存 | 出し方 |
+|---|---|---|
+| Event Flow（`./`・`index.html`・`event.html`・アイコン・manifest）、`Vlog-Studio.html`、`bokasi.html` | `event-flow-shell-v2`。? 以降は無視して1件 | まずネット。3秒で返らなければ保存してある版を出し、ネットの分は裏で受け取って保存する |
+| Vlog-Studio と bokasi が読み込む外部の部品（esm.sh・jsdelivr・Google Fonts・tailwind・storage.googleapis.com・tfhub.dev・kaggle） | `offline-cdn-v1` | 保存してある版を先に使う |
+| ほかのアプリのファイル | 保存しない | `sw.js` は関わらない |
+
+- `Vlog-Studio.html` と `bokasi.html` も `sw.js` を登録する（Event Flow を開いたことがない端末でも効くように）。
+- 外部の部品は、初めて使った時に保存される。圏外で使う前に、電波の良い所で一度、書き出し・顔検出まで通しておく。
+- 圏外で使いたいページを増やす時は、`sw.js` の `OFFLINE_PAGES`（外部の部品も要るなら `CDN_CLIENT_PAGES` と `CDN_HOSTS`）に足す。
