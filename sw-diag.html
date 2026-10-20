@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>保存の診断</title>
+<meta name="description" content="このサイトのService Workerと、端末に保存されているキャッシュの中身を表示する診断ページ（読むだけで、消したり変えたりしない）">
+<style>
+:root{--bg:#f6f7f9;--fg:#1d2433;--sub:#5d6678;--line:#d9dde5;--card:#fff;--warn:#b54708;--accent:#2f6fdf}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#14171d;--fg:#e6e9ef;--sub:#9aa3b2;--line:#2c323d;--card:#1c2028;--warn:#f5a25d;--accent:#7aa7ff}}
+:root[data-theme="dark"]{--bg:#14171d;--fg:#e6e9ef;--sub:#9aa3b2;--line:#2c323d;--card:#1c2028;--warn:#f5a25d;--accent:#7aa7ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,"Hiragino Sans",sans-serif}
+main{max-width:760px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:4px 0 2px}
+h2{font-size:16px;margin:0 0 8px}
+p.note{color:var(--sub);font-size:13px;margin:0 0 12px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin:12px 0}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 12px;margin:0}
+dt{color:var(--sub)}dd{margin:0;word-break:break-all}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:4px 6px;border-top:1px solid var(--line);vertical-align:top}
+td.url{word-break:break-all}td.num{text-align:right;white-space:nowrap}
+.warn{color:var(--warn)}
+button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff}
+button.sub{background:transparent;color:var(--accent)}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+</style>
+</head>
+<body>
+<main>
+<h1>保存の診断</h1>
+<p class="note">このサイト（同じ場所に置いたアプリ全部）の Service Worker と、端末に保存されているキャッシュを表示します。読むだけで、消したり変えたりはしません。</p>
+<div class="row"><button id="run">もう一度調べる</button><button id="copy" class="sub">結果をコピー</button></div>
+<div id="out"><p class="note">調べています…</p></div>
+</main>
+<script>
+const fmt=n=>n==null?'不明':n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(1)+' MB';
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let report=null;
+
+async function collect(){
+  const r={at:new Date().toISOString(),page:location.href,ua:navigator.userAgent,controller:null,registrations:[],storage:null,persisted:null,caches:[],errors:[]};
+  try{r.controller=navigator.serviceWorker?.controller?.scriptURL||null;}catch(e){r.errors.push('controller: '+e);}
+  try{
+    for(const reg of await navigator.serviceWorker.getRegistrations()){
+      const w=reg.active||reg.waiting||reg.installing;
+      r.registrations.push({scope:reg.scope,script:w?.scriptURL||null,state:w?.state||null});
+    }
+  }catch(e){r.errors.push('registrations: '+e);}
+  try{const est=await navigator.storage.estimate();r.storage={usage:est.usage??null,quota:est.quota??null,details:est.usageDetails||null};}catch(e){r.errors.push('storage: '+e);}
+  try{r.persisted=await navigator.storage.persisted();}catch(e){r.errors.push('persisted: '+e);}
+  try{
+    for(const name of await caches.keys()){
+      const cache=await caches.open(name),entries=[];
+      for(const req of await cache.keys()){
+        let size=null,type=null;
+        try{
+          const res=await cache.match(req);
+          type=res?.headers.get('content-type')||null;
+          const len=res?.headers.get('content-length');
+          // content-length が無いときだけ中身を読んで大きさを測る。
+          size=len!=null?Number(len):res?(await res.blob()).size:null;
+        }catch(e){r.errors.push('entry '+req.url+': '+e);}
+        entries.push({url:req.url,size,type});
+      }
+      entries.sort((a,b)=>(b.size||0)-(a.size||0));
+      r.caches.push({name,count:entries.length,total:entries.reduce((s,e)=>s+(e.size||0),0),entries});
+    }
+  }catch(e){r.errors.push('caches: '+e);}
+  return r;
+}
+
+function render(r){
+  const site=new URL('./',location.href).href;
+  let h='<section><h2>Service Worker</h2><dl>';
+  h+=`<dt>このページを受け持つ</dt><dd>${esc(r.controller||'なし')}</dd>`;
+  h+=`<dt>登録の数</dt><dd>${r.registrations.length}</dd></dl>`;
+  if(r.registrations.length){
+    h+='<table><tr><th>受け持つ範囲</th><th>スクリプト</th><th>状態</th></tr>';
+    for(const g of r.registrations){
+      const wide=g.scope===site;
+      h+=`<tr><td class="url${wide?' warn':''}">${esc(g.scope)}${wide?'<br>（サイト全体）':''}</td><td class="url">${esc(g.script||'')}</td><td>${esc(g.state||'')}</td></tr>`;
+    }
+    h+='</table>';
+  }
+  h+='</section><section><h2>保存領域</h2><dl>';
+  h+=`<dt>使用量</dt><dd>${fmt(r.storage?.usage)}</dd><dt>上限の目安</dt><dd>${fmt(r.storage?.quota)}</dd>`;
+  if(r.storage?.details) for(const [k,v] of Object.entries(r.storage.details)) h+=`<dt>　${esc(k)}</dt><dd>${fmt(v)}</dd>`;
+  h+=`<dt>消されにくい保存</dt><dd>${r.persisted==null?'不明':r.persisted?'はい':'いいえ'}</dd></dl></section>`;
+  h+=`<section><h2>キャッシュ（${r.caches.length}個）</h2>`;
+  if(!r.caches.length) h+='<p class="note">キャッシュはありません。</p>';
+  for(const c of r.caches){
+    h+=`<h2>${esc(c.name)}：${c.count}件・${fmt(c.total)}</h2><table><tr><th>URL</th><th>大きさ</th></tr>`;
+    for(const e of c.entries) h+=`<tr><td class="url">${esc(e.url.startsWith(site)?e.url.slice(site.length)||'./':e.url)}</td><td class="num">${fmt(e.size)}</td></tr>`;
+    h+='</table>';
+  }
+  h+='</section>';
+  if(r.errors.length) h+=`<section><h2 class="warn">読めなかったもの</h2><p class="note">${r.errors.map(esc).join('<br>')}</p></section>`;
+  h+=`<p class="note">調べた時刻 ${esc(r.at)}<br>${esc(r.ua)}</p>`;
+  document.getElementById('out').innerHTML=h;
+}
+
+async function run(){
+  document.getElementById('out').innerHTML='<p class="note">調べています…</p>';
+  report=await collect();render(report);
+}
+document.getElementById('run').onclick=run;
+document.getElementById('copy').onclick=async()=>{
+  if(!report) return;
+  const text=JSON.stringify(report,null,1);
+  try{await navigator.clipboard.writeText(text);alert('コピーしました');}
+  catch{prompt('コピーできなかったので、ここから選んでコピーしてください',text);}
+};
+run();
+</script>
+</body>
+</html>
