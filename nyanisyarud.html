@@ -12245,6 +12245,28 @@ function currentGhostKeys(){
   for(const track of Object.keys(TRACKS))if(TRACKS[track].points)for(const scope of ['classic','nyanV2'])keys.add(ghostKeyFor(track,scope));
   return keys;
 }
+// ランキングの鍵(コース×モード)。版はファイル全体で照合する
+function currentRecordKeys(){
+  const keys=new Set();
+  for(const track of Object.keys(TRACKS))for(const scope of ['classic','nyanV2'])keys.add(trackRecordKey(track,scope));
+  return keys;
+}
+// 引き継いだランキングは今の記録と合わせ、速い順に上位10件を残す(同じ記録は二重にしない)
+function mergeImportedRecords(records){
+  if(!records||typeof records!=='object')return 0;
+  const keys=currentRecordKeys(),all=loadAllRecords();let added=0;
+  for(const [key,entries] of Object.entries(records)){
+    if(!keys.has(key)||!Array.isArray(entries))continue;
+    const list=Array.isArray(all[key])?all[key]:[],seen=new Set(list.map(entry=>entry.id));
+    for(const entry of entries){
+      if(!entry||!Number.isFinite(entry.time)||entry.time<=0||seen.has(entry.id))continue;
+      list.push({time:entry.time,date:Number.isFinite(entry.date)?entry.date:Date.now(),id:entry.id??Date.now()+Math.random(),rules:entry.rules});seen.add(entry.id);added++;
+    }
+    list.sort((a,b)=>a.time-b.time);all[key]=list.slice(0,10);
+  }
+  saveAllRecords(all);
+  return added;
+}
 async function ghostStoreAll(store){
   const db=await openGhostDB();
   return new Promise((resolve,reject)=>{const r=db.transaction(store,'readonly').objectStore(store).getAll();r.onsuccess=()=>resolve(r.result||[]);r.onerror=()=>reject(r.error);});
@@ -12280,10 +12302,12 @@ async function exportGhostFile(){
   try{
     const keys=currentGhostKeys(),runs=[];
     for(const record of await ghostStoreAll('runs'))if(keys.has(record.key)&&validGhost(record,record.key))runs.push(await packGhostRun(record));
-    if(!runs.length){ghostShareStatus('書き出せるゴーストがありません。完走するとゴーストが記録されます。');return;}
-    const payload={format:GHOST_FILE_FORMAT,version:GHOST_FILE_VERSION,name,handling:HANDLING_REVISION,exportedAt:Date.now(),runs};
+    const recordKeys=currentRecordKeys(),records=Object.fromEntries(Object.entries(loadAllRecords()).filter(([key,list])=>recordKeys.has(key)&&Array.isArray(list)&&list.length));
+    const recordCount=Object.values(records).reduce((n,list)=>n+list.length,0);
+    if(!runs.length&&!recordCount){ghostShareStatus('書き出せるゴーストと記録がありません。完走するとゴーストが記録されます。');return;}
+    const payload={format:GHOST_FILE_FORMAT,version:GHOST_FILE_VERSION,name,handling:HANDLING_REVISION,exportedAt:Date.now(),runs,records};
     const file=new File([JSON.stringify(payload)],`nyanisyarud-ghost-${name}.json`,{type:'application/json'});
-    const done=`${runs.length}本のゴーストを書き出しました。`;
+    const done=`ゴースト${runs.length}本とランキング${recordCount}件を書き出しました。`;
     if(navigator.canShare?.({files:[file]})){
       try{await navigator.share({files:[file],title:friendLabel(name)+'のゴースト'});ghostShareStatus(done);return;}
       catch(e){if(e?.name==='AbortError'){ghostShareStatus('書き出しをやめました。');return;}}
@@ -12302,11 +12326,14 @@ async function readGhostFile(file){
   ghostShareStatus('読み込み中…');
   const keys=currentGhostKeys(),runs=[];
   for(const packed of payload.runs)if(keys.has(packed?.key)&&await unpackGhostRun(packed))runs.push(packed);
-  if(!runs.length){ghostShareStatus('このファイルには、今の版で使えるゴーストがありません。');return;}
+  const records=payload.records&&typeof payload.records==='object'?payload.records:{},recordKeys=currentRecordKeys();
+  const recordCount=Object.entries(records).reduce((n,[key,list])=>n+(recordKeys.has(key)&&Array.isArray(list)?list.length:0),0);
+  if(!runs.length&&!recordCount){ghostShareStatus('このファイルには、今の版で使えるゴーストや記録がありません。');return;}
   const name=cleanGhostName(payload.name)||'ともだち';
-  ghostShare.pending={name,runs};
-  document.getElementById('ghostImportSummary').textContent=`${friendLabel(name)}のファイル：ゴースト${runs.length}本`;
-  document.getElementById('btnGhostImportFriend').textContent=friendLabel(name)+'として保存';
+  ghostShare.pending={name,runs,records};
+  document.getElementById('ghostImportSummary').textContent=`${friendLabel(name)}のファイル：ゴースト${runs.length}本・ランキング${recordCount}件（ランキングは自分として取り込むときだけ使います）`;
+  const friendButton=document.getElementById('btnGhostImportFriend');
+  friendButton.textContent=friendLabel(name)+'として保存';friendButton.hidden=!runs.length;
   document.getElementById('ghostImportChoice').hidden=false;ghostShareStatus('取り込み方を選んでください。');
 }
 async function importGhostAsSelf(){
@@ -12314,8 +12341,10 @@ async function importGhostAsSelf(){
   let updated=0;
   try{for(const packed of pending.runs){const record=await unpackGhostRun(packed);if(record&&await saveGhost(record))updated++;}}
   catch(e){ghostShareStatus('この環境ではゴーストを保存できませんでした。');return;}
+  const added=mergeImportedRecords(pending.records);
   if(gameState!=='racing')prepareGhost();
-  ghostShareStatus(updated?`自分のゴーストとして取り込みました（${updated}本を速い方に更新）。`:'取り込みました。今のゴーストの方が速いか同じため、更新はありません。');
+  const ghostText=!pending.runs.length?'取り込みました。':updated?`自分のゴーストとして取り込みました（${updated}本を速い方に更新）。`:'取り込みました。今のゴーストの方が速いか同じため、ゴーストの更新はありません。';
+  ghostShareStatus(ghostText+`ランキングは${added}件を追加しました（各コース上位10件まで）。`);
 }
 async function saveGhostFriend(name,runs,replace=null){
   await ghostStoreWrite('friends',store=>{if(replace&&replace!==name)store.delete(replace);store.put({name,importedAt:Date.now(),runs});});
