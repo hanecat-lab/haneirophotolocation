@@ -6997,6 +6997,48 @@ const correctLightPixels=(pixels, light)=>{
   }finally{if(profileToken)vlogExportDrawProfiler?.end(profileToken);}
 };
 
+// 光を基準に合わせる時に測る、素材の小さな見本（中央80%を48px角に）。
+// 写真は読み込み済みの絵、動画は取り込み時に作った小さな絵を使う（iPhone ではシーク後のコマ取り出しが信用できないため）。
+const vlogLightSample=src=>new Promise(resolve=>{
+  const take=img=>{
+    try{
+      const w=img.naturalWidth||img.width, h=img.naturalHeight||img.height;
+      if(!w||!h){ resolve(null); return; }
+      const c=document.createElement('canvas'); c.width=c.height=48;
+      const g=c.getContext('2d',{willReadFrequently:true});
+      g.drawImage(img,w*0.1,h*0.1,w*0.8,h*0.8,0,0,48,48);
+      resolve(g.getImageData(0,0,48,48));
+    }catch{ resolve(null); }
+  };
+  if(typeof src==='string'){ const img=new Image(); img.onload=()=>take(img); img.onerror=()=>resolve(null); img.src=src; return; }
+  if(src && src.tagName==='IMG'){
+    if(src.complete && src.naturalWidth) take(src);
+    else{ src.addEventListener('load',()=>take(src),{once:true}); src.addEventListener('error',()=>resolve(null),{once:true}); }
+    return;
+  }
+  resolve(null);
+});
+// 見本に光の補正をかけた後の、平均の明るさ（0〜1）と暖かさ（赤−青の平均）。
+const vlogLightStats=(sample,light)=>{
+  const px=new ImageData(new Uint8ClampedArray(sample.data),sample.width,sample.height);
+  if(light && hasLightCorrection(light)) correctLightPixels(px,light);
+  const d=px.data; let luma=0,warm=0,n=0;
+  for(let i=0;i<d.length;i+=4){ if(d[i+3]===0) continue; luma+=(0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2])/255; warm+=d[i]-d[i+2]; n++; }
+  return n?{luma:luma/n,warm:warm/n}:null;
+};
+// 基準の明るさ・暖かさに近づく「明るさ」「色温度」を、実際の補正の式で探す（±40まで）。ほかの補正はそのまま。
+const VLOG_LIGHT_MATCH_LIMIT=40;
+const vlogSolveLightMatch=(sample,target,base={})=>{
+  const L=VLOG_LIGHT_MATCH_LIMIT;
+  const search=(value)=>{ let lo=-L,hi=L; for(let i=0;i<12;i++){ const mid=(lo+hi)/2; if(value(mid)) lo=mid; else hi=mid; } return (lo+hi)/2; };
+  let brightness=0,temperature=0;
+  for(let round=0;round<2;round++){
+    brightness=search(b=>vlogLightStats(sample,{...base,brightness:b,temperature}).luma<target.luma);
+    temperature=search(t=>vlogLightStats(sample,{...base,brightness,temperature:t}).warm<target.warm);
+  }
+  return {brightness:Math.round(brightness),temperature:Math.round(temperature)};
+};
+
 const getClipFilterSettings=(clip,fallbackFilter='none',intensity=100)=>({
   id:clip?._filter || clip?._filterId || fallbackFilter,
   intensity:Math.max(0,Math.min(200,Number.isFinite(clip?._filterIntensity)
@@ -8073,7 +8115,8 @@ const vlogFormatCaptureDate=(ymd,format)=>{
 const vlogValidYmd=(y,mo,d)=>y>=1990 && y<=2100 && mo>=1 && mo<=12 && d>=1 && d<=31
   ? `${String(y).padStart(4,'0')}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}` : null;
 // JPEG の EXIF から DateTimeOriginal（なければ DateTime）を読む。
-const vlogJpegCaptureDate=bytes=>{
+// full=true の時は、撮影日時を「撮影地の時計の数値」（Date.UTC で並べ替え用）で返す。
+const vlogJpegCaptureDate=(bytes,full=false)=>{
   const v=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
   if(v.byteLength<4 || v.getUint16(0)!==0xFFD8) return null;
   let p=2;
@@ -8111,6 +8154,12 @@ const vlogJpegCaptureDate=bytes=>{
       const ifd0=readIfd(u32(4),[0x8769,0x0132]);
       const exif=ifd0[0x8769]!=null ? readIfd(ifd0[0x8769],[0x9003,0x9004]) : {};
       for(const str of [exif[0x9003],exif[0x9004],ifd0[0x0132]]){
+        if(full){
+          const f=/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(str||'');
+          if(f && vlogValidYmd(Number(f[1]),Number(f[2]),Number(f[3])))
+            return Date.UTC(+f[1],+f[2]-1,+f[3],+f[4],+f[5],+f[6]);
+          continue;
+        }
         const m=/^(\d{4}):(\d{2}):(\d{2})/.exec(str||'');
         const ymd=m && vlogValidYmd(Number(m[1]),Number(m[2]),Number(m[3]));
         if(ymd) return ymd;
@@ -8123,7 +8172,7 @@ const vlogJpegCaptureDate=bytes=>{
 };
 // 動画（mov/mp4）の moov から撮影日を読む。Apple の creationdate（撮影地の時刻帯つき文字列）を優先し、
 // なければ mvhd の作成日時（UTC 秒）を端末の時刻帯で暦日にする。
-const vlogMoovCaptureDate=bytes=>{
+const vlogMoovCaptureDate=(bytes,full=false)=>{
   const v=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
   let text='';
   for(let i=0;i<bytes.length;i++) text+=String.fromCharCode(bytes[i]);
@@ -8143,6 +8192,13 @@ const vlogMoovCaptureDate=bytes=>{
       const size=v.getUint32(e);
       if(size<8) break;
       if(v.getUint32(e+4)===index && text.slice(e+12,e+16)==='data'){
+        if(full){
+          // 時刻帯は外し、撮影地の時計の数値で比べる（写真の EXIF と同じ基準）。
+          const f=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/.exec(text.slice(e+24,e+size));
+          if(f && vlogValidYmd(Number(f[1]),Number(f[2]),Number(f[3])))
+            return Date.UTC(+f[1],+f[2]-1,+f[3],+f[4],+f[5],+f[6]);
+          e+=size; continue;
+        }
         const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(text.slice(e+24,e+size));
         const ymd=m && vlogValidYmd(Number(m[1]),Number(m[2]),Number(m[3]));
         if(ymd) return ymd;
@@ -8156,6 +8212,7 @@ const vlogMoovCaptureDate=bytes=>{
     const secs=version===1 ? (at+20<=bytes.length ? v.getUint32(at+8)*4294967296+v.getUint32(at+12) : 0) : v.getUint32(at+8);
     if(secs>0){
       const date=new Date((secs-2082844800)*1000);
+      if(full) return Date.UTC(date.getFullYear(),date.getMonth(),date.getDate(),date.getHours(),date.getMinutes(),date.getSeconds());
       return vlogValidYmd(date.getFullYear(),date.getMonth()+1,date.getDate());
     }
   }
@@ -8175,12 +8232,12 @@ const vlogFindMoov=async blob=>{
   }
   return null;
 };
-const vlogReadCaptureDate=async clip=>{
+const vlogReadCaptureDate=async (clip,full=false)=>{
   if(!clip?.url) return null;
   const blob=await (await fetch(clip.url)).blob();
-  if(clip.type==='photo') return vlogJpegCaptureDate(new Uint8Array(await blob.slice(0,256*1024).arrayBuffer()));
+  if(clip.type==='photo') return vlogJpegCaptureDate(new Uint8Array(await blob.slice(0,256*1024).arrayBuffer()),full);
   const moov=await vlogFindMoov(blob);
-  return moov ? vlogMoovCaptureDate(moov) : null;
+  return moov ? vlogMoovCaptureDate(moov,full) : null;
 };
 
 // 表紙のタイトル。frame=白フチ文字、band=帯、hand=手書き風。改行で最大3行、幅に合わせて縮める。
@@ -8300,6 +8357,15 @@ function drawVlogCaptionFocus(ctx,txt,width,height,options,st){
   ctx.restore();
 }
 
+// 字幕が読み切れる長さの目安：0.5秒＋1秒に5文字（空白は数えない）。
+const vlogTextReadSeconds=txt=>{
+  const n=Array.from(String(txt?.text||'').replace(/\s/g,'')).length;
+  return n ? Math.round((0.5+n/5)*10)/10 : 0;
+};
+const vlogTextTooShort=(txt,start=txt?.start,end=txt?.end)=>{
+  const need=vlogTextReadSeconds(txt);
+  return need>0 && (end-start)+0.05<need;
+};
 // 文字の「見た目」として写す項目。位置（x・y）・時間・中身・くっつく素材は写さない。
 const VLOG_TEXT_STYLE_KEYS=['fontFamily','bold','color','outline','strokeColor','fontSize','bgColor','backgroundMode','bandColor',
   'bandOpacity','textOpacity','letterSpacing','verticalSpacing','vertical','align','anim','flow','flowAmount'];
@@ -8783,6 +8849,21 @@ function getTextCanvasBounds(txt, canvas){
 }
 
 // 並び替えの仮配置と確定は同じ計算を使う。効果は元の隣接関係が残るときだけ保持する。
+function planMaterialOrder(clips,orderedIds){
+  const byId=new Map(clips.map(c=>[c.id,c]));
+  const arranged=orderedIds.map(id=>byId.get(id)).filter(Boolean);
+  if(arranged.length!==clips.length) return null;
+  let removed=0;
+  const items=arranged.map((clip,i)=>{
+    if(!clip._transitionToNext || clip._transitionToNext.type==='none') return clip;
+    const oldIndex=clips.findIndex(c=>c.id===clip.id);
+    if(clips[oldIndex+1]?.id===arranged[i+1]?.id) return clip;
+    removed++;
+    const {_transitionToNext,...rest}=clip;
+    return rest;
+  });
+  return {items,removed};
+}
 function planMaterialMove(clips,clipId,toIndex){
   const fromIndex=clips.findIndex(c=>c.id===clipId);
   if(fromIndex<0 || toIndex<0 || toIndex>=clips.length || fromIndex===toIndex) return null;
@@ -9705,7 +9786,7 @@ function VlogMiddleCutControls({clip,start,end,onChange,plan,sourceAudioVolume,p
   );
 }
 
-function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
+function ReorderMaterials({clips,initialSourceId,onClose,onCommit,onSortByCapture}){
   const [sourceId,setSourceId]=useState(initialSourceId||null);
   const [draftIndex,setDraftIndex]=useState(()=>initialSourceId?clips.findIndex(c=>c.id===initialSourceId):null);
   const [frames,setFrames]=useState({});
@@ -9884,6 +9965,8 @@ function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
   return React.createElement('div', {className:'fixed inset-0 z-[1100] bg-[#0a0a0b] text-white flex flex-col',role:'dialog','aria-modal':true,'aria-label':'素材の並び順を変更'},
     React.createElement('div', {className:'shrink-0 px-4 py-3 border-b border-white/15 flex items-center gap-3'},
       React.createElement('div',{className:'font-bold text-sm flex-1'},'素材の順番を変える'),
+      !source && onSortByCapture && clips.length>1 && React.createElement('button',{type:'button',onClick:()=>{cancelTrial();onSortByCapture();},
+        className:'px-3 py-2 rounded-full border border-violet-300/50 bg-violet-500/20 text-xs font-bold'},'撮影した順にする'),
       React.createElement('button',{type:'button',onClick:()=>{cancelTrial();onClose();},className:'px-3 py-2 rounded-full bg-white/10 text-xs'},plan?'取り消して閉じる':'閉じる')),
     React.createElement('div',{className:'shrink-0 px-4 py-2 bg-violet-500/10 border-b border-violet-400/20 text-xs'},
       source ? React.createElement(React.Fragment,null,
@@ -11073,6 +11156,7 @@ function App(){
   const [selectedLightControl, setSelectedLightControl] = useState('brightness');
   const [lightCompareHeld, setLightCompareHeld] = useState(false);
   const [lightReference, setLightReference] = useState(null);
+  const [lightMatchNote, setLightMatchNote] = useState('');
   const [lightReferenceHeld, setLightReferenceHeld] = useState(false);
   const peakingCanvasRef = useRef(null);
   const zebraCanvasRef = useRef(null);
@@ -19407,6 +19491,37 @@ const recomputeStarts=(arr)=>{
     setLightCompareHeld(held);
     requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
+  // ほかの素材の光を、基準にした素材の見た目（その素材の補正込み）に合わせる。「戻す」1回分。
+  const matchLightToReference=async(onlySelected=false)=>{
+    const ref=lightReference && clipsRef.current.find(c=>c.id===lightReference.clipId);
+    if(!ref) return;
+    const sourceOf=clip=>clip._splitScreen ? null
+      : clip.type==='photo' ? photoRefs.current.get(clip.id)
+      : (typeof materialThumbnailsRef.current[clip.id]==='string' ? materialThumbnailsRef.current[clip.id] : null);
+    setLightMatchNote('光を測っています…');
+    const refSample=await vlogLightSample(sourceOf(ref));
+    const target=refSample && vlogLightStats(refSample,ref._light);
+    if(!target){ setLightMatchNote('基準の素材の光を測れませんでした。'); return; }
+    const pool=clipsRef.current.filter(c=>c.id!==ref.id && (!onlySelected || selectedClipIds.includes(c.id)));
+    const results=new Map(); let skipped=0, capped=0;
+    for(const clip of pool){
+      const sample=await vlogLightSample(sourceOf(clip));
+      if(!sample){ skipped++; continue; }
+      const {brightness:_b,temperature:_t,...base}=clip._light||{};
+      const solved=vlogSolveLightMatch(sample,target,base);
+      if(Math.abs(solved.brightness)>=VLOG_LIGHT_MATCH_LIMIT || Math.abs(solved.temperature)>=VLOG_LIGHT_MATCH_LIMIT) capped++;
+      results.set(clip.id,solved);
+    }
+    if(!results.size){ setLightMatchNote(`合わせられる素材がありませんでした。${skipped?`（${skipped}件は光を測れませんでした）`:''}`); return; }
+    const before=editSnapshot();
+    const next=clipsRef.current.map(clip=>results.has(clip.id) ? {...clip,_light:{...(clip._light||{}),...results.get(clip.id)}} : clip);
+    clipsRef.current=next; setClips(next);
+    recordEdit(before,{label:'光を基準に合わせる'});
+    setLightMatchNote(`${results.size}件の素材を、基準の光に合わせました。`+
+      (capped?` ${capped}件は差が大きく、補正の上限（±${VLOG_LIGHT_MATCH_LIMIT}）まで合わせました。`:'')+
+      (skipped?` ${skipped}件は光を測れず、そのままです。`:''));
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
   const captureLightReference=()=>{
     const clip=clipsRef.current.find(c=>timeRef.current>=c.timelineStart && timeRef.current<c.timelineStart+c.duration);
     const canvas=canvasRef.current;
@@ -19416,6 +19531,43 @@ const recomputeStarts=(arr)=>{
       setLightReference({clipId:clip.id,name:clip.name,localTime:Math.max(0,timeRef.current-clip.timelineStart),image:canvas.toDataURL('image/png')});
       setLightReferenceHeld(false);
     }catch{}
+  };
+  // 撮影した順に並べる。時刻が読めない素材（スクショ・保存画像など）は、元の順のまま最後に回す。
+  const captureTimeCacheRef=useRef(new Map());
+  const sortClipsByCapture=async()=>{
+    const old=clipsRef.current;
+    if(old.length<2) return;
+    setEditNotice('撮影した時刻を読んでいます…');
+    const times=new Map();
+    for(const clip of old){
+      const media=clip._splitScreen?.clips?.[0]||clip;
+      const key=`${media.id}|${media.url}`;
+      let at=captureTimeCacheRef.current.get(key);
+      if(at===undefined){
+        try{ at=await vlogReadCaptureDate(media,true); }catch{ at=null; }
+        captureTimeCacheRef.current.set(key,Number.isFinite(at)?at:null);
+      }
+      times.set(clip.id,Number.isFinite(at)?at:null);
+    }
+    if(clipsRef.current!==old){ setEditNotice('並べ替えの途中で素材が変わったので、やめました。'); return; }
+    const known=old.filter(c=>times.get(c.id)!=null), unknown=old.filter(c=>times.get(c.id)==null);
+    // 時刻が同じ素材（切り分けた動画など）は元の順を保つ。
+    const ordered=[...known].sort((a,b)=>times.get(a.id)-times.get(b.id) || old.indexOf(a)-old.indexOf(b)).concat(unknown);
+    const unknownNote=unknown.length?` 撮影時刻が分からない${unknown.length}件は最後に置きました。`:'';
+    if(!known.length){ setEditNotice('撮影した時刻が読める素材がありませんでした。'); return; }
+    if(ordered.every((c,i)=>c.id===old[i].id)){ setEditNotice(`もう撮影した順に並んでいます。${unknownNote}`); return; }
+    const plan=planMaterialOrder(old,ordered.map(c=>c.id));
+    if(!plan) return;
+    const before=editSnapshot();
+    handleStop();
+    const next=recomputeStarts(plan.items);
+    clipsRef.current=next; setClips(next);
+    const end=Math.max(...next.map(c=>c.timelineStart+c.duration));
+    durationRef.current=end; setDuration(end);
+    timeRef.current=0; setCurrentTime(0);
+    recordEdit(before,{label:'撮影した順に並べる'});
+    setEditNotice(`撮影した順に並べました。${unknownNote}${plan.removed?` 隣が変わったつなぎ目の効果${plan.removed}件を外しました。`:''}`);
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
   const reorderMaterial=(clipId,toIndex)=>{
     const old=clipsRef.current;
@@ -22934,7 +23086,8 @@ const recomputeStarts=(arr)=>{
     reorderOpen && React.createElement(ReorderMaterials,{
       clips,initialSourceId:reorderInitialId,
       onClose:()=>{setReorderOpen(false);setReorderInitialId(null);},
-      onCommit:reorderMaterial
+      onCommit:reorderMaterial,
+      onSortByCapture:()=>{setReorderOpen(false);setReorderInitialId(null);sortClipsByCapture();}
     }),
     exportChoiceOpen && React.createElement('div', {className:'camera-export-dialog fixed inset-0 z-[1000] bg-black/75 flex items-center justify-center p-5', role:'dialog', 'aria-modal':'true', 'aria-label':'書き出す素材の選択'},
       React.createElement('div', {className:'camera-export-panel w-full max-w-sm max-h-[88dvh] overflow-y-auto rounded-2xl bg-[#17171a] border border-white/20 p-5 shadow-2xl'},
@@ -23722,6 +23875,14 @@ const recomputeStarts=(arr)=>{
               'aria-pressed':lightReferenceHeld
             }, lightReferenceHeld?'基準表示中':'基準を見る')
           ),
+          // 基準の光に、ほかの素材の明るさと色温度を合わせる。
+          lightReference && React.createElement('div',{className:'flex flex-wrap gap-1.5 mt-2'},
+            React.createElement('button',{type:'button',onClick:e=>{e.stopPropagation();matchLightToReference(false);},
+              'aria-label':'ほかの全部の素材を、基準の光に合わせる'},'全部を基準に合わせる'),
+            selectedClipIds.some(id=>id!==lightReference.clipId) && React.createElement('button',{type:'button',
+              onClick:e=>{e.stopPropagation();matchLightToReference(true);},
+              'aria-label':'選んだ素材だけ、基準の光に合わせる'},`選んだ${selectedClipIds.filter(id=>id!==lightReference.clipId).length}件だけ`)),
+          lightMatchNote && React.createElement('div',{role:'status',className:'text-[10px] text-white/70 mt-1'},lightMatchNote),
           React.createElement('div',{className:'text-[10px] text-white/45 mt-1'},'白く潰れた部分の細部は戻せません。')
         )
       ),
@@ -26547,6 +26708,17 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                 `${draft.start.toFixed(1)}秒〜${draft.end.toFixed(1)}秒（${(draft.end-draft.start).toFixed(1)}秒間）`),
               React.createElement('div',{className:'text-[10px] text-white/60 text-center mt-1 mb-3 truncate'},
                 owner?`${owner.name} にくっつく`:'動画全体の時間に固定'),
+              // 読み切れる長さの目安。足りない時だけ、1タップで目安の長さにする。
+              (()=>{
+                const need=vlogTextReadSeconds(source);
+                if(!need) return null;
+                const short=vlogTextTooShort(source,draft.start,draft.end);
+                const end=Math.min(duration,draft.start+need), start=Math.max(0,end-need);
+                return React.createElement('div',{role:'status',className:`flex items-center justify-center gap-2 -mt-1 mb-3 text-[11px] ${short?'text-amber-200':'text-white/50'}`},
+                  React.createElement('span',null,`${short?'⚠ ':''}読み切るには約${need.toFixed(1)}秒`),
+                  short && React.createElement('button',{type:'button',onClick:()=>applyTextRange(source.id,start,end),
+                    className:'min-h-9 rounded-full border border-amber-200/50 px-3 text-[11px] font-bold'},`${need.toFixed(1)}秒にする`));
+              })(),
               React.createElement(TimeRangeBand,{scopeKey:`text-${source.id}`,start:draft.start,end:draft.end,
                 min:0,max:duration,minSpan:0.2,label:'文字の表示範囲',segments,snapPoints,
                 onFocusChange:kind=>setTextRangeEdge({textId:source.id,edge:kind}),
@@ -27394,7 +27566,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                     'data-timeline-text-id':t.id,
                     className:`absolute top-1 bottom-1 rounded border text-[9px] flex items-center ${selected?'bg-yellow-500/60 timeline-text-selected z-10':'bg-yellow-500/30 border-yellow-500 overflow-hidden'}`,
                     style:{left:`${left}px`, width:`${width}px`},
-                    title:`${(t.text||t.content||'')} ${t.start.toFixed(1)}s-${t.end.toFixed(1)}s`,
+                    title:`${(t.text||t.content||'')} ${t.start.toFixed(1)}s-${t.end.toFixed(1)}s${vlogTextTooShort(t)?`（読み切るには約${vlogTextReadSeconds(t).toFixed(1)}秒）`:''}`,
                     onClick:e=>{
                       e.stopPropagation();
                       if(performance.now()<suppressTextBarClickRef.current) return;
@@ -27417,7 +27589,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                       onClick:selected ? e=>e.stopPropagation() : undefined,
                       className:`flex-1 min-w-0 truncate px-1 flex items-center ${selected?'touch-none cursor-grab':''}`,
                       role:selected?'button':undefined,'aria-label':selected?`${(t.text||t.content||'')}を移動`:undefined
-                    },(t.text||'').slice(0,14)),
+                    },vlogTextTooShort(t)&&React.createElement('span',{className:'shrink-0 mr-0.5','aria-label':'表示時間が短く、読み切れないかもしれません'},'⚠'),(t.text||'').slice(0,14)),
                     showHandles && React.createElement('div', {
                       onPointerDown:e=>handleTextPointerDown(e,t.id,'right'), onClick:e=>e.stopPropagation(),
                       className:`${handleClass} w-8 ${narrow?'absolute -right-8 top-0 bottom-0 rounded-r border border-white':''}`,
