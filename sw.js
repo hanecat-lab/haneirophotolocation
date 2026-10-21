@@ -1,4 +1,10 @@
 const CACHE_NAME='event-flow-shell-v2';
+// 実機でどの版の sw.js が動いているかを sw-diag.html で見分けるための印。sw.js を変えたら更新する。
+const SW_VERSION='2026-10-21-log';
+// 外部の部品とフォントをどう扱ったかの記録（sw-diag.html に表示する）。
+const LOG_CACHE='sw-diag-log-v1';
+const LOG_KEY=new URL('./__sw-diag-log.json',self.location.href).href;
+const LOG_LIMIT=300;
 // 外部の部品（CDN）の保存先。URLに版が入っているので中身は変わらない。
 const CDN_CACHE='offline-cdn-v1';
 const APP_SHELL=['./','./index.html','./manifest.webmanifest','./pwa-icon.svg','./icon-192.png','./icon-512.png','./apple-touch-icon.png'];
@@ -13,13 +19,34 @@ const CDN_CLIENT_PATHS=new Set(CDN_CLIENT_PAGES.map(pathOf));
 // 外部の部品を探す先（この2つのアプリが使う所）。それ以外の外部サイトへの読み込みには関わらない。
 const CDN_HOSTS=new Set(['esm.sh','cdn.jsdelivr.net','fonts.googleapis.com','fonts.gstatic.com','cdn.tailwindcss.com','storage.googleapis.com','tfhub.dev','www.kaggle.com']);
 
+// 同時に読み込みが走っても1つの配列を共有するよう、読み込みの約束ごと持つ。
+let diagLog=null;
+function loadLog(){
+  if(!diagLog)diagLog=(async()=>{
+    try{const saved=await (await caches.open(LOG_CACHE)).match(LOG_KEY);return saved?await saved.json():[];}catch{return [];}
+  })();
+  return diagLog;
+}
+function writeLog(event,entry){
+  const done=(async()=>{
+    const log=await loadLog();
+    log.push({at:new Date().toISOString(),v:SW_VERSION,...entry});
+    if(log.length>LOG_LIMIT)log.splice(0,log.length-LOG_LIMIT);
+    await (await caches.open(LOG_CACHE)).put(LOG_KEY,new Response(JSON.stringify(log),{headers:{'content-type':'application/json'}}));
+  })().catch(()=>{});
+  event.waitUntil(done);
+}
+const requestInfo=event=>({url:event.request.url,dest:event.request.destination||'',mode:event.request.mode,client:!!event.clientId});
+
 self.addEventListener('install',event=>{
+  writeLog(event,{kind:'install'});
   event.waitUntil(caches.open(CACHE_NAME).then(cache=>Promise.allSettled(APP_SHELL.map(url=>cache.add(url)))));
   self.skipWaiting();
 });
 
 self.addEventListener('activate',event=>{
-  event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(key=>key!==CACHE_NAME&&key!==CDN_CACHE).map(key=>caches.delete(key)))).then(()=>self.clients.claim()));
+  writeLog(event,{kind:'activate'});
+  event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(key=>key!==CACHE_NAME&&key!==CDN_CACHE&&key!==LOG_CACHE).map(key=>caches.delete(key)))).then(()=>self.clients.claim()));
 });
 
 // ページ: まずネットから取り、3秒で返らなければ保存してある版を出す。届いた分は次回のために保存する。
@@ -50,16 +77,24 @@ async function pageResponse(event,url){
 // 外部の部品: Vlog-Studio と bokasi が読み込んだものだけ、保存してある版を先に使う。
 async function cdnResponse(event){
   const client=event.clientId?await self.clients.get(event.clientId):null;
-  if(!client||!CDN_CLIENT_PATHS.has(new URL(client.url).pathname))return fetch(event.request);
+  if(!client||!CDN_CLIENT_PATHS.has(new URL(client.url).pathname)){
+    writeLog(event,{kind:'cdn',...requestInfo(event),result:client?'other-page':'client-not-found'});
+    return fetch(event.request);
+  }
   return cacheFirst(event);
 }
 
 async function cacheFirst(event){
   const cache=await caches.open(CDN_CACHE);
+  const info={kind:'cdn',...requestInfo(event)};
   const cached=await cache.match(event.request);
-  if(cached)return cached;
-  const response=await fetch(event.request);
-  if(response.ok||response.type==='opaque')event.waitUntil(cache.put(event.request,response.clone()).catch(()=>{}));
+  if(cached){writeLog(event,{...info,result:'hit'});return cached;}
+  let response;
+  try{response=await fetch(event.request);}
+  catch(error){writeLog(event,{...info,result:'fetch-error',detail:String(error?.message||error).slice(0,80)});throw error;}
+  const store=response.ok||response.type==='opaque';
+  if(store)event.waitUntil(cache.put(event.request,response.clone()).catch(error=>writeLog(event,{...info,result:'put-error',detail:String(error?.message||error).slice(0,80)})));
+  writeLog(event,{...info,result:store?'stored':'not-stored',status:response.status,type:response.type});
   return response;
 }
 
@@ -73,7 +108,9 @@ self.addEventListener('fetch',event=>{
   }
   // フォント本体は、iPhone では読み込んだページが分からない（clientId が空）ことがあるため、ページに関係なく保存する。
   if(url.hostname==='fonts.gstatic.com'){event.respondWith(cacheFirst(event));return;}
-  if(CDN_HOSTS.has(url.hostname)&&event.clientId)event.respondWith(cdnResponse(event));
+  if(!CDN_HOSTS.has(url.hostname))return;
+  if(event.clientId)event.respondWith(cdnResponse(event));
+  else writeLog(event,{kind:'cdn',...requestInfo(event),result:'no-client'});
 });
 
 self.addEventListener('push',event=>{
