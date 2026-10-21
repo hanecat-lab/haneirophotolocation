@@ -258,6 +258,7 @@ body{background:var(--yn-paper)}
 /* 書き出し前の確認: the two answers act now (solid orange); the time buttons for faces left uncovered are light orange. */
 .yn-studio .yn-decide-actions .yn-button,.yn-studio .yn-decide-actions .yn-button:hover:not(:disabled){background:#c2410c;border:1px solid #9a3412;color:#fff;font-weight:700;box-shadow:0 3px 0 #7c2d12}
 .yn-studio .yn-decide-hints .yn-button,.yn-studio .yn-decide-hints .yn-button:hover:not(:disabled){background:#fff7ed;border:1px solid #fb923c;color:#7c2d12;font-weight:700;box-shadow:0 3px 0 #fdba74}
+.yn-autocut-plan{font-size:12px;margin:0;color:#431407}
 .yn-studio .yn-group-ask[role=group] .yn-primary,.yn-studio .yn-group-ask[role=group] .yn-primary:hover:not(:disabled){background:#c2410c!important;border:1px solid #9a3412;color:#fff!important;box-shadow:0 3px 0 #7c2d12}
 /* The button to press now (edit tab): same orange as the answers of a question. */
 .yn-studio .yn-now,.yn-studio .yn-now:hover:not(:disabled){background:#c2410c!important;border:1px solid #9a3412;color:#fff!important;font-weight:700;box-shadow:0 3px 0 #7c2d12}
@@ -414,12 +415,15 @@ function ynAssociate(tracks,faces,time,scene,step,nextID){
  return nextID;
 }
 function ynBoxUnion(a,b){const x=Math.min(a.x,b.x),y=Math.min(a.y,b.y);return {x,y,w:Math.max(a.x+a.w,b.x+b.w)-x,h:Math.max(a.y+a.h,b.y+b.h)-y}}
+// An automatic ID can have ranges where it is not drawn (tr.cutOut, set by 「重なっている所だけ消す」): another ID covers the same face there.
+function ynTrackCutAt(tr,time){const c=tr&&tr.cutOut;if(!c||!c.length)return false;for(const r of c)if(time>=r.t0-1e-6&&time<=r.t1+1e-6)return true;return false}
 function ynFacesAt(tracks,samples,cuts,time,step){
- const faces=[];let interpolated=false,held=false;
+ const faces=[],cutBoxes=[];let interpolated=false,held=false;
  // Cuts with another cut within 1s are often false (fast motion). Let the short cover before and after a face ignore them; over-covering is the safe side.
  const sure=cuts.filter(c=>!cuts.some(o=>o!==c&&Math.abs(o-c)<=1+1e-6));
  for(const tr of tracks){
   const h=tr.history;if(!h.length)continue;
+  if(tr.cutOut&&ynTrackCutAt(tr,time)){const ex=h.find(f=>Math.abs(f.time-time)<0.001);if(ex)cutBoxes.push(ex);continue}
   let low=0,high=h.length;
   while(low<high){const mid=(low+high)>>1;if(h[mid].time<time)low=mid+1;else high=mid}
   const after=h[low],before=h[low-1];
@@ -447,7 +451,7 @@ function ynFacesAt(tracks,samples,cuts,time,step){
  }
  // Current-frame rescue detections have no track yet. Use only at that exact time.
  const exact=samples.get(time);
- if(exact)for(const face of exact)if(!faces.some(other=>Ds(face,other)>0.4))faces.push(face);
+ if(exact)for(const face of exact)if(!faces.some(other=>Ds(face,other)>0.4)&&!cutBoxes.some(q=>Math.abs(q.x-face.x)<1&&Math.abs(q.y-face.y)<1&&Math.abs(q.w-face.w)<1&&Math.abs(q.h-face.h)<1))faces.push(face);
  return {faces,isExact:!interpolated&&!held,diff:0,interpolated,held};
 }
 function ynSceneSignature(canvas){
@@ -2759,9 +2763,14 @@ const ynPickPart=q=>{const g=ynGroups.current.find(x=>x.id===q.gid),v=n.current;
   ynSaveUndo();ynPutAnchor(g,{time:q.t,plane,faces:[{id:q.pick.fid,poly}]});ynSetReviewed(false);ynIssuesRefresh();b(x=>x+1);
   ynSetGroupAsk({gid:g.id,done:`対象${g.id}の ${ynSecText(q.t)}秒 を、候補${q.pick.k+1}の位置で基準にしました。「追い直す」を押すと、ここから前後の追従をやり直します。`,undo:true,retrack:true})};
 const ynGroupAskEl=()=>{
-  const q=ynGroupAsk;if(!q||!Ot||ynExpandedView!=='review')return null;
+  const q=ynGroupAsk;if(!q||!Ot||(ynExpandedView!=='review'&&!q.auto))return null;
   const btn=(text,fn,primary)=>D('button',{className:primary?'yn-button yn-primary':'yn-button',onClick:fn,children:text}),close=()=>ynSetGroupAsk(null);
-  if(q.done)return G('div',{className:'yn-fix-sheet-none yn-group-ask',role:'status',children:[D('p',{children:q.done}),G('div',{className:'yn-fix-sheet-actions',children:[btn('前後1秒を再生して確かめる',ynPlayAround),q.retrack&&btn('追い直す',()=>{ynSetGroupAsk(null);ynMotionAnalyseAll()},true),q.undo&&btn('元に戻す',()=>{ynUndoAction();ynSetGroupAsk({gid:q.gid,done:q.undoMsg||`対象${q.gid}を元に戻しました。`})}),btn('閉じる',close)]})]});
+  if(q.auto&&!q.done){const ps=(q.keep?[q.keep]:q.partners||[]).filter(id=>Ut.some(t=>t.id===id));if(!Ut.some(t=>t.id===q.del))return null;let cov=null;try{cov=ynIdCoverage(Ut.filter(t=>t.id===q.del),Ut,ynGroups.current)}catch{}
+    const plans=ps.map(id=>ynAutoCutPlan(q.del,id)).filter(Boolean),pl=r=>r.rs.map(x=>`${x.t0.toFixed(1)}〜${x.t1.toFixed(1)}秒`).join('・');
+    return G('div',{className:'yn-fix-sheet-none yn-group-ask',role:'group',children:[D('p',{children:`ここでは同じ顔に ID:${q.del} と ${ps.map(id=>'ID:'+id).join('・')} が重なっています。${cov&&cov.uncovered>=.2?`ID:${q.del}を丸ごと消すと、${cov.uncovered.toFixed(1)}秒 顔が隠れなくなります。`:''}`}),
+      ...plans.map(r=>D('p',{className:'yn-autocut-plan',children:r.rs.length?`「ID:${r.keepId}を残す」で消すのは、ID:${q.del}の${pl(r)}（${ynSecText(r.cut)}秒・${r.rs.length}か所）。ほかの${ynSecText(r.keep)}秒は残します。顔が隠れなくなる時間：0秒`:`ID:${r.keepId}が検出している所では重なっていないので、重なっている所だけ消すことはできません。`})),
+      G('div',{className:'yn-fix-sheet-actions',children:[...plans.map((r,j)=>D('button',{className:j===0?'yn-button yn-primary':'yn-button',disabled:!r.rs.length,onClick:()=>ynAutoCutApply(r),children:`重なっている所だけ消す（ID:${r.keepId}を残す）`})),btn(`ID:${q.del}を丸ごと消す`,()=>{ynSetGroupAsk(null);ynDeleteAutoIds([q.del])}),btn('やめる',close)]})]})}
+  if(q.done)return G('div',{className:'yn-fix-sheet-none yn-group-ask',role:'status',children:[D('p',{children:q.done}),G('div',{className:'yn-fix-sheet-actions',children:[btn('前後1秒を再生して確かめる',ynPlayAround),q.retrack&&btn('追い直す',()=>{ynSetGroupAsk(null);ynMotionAnalyseAll()},true),q.undo&&btn('元に戻す',()=>{if(q.undoFn)q.undoFn();else ynUndoAction();ynSetGroupAsk({gid:q.gid,auto:q.auto,done:q.undoMsg||`対象${q.gid}を元に戻しました。`})}),btn('閉じる',close)]})]});
   if(q.gids){const gs=q.gids.map(id=>ynGroups.current.find(x=>x.id===id)).filter(Boolean);if(gs.length<2)return null;
     if(q.pick)return G('div',{className:'yn-fix-sheet-none yn-group-ask',role:'group',children:[D('p',{children:'どの対象を扱いますか？'}),G('div',{className:'yn-fix-sheet-actions',children:[...gs.map(g=>btn(`対象${g.id}${q.helds&&q.helds[g.id]?'(予測)':''}`,()=>ynSetGroupAsk({gid:g.id,t:q.t,held:q.helds?q.helds[g.id]||null:null}))),btn('戻る',()=>ynSetGroupAsk({...q,pick:false}))]})]});
     return G('div',{className:'yn-fix-sheet-none yn-group-ask',role:'group',children:[D('p',{children:`ここでは同じ顔に ${gs.map(g=>'対象'+g.id).join('・')} が重なっています。どれを残しますか？ ほかの対象は、残した対象が自分で追えている所だけ消し、見失う所では予備として残します。`}),G('div',{className:'yn-fix-sheet-actions',children:[...gs.map(g=>btn(`対象${g.id}を残す`,()=>ynKeepOneCut(g.id,gs.map(x=>x.id)))),btn('1つずつ扱う',()=>ynSetGroupAsk({...q,pick:true})),btn('やめる',close)]})]})}
@@ -2817,6 +2826,22 @@ E.useEffect(()=>{if(!Ot)ynSetTlNavOn(false)},[Ot]);
 const ynTlSeek=(e,el)=>{const tl=ynTl;if(!tl||!el)return;const r=el.getBoundingClientRect();if(!r.width)return;ynLeakSeek(Math.max(0,Math.min(1,(e.clientX-r.left)/r.width))*tl.dur)};
 const ynDupOpen=r=>{const back=Ot&&ynExpandedView==='edit'?{time:r.t0+.02,zoom:ut,pan:Ce}:null;ynLeakSeek(r.t0+.02);if(!Ot||ynExpandedView!=='review'||!ynFixSheet){ynShowPreview('review');if(back)ynSetFixReturn(back);ynOpenFixSheet()}ynSetMiniKey(r.info.a.key)};
 const ynDupGo=dir=>{const tl=ynTl,runs=tl?tl.dupRuns:[];if(!runs.length)return;const cur=ynCurrentFrameTime();let target=null;if(dir>0)target=runs.find(r=>r.t0>cur+.05);else for(const r of runs)if(r.t1<cur-.05)target=r;if(!target){ynSetFixMsg(dir>0?'これより後に、猫の重なりはありません':'これより前に、猫の重なりはありません');return}ynSetFixMsg('');ynLeakSeek(target.t0+.02);ynSetMiniKey(target.info.a.key)};
+// 「重なっている所だけ消す」: cut ID delId only where ID keepId is detected (not predicted) on the same face (centres within 1.5 face sizes),
+// 0.1 s inside each end so both cover the switch. Where keepId loses the face, delId stays as a spare, so nothing is left uncovered.
+const ynAutoCutPlan=(delId,keepId)=>{const Dt=Ut.find(t=>t.id===delId),K=Ut.find(t=>t.id===keepId);if(!Dt||!K)return null;const h=ynSortedHist(Dt);if(!h.length)return null;
+ const step=1/30,a=h[0].time||0,z=h[h.length-1].time||0,at=(tr,t)=>(ynFacesAt([tr],new Map(),ynCuts.current,t,ynStep.current).faces||[])[0],runs=[];let run=null;
+ for(let k=Math.ceil(a/step-1e-6);k*step<=z+1e-6;k++){const t=k*step,d=at(Dt,t),q=d&&!ynTrackCutAt(K,t)?at(K,t):null;
+  const same=!!q&&q.src!=='hold'&&q.src!=='hold-back'&&Math.hypot(d.x+d.w/2-q.x-q.w/2,d.y+d.h/2-q.y-q.h/2)<=1.5*Math.max(d.w,d.h,q.w,q.h);
+  if(same){if(run)run.t1=t;else run={t0:t,t1:t}}else if(run){runs.push(run);run=null}}
+ if(run)runs.push(run);const rs=runs.map(r=>({t0:r.t0+.1,t1:r.t1+step-.1})).filter(r=>r.t1-r.t0>=.05),cut=rs.reduce((v,r)=>v+r.t1-r.t0,0);
+ return {delId,keepId,rs,cut,keep:Math.max(0,z-a-cut)}};
+const ynAutoCutApply=plan=>{if(!plan||!plan.rs.length)return;const prev=(Ut.find(t=>t.id===plan.delId)||{}).cutOut||null;
+ je(cur=>cur.map(t=>t.id===plan.delId?{...t,cutOut:[...(t.cutOut||[]),...plan.rs.map(r=>({t0:Math.round(r.t0*1000)/1000,t1:Math.round(r.t1*1000)/1000}))]}:t));ynSetReviewed(false);b(v=>v+1);
+ ynSetGroupAsk({auto:true,done:`ID:${plan.keepId}を残し、ID:${plan.delId}の重なっている所 ${ynSecText(plan.cut)}秒（${plan.rs.length}か所）を消しました。ID:${plan.keepId}が見失う所では、ID:${plan.delId}が予備として残ります。`,undo:true,undoMsg:`ID:${plan.delId}を、重なりを消す前に戻しました。`,undoFn:()=>{je(cur=>cur.map(t=>{if(t.id!==plan.delId)return t;const o={...t};if(prev)o.cutOut=prev;else delete o.cutOut;return o}));ynSetReviewed(false);b(v=>v+1)}})};
+// ✕ on one automatic ID: when another ID sees the same face here, ask first (重なっている所だけ消す / 丸ごと消す / やめる).
+const ynAutoDelAsk=ids=>{if(ids.length===1){const t=ynCurrentFrameTime();let fs=[];try{fs=nc(t).faces||[]}catch{}const me=fs.find(f=>f.trackId===ids[0]);
+  const partners=me?[...new Set(fs.filter(o=>o.trackId!=null&&o.trackId!==ids[0]&&o.src!=='hold'&&o.src!=='hold-back'&&Math.hypot(me.x+me.w/2-o.x-o.w/2,me.y+me.h/2-o.y-o.h/2)<=1.5*Math.max(me.w,me.h,o.w,o.h)).map(o=>o.trackId))]:[];
+  if(partners.length){ynSetGroupAsk({auto:true,del:ids[0],t,partners});return}}ynDeleteAutoIds(ids)};
 const ynDupDeleteAuto=id=>{const trs=Ut.filter(t=>t.id===id);if(!trs.length)return;let cov=null;try{cov=ynIdCoverage(trs,Ut,ynGroups.current)}catch{}const msg=cov&&cov.uncovered>=.2?`ID:${id}を消すと、${cov.uncovered.toFixed(1)}秒 顔が隠れなくなります。それでも削除しますか？（元に戻せます）`:`ID:${id}を削除します（ほかの枠が覆っています）。元に戻せます。`;if(confirm(msg))ynDeleteAutoIds([id])};
 const ynTlJump=(dir,open=false)=>{
   const tl=ynTl,list=ynTlList(tl);if(!list.length)return;const cur=ynCurrentFrameTime();let target=null;
@@ -2922,7 +2947,7 @@ const ynTruthReport=E.useMemo(()=>{
 },[Ln,Dn,Ut,J,ynFixTick,ynKeptTick,ynTruthTick]);
 const ynTruthBuild=()=>{
   const video=n.current,key=ynFileKey.current||'|',name=key.slice(0,key.lastIndexOf('|')),r1=v=>Math.round(v*10)/10,r3=v=>Math.round(v*1000)/1000;
-  const tracks=Ut.map(tr=>{const h=ynSortedHist(tr),ev=ynIdEvidence([tr]);return {id:tr.id,scene:tr.scene,evidence:{n:ev.n,dur:r3(ev.dur),maxScore:r3(ev.maxScore),landmarks:ev.lm,cls:ev.cls},samples:h.map(f=>[r3(f.time||0),r1(f.x),r1(f.y),r1(f.w),r1(f.h),r3(f.score||0),...(f.landmarks||[]).slice(0,6).flatMap(q=>[r1(q.x),r1(q.y)])])}});
+  const tracks=Ut.map(tr=>{const h=ynSortedHist(tr),ev=ynIdEvidence([tr]);return {id:tr.id,scene:tr.scene,...(tr.cutOut&&tr.cutOut.length?{cutOut:tr.cutOut.map(r=>({t0:r3(r.t0),t1:r3(r.t1)}))}:{}),evidence:{n:ev.n,dur:r3(ev.dur),maxScore:r3(ev.maxScore),landmarks:ev.lm,cls:ev.cls},samples:h.map(f=>[r3(f.time||0),r1(f.x),r1(f.y),r1(f.w),r1(f.h),r3(f.score||0),...(f.landmarks||[]).slice(0,6).flatMap(q=>[r1(q.x),r1(q.y)])])}});
   const manual=[];for(const g of ynGroups.current)for(const a of g.anchors||[])for(const f of a.faces||[]){if(!f.poly)continue;const bx=ynFaceBoxFromPoly(f.poly);manual.push({group:g.id,face:f.id,time:r3(a.time),box:[r1(bx.x),r1(bx.y),r1(bx.w),r1(bx.h)]})}
   const ynGroupsOut=ynGroups.current.map(g=>{
     const rows=[],weak=[];let cur=null;const frames=g.frames||[],stride=Math.max(1,Math.ceil(frames.length/800));
@@ -3104,7 +3129,7 @@ const ynFixSheetEl=()=>{
       return G('div',{className:'yn-fix-sheet-none yn-dup-box',role:'status',children:[
         G('div',{className:'yn-dup-nav',children:[btn('◀',()=>ynDupGo(-1),{'aria-label':'前の猫の重なりへ'}),D('strong',{children:r?`猫の重なり ${i+1}/${runs.length}`:`猫の重なり 全${runs.length}か所`}),btn('▶',()=>ynDupGo(1),{'aria-label':'次の猫の重なりへ'})]}),
         info&&D('p',{children:info.split?`${info.a.label}が、前後の追従の食い違いで2つになっています。「顔を編集」でこの場面の顔を囲み直して一括追従すると、1つに戻ります。`:`${info.a.label} と ${info.b.label} の画像が近くに重なっています（同じ顔に2つ付いているかもしれません）。`}),
-        info&&!info.split&&G('div',{className:'yn-fix-sheet-actions',children:autos.length?autos.map(x=>btn(`${x.label}を削除`,()=>ynDupDeleteAuto(x.id))):[btn(`対象${info.b.gid}を削除（まとめる）`,()=>ynMergeGroup(info.b.gid))]})
+        info&&!info.split&&G('div',{className:'yn-fix-sheet-actions',children:autos.length?[...(autos.length===2?autos.map((x,j)=>{const o=autos[1-j];return btn(`${x.label}を残す（重なりだけ${o.label}を消す）`,()=>ynSetGroupAsk({auto:true,del:o.id,t:ynCurrentFrameTime(),partners:[x.id],keep:x.id}))}):[]),...autos.map(x=>btn(`${x.label}を丸ごと削除`,()=>ynDupDeleteAuto(x.id)))]:[btn(`対象${info.b.gid}を削除（まとめる）`,()=>ynMergeGroup(info.b.gid))]})
       ]})})(),
     none&&G('div',{className:'yn-fix-sheet-none',role:'status',children:[
       D('p',{children:'この再生位置には、ぼかしが描かれている顔がありません（追従を見失った区間は、ぼかしが描かれません）。時間を動かして顔のある場面へ移るか、次の操作で指定してください。'}),
@@ -3218,7 +3243,7 @@ const ynIdChipsEl=()=>{
   if(!grs.length&&!men.length)return null;
   const chip=(key,label,flashLabel,onDel,del)=>G('span',{className:'yn-id-chip',style:{display:'inline-flex',alignItems:'center',gap:2,border:'1px solid #94a3b8',borderRadius:12,padding:'0 2px 0 8px',fontSize:12,whiteSpace:'nowrap'},children:[D('button',{style:{border:0,background:'transparent',padding:'4px 2px',fontSize:12},onClick:()=>ynFlashFocus([{key,label:flashLabel}]),children:label}),D('button',{'aria-label':del,style:{border:0,borderRadius:'50%',width:28,height:28,background:'#c2410c',color:'#fff',fontSize:14,lineHeight:'28px',padding:0},onClick:onDel,children:'×'})]},key);
   return G('div',{className:'yn-preview-playback yn-id-chips',style:{flexWrap:'wrap',gap:6,justifyContent:'flex-start'},children:[D('span',{style:{fontSize:11,flex:'0 0 auto'},children:'この時刻：'}),
-    ...grs.map(g=>chip('a:'+g.id,'ID:'+g.id+(g.ids.length>1?' 他'+(g.ids.length-1):''),'ID:'+g.id,()=>ynDeleteAutoIds(g.ids),'ID:'+g.id+'を削除')),
+    ...grs.map(g=>chip('a:'+g.id,'ID:'+g.id+(g.ids.length>1?' 他'+(g.ids.length-1):''),'ID:'+g.id,()=>ynAutoDelAsk(g.ids),'ID:'+g.id+'を削除')),
     ...men.map(m=>{const gids=m.gids||[m.gid];return chip('g:'+m.gid,'対象'+gids.join('・'),'対象'+gids.join('・'),()=>ynSetGroupAsk(m.gids?{gid:m.gid,gids:m.gids,helds:m.helds,t}:{gid:m.gid,t,held:m.held}),'対象'+gids.join('・')+'を消す')})]});
 };
 const ynReviewCardEl=()=>{
@@ -3337,7 +3362,7 @@ E.useEffect(()=>{
       const ynFocus=ynIdFocus.current,ynFocusItem=ynFocus&&Math.abs(ynCurrentFrameTime()-ynFocus.time)<.1?ynFocus.items.find(it=>it.ids.some(i=>grp.ids.includes(i))):null;if(ynFocusItem){el.style.border='4px solid #ffffff';el.style.boxShadow='0 0 0 2px #0f172a';label.textContent+=' · '+(ynFocusItem.type==='appear'?'現れる':ynFocusItem.type==='review'?'確認中':'消える');label.style.color='#ffffff'}el.appendChild(label);
       const delBtn=document.createElement('button');
       delBtn.setAttribute('aria-label','このIDを削除');delBtn.style.position='absolute';delBtn.style.right='-20px';delBtn.style.top='-20px';delBtn.style.width='44px';delBtn.style.height='44px';delBtn.style.padding='0';delBtn.style.border='0';delBtn.style.background='transparent';delBtn.style.display='flex';delBtn.style.alignItems='center';delBtn.style.justifyContent='center';delBtn.style.zIndex='2';delBtn.style.touchAction='manipulation';delBtn.style.cursor='pointer';delBtn.style.pointerEvents='auto';const delDot=document.createElement('span');delDot.textContent='×';delDot.style.pointerEvents='none';delDot.style.width='24px';delDot.style.height='24px';delDot.style.borderRadius='50%';delDot.style.display='flex';delDot.style.alignItems='center';delDot.style.justifyContent='center';delDot.style.background=isSelected?'#ef4444':'#c2410c';delDot.style.color='white';delDot.style.fontSize='15px';delDot.style.lineHeight='1';delDot.style.boxShadow='0 0 0 2px rgba(255,255,255,.85)';delBtn.appendChild(delDot);
-      delBtn.addEventListener('click',function(ev){ev.preventDefault();ev.stopPropagation();ynDeleteAutoIds(grp.ids);});
+      delBtn.addEventListener('click',function(ev){ev.preventDefault();ev.stopPropagation();ynAutoDelAsk(grp.ids);});
       el.appendChild(delBtn);ynKeepBtnInside(delBtn,el,clientLeft+clientW-2,clientTop+2,clientLeft,clientTop,ynVid,ynInfo.color||'#facc15');
       el.addEventListener('click',function(ev){if(ev.target===delBtn) return; ev.preventDefault();ev.stopPropagation();ynToggleAutoGroup(grp.ids);ynSetIdToast({time:ynCurrentFrameTime(),text:'ID:'+grp.id+(grp.ids.length>1?' 他'+(grp.ids.length-1):'')+'（'+ynInfo.clsLabel+' · '+ynInfo.evidence+(ynInfo.cov.total>0?(ynInfo.needed?' · 消すと'+ynInfo.cov.uncovered.toFixed(1)+'秒隠れなくなる':' · 重複'):'')+'）'});});
       overlay.appendChild(el);
