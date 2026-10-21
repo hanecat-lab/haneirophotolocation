@@ -54,5 +54,5 @@ const {blob,stats}=await w.finish();
 
 - `Vlog-Studio.html` と `bokasi.html` も `sw.js` を登録する（Event Flow を開いたことがない端末でも効くように）。
 - 外部の部品は、初めて使った時に保存される。圏外で使う前に、電波の良い所で一度、書き出し・顔検出まで通しておく。
-- `sw.js` は外部の部品とフォントをどう扱ったか（保存した・保存済みを使った・ページが分からず素通し など）を `sw-diag-log-v1` に最新300件まで記録し、`sw-diag.html` に版（`SW_VERSION`）と一緒に表示する。`sw.js` を変えたら `SW_VERSION` も変える。
+- `sw.js` は外部の部品とフォントをどう扱ったか（保存した・保存済みを使った・ページが分からず素通し など）と、ページを開いた操作を `sw-diag-log-v1` に最新300件まで記録し、`sw-diag.html` に版（`SW_VERSION`）と一緒に表示する。`sw.js` を変えたら `SW_VERSION` も変える。
 - 圏外で使いたいページを増やす時は、`sw.js` の `OFFLINE_PAGES`（外部の部品も要るなら `CDN_CLIENT_PAGES` と `CDN_HOSTS`）に足す。
