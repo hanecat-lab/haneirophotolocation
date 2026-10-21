@@ -6997,6 +6997,86 @@ const correctLightPixels=(pixels, light)=>{
   }finally{if(profileToken)vlogExportDrawProfiler?.end(profileToken);}
 };
 
+// 逆再生・ブーメラン：書き出しと同じく、シークしてそのコマが出るまで待つ。
+const vlogSettleVideo=(video,time)=>new Promise(resolve=>{
+  if(!video.seeking && Math.abs(video.currentTime-time)<0.0005 && video.readyState>=2){ resolve(); return; }
+  let done=false;
+  const finish=()=>{ if(done) return; done=true; clearTimeout(timer); video.removeEventListener('seeked',onSeeked); resolve(); };
+  const onSeeked=()=>{
+    if(typeof video.requestVideoFrameCallback==='function'){
+      const fallback=setTimeout(finish,120);
+      try{ video.requestVideoFrameCallback(()=>{ clearTimeout(fallback); finish(); }); }catch{ clearTimeout(fallback); finish(); }
+    }else finish();
+  };
+  const timer=setTimeout(finish,3000);
+  video.addEventListener('seeked',onSeeked);
+  try{ video.currentTime=time; }catch{ finish(); }
+});
+// 作れるエンコーダーを探す。書き出しと同じ H.264 を先に。vp9 は H.264 の無いブラウザ用。
+const vlogPickMotionCodec=async(width,height)=>{
+  if(typeof VideoEncoder!=='function' || typeof VideoFrame!=='function') return null;
+  for(const [codec,mux] of [['avc1.42001f','avc'],['avc1.640028','avc'],['vp09.00.10.08','vp9']]){
+    try{ const r=await VideoEncoder.isConfigSupported({codec,width,height,bitrate:6000000,framerate:30}); if(r?.supported) return {codec,mux}; }catch{}
+  }
+  return null;
+};
+// 出すコマの順番（元のコマの番号）。逆再生は終わり→始め、ブーメランは往復（折り返しで hold コマ止める）。
+const vlogMotionSequence=(n,kind,loops,holdFrames)=>{
+  const seq=[];
+  if(kind==='reverse'){ for(let i=n-1;i>=0;i--) seq.push(i); return seq; }
+  for(let l=0;l<loops;l++){
+    if(l>0) for(let h=0;h<holdFrames;h++) seq.push(0);
+    for(let i=0;i<n;i++) seq.push(i);
+    for(let h=0;h<holdFrames;h++) seq.push(n-1);
+    for(let i=n-2;i>=1;i--) seq.push(i);
+  }
+  seq.push(0);
+  return seq;
+};
+const VLOG_MOTION_LABEL={reverse:'逆再生',boomerang:'ブーメラン'};
+
+// 光を基準に合わせる時に測る、素材の小さな見本（中央80%を48px角に）。
+// 写真は読み込み済みの絵、動画は取り込み時に作った小さな絵を使う（iPhone ではシーク後のコマ取り出しが信用できないため）。
+const vlogLightSample=src=>new Promise(resolve=>{
+  const take=img=>{
+    try{
+      const w=img.naturalWidth||img.width, h=img.naturalHeight||img.height;
+      if(!w||!h){ resolve(null); return; }
+      const c=document.createElement('canvas'); c.width=c.height=48;
+      const g=c.getContext('2d',{willReadFrequently:true});
+      g.drawImage(img,w*0.1,h*0.1,w*0.8,h*0.8,0,0,48,48);
+      resolve(g.getImageData(0,0,48,48));
+    }catch{ resolve(null); }
+  };
+  if(typeof src==='string'){ const img=new Image(); img.onload=()=>take(img); img.onerror=()=>resolve(null); img.src=src; return; }
+  if(src && src.tagName==='IMG'){
+    if(src.complete && src.naturalWidth) take(src);
+    else{ src.addEventListener('load',()=>take(src),{once:true}); src.addEventListener('error',()=>resolve(null),{once:true}); }
+    return;
+  }
+  resolve(null);
+});
+// 見本に光の補正をかけた後の、平均の明るさ（0〜1）と暖かさ（赤−青の平均）。
+const vlogLightStats=(sample,light)=>{
+  const px=new ImageData(new Uint8ClampedArray(sample.data),sample.width,sample.height);
+  if(light && hasLightCorrection(light)) correctLightPixels(px,light);
+  const d=px.data; let luma=0,warm=0,n=0;
+  for(let i=0;i<d.length;i+=4){ if(d[i+3]===0) continue; luma+=(0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2])/255; warm+=d[i]-d[i+2]; n++; }
+  return n?{luma:luma/n,warm:warm/n}:null;
+};
+// 基準の明るさ・暖かさに近づく「明るさ」「色温度」を、実際の補正の式で探す（±40まで）。ほかの補正はそのまま。
+const VLOG_LIGHT_MATCH_LIMIT=40;
+const vlogSolveLightMatch=(sample,target,base={})=>{
+  const L=VLOG_LIGHT_MATCH_LIMIT;
+  const search=(value)=>{ let lo=-L,hi=L; for(let i=0;i<12;i++){ const mid=(lo+hi)/2; if(value(mid)) lo=mid; else hi=mid; } return (lo+hi)/2; };
+  let brightness=0,temperature=0;
+  for(let round=0;round<2;round++){
+    brightness=search(b=>vlogLightStats(sample,{...base,brightness:b,temperature}).luma<target.luma);
+    temperature=search(t=>vlogLightStats(sample,{...base,brightness,temperature:t}).warm<target.warm);
+  }
+  return {brightness:Math.round(brightness),temperature:Math.round(temperature)};
+};
+
 const getClipFilterSettings=(clip,fallbackFilter='none',intensity=100)=>({
   id:clip?._filter || clip?._filterId || fallbackFilter,
   intensity:Math.max(0,Math.min(200,Number.isFinite(clip?._filterIntensity)
@@ -7981,7 +8061,8 @@ const cleanupVlogAssetIds=ids=>{
       const used=new Set();
       e.target.result.forEach(project=>{
         for(const snapshot of [project.snapshot,project.previousSnapshot]){
-          vlogMediaClips(snapshot?.clips||[]).forEach(c=>used.add(c.assetId));
+          // 逆再生・ブーメランにした素材の、元の動画も使用中に数える（ふつうに戻せるように）。
+          vlogMediaClips(snapshot?.clips||[]).forEach(c=>{used.add(c.assetId);if(c._motion?.source?.assetId)used.add(c._motion.source.assetId);});
           (snapshot?.customBgms||[]).forEach(b=>used.add(b.assetId));
         }
       });
@@ -8073,7 +8154,8 @@ const vlogFormatCaptureDate=(ymd,format)=>{
 const vlogValidYmd=(y,mo,d)=>y>=1990 && y<=2100 && mo>=1 && mo<=12 && d>=1 && d<=31
   ? `${String(y).padStart(4,'0')}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}` : null;
 // JPEG の EXIF から DateTimeOriginal（なければ DateTime）を読む。
-const vlogJpegCaptureDate=bytes=>{
+// full=true の時は、撮影日時を「撮影地の時計の数値」（Date.UTC で並べ替え用）で返す。
+const vlogJpegCaptureDate=(bytes,full=false)=>{
   const v=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
   if(v.byteLength<4 || v.getUint16(0)!==0xFFD8) return null;
   let p=2;
@@ -8111,6 +8193,12 @@ const vlogJpegCaptureDate=bytes=>{
       const ifd0=readIfd(u32(4),[0x8769,0x0132]);
       const exif=ifd0[0x8769]!=null ? readIfd(ifd0[0x8769],[0x9003,0x9004]) : {};
       for(const str of [exif[0x9003],exif[0x9004],ifd0[0x0132]]){
+        if(full){
+          const f=/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(str||'');
+          if(f && vlogValidYmd(Number(f[1]),Number(f[2]),Number(f[3])))
+            return Date.UTC(+f[1],+f[2]-1,+f[3],+f[4],+f[5],+f[6]);
+          continue;
+        }
         const m=/^(\d{4}):(\d{2}):(\d{2})/.exec(str||'');
         const ymd=m && vlogValidYmd(Number(m[1]),Number(m[2]),Number(m[3]));
         if(ymd) return ymd;
@@ -8123,7 +8211,7 @@ const vlogJpegCaptureDate=bytes=>{
 };
 // 動画（mov/mp4）の moov から撮影日を読む。Apple の creationdate（撮影地の時刻帯つき文字列）を優先し、
 // なければ mvhd の作成日時（UTC 秒）を端末の時刻帯で暦日にする。
-const vlogMoovCaptureDate=bytes=>{
+const vlogMoovCaptureDate=(bytes,full=false)=>{
   const v=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
   let text='';
   for(let i=0;i<bytes.length;i++) text+=String.fromCharCode(bytes[i]);
@@ -8143,6 +8231,13 @@ const vlogMoovCaptureDate=bytes=>{
       const size=v.getUint32(e);
       if(size<8) break;
       if(v.getUint32(e+4)===index && text.slice(e+12,e+16)==='data'){
+        if(full){
+          // 時刻帯は外し、撮影地の時計の数値で比べる（写真の EXIF と同じ基準）。
+          const f=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/.exec(text.slice(e+24,e+size));
+          if(f && vlogValidYmd(Number(f[1]),Number(f[2]),Number(f[3])))
+            return Date.UTC(+f[1],+f[2]-1,+f[3],+f[4],+f[5],+f[6]);
+          e+=size; continue;
+        }
         const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(text.slice(e+24,e+size));
         const ymd=m && vlogValidYmd(Number(m[1]),Number(m[2]),Number(m[3]));
         if(ymd) return ymd;
@@ -8156,6 +8251,7 @@ const vlogMoovCaptureDate=bytes=>{
     const secs=version===1 ? (at+20<=bytes.length ? v.getUint32(at+8)*4294967296+v.getUint32(at+12) : 0) : v.getUint32(at+8);
     if(secs>0){
       const date=new Date((secs-2082844800)*1000);
+      if(full) return Date.UTC(date.getFullYear(),date.getMonth(),date.getDate(),date.getHours(),date.getMinutes(),date.getSeconds());
       return vlogValidYmd(date.getFullYear(),date.getMonth()+1,date.getDate());
     }
   }
@@ -8175,12 +8271,12 @@ const vlogFindMoov=async blob=>{
   }
   return null;
 };
-const vlogReadCaptureDate=async clip=>{
+const vlogReadCaptureDate=async (clip,full=false)=>{
   if(!clip?.url) return null;
   const blob=await (await fetch(clip.url)).blob();
-  if(clip.type==='photo') return vlogJpegCaptureDate(new Uint8Array(await blob.slice(0,256*1024).arrayBuffer()));
+  if(clip.type==='photo') return vlogJpegCaptureDate(new Uint8Array(await blob.slice(0,256*1024).arrayBuffer()),full);
   const moov=await vlogFindMoov(blob);
-  return moov ? vlogMoovCaptureDate(moov) : null;
+  return moov ? vlogMoovCaptureDate(moov,full) : null;
 };
 
 // 表紙のタイトル。frame=白フチ文字、band=帯、hand=手書き風。改行で最大3行、幅に合わせて縮める。
@@ -8300,6 +8396,15 @@ function drawVlogCaptionFocus(ctx,txt,width,height,options,st){
   ctx.restore();
 }
 
+// 字幕が読み切れる長さの目安：0.5秒＋1秒に5文字（空白は数えない）。
+const vlogTextReadSeconds=txt=>{
+  const n=Array.from(String(txt?.text||'').replace(/\s/g,'')).length;
+  return n ? Math.round((0.5+n/5)*10)/10 : 0;
+};
+const vlogTextTooShort=(txt,start=txt?.start,end=txt?.end)=>{
+  const need=vlogTextReadSeconds(txt);
+  return need>0 && (end-start)+0.05<need;
+};
 // 文字の「見た目」として写す項目。位置（x・y）・時間・中身・くっつく素材は写さない。
 const VLOG_TEXT_STYLE_KEYS=['fontFamily','bold','color','outline','strokeColor','fontSize','bgColor','backgroundMode','bandColor',
   'bandOpacity','textOpacity','letterSpacing','verticalSpacing','vertical','align','anim','flow','flowAmount'];
@@ -8783,6 +8888,21 @@ function getTextCanvasBounds(txt, canvas){
 }
 
 // 並び替えの仮配置と確定は同じ計算を使う。効果は元の隣接関係が残るときだけ保持する。
+function planMaterialOrder(clips,orderedIds){
+  const byId=new Map(clips.map(c=>[c.id,c]));
+  const arranged=orderedIds.map(id=>byId.get(id)).filter(Boolean);
+  if(arranged.length!==clips.length) return null;
+  let removed=0;
+  const items=arranged.map((clip,i)=>{
+    if(!clip._transitionToNext || clip._transitionToNext.type==='none') return clip;
+    const oldIndex=clips.findIndex(c=>c.id===clip.id);
+    if(clips[oldIndex+1]?.id===arranged[i+1]?.id) return clip;
+    removed++;
+    const {_transitionToNext,...rest}=clip;
+    return rest;
+  });
+  return {items,removed};
+}
 function planMaterialMove(clips,clipId,toIndex){
   const fromIndex=clips.findIndex(c=>c.id===clipId);
   if(fromIndex<0 || toIndex<0 || toIndex>=clips.length || fromIndex===toIndex) return null;
@@ -9705,7 +9825,7 @@ function VlogMiddleCutControls({clip,start,end,onChange,plan,sourceAudioVolume,p
   );
 }
 
-function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
+function ReorderMaterials({clips,initialSourceId,onClose,onCommit,onSortByCapture}){
   const [sourceId,setSourceId]=useState(initialSourceId||null);
   const [draftIndex,setDraftIndex]=useState(()=>initialSourceId?clips.findIndex(c=>c.id===initialSourceId):null);
   const [frames,setFrames]=useState({});
@@ -9884,6 +10004,8 @@ function ReorderMaterials({clips,initialSourceId,onClose,onCommit}){
   return React.createElement('div', {className:'fixed inset-0 z-[1100] bg-[#0a0a0b] text-white flex flex-col',role:'dialog','aria-modal':true,'aria-label':'素材の並び順を変更'},
     React.createElement('div', {className:'shrink-0 px-4 py-3 border-b border-white/15 flex items-center gap-3'},
       React.createElement('div',{className:'font-bold text-sm flex-1'},'素材の順番を変える'),
+      !source && onSortByCapture && clips.length>1 && React.createElement('button',{type:'button',onClick:()=>{cancelTrial();onSortByCapture();},
+        className:'px-3 py-2 rounded-full border border-violet-300/50 bg-violet-500/20 text-xs font-bold'},'撮影した順にする'),
       React.createElement('button',{type:'button',onClick:()=>{cancelTrial();onClose();},className:'px-3 py-2 rounded-full bg-white/10 text-xs'},plan?'取り消して閉じる':'閉じる')),
     React.createElement('div',{className:'shrink-0 px-4 py-2 bg-violet-500/10 border-b border-violet-400/20 text-xs'},
       source ? React.createElement(React.Fragment,null,
@@ -10256,9 +10378,12 @@ const makeVlogSplitScene=(children,id)=>{
 };
 const serializeVlogClip=clip=>{
   const {url,...saved}=clip;
+  // 逆再生・ブーメランの元の動画は、ID だけを保存する（blob の URL は保存しない）。
+  if(saved._motion?.source){ const {url:_sourceUrl,...source}=saved._motion.source; saved._motion={...saved._motion,source}; }
   return {...saved,assetId:clip.assetId||clip._parentId||clip.id,
     ...(clip._splitScreen?{_splitScreen:{...clip._splitScreen,clips:clip._splitScreen.clips.map(serializeVlogClip)}}:{})};
 };
+const vlogMotionSourceIds=snapshot=>vlogMediaClips(snapshot?.clips||[]).map(c=>c._motion?.source?.assetId).filter(Boolean);
 const hydrateVlogClip=(clip,urls)=>({...clip,url:urls.get(clip.assetId),
   ...(clip._splitScreen?{_splitScreen:{...clip._splitScreen,clips:clip._splitScreen.clips.map(child=>hydrateVlogClip(child,urls))}}:{})});
 // この版で映像準備後に作った小さいJPEGだけを保存・復元する。
@@ -11073,6 +11198,7 @@ function App(){
   const [selectedLightControl, setSelectedLightControl] = useState('brightness');
   const [lightCompareHeld, setLightCompareHeld] = useState(false);
   const [lightReference, setLightReference] = useState(null);
+  const [lightMatchNote, setLightMatchNote] = useState('');
   const [lightReferenceHeld, setLightReferenceHeld] = useState(false);
   const peakingCanvasRef = useRef(null);
   const zebraCanvasRef = useRef(null);
@@ -12087,6 +12213,11 @@ function App(){
   const fogTextureCacheRef = useRef(new Map());
   const [fogLengthPickerId, setFogLengthPickerId] = useState(null);
   const [speedPickerId, setSpeedPickerId] = useState(null);
+  // 逆再生・ブーメラン：設定の欄を開いている素材、選んでいる設定、作っている最中の状態。
+  const [motionPickerId, setMotionPickerId] = useState(null);
+  const [motionOpts, setMotionOpts] = useState({kind:'boomerang',loops:2,cap:3,hold:0,speed:1.5});
+  const [motionJob, setMotionJob] = useState(null);
+  const motionCancelRef = useRef(false);
   const [speedPickerPos, setSpeedPickerPos] = useState({x:0,y:0});
   const fogLongPressTimerRef = useRef(null);
   const fogLongPressFiredRef = useRef(false);
@@ -18320,6 +18451,149 @@ const recomputeStarts=(arr)=>{
   }); 
 };
 
+  // 素材の元の動画（逆再生・ブーメランにした素材なら、その元）の URL と範囲。
+  const motionInputOf=async(clip)=>{
+    const src=clip._motion?.source;
+    if(!src) return {url:clip.url,trimStart:clip.trimStart||0,span:(clip.duration||0)*vlogClipSourceRate(clip),name:clip.name};
+    let url=src.url;
+    if(!url){
+      const stored=await readVlogAssets([src.assetId]);
+      const blob=stored.get(src.assetId)?.blob;
+      if(!blob) return null;
+      url=URL.createObjectURL(blob);
+      src.url=url;
+    }
+    return {url,trimStart:src.trimStart||0,span:(src.duration||0)*(Number(src._playbackRate)||1),name:src.name};
+  };
+  const loadMotionVideo=(url,preload='auto')=>new Promise(resolve=>{
+    const v=document.createElement('video');
+    v.muted=true; v.playsInline=true; v.preload=preload;
+    v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
+    let done=false; const fin=ok=>{ if(done) return; done=true; resolve(ok?v:null); };
+    v.addEventListener(preload==='auto'?'loadeddata':'loadedmetadata',()=>fin(true),{once:true});
+    v.addEventListener('error',()=>fin(false),{once:true});
+    setTimeout(()=>fin(v.readyState>=1),8000);
+    v.src=url;
+  });
+  // 素材を入れ替える（id が変わる）。くっついた文字・選択も付け替え、「戻す」1回分にする。
+  const swapClipForMotion=(oldId,nextClip,label)=>{
+    const before=editSnapshot();
+    handleStop();
+    const nextClips=recomputeStarts(clipsRef.current.map(c=>c.id===oldId?nextClip:c));
+    clipsRef.current=nextClips; setClips(nextClips);
+    const nextTexts=textsRef.current.map(t=>t._clipId===oldId?{...t,_clipId:nextClip.id}:t);
+    textsRef.current=nextTexts; setTexts(nextTexts);
+    setSelectedClipIds(prev=>prev.map(id=>id===oldId?nextClip.id:id));
+    setFocusedClipId(prev=>prev===oldId?nextClip.id:prev);
+    setSelectedTimelineItem(prev=>prev?.type==='clip'&&prev.id===oldId?{type:'clip',id:nextClip.id}:prev);
+    setMotionPickerId(prev=>prev===oldId?nextClip.id:prev);
+    const end=Math.max(...nextClips.map(c=>c.timelineStart+c.duration));
+    durationRef.current=end; setDuration(end);
+    timeRef.current=Math.min(timeRef.current,Math.max(0,end-0.01)); setCurrentTime(timeRef.current);
+    recordEdit(before,{allowIdentityChange:true,label});
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
+  const bakeClipMotion=async(clipId,opts)=>{
+    const clip=clipsRef.current.find(c=>c.id===clipId);
+    if(!clip || clip.type!=='video' || clip._splitScreen) return;
+    if(clip._cutGroupId || clip._splitGroupId){ setMotionJob({clipId,error:'切り分けた素材には使えません。'}); return; }
+    if(exportJobRef.current){ setMotionJob({clipId,error:'書き出しが終わってから作ってください。'}); return; }
+    const {kind,loops,hold,speed}=opts;
+    const cap=kind==='reverse'?10:opts.cap;
+    motionCancelRef.current=false;
+    setMotionJob({clipId,progress:0});
+    let work=null;
+    try{
+      const input=await motionInputOf(clip);
+      if(!input) throw new Error('元の動画が見つかりません。');
+      work=await loadMotionVideo(input.url);
+      if(!work || !work.videoWidth) throw new Error('動画を読み込めませんでした。');
+      const fps=30;
+      const srcStart=Math.max(0,input.trimStart);
+      const srcEnd=Math.min(Number.isFinite(work.duration)?work.duration:Infinity,srcStart+input.span);
+      const span=Math.min(cap,Math.max(0.2,srcEnd-srcStart));
+      const truncated=srcEnd-srcStart>cap+0.05;
+      const n=Math.max(2,Math.round(span*fps));
+      const seq=vlogMotionSequence(n,kind,loops,Math.round((hold||0)*fps));
+      const scale=Math.min(1,1080/Math.max(work.videoWidth,work.videoHeight));
+      const width=Math.max(2,Math.round(work.videoWidth*scale/2)*2), height=Math.max(2,Math.round(work.videoHeight*scale/2)*2);
+      const picked=await vlogPickMotionCodec(width,height);
+      if(!picked) throw new Error('この端末では動画を作れません。');
+      let muxerModule;
+      try{ muxerModule=await import('https://esm.sh/mp4-muxer@5.1.3'); }
+      catch{ throw new Error('動画を作る部品を読み込めませんでした。通信を確認してください。'); }
+      const {Muxer,ArrayBufferTarget}=muxerModule;
+      const target=new ArrayBufferTarget();
+      const muxer=new Muxer({target,fastStart:'in-memory',firstTimestampBehavior:'offset',
+        video:{codec:picked.mux,width,height,frameRate:fps}});
+      let encoderError=null;
+      const encoder=new VideoEncoder({output:(chunk,meta)=>muxer.addVideoChunk(chunk,meta),error:e=>{encoderError=e;}});
+      encoder.configure({codec:picked.codec,width,height,bitrate:6000000,framerate:fps,...(picked.mux==='avc'?{avc:{format:'avc'}}:{})});
+      const canvas=document.createElement('canvas'); canvas.width=width; canvas.height=height;
+      const ctx=canvas.getContext('2d');
+      let shown=-1;
+      for(let k=0;k<seq.length;k++){
+        if(motionCancelRef.current) throw new Error('やめました。');
+        if(encoderError) throw new Error(`動画を作れませんでした（${encoderError?.message||'エンコード'}）。`);
+        if(seq[k]!==shown){
+          await vlogSettleVideo(work,Math.min(srcEnd-0.001,srcStart+seq[k]/fps));
+          ctx.drawImage(work,0,0,width,height);
+          shown=seq[k];
+        }
+        const frame=new VideoFrame(canvas,{timestamp:Math.round(k*1e6/fps),duration:Math.round(1e6/fps)});
+        encoder.encode(frame,{keyFrame:k%(fps*2)===0});
+        frame.close();
+        while(encoder.encodeQueueSize>4) await new Promise(r=>setTimeout(r,4));
+        if(k%3===0) setMotionJob({clipId,progress:Math.round(k/seq.length*100)});
+      }
+      await encoder.flush(); encoder.close();
+      if(encoderError) throw new Error('動画を作れませんでした。');
+      muxer.finalize();
+      const label=VLOG_MOTION_LABEL[kind];
+      const file=new File([target.buffer],`${String(input.name||'video').replace(/\.[^/.]+$/,'')}-${label}.mp4`,{type:'video/mp4'});
+      const newId=`${Date.now()}-${Math.random().toString(36).slice(2,9)}-${Math.random().toString(36).slice(2,6)}`;
+      if(projectIdRef.current){
+        try{ await storeProjectAsset(newId,file); }
+        catch(error){ throw new Error(`作った動画を端末に保存できませんでした。${vlogStorageMessage(error)}`); }
+      }
+      const url=URL.createObjectURL(file);
+      // 最初のコマまで読み込んでから差し替える（読み込み前だとプレビューが空になる）。
+      const video=await loadMotionVideo(url,'auto');
+      if(!video) throw new Error('作った動画を読み込めませんでした。');
+      videoRefs.current.set(newId,video);
+      const current=clipsRef.current.find(c=>c.id===clipId);
+      if(!current) throw new Error('素材が見つかりません。');
+      const source=current._motion?.source||{id:current.id,assetId:current.assetId||current.id,url:current.url,name:current.name,
+        trimStart:current.trimStart||0,duration:current.duration,_sourceDuration:current._sourceDuration,
+        _playbackRate:current._playbackRate,_finderMarks:current._finderMarks};
+      const {_finderMarks,_motion,...rest}=current;
+      const baked=seq.length/fps;
+      swapClipForMotion(clipId,{...rest,id:newId,assetId:newId,url,name:file.name,trimStart:0,_sourceDuration:baked,
+        _playbackRate:speed,duration:baked/speed,_motion:{kind,loops,cap,hold,speed,source}},`${label}にする`);
+      setMotionJob({clipId:newId,done:true,note:truncated?`使う範囲が長いので、最初の${cap}秒で作りました。`:''});
+    }catch(error){
+      setMotionJob({clipId,error:error?.message||'作れませんでした。'});
+    }finally{
+      if(work){ try{ work.removeAttribute('src'); work.load(); }catch{} }
+    }
+  };
+  const restoreClipMotion=async(clipId)=>{
+    const clip=clipsRef.current.find(c=>c.id===clipId);
+    const src=clip?._motion?.source;
+    if(!src) return;
+    const input=await motionInputOf(clip);
+    if(!input){ setMotionJob({clipId,error:'元の動画が見つかりません。'}); return; }
+    if(!videoRefs.current.get(src.id)){
+      const video=await loadMotionVideo(input.url,'auto');
+      if(!video){ setMotionJob({clipId,error:'元の動画を読み込めませんでした。'}); return; }
+      videoRefs.current.set(src.id,video);
+    }
+    const {_motion,...rest}=clip;
+    const restored={...rest,id:src.id,assetId:src.assetId,url:input.url,name:src.name,trimStart:src.trimStart||0,duration:src.duration};
+    for(const key of ['_sourceDuration','_playbackRate','_finderMarks']){ if(src[key]===undefined) delete restored[key]; else restored[key]=src[key]; }
+    swapClipForMotion(clipId,restored,'ふつうに戻す');
+    setMotionJob(null);
+  };
   const setClipPlaybackRate = (clipId, newRate) => {
     setClips(prev=>{
       const newClips = prev.map(c=>{
@@ -18493,7 +18767,7 @@ const recomputeStarts=(arr)=>{
           setProjectStatus('保存済み');setProjectLastSaved(saved.updatedAt);setProjectError('');
         }
       }
-      const oldIds=projectAssetIds(saved.cleanupSnapshot);
+      const oldIds=[...projectAssetIds(saved.cleanupSnapshot),...vlogMotionSourceIds(saved.cleanupSnapshot)];
       cleanupVlogAssetIds(oldIds).catch(()=>{});
       return true;
     });
@@ -18856,7 +19130,8 @@ const recomputeStarts=(arr)=>{
     try{
       const old=await readVlogProject(id);
       await deleteVlogProject(id);
-      await cleanupVlogAssetIds([...projectAssetIds(old?.snapshot),...projectAssetIds(old?.previousSnapshot)]);
+      await cleanupVlogAssetIds([...projectAssetIds(old?.snapshot),...projectAssetIds(old?.previousSnapshot),
+        ...vlogMotionSourceIds(old?.snapshot),...vlogMotionSourceIds(old?.previousSnapshot)]);
       await refreshProjectList();
     }
     catch(error){setProjectError(error?.message||'削除できませんでした。');}
@@ -18887,7 +19162,8 @@ const recomputeStarts=(arr)=>{
       for(const id of targets){
         const old=await readVlogProject(id);
         await deleteVlogProject(id);
-        assetIds.push(...projectAssetIds(old?.snapshot),...projectAssetIds(old?.previousSnapshot));
+        assetIds.push(...projectAssetIds(old?.snapshot),...projectAssetIds(old?.previousSnapshot),
+          ...vlogMotionSourceIds(old?.snapshot),...vlogMotionSourceIds(old?.previousSnapshot));
       }
       setProjectBulkIds(null);
     }
@@ -19407,6 +19683,37 @@ const recomputeStarts=(arr)=>{
     setLightCompareHeld(held);
     requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
+  // ほかの素材の光を、基準にした素材の見た目（その素材の補正込み）に合わせる。「戻す」1回分。
+  const matchLightToReference=async(onlySelected=false)=>{
+    const ref=lightReference && clipsRef.current.find(c=>c.id===lightReference.clipId);
+    if(!ref) return;
+    const sourceOf=clip=>clip._splitScreen ? null
+      : clip.type==='photo' ? photoRefs.current.get(clip.id)
+      : (typeof materialThumbnailsRef.current[clip.id]==='string' ? materialThumbnailsRef.current[clip.id] : null);
+    setLightMatchNote('光を測っています…');
+    const refSample=await vlogLightSample(sourceOf(ref));
+    const target=refSample && vlogLightStats(refSample,ref._light);
+    if(!target){ setLightMatchNote('基準の素材の光を測れませんでした。'); return; }
+    const pool=clipsRef.current.filter(c=>c.id!==ref.id && (!onlySelected || selectedClipIds.includes(c.id)));
+    const results=new Map(); let skipped=0, capped=0;
+    for(const clip of pool){
+      const sample=await vlogLightSample(sourceOf(clip));
+      if(!sample){ skipped++; continue; }
+      const {brightness:_b,temperature:_t,...base}=clip._light||{};
+      const solved=vlogSolveLightMatch(sample,target,base);
+      if(Math.abs(solved.brightness)>=VLOG_LIGHT_MATCH_LIMIT || Math.abs(solved.temperature)>=VLOG_LIGHT_MATCH_LIMIT) capped++;
+      results.set(clip.id,solved);
+    }
+    if(!results.size){ setLightMatchNote(`合わせられる素材がありませんでした。${skipped?`（${skipped}件は光を測れませんでした）`:''}`); return; }
+    const before=editSnapshot();
+    const next=clipsRef.current.map(clip=>results.has(clip.id) ? {...clip,_light:{...(clip._light||{}),...results.get(clip.id)}} : clip);
+    clipsRef.current=next; setClips(next);
+    recordEdit(before,{label:'光を基準に合わせる'});
+    setLightMatchNote(`${results.size}件の素材を、基準の光に合わせました。`+
+      (capped?` ${capped}件は差が大きく、補正の上限（±${VLOG_LIGHT_MATCH_LIMIT}）まで合わせました。`:'')+
+      (skipped?` ${skipped}件は光を測れず、そのままです。`:''));
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
   const captureLightReference=()=>{
     const clip=clipsRef.current.find(c=>timeRef.current>=c.timelineStart && timeRef.current<c.timelineStart+c.duration);
     const canvas=canvasRef.current;
@@ -19416,6 +19723,43 @@ const recomputeStarts=(arr)=>{
       setLightReference({clipId:clip.id,name:clip.name,localTime:Math.max(0,timeRef.current-clip.timelineStart),image:canvas.toDataURL('image/png')});
       setLightReferenceHeld(false);
     }catch{}
+  };
+  // 撮影した順に並べる。時刻が読めない素材（スクショ・保存画像など）は、元の順のまま最後に回す。
+  const captureTimeCacheRef=useRef(new Map());
+  const sortClipsByCapture=async()=>{
+    const old=clipsRef.current;
+    if(old.length<2) return;
+    setEditNotice('撮影した時刻を読んでいます…');
+    const times=new Map();
+    for(const clip of old){
+      const media=clip._splitScreen?.clips?.[0]||clip;
+      const key=`${media.id}|${media.url}`;
+      let at=captureTimeCacheRef.current.get(key);
+      if(at===undefined){
+        try{ at=await vlogReadCaptureDate(media,true); }catch{ at=null; }
+        captureTimeCacheRef.current.set(key,Number.isFinite(at)?at:null);
+      }
+      times.set(clip.id,Number.isFinite(at)?at:null);
+    }
+    if(clipsRef.current!==old){ setEditNotice('並べ替えの途中で素材が変わったので、やめました。'); return; }
+    const known=old.filter(c=>times.get(c.id)!=null), unknown=old.filter(c=>times.get(c.id)==null);
+    // 時刻が同じ素材（切り分けた動画など）は元の順を保つ。
+    const ordered=[...known].sort((a,b)=>times.get(a.id)-times.get(b.id) || old.indexOf(a)-old.indexOf(b)).concat(unknown);
+    const unknownNote=unknown.length?` 撮影時刻が分からない${unknown.length}件は最後に置きました。`:'';
+    if(!known.length){ setEditNotice('撮影した時刻が読める素材がありませんでした。'); return; }
+    if(ordered.every((c,i)=>c.id===old[i].id)){ setEditNotice(`もう撮影した順に並んでいます。${unknownNote}`); return; }
+    const plan=planMaterialOrder(old,ordered.map(c=>c.id));
+    if(!plan) return;
+    const before=editSnapshot();
+    handleStop();
+    const next=recomputeStarts(plan.items);
+    clipsRef.current=next; setClips(next);
+    const end=Math.max(...next.map(c=>c.timelineStart+c.duration));
+    durationRef.current=end; setDuration(end);
+    timeRef.current=0; setCurrentTime(0);
+    recordEdit(before,{label:'撮影した順に並べる'});
+    setEditNotice(`撮影した順に並べました。${unknownNote}${plan.removed?` 隣が変わったつなぎ目の効果${plan.removed}件を外しました。`:''}`);
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
   const reorderMaterial=(clipId,toIndex)=>{
     const old=clipsRef.current;
@@ -22934,7 +23278,8 @@ const recomputeStarts=(arr)=>{
     reorderOpen && React.createElement(ReorderMaterials,{
       clips,initialSourceId:reorderInitialId,
       onClose:()=>{setReorderOpen(false);setReorderInitialId(null);},
-      onCommit:reorderMaterial
+      onCommit:reorderMaterial,
+      onSortByCapture:()=>{setReorderOpen(false);setReorderInitialId(null);sortClipsByCapture();}
     }),
     exportChoiceOpen && React.createElement('div', {className:'camera-export-dialog fixed inset-0 z-[1000] bg-black/75 flex items-center justify-center p-5', role:'dialog', 'aria-modal':'true', 'aria-label':'書き出す素材の選択'},
       React.createElement('div', {className:'camera-export-panel w-full max-w-sm max-h-[88dvh] overflow-y-auto rounded-2xl bg-[#17171a] border border-white/20 p-5 shadow-2xl'},
@@ -23722,6 +24067,14 @@ const recomputeStarts=(arr)=>{
               'aria-pressed':lightReferenceHeld
             }, lightReferenceHeld?'基準表示中':'基準を見る')
           ),
+          // 基準の光に、ほかの素材の明るさと色温度を合わせる。
+          lightReference && React.createElement('div',{className:'flex flex-wrap gap-1.5 mt-2'},
+            React.createElement('button',{type:'button',onClick:e=>{e.stopPropagation();matchLightToReference(false);},
+              'aria-label':'ほかの全部の素材を、基準の光に合わせる'},'全部を基準に合わせる'),
+            selectedClipIds.some(id=>id!==lightReference.clipId) && React.createElement('button',{type:'button',
+              onClick:e=>{e.stopPropagation();matchLightToReference(true);},
+              'aria-label':'選んだ素材だけ、基準の光に合わせる'},`選んだ${selectedClipIds.filter(id=>id!==lightReference.clipId).length}件だけ`)),
+          lightMatchNote && React.createElement('div',{role:'status',className:'text-[10px] text-white/70 mt-1'},lightMatchNote),
           React.createElement('div',{className:'text-[10px] text-white/45 mt-1'},'白く潰れた部分の細部は戻せません。')
         )
       ),
@@ -24811,6 +25164,15 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   className:`px-3 py-1.5 rounded-full border-2 text-[11px] font-bold min-w-[64px] min-h-[32px] touch-manipulation ${(c._playbackRate||1)!==1 ? 'bg-amber-500/30 border-amber-400 text-amber-100 shadow-[0_0_8px_rgba(251,191,36,0.4)]' : 'bg-white/15 border-white/30 text-white/80 hover:bg-white/25'}`,
                   title: (c._playbackRate||1)===1 ? 'タップで速度を変更' : `速度 ${(c._playbackRate||1)}x`
                 }, `${(c._playbackRate||1)>1?'🐇':'🐢'}${(c._playbackRate||1)}x`),
+                // 逆再生・ブーメラン（作った後は印が変わる）。
+                !isPhoto && !c._splitScreen && React.createElement('button', {
+                  type:'button',
+                  onClick:(e)=>{ e.stopPropagation(); setMotionPickerId(motionPickerId===c.id?null:c.id);
+                    // 作っている最中でなければ、前の結果の知らせは消す。
+                    if(motionJob && !(Number.isFinite(motionJob.progress)&&!motionJob.done&&!motionJob.error)) setMotionJob(null); },
+                  className:`h-8 inline-flex items-center px-3 rounded-full border text-[10px] font-bold ${c._motion?'border-sky-300 bg-sky-400/25 text-sky-50':'border-white/25 bg-white/10 text-white/85'}`,
+                  'aria-label':`${c.name}を逆再生・ブーメランにする`,'aria-expanded':motionPickerId===c.id
+                }, c._motion ? (c._motion.kind==='reverse'?'↺ 逆再生':'⇆ ブーメラン') : '⇆ 往復'),
                 // ポラに差し込む: 写真を選ぶとすぐ素材の真ん中に入る。
                 (()=>{
                   const room=3-(c._snapshots||[]).length;
@@ -24897,6 +25259,49 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     : React.createElement('div',{className:'text-[10px] text-white/55 mt-2'},audioScene._splitScreen?'音声は「なし」です。分割素材を選ぶと調整できます。':'写真には音声がありません。'),
                   sourceAudioVolume===0 && audioTarget && React.createElement('div',{className:'text-[9px] text-white/55 mt-1'},'全体の素材音量が0%のため、個別設定に関係なく無音'),
                   React.createElement('div',{className:'text-[9px] text-white/40 mt-1'},'全体の素材音量 × 個別音量'));
+              })(),
+              motionPickerId===c.id && (()=>{
+                const o=motionOpts;
+                const job=motionJob && (motionJob.clipId===c.id) ? motionJob : null;
+                const working=job && Number.isFinite(job.progress) && !job.done && !job.error;
+                const anyWorking=motionJob && Number.isFinite(motionJob.progress) && !motionJob.done && !motionJob.error;
+                const pick=(key,value,label)=>React.createElement('button',{key:String(value),type:'button',disabled:anyWorking,
+                  onClick:e=>{e.stopPropagation();setMotionOpts(prev=>({...prev,[key]:value}));},'aria-pressed':o[key]===value,
+                  className:`min-h-9 px-3 rounded-full text-[11px] font-bold disabled:opacity-40 ${o[key]===value?'bg-sky-400 text-black':'bg-white/10 text-white/75'}`},label);
+                const row=(title,children)=>React.createElement('div',{className:'flex items-center gap-1.5 mt-2 flex-wrap'},
+                  React.createElement('span',{className:'w-16 shrink-0 text-[10px] text-white/55'},title),...children);
+                const blocked=c._cutGroupId||c._splitGroupId;
+                return React.createElement('div', {
+                  className:'camera-detail-panel self-start ml-2 mt-2 w-full max-w-[360px] rounded-2xl border border-sky-400/30 bg-[#1a1a1c] p-3 shadow-xl',
+                  onClick:e=>e.stopPropagation()},
+                  React.createElement('div',{className:'text-[11px] font-bold text-sky-100'},'⇆ 逆再生・ブーメラン'),
+                  c._motion && React.createElement('div',{className:'text-[10px] text-white/60 mt-1'},
+                    `いまの動き：${VLOG_MOTION_LABEL[c._motion.kind]}${c._motion.kind==='boomerang'?` ${c._motion.loops}往復`:''}・${c._motion.speed}倍`),
+                  blocked ? React.createElement('div',{className:'text-[10px] text-amber-200 mt-2'},'切り分けた素材には使えません。')
+                  : React.createElement(React.Fragment,null,
+                    row('種類',[pick('kind','boomerang','ブーメラン'),pick('kind','reverse','逆再生')]),
+                    o.kind==='boomerang' && row('往復',[1,2,3].map(n=>pick('loops',n,`${n}回`))),
+                    o.kind==='boomerang' && row('使う長さ',[2,3,5].map(n=>pick('cap',n,`${n}秒まで`))),
+                    o.kind==='boomerang' && row('折り返し',[pick('hold',0,'ためなし'),pick('hold',0.1,'0.1秒ため')]),
+                    row('速度',[1,1.5,2].map(n=>pick('speed',n,`${n}倍`))),
+                    React.createElement('div',{className:'text-[10px] text-white/45 mt-2'},
+                      o.kind==='reverse'?'使う範囲（10秒まで）を、終わりから始めへ再生する動画を作ります。音は入りません。'
+                        :'使う範囲の始めから、往復する動画を作ります。音は入りません。'),
+                    working
+                      ? React.createElement('div',{className:'flex items-center gap-2 mt-2'},
+                          React.createElement('div',{role:'status',className:'flex-1 text-[11px] text-sky-100'},`作っています ${job.progress}%`),
+                          React.createElement('button',{type:'button',onClick:e=>{e.stopPropagation();motionCancelRef.current=true;},
+                            className:'min-h-9 px-3 rounded-full bg-white/10 text-[11px]'},'やめる'))
+                      : React.createElement('div',{className:'flex gap-2 mt-2'},
+                          React.createElement('button',{type:'button',disabled:anyWorking,onClick:e=>{e.stopPropagation();bakeClipMotion(c.id,motionOpts);},
+                            className:'flex-1 min-h-10 rounded-full bg-sky-400 text-black text-[11px] font-bold disabled:opacity-40'},c._motion?'作り直す':'作る'),
+                          c._motion && React.createElement('button',{type:'button',disabled:anyWorking,onClick:e=>{e.stopPropagation();restoreClipMotion(c.id);},
+                            className:'flex-1 min-h-10 rounded-full bg-white/10 text-[11px] disabled:opacity-40'},'ふつうに戻す'))),
+                  job?.error && React.createElement('div',{role:'status',className:'text-[10px] text-amber-200 mt-2'},job.error),
+                  job?.done && React.createElement('div',{role:'status',className:'text-[10px] text-sky-100 mt-2'},
+                    `${VLOG_MOTION_LABEL[c._motion?.kind]||''}にしました。「戻す」か「ふつうに戻す」で元に戻せます。${job.note?` ${job.note}`:''}`),
+                  React.createElement('button',{type:'button',onClick:e=>{e.stopPropagation();setMotionPickerId(null);},
+                    className:'w-full mt-2 min-h-8 rounded-full bg-white/10 text-[10px]'},'閉じる'));
               })(),
               speedPickerId===c.id && React.createElement('div', {
                 className:'camera-detail-panel self-start ml-2 mt-2 w-full max-w-[360px] rounded-2xl border border-amber-500/30 bg-[#1a1a1c] p-3 shadow-xl',
@@ -26547,6 +26952,17 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                 `${draft.start.toFixed(1)}秒〜${draft.end.toFixed(1)}秒（${(draft.end-draft.start).toFixed(1)}秒間）`),
               React.createElement('div',{className:'text-[10px] text-white/60 text-center mt-1 mb-3 truncate'},
                 owner?`${owner.name} にくっつく`:'動画全体の時間に固定'),
+              // 読み切れる長さの目安。足りない時だけ、1タップで目安の長さにする。
+              (()=>{
+                const need=vlogTextReadSeconds(source);
+                if(!need) return null;
+                const short=vlogTextTooShort(source,draft.start,draft.end);
+                const end=Math.min(duration,draft.start+need), start=Math.max(0,end-need);
+                return React.createElement('div',{role:'status',className:`flex items-center justify-center gap-2 -mt-1 mb-3 text-[11px] ${short?'text-amber-200':'text-white/50'}`},
+                  React.createElement('span',null,`${short?'⚠ ':''}読み切るには約${need.toFixed(1)}秒`),
+                  short && React.createElement('button',{type:'button',onClick:()=>applyTextRange(source.id,start,end),
+                    className:'min-h-9 rounded-full border border-amber-200/50 px-3 text-[11px] font-bold'},`${need.toFixed(1)}秒にする`));
+              })(),
               React.createElement(TimeRangeBand,{scopeKey:`text-${source.id}`,start:draft.start,end:draft.end,
                 min:0,max:duration,minSpan:0.2,label:'文字の表示範囲',segments,snapPoints,
                 onFocusChange:kind=>setTextRangeEdge({textId:source.id,edge:kind}),
@@ -27394,7 +27810,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                     'data-timeline-text-id':t.id,
                     className:`absolute top-1 bottom-1 rounded border text-[9px] flex items-center ${selected?'bg-yellow-500/60 timeline-text-selected z-10':'bg-yellow-500/30 border-yellow-500 overflow-hidden'}`,
                     style:{left:`${left}px`, width:`${width}px`},
-                    title:`${(t.text||t.content||'')} ${t.start.toFixed(1)}s-${t.end.toFixed(1)}s`,
+                    title:`${(t.text||t.content||'')} ${t.start.toFixed(1)}s-${t.end.toFixed(1)}s${vlogTextTooShort(t)?`（読み切るには約${vlogTextReadSeconds(t).toFixed(1)}秒）`:''}`,
                     onClick:e=>{
                       e.stopPropagation();
                       if(performance.now()<suppressTextBarClickRef.current) return;
@@ -27417,7 +27833,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
                       onClick:selected ? e=>e.stopPropagation() : undefined,
                       className:`flex-1 min-w-0 truncate px-1 flex items-center ${selected?'touch-none cursor-grab':''}`,
                       role:selected?'button':undefined,'aria-label':selected?`${(t.text||t.content||'')}を移動`:undefined
-                    },(t.text||'').slice(0,14)),
+                    },vlogTextTooShort(t)&&React.createElement('span',{className:'shrink-0 mr-0.5','aria-label':'表示時間が短く、読み切れないかもしれません'},'⚠'),(t.text||'').slice(0,14)),
                     showHandles && React.createElement('div', {
                       onPointerDown:e=>handleTextPointerDown(e,t.id,'right'), onClick:e=>e.stopPropagation(),
                       className:`${handleClass} w-8 ${narrow?'absolute -right-8 top-0 bottom-0 rounded-r border border-white':''}`,
