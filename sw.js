@@ -1,6 +1,6 @@
 const CACHE_NAME='event-flow-shell-v2';
 // 実機でどの版の sw.js が動いているかを sw-diag.html で見分けるための印。sw.js を変えたら更新する。
-const SW_VERSION='2026-10-21-log';
+const SW_VERSION='2026-10-21-log2';
 // 外部の部品とフォントをどう扱ったかの記録（sw-diag.html に表示する）。
 const LOG_CACHE='sw-diag-log-v1';
 const LOG_KEY=new URL('./__sw-diag-log.json',self.location.href).href;
@@ -27,14 +27,17 @@ function loadLog(){
   })();
   return diagLog;
 }
+// 書き込みは1件ずつ順に行う（同時に書くと、古い内容の書き込みが後から終わって記録が欠けるため）。
+let logChain=Promise.resolve();
 function writeLog(event,entry){
-  const done=(async()=>{
+  const record={at:new Date().toISOString(),v:SW_VERSION,...entry};
+  logChain=logChain.then(async()=>{
     const log=await loadLog();
-    log.push({at:new Date().toISOString(),v:SW_VERSION,...entry});
+    log.push(record);
     if(log.length>LOG_LIMIT)log.splice(0,log.length-LOG_LIMIT);
     await (await caches.open(LOG_CACHE)).put(LOG_KEY,new Response(JSON.stringify(log),{headers:{'content-type':'application/json'}}));
-  })().catch(()=>{});
-  event.waitUntil(done);
+  }).catch(()=>{});
+  event.waitUntil(logChain);
 }
 const requestInfo=event=>({url:event.request.url,dest:event.request.destination||'',mode:event.request.mode,client:!!event.clientId});
 
@@ -103,6 +106,8 @@ self.addEventListener('fetch',event=>{
   if(request.method!=='GET')return;
   const url=new URL(request.url);
   if(url.origin===self.location.origin){
+    // ページを開いた操作がこの版の sw.js に届いたかを記録する。
+    if(request.mode==='navigate')writeLog(event,{kind:'page',url:request.url});
     if(KEEP_PATHS.has(url.pathname))event.respondWith(pageResponse(event,url));
     return;
   }
