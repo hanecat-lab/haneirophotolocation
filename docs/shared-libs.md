@@ -49,6 +49,7 @@ const {blob,stats}=await w.finish();
 |---|---|---|
 | Event Flow（`./`・`index.html`・`event.html`・アイコン・manifest）、`Vlog-Studio.html`、`bokasi.html` | `event-flow-shell-v2`。? 以降は無視して1件 | まずネット。3秒で返らなければ保存してある版を出し、ネットの分は裏で受け取って保存する |
 | Vlog-Studio と bokasi が読み込む外部の部品（esm.sh・jsdelivr・Google Fonts・tailwind・storage.googleapis.com・tfhub.dev・kaggle） | `offline-cdn-v1` | 保存してある版を先に使う |
+| Google Fonts のフォント本体（fonts.gstatic.com） | `offline-cdn-v1` | 保存してある版を先に使う。iPhone では読み込んだページが分からないことがあるため、ページに関係なく保存する（ほかのアプリのフォントも入る） |
 | ほかのアプリのファイル | 保存しない | `sw.js` は関わらない |
 
 - `Vlog-Studio.html` と `bokasi.html` も `sw.js` を登録する（Event Flow を開いたことがない端末でも効くように）。

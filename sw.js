@@ -51,6 +51,10 @@ async function pageResponse(event,url){
 async function cdnResponse(event){
   const client=event.clientId?await self.clients.get(event.clientId):null;
   if(!client||!CDN_CLIENT_PATHS.has(new URL(client.url).pathname))return fetch(event.request);
+  return cacheFirst(event);
+}
+
+async function cacheFirst(event){
   const cache=await caches.open(CDN_CACHE);
   const cached=await cache.match(event.request);
   if(cached)return cached;
@@ -67,6 +71,8 @@ self.addEventListener('fetch',event=>{
     if(KEEP_PATHS.has(url.pathname))event.respondWith(pageResponse(event,url));
     return;
   }
+  // フォント本体は、iPhone では読み込んだページが分からない（clientId が空）ことがあるため、ページに関係なく保存する。
+  if(url.hostname==='fonts.gstatic.com'){event.respondWith(cacheFirst(event));return;}
   if(CDN_HOSTS.has(url.hostname)&&event.clientId)event.respondWith(cdnResponse(event));
 });
 
