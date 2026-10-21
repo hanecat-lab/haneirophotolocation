@@ -5647,6 +5647,127 @@ function placeCityKit(){
 }
 // にゃん港の地面：道の高さから緩やかに下る丘(いちばん北の道より北はさらに上る山)、海岸の岸壁、海、海の上の道の土台(防波堤・桟橋・灯台の台)
 const HARBOR={sea:-.7,slope:.32,flat:10,step:4,margin:250,backMax:18,fade:90,cut:10.5,deck:ROAD_HALF+WALL_OFFSET+1};
+// にゃん港の建物：いただいたGLB(1棟1ファイル、正面+z)。店6棟の通常版、そのうち番屋・うおにゃ・ひもの日和・ねこめしの遠景用(屋根3色)、民家3棟、灯台、漁船。
+// 店・民家・灯台は3.4倍(店の幅が約9m)、漁船は2.2倍(長さ約17m)にする
+const HARBOR_SHOPS=['fish','hut','kiosk','himono','ferry','diner'],HARBOR_FAR=['hut','fish','himono','diner'],HARBOR_ROOFS=['navy','rust','sage'],HARBOR_HOMES=['indigo','terracotta','sage'];
+const HARBOR_GLBS={lighthouse:{url:'nyanisyarud-harbor-lighthouse.glb',scale:3.4},boat:{url:'nyanisyarud-harbor-boat.glb',scale:2.2}};
+for(const n of HARBOR_SHOPS)HARBOR_GLBS[n]={url:`nyanisyarud-harbor-${n}.glb`,scale:3.4};
+for(const n of HARBOR_FAR)for(const c of HARBOR_ROOFS)HARBOR_GLBS[n+'_'+c]={url:`nyanisyarud-harbor-${n}-far-${c}.glb`,scale:3.4};
+for(const n of HARBOR_HOMES)HARBOR_GLBS['home_'+n]={url:`nyanisyarud-harbor-home-${n}.glb`,scale:3.4};
+// 区間ごとの割合。fish(うおにゃ)・himono(ひもの日和)・diner(ねこめし)・kiosk(売店)は名前のある店で、道ぞいの列だけに、1つの区間に1棟まで置く(同じ名前の店が並ばないように)。
+// hutは番屋、homeは民家3種。魚市場通りの道ぞいの列は通常版、ほかは遠景用の屋根3色。列は道から12mおきに、区間ごとの数だけ並べる
+const HARBOR_ZONE_ITEMS={switchback:[['home',6],['hut',1]],market:[['fish',3],['himono',3],['diner',3],['kiosk',2],['hut',2],['home',1]],seaside:[['hut',4],['home',3],['diner',1]],down:[['hut',4],['home',3],['fish',1],['himono',1]],climb:[['home',6],['hut',1]]};
+const HARBOR_ROWS={switchback:2,market:2,seaside:3,down:3,climb:2},HARBOR_NAMED=new Set(['fish','himono','diner','kiosk']);
+let harborKit=null,harborKitLoading=null;
+function loadHarborKit(){
+  if(!harborKitLoading)harborKitLoading=import('three/addons/loaders/GLTFLoader.js').then(({GLTFLoader})=>{
+    const loader=new GLTFLoader(),names=Object.keys(HARBOR_GLBS);
+    return Promise.all(names.map(n=>loader.loadAsync(HARBOR_GLBS[n].url).catch(()=>null))).then(list=>{
+      const items={};
+      list.forEach((gltf,i)=>{
+        if(!gltf)return;const k=HARBOR_GLBS[names[i]].scale,parts=[],box=new THREE.Box3();gltf.scene.updateMatrixWorld(true);
+        gltf.scene.traverse(o=>{
+          if(!o.isMesh)return;const geometry=o.geometry.clone().applyMatrix4(o.matrixWorld).scale(k,k,k);geometry.computeBoundingBox();box.union(geometry.boundingBox);
+          // 遠くで絵がちらつかないように、縮小用の画像(ミップマップ)を使う
+          const map=o.material.map;if(map&&map.minFilter===THREE.LinearFilter){map.minFilter=THREE.LinearMipmapLinearFilter;map.needsUpdate=true;}
+          parts.push({geometry,material:o.material});
+        });
+        if(parts.length)items[names[i]]={parts,box};
+      });
+      harborKit={items};placeHarborKit();
+    });
+  }).catch(()=>{harborKitLoading=null;});
+  return harborKitLoading;
+}
+// にゃん港の地面の高さ(街の地面からの高さ。地面の三角形と同じ補間)
+function harborGroundHeight(g,x,z){
+  const fx=THREE.MathUtils.clamp((x-g.x0)/g.step,0,g.nx-1e-6),fz=THREE.MathUtils.clamp((z-g.z0)/g.step,0,g.nz-1e-6),i=Math.floor(fx),j=Math.floor(fz),u=fx-i,v=fz-j,H=(a,b)=>g.h[b*(g.nx+1)+a];
+  return u+v<=1?H(i,j)+(H(i+1,j)-H(i,j))*u+(H(i,j+1)-H(i,j))*v:H(i+1,j+1)+(H(i,j+1)-H(i+1,j+1))*(1-u)+(H(i+1,j)-H(i+1,j+1))*(1-v);
+}
+function harborStoneTexture(){
+  const c=document.createElement('canvas');c.width=c.height=128;const g=c.getContext('2d');g.fillStyle='#857f73';g.fillRect(0,0,128,128);
+  for(let row=0;row<6;row++)for(let k=-1;k<4;k++){const v=((row*7+k*13+20)%5)*6;g.fillStyle=`rgb(${172+v},${166+v},${153+v})`;g.fillRect(k*32+(row%2)*16+2,row*128/6+2,28,128/6-4);}
+  const texture=new THREE.CanvasTexture(c);texture.colorSpace=THREE.SRGBColorSpace;texture.wrapS=texture.wrapT=THREE.RepeatWrapping;return texture;
+}
+// 建物を置く：わかにゃん駅前と同じく、決まった乱数で区間ごとの割合から選び、上から見た四角が道・ほかの建物・追従カメラの通り道に重ならない所だけ使う。
+// 斜面では四角の中のいちばん高い地面に建て、低い側は石垣でふさぐ(高低差4.5mまで)。どの建物も裏まで描かれているので、裏の向きは気にしない
+function placeHarborKit(){
+  const def=TRACKS[currentKey];
+  if(!harborKit||!cityRoad||cityRoad.placed||!def?.harbor||!cityScenery)return;
+  cityRoad.placed=true;
+  const {samples,L,zones,ground,coast,lighthouse}=cityRoad,{items}=harborKit,records=[],boxes=[],walls=[],cell=24,grid=new Map(),cams=new Map();
+  let seed=20261021;const rand=()=>{seed=(seed*16807)%2147483647;return seed/2147483647;};
+  const sampleAt=d=>samples[Math.round((((d%L)+L)%L)/2)%samples.length];
+  const addTo=(map,o)=>{const k=Math.floor(o.x/cell)+','+Math.floor(o.z/cell);if(!map.has(k))map.set(k,[]);map.get(k).push(o);};
+  // 道の点と、追従カメラ(猫の10.5m後ろ)の通り道
+  for(const s of samples){addTo(grid,s);addTo(cams,{x:s.x-s.tx*10.5,z:s.z-s.tz*10.5});}
+  const near=(map,x,z,r,fn)=>{for(let i=Math.floor((x-r)/cell);i<=Math.floor((x+r)/cell);i++)for(let j=Math.floor((z-r)/cell);j<=Math.floor((z+r)/cell);j++)for(const o of map.get(i+','+j)||[])if(fn(o))return true;return false;};
+  // 道の中心からneed(高い所の道は、高さの1.6倍だけ遠く)より近いか
+  const clearOfRoad=(x,z,gy,need)=>!near(grid,x,z,cell,o=>{const r=need+1.6*Math.max(0,o.y-gy);return (x-o.x)**2+(z-o.z)**2<r*r;});
+  // 上から見た四角：中心・半分の幅と奥行き・向き(cos,sin)
+  const footprint=(name,x,z,yaw)=>{const b=items[name].box,c=Math.cos(yaw),sn=Math.sin(yaw),mx=(b.min.x+b.max.x)/2,mz=(b.min.z+b.max.z)/2;return {x:x+mx*c+mz*sn,z:z-mx*sn+mz*c,hx:(b.max.x-b.min.x)/2,hz:(b.max.z-b.min.z)/2,c,s:sn};};
+  const overlap=(a,b)=>{const dx=b.x-a.x,dz=b.z-a.z;for(const [ux,uz] of [[a.c,-a.s],[a.s,a.c],[b.c,-b.s],[b.s,b.c]]){const ra=a.hx*Math.abs(a.c*ux-a.s*uz)+a.hz*Math.abs(a.s*ux+a.c*uz),rb=b.hx*Math.abs(b.c*ux-b.s*uz)+b.hz*Math.abs(b.s*ux+b.c*uz);if(Math.abs(dx*ux+dz*uz)>ra+rb)return false;}return true;};
+  const inside=(f,x,z,m)=>{const lx=(x-f.x)*f.c-(z-f.z)*f.s,lz=(x-f.x)*f.s+(z-f.z)*f.c;return Math.abs(lx)<f.hx+m&&Math.abs(lz)<f.hz+m;};
+  const point=(f,i,j)=>[f.x+i*f.hx*f.c+j*f.hz*f.s,f.z-i*f.hx*f.s+j*f.hz*f.c];
+  const start=samples[0],put=(name,x,y,z,yaw)=>records.push({name,x,y,z,yaw});
+  const tryPlace=(name,x,z,yaw,need=7)=>{
+    const f=footprint(name,x,z,yaw);
+    for(const i of [-1,0,1])for(const j of [-1,0,1]){const [px,pz]=point(f,i,j);if(pz>coast-1.5||Math.hypot(px-start.x,pz-start.z)<20)return false;}
+    // 四角の中の地面(5×5点)の高さ。平らに近ければ低い所に、斜面なら高い所に建てる
+    let lo=Infinity,hi=-Infinity;for(let i=-2;i<=2;i++)for(let j=-2;j<=2;j++){const v=harborGroundHeight(ground,...point(f,i/2,j/2));lo=Math.min(lo,v);hi=Math.max(hi,v);}
+    const gy=hi-lo<.5?lo:hi;
+    if(hi-lo>4.5)return false;
+    for(const i of [-1,0,1])for(const j of [-1,0,1])if(!clearOfRoad(...point(f,i,j),gy,need))return false;
+    if(boxes.some(b=>overlap(b,f))||near(cams,f.x,f.z,cell,o=>inside(f,o.x,o.z,1.2)))return false;
+    put(name,x,CITY_GROUND+gy,z,yaw);boxes.push(f);if(gy>lo)walls.push({f,top:CITY_GROUND+gy,bottom:CITY_GROUND+lo-.3});
+    return true;
+  };
+  // 道ぞいの1つの場所に、正面を道へ向けて置く(row列目。sideは道のどちら側か)
+  const placeBeside=(name,d,side,row=0,need=7)=>{const b=items[name].box,s=sampleAt(d),off=CITY_FRONT+row*12+b.max.z;return tryPlace(name,s.x+s.nx*side*off,s.z+s.nz*side*off,Math.atan2(-side*s.nx,-side*s.nz),need);};
+  // 灯台：灯台ヘアピンの台のまん中。戸口(正面)を、防波堤を走ってくる側(北)へ向ける
+  if(lighthouse&&items.lighthouse)put('lighthouse',lighthouse.x,lighthouse.y+ROAD_Y-.04,lighthouse.z,Math.PI);
+  // 漁船：魚市場通りの最後の直線の海側に、船名と大漁旗の側を道へ向けて陸に置く
+  const seaside=zones.find(z=>z.kind==='seaside'),ferry=zones.find(z=>z.kind==='ferry');
+  if(seaside&&items.boat){const d=seaside.from-25;placeBeside('boat',d,Math.sign(sampleAt(d).nz)||1,0,5);}
+  // フェリー乗り場：海へ出る手前の陸側(東)に、ねこ島ゆきの待合所と売店
+  if(ferry)for(const [name,dd] of [['ferry',6],['kiosk',-8]])if(items[name])placeBeside(name,ferry.from+dd,Math.sign(sampleAt(ferry.from+dd).nx)||1,0,5);
+  // 区間ごとの列：区間の割合で選び、となりと同じ物は避ける
+  let last=null;
+  for(const zone of zones){
+    const table=HARBOR_ZONE_ITEMS[zone.kind];if(!table)continue;
+    const count={};
+    for(let row=0;row<HARBOR_ROWS[zone.kind];row++)for(const side of [-1,1]){
+      let d=zone.from+3;
+      while(d<zone.to-3){
+        const pool=table.filter(([n])=>!HARBOR_NAMED.has(n)||row===0&&!count[n]);
+        let r=rand()*pool.reduce((a,[,w])=>a+w,0),kind=pool[0][0];for(const [n,w] of pool){if((r-=w)<0){kind=n;break;}}
+        const list=(kind==='home'?HARBOR_HOMES.map(h=>'home_'+h):zone.kind==='market'&&row===0?[kind]:HARBOR_ROOFS.map(c=>kind+'_'+c)).filter(n=>items[n]&&n!==last);
+        if(!list.length){d+=3;continue;}
+        const name=list[Math.floor(rand()*list.length)],b=items[name].box,W=b.max.x-b.min.x;
+        if(placeBeside(name,d+W/2,side,row)){d+=W+(zone.kind==='market'?.6+rand()*1.8:2+rand()*5);last=name;if(HARBOR_NAMED.has(kind))count[kind]=true;}else d+=3;
+      }
+    }
+  }
+  const placements={};for(const r of records)(placements[r.name]??=[]).push(r);
+  const matrix=new THREE.Matrix4(),q=new THREE.Quaternion(),up=new THREE.Vector3(0,1,0),p=new THREE.Vector3(),one=new THREE.Vector3(1,1,1);
+  for(const [name,list] of Object.entries(placements))for(const part of items[name].parts){
+    const mesh=new THREE.InstancedMesh(part.geometry,part.material,list.length);mesh.name='harbor_'+name;
+    list.forEach((o,i)=>{q.setFromAxisAngle(up,o.yaw);mesh.setMatrixAt(i,matrix.compose(p.set(o.x,o.y,o.z),q,one));});
+    mesh.instanceMatrix.needsUpdate=true;mesh.computeBoundingSphere();cityScenery.add(mesh);
+  }
+  // 石垣：斜面に建てた建物の四角の4辺を、床から地面の下までふさぎ、上を石の台にする(軒下も台になる)
+  if(walls.length){
+    const positions=[],uvs=[];
+    for(const {f,top,bottom} of walls){
+      const pts=[[-1,-1],[1,-1],[1,1],[-1,1]].map(([i,j])=>point(f,i,j));let u=0;
+      for(let k=0;k<4;k++){const [ax,az]=pts[k],[bx,bz]=pts[(k+1)%4],u2=u+Math.hypot(bx-ax,bz-az);
+        positions.push(ax,top,az,bx,top,bz,bx,bottom,bz,ax,top,az,bx,bottom,bz,ax,bottom,az);uvs.push(u/2,top/2,u2/2,top/2,u2/2,bottom/2,u/2,top/2,u2/2,bottom/2,u/2,bottom/2);u=u2;}
+      for(const k of [0,1,2,0,2,3]){const [x,z]=pts[k];positions.push(x,top-.02,z);uvs.push(x/2,z/2);}
+    }
+    const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));geometry.setAttribute('uv',new THREE.Float32BufferAttribute(uvs,2));geometry.computeVertexNormals();
+    const mesh=new THREE.Mesh(geometry,new THREE.MeshLambertMaterial({map:harborStoneTexture(),side:THREE.DoubleSide}));mesh.receiveShadow=true;mesh.name='harborStoneWalls';cityScenery.add(mesh);
+  }
+}
 function buildHarborScenery(def){
   cityRoad=measureCityRoad(def);
   const group=new THREE.Group();group.name='harborScenery';cityScenery=group;scene.add(group);
@@ -5674,6 +5795,7 @@ function buildHarborScenery(def){
   const nearD=new Float32Array(h.length).fill(Infinity),nearY=new Float32Array(h.length),cut=HARBOR.cut;
   for(const s of samples)each(s,cut+40,(k,d)=>{if(d<nearD[k]){nearD[k]=d;nearY[k]=s.y;}});
   for(let k=0;k<h.length;k++)if(nearD[k]<Infinity)h[k]=Math.min(h[k],nearY[k]-.15+Math.max(0,nearD[k]-cut)*.8);
+  cityRoad.ground={x0,z0,step,nx,nz,h};
   const positions=[],colors=[],indices=[],paved=new THREE.Color('#c9c2ae'),grass=new THREE.Color('#8fbf6a'),c=new THREE.Color();
   for(let j=0;j<=nz;j++)for(let i=0;i<=nx;i++){const v=h[at(i,j)];positions.push(x0+i*step,CITY_GROUND+v,z0+j*step);c.copy(paved).lerp(grass,THREE.MathUtils.smoothstep(v,1.5,3.5));colors.push(c.r,c.g,c.b);}
   for(let j=0;j<nz;j++)for(let i=0;i<nx;i++){const a=at(i,j),b=a+1,d=at(i,j+1);indices.push(a,d,b,b,d,d+1);}
@@ -5703,6 +5825,7 @@ function buildHarborScenery(def){
       quad(V(cx,top,cz),p2,p1,V(cx,top,cz));quad(p1,p2,p2.clone().setY(bottom),p1.clone().setY(bottom));}}
   const wallGeo=new THREE.BufferGeometry();wallGeo.setAttribute('position',new THREE.Float32BufferAttribute(walls,3));wallGeo.computeVertexNormals();
   const quay=new THREE.Mesh(wallGeo,concrete);quay.receiveShadow=true;quay.name='harborQuay';group.add(quay);
+  if(harborKit)placeHarborKit();else loadHarborKit();
 }
 function buildCityStructures(def){
   const group=new THREE.Group();group.name='cityStructures';
