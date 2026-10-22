@@ -11952,6 +11952,9 @@ function App(){
   const lastTapRef = useRef(0);
   const [showSwipe, setShowSwipe] = useState(false);
   const [swipeIndex, setSwipeIndex] = useState(0);
+  // スワイプ選別: 「いらない」は印だけ付け、最後にまとめて確認してから外す。
+  const [swipeDiscardIds, setSwipeDiscardIds] = useState([]);
+  const [swipeConfirmOpen, setSwipeConfirmOpen] = useState(false);
   const [swipeMediaError,setSwipeMediaError]=useState('');
   const swipeVideoRef=useRef(null);
   const [fiveShotMode, setFiveShotMode] = useState(false);
@@ -21462,59 +21465,89 @@ const recomputeStarts=(arr)=>{
     handleStop();
     setSwipeIndex(0);
     setSwipeMediaError('');
+    setSwipeDiscardIds([]);
+    setSwipeConfirmOpen(false);
     setShowSwipe(true);
     modeRef.current='swipe';
     setMode('swipe');
   },[handleStop]);
 
-  const handleSwipeKeep = useCallback(()=>{
+  const closeSwipe = useCallback(()=>{
+    swipeVideoRef.current?.pause();
+    setSwipeConfirmOpen(false);
+    setSwipeDiscardIds([]);
+    setShowSwipe(false);
+    setModeSafe('normal');
+    drawFrameRef.current(timeRef.current);
+  },[setModeSafe]);
+
+  // 次へ進む。最後まで来たら、いらない印があれば確認を出し、なければ閉じる。
+  const advanceSwipe = useCallback((discardIds)=>{
     swipeVideoRef.current?.pause();
     setSwipeMediaError('');
     const next = swipeIndex+1;
     if(next>=clipsRef.current.length){
-      setShowSwipe(false);
-      setModeSafe('normal');
+      if(discardIds.length) setSwipeConfirmOpen(true);
+      else closeSwipe();
     } else {
       setSwipeIndex(next);
     }
     drawFrameRef.current(timeRef.current);
-  },[swipeIndex, setModeSafe]);
+  },[swipeIndex, closeSwipe]);
+
+  const handleSwipeKeep = useCallback(()=>{
+    const id = clipsRef.current[swipeIndex]?.id;
+    const nextIds = swipeDiscardIds.filter(x=>x!==id);
+    setSwipeDiscardIds(nextIds);
+    advanceSwipe(nextIds);
+  },[swipeIndex, swipeDiscardIds, advanceSwipe]);
 
   const handleSwipeDiscard = useCallback(()=>{
+    const id = clipsRef.current[swipeIndex]?.id;
+    const nextIds = id && !swipeDiscardIds.includes(id) ? [...swipeDiscardIds, id] : swipeDiscardIds;
+    setSwipeDiscardIds(nextIds);
+    advanceSwipe(nextIds);
+  },[swipeIndex, swipeDiscardIds, advanceSwipe]);
+
+  const handleSwipeBack = useCallback(()=>{
     swipeVideoRef.current?.pause();
     setSwipeMediaError('');
-    const originalCount=clipsRef.current.length;
-    const id = clipsRef.current[swipeIndex]?.id;
-    if(id){
-      const clip = clipsRef.current.find(c=>c.id===id);
-      const urlIsShared = clip ? clipsRef.current.some(item=>item.id!==id && item.url===clip.url) : false;
-      try{ cleanupClipAudioResources(id); }catch{}
-      const v=videoRefs.current.get(id);
-      if(v){ try{ v.pause(); v.src=''; v.load(); }catch{} videoRefs.current.delete(id); }
-      const img=photoRefs.current.get(id);
-      if(img){ try{ photoRefs.current.delete(id); }catch{} }
-      if(clip && !urlIsShared && clip.url?.startsWith('blob:')){
-        try{ URL.revokeObjectURL(clip.url); }catch{}
-      }
-      const filtered = clipsRef.current.filter(c=> c.id!==id);
-      const recomputed = recomputeStarts(filtered);
-      setClips(recomputed);
-      clipsRef.current=recomputed;
-      setLastViewedClipId(prev=>prev===id?null:prev);
-      setSelectedClipIds(prev=>prev.filter(clipId=>clipId!==id));
-      window.dispatchEvent(new CustomEvent('haneiro:removerecentmaterial',{detail:{clipId:id}}));
-      const maxEnd=recomputed.length ? Math.max(0, ...recomputed.map(c=>c.timelineStart+c.duration)) : 3; // バグ修正: NaN/-Infinity防止
-      setDuration(maxEnd);
-      durationRef.current=maxEnd;
+    setSwipeIndex(i=>Math.max(0,i-1));
+  },[]);
+
+  const handleSwipeClose = useCallback(()=>{
+    if(swipeDiscardIds.length) setSwipeConfirmOpen(true);
+    else closeSwipe();
+  },[swipeDiscardIds, closeSwipe]);
+
+  const removeSwipeClip = (id)=>{
+    const clip = clipsRef.current.find(c=>c.id===id);
+    if(!clip) return;
+    const urlIsShared = clipsRef.current.some(item=>item.id!==id && item.url===clip.url);
+    try{ cleanupClipAudioResources(id); }catch{}
+    const v=videoRefs.current.get(id);
+    if(v){ try{ v.pause(); v.src=''; v.load(); }catch{} videoRefs.current.delete(id); }
+    const img=photoRefs.current.get(id);
+    if(img){ try{ photoRefs.current.delete(id); }catch{} }
+    if(!urlIsShared && clip.url?.startsWith('blob:')){
+      try{ URL.revokeObjectURL(clip.url); }catch{}
     }
-    const next = swipeIndex;
-    if(next>=originalCount-1){
-      setShowSwipe(false);
-      setModeSafe('normal');
-    } else {
-      setSwipeIndex(next);
-    }
-  },[swipeIndex, setModeSafe]);
+    const filtered = clipsRef.current.filter(c=> c.id!==id);
+    const recomputed = recomputeStarts(filtered);
+    setClips(recomputed);
+    clipsRef.current=recomputed;
+    setLastViewedClipId(prev=>prev===id?null:prev);
+    setSelectedClipIds(prev=>prev.filter(clipId=>clipId!==id));
+    window.dispatchEvent(new CustomEvent('haneiro:removerecentmaterial',{detail:{clipId:id}}));
+    const maxEnd=recomputed.length ? Math.max(0, ...recomputed.map(c=>c.timelineStart+c.duration)) : 3; // バグ修正: NaN/-Infinity防止
+    setDuration(maxEnd);
+    durationRef.current=maxEnd;
+  };
+
+  const confirmSwipeDiscard = ()=>{
+    swipeDiscardIds.forEach(removeSwipeClip);
+    closeSwipe();
+  };
 
   // BGMは組み込みプリセットを削除（カスタムBGMのみ使用）
   const BGM_MAP = {};
@@ -25073,6 +25106,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   }, hasTrans ? (trans.type==='fade'?'◐': trans.type==='white'?'◑': trans.type==='slide-left'?'→': trans.type==='black'?'●': trans.type==='iris'?'○': trans.type==='wipe'?'⇥': trans.type==='slide-up'?'↑':trans.type==='page'?'📄':trans.type==='fold'?'📖':'◎') : '+'),
                   React.createElement('button', {
                     onClick:()=>{
+                      if(!confirm(`「${c.name}」を外しますか？（元に戻せません。元の写真・動画は端末に残ります）`)) return;
                       if(c._splitScreen){
                         for(const child of c._splitScreen.clips){
                           try{cleanupClipAudioResources(child.id);}catch{}
@@ -28116,8 +28150,16 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
       React.createElement('div', {className:'h-14 flex items-center px-3 border-b border-white/10 shrink-0'},
         React.createElement('span', {className:'font-bold'}, '👉 スワイプ選別'),
         React.createElement('span', {className:'ml-3 text-[11px] bg-white/10 px-2 py-1 rounded-full'}, `${swipeIndex+1} / ${clipsRef.current.length}`),
-        React.createElement('button', {onClick:()=>{ setShowSwipe(false); setModeSafe('normal'); }, className:'ml-auto w-8 h-8 rounded-full bg-white text-black'}, '×')
+        swipeDiscardIds.length>0 && React.createElement('span', {className:'ml-2 text-[11px] text-amber-200'}, `いらない ${swipeDiscardIds.length}本`),
+        React.createElement('button', {onClick:handleSwipeClose, 'aria-label':'スワイプ選別を閉じる', className:'ml-auto w-8 h-8 rounded-full bg-white text-black'}, '×')
       ),
+      swipeConfirmOpen && React.createElement('div', {className:'absolute inset-0 z-10 bg-black/80 flex items-center justify-center p-6', role:'dialog', 'aria-modal':'true', 'aria-label':'いらない素材を外す'},
+        React.createElement('div', {className:'w-full max-w-[320px] rounded-2xl bg-[#17171a] border border-white/20 p-5'},
+          React.createElement('div', {className:'text-base font-bold mb-2'}, `${swipeDiscardIds.length}本を外します`),
+          React.createElement('div', {className:'text-xs text-white/60 mb-4'}, '元に戻せません（元の写真・動画は端末に残ります）。'),
+          React.createElement('button', {type:'button', onClick:confirmSwipeDiscard, className:'w-full h-11 rounded-full bg-white text-black font-bold mb-2'}, '外す'),
+          React.createElement('button', {type:'button', onClick:()=>setSwipeConfirmOpen(false), className:'w-full h-10 rounded-full bg-white/10 mb-2'}, 'やめて選び直す'),
+          React.createElement('button', {type:'button', onClick:closeSwipe, className:'w-full text-xs text-white/60 py-2'}, '外さずに閉じる'))),
       React.createElement('div', {className:'flex-1 flex flex-col items-center justify-center p-6 gap-4'},
         React.createElement('div', {className:'w-full max-w-[320px] aspect-[9/16] bg-black rounded-2xl border border-white/20 flex items-center justify-center relative overflow-hidden'},
           clips[swipeIndex]?.type==='photo' && React.createElement(VlogRotatedMedia,{as:'img',clip:clips[swipeIndex],
@@ -28134,6 +28176,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             onTimeUpdate:e=>{const clip=clips[swipeIndex];if(clip && e.currentTarget.currentTime>=(clip.trimStart||0)+clip.duration-.05){e.currentTarget.currentTime=clip.trimStart||0;}},
             onError:()=>setSwipeMediaError('動画を読み込めません。元素材を確認してください。')}),
           !clips[swipeIndex] && React.createElement('div',{className:'text-sm text-white/60'},'素材がありません'),
+          clips[swipeIndex] && swipeDiscardIds.includes(clips[swipeIndex].id) && React.createElement('div',{className:'absolute top-2 left-2 text-xs bg-amber-500/90 text-black font-bold rounded-full px-3 py-1'},'いらない印'),
           swipeMediaError && React.createElement('div',{className:'absolute bottom-12 left-2 right-2 text-center text-xs bg-black/75 rounded-lg p-2',role:'status'},swipeMediaError),
           clips[swipeIndex]?.type==='video' && React.createElement('button',{
             onClick:()=>{const video=swipeVideoRef.current;if(!video)return;video.muted=true;
@@ -28141,6 +28184,7 @@ React.createElement('div', {className:'text-[11px] text-white/50 mb-2'}, 'アニ
             className:'absolute bottom-2 left-1/2 -translate-x-1/2 bg-white/85 text-black rounded-full px-4 py-1.5 text-xs'},'▶ 再生')
         ),
         React.createElement('div', {className:'flex gap-4 w-full max-w-[320px]'},
+          React.createElement('button', {onClick:handleSwipeBack, disabled:swipeIndex===0, 'aria-label':'前の素材へ', className:'shrink-0 w-14 h-14 rounded-full bg-white/10 border border-white/20 text-[14px] disabled:opacity-30'}, '←'),
           React.createElement('button', {onClick:handleSwipeDiscard, className:'flex-1 h-14 rounded-full bg-white/10 border border-white/20 text-[16px]'}, '✕ いらない'),
           React.createElement('button', {onClick:handleSwipeKeep, className:'flex-1 h-14 rounded-full bg-white text-black font-bold text-[16px]'}, '♥ 残す')
         )
