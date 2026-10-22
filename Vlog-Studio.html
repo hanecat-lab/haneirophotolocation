@@ -12591,6 +12591,11 @@ function App(){
   const [exportProgress, setExportProgress] = useState(0);
   const [exportMessage, setExportMessage] = useState('');
   const [exportFile, setExportFile] = useState(null);
+  // 書き出した動画を保存したか（まだなら閉じる前に確かめる）と、保存先の案内。
+  const exportSavedUrlRef = useRef(null);
+  const [exportSaveNote, setExportSaveNote] = useState('');
+  // 素材の行で開く、つなぎの種類の選択。
+  const [rowTransPickerId, setRowTransPickerId] = useState(null);
   const exportFileRef = useRef(null);
   useEffect(()=>{ exportFileRef.current = exportFile; }, [exportFile]);
   const [exportDiagnosticText, setExportDiagnosticText] = useState('');
@@ -16072,17 +16077,34 @@ function App(){
       exportJobRef.current.stopWaiting?.();
     }
   };
-  const saveExport=()=>{
+  const saveExport=async()=>{
     if(!exportFile?.url) return;
+    // iPhone では共有メニューの「ビデオを保存」で写真アプリに入る。使えない端末だけファイルとして保存する。
+    const file=exportFile.blob ? new File([exportFile.blob],exportFile.name,{type:exportFile.blob.type||'video/mp4'}) : null;
+    if(file && navigator.share && navigator.canShare?.({files:[file]})){
+      try{
+        await navigator.share({files:[file],title:exportFile.name});
+        exportSavedUrlRef.current=exportFile.url;
+        setExportSaveNote('保存しました。「ビデオを保存」を選んだ場合は写真アプリに入っています。');
+      }catch(e){
+        if(e?.name!=='AbortError') setExportSaveNote('共有メニューを開けませんでした。もう一度押してください。');
+      }
+      return;
+    }
     const link=document.createElement('a');
     link.href=exportFile.url;
     link.download=exportFile.name;
     document.body.appendChild(link);
     link.click();
     link.remove();
+    exportSavedUrlRef.current=exportFile.url;
+    setExportSaveNote('「ファイル」アプリの「ダウンロード」に保存しました（写真アプリには入りません）。');
   };
   const closeExport=()=>{
     if(exportStatus==='recording' || exportStatus==='preparing' || exportStatus==='verifying') return;
+    if(exportStatus==='done' && exportFile?.url && exportSavedUrlRef.current!==exportFile.url &&
+      !confirm('書き出した動画をまだ保存していません。閉じると動画は消えます。閉じますか？')) return;
+    setExportSaveNote('');
     if(exportFile?.url){ try{ URL.revokeObjectURL(exportFile.url); }catch{} }
     setExportFile(null);
     setExportStatus('idle');
@@ -16739,7 +16761,7 @@ function App(){
         recordExportEvent('recording-verified',null,{verification,videoSamples:inspection?.samples??null,
           lastVideoTime:inspection?.lastVideoTime??null,expectedFrames:frameCount,engine:'frame'});
         const name=`Vlog-Studio-${new Date().toISOString().replace(/[:.]/g,'-')}.mp4`;
-        setExportFile({url:URL.createObjectURL(blob),name,size:blob.size,bitrateFallback:false,verification,
+        setExportFile({url:URL.createObjectURL(blob),blob,name,size:blob.size,bitrateFallback:false,verification,
           videoSamples:job.stats.recordedVideoSamples,profileLabel:exportProfile.label,actualTotalBitrate:job.stats.actualTotalBitrate});
         const reasonLabel={'unsupported-codec':'この形式は未対応','decoder-error':'デコードに失敗','fetch-error':'読み込みに失敗',
           'decodeAudioData-error':'読み込みに失敗','demux-error':'ファイルを解析できない','not-mp4':'形式を判別できない'};
@@ -17229,7 +17251,7 @@ function App(){
       }
       const extension=type.includes('webm')?'webm':'mp4';
       const name=`Vlog-Studio-${new Date().toISOString().replace(/[:.]/g,'-')}.${extension}`;
-      setExportFile({url:URL.createObjectURL(blob),name,size:blob.size,
+      setExportFile({url:URL.createObjectURL(blob),blob,name,size:blob.size,
         bitrateFallback:job.bitrateFallback,verification,
         videoSamples:job.stats.recordedVideoSamples,
         profileLabel:exportProfile.label,actualTotalBitrate:job.stats.actualTotalBitrate});
@@ -20076,6 +20098,33 @@ const recomputeStarts=(arr)=>{
       rightMark && markInClip(right,rightMark) ? rightMark.sourceTime : null);
   },[connectionEditor,connectionMarkPeek,connectionCompareOriginal,clips]);
 
+  // 素材の行のつなぎボタン: 選んだ種類を付け、「↶ 戻す」で取り消せるようにする。
+  const applyRowTransition=(clipId,newType)=>{
+    const before=editSnapshot();
+    const currentClips=clipsRef.current;
+    const targetClip=currentClips.find(x=> x.id===clipId);
+    if(!targetClip) return;
+    const currentTrans=targetClip._transitionToNext;
+    const newClips = newType==='none'
+      ? currentClips.map(x=> x.id===clipId ? (()=>{ const { _transitionToNext, ...rest } = x; return rest; })() : x)
+      : currentClips.map(x=> x.id===clipId ? {...x, _transitionToNext:{type:newType, duration:(currentTrans&&currentTrans.type!=='none'&&currentTrans.duration)||0.5}} : x);
+    const recomputed=recomputeStarts(newClips);
+    setClips(recomputed);
+    clipsRef.current=recomputed;
+    const maxEnd=recomputed.length ? Math.max(...recomputed.map(x=>x.timelineStart+x.duration)) : 3;
+    setDuration(maxEnd);
+    durationRef.current=maxEnd;
+    recordEdit(before,{label:'つながりの種類'});
+    setRowTransPickerId(null);
+    setTimeout(()=>{
+      const clip=recomputed.find(x=> x.id===clipId);
+      if(!clip) return;
+      const t = newType==='none' ? clip.timelineStart
+        : clip.timelineStart + Math.max(0.1, clip.duration - (clip._transitionToNext?.duration||0.5) - 0.3);
+      timeRef.current=t; setCurrentTime(t);
+      drawFrameRef.current(t);
+    },10);
+  };
   const openConnection=(leftId)=>{
     const list=clipsRef.current;
     const i=list.findIndex(c=>c.id===leftId);
@@ -23396,7 +23445,7 @@ const recomputeStarts=(arr)=>{
         (exportStatus==='preparing'||exportStatus==='recording'||exportStatus==='verifying') && React.createElement(React.Fragment,null,
           React.createElement('div', {className:'text-sm text-white/70 mb-3'}, exportStatus==='preparing'?'素材を準備しています':exportStatus==='verifying'?'完成した動画を確認しています':`書き出し中 ${exportProgress}%`),
           exportMessage && React.createElement('div',{className:'text-xs text-white/60 mb-2','aria-live':'polite'},exportMessage),
-          React.createElement('div',{className:'text-xs text-amber-100 mb-3'},
+          React.createElement('div',{className:'text-sm font-bold text-amber-100 mb-3'},
             EXPORT_FRAME_ENGINE && typeof VideoEncoder==='function' && typeof VideoFrame==='function'
               ? 'なめらか書き出し中です。動画の長さの1〜2倍ほど時間がかかります。書き出し中は音が鳴りませんが、完成後にこの画面で試聴できます。画面を開いたままにしてください（自動消灯を防止します。端末が許可した場合）。'
               : '書き出し中はこの画面を開いたままにしてください。画面の自動消灯を防止します（端末が許可した場合）。'),
@@ -23408,6 +23457,8 @@ const recomputeStarts=(arr)=>{
           // 保存はスクロールせずに押せるよう、試聴の動画より上に置く。
           React.createElement('button', {onClick:saveExport, className:'camera-key-primary w-full h-11 rounded-full bg-white text-black font-bold mb-3'},
             ['short','uncertain','unknown','motion-degraded'].includes(exportFile?.verification)?'確認用動画を保存':'端末に保存'),
+          React.createElement('div', {className:`text-xs mb-3 ${exportSaveNote?'text-emerald-200':'text-white/60'}`, role:'status'},
+            exportSaveNote || '押すと共有メニューが開きます。「ビデオを保存」を選ぶと写真アプリに入ります。'),
           // 出来上がった動画をその場で再生して、映像と音を確かめる（なめらか書き出しは書き出し中に音が鳴らないため）。
           exportFile?.url && React.createElement('video', {key:exportFile.url,src:exportFile.url,controls:true,playsInline:true,preload:'metadata',
             'aria-label':'書き出した動画の試聴',className:'w-full rounded-xl bg-black mb-3',style:{maxHeight:'min(320px, 40dvh)'}}),
@@ -23484,10 +23535,16 @@ const recomputeStarts=(arr)=>{
             return React.createElement('button', {
               onClick:()=>{
                 if(!hasFog) return;
-                if(confirm('全ての霧漏れをOFFにしますか？')){
-                  setLightLeaks({});
+                if(confirm('霧のつなぎ（☁️）を全部外しますか？ ほかのつなぎはそのままです。')){
+                  const before=editSnapshot(true);
+                  const fogTypes=['lightleak','fogleak','fog'];
+                  const next=recomputeStarts(clipsRef.current.map(c=> fogTypes.includes(c._transitionToNext?.type) ? {...c, _transitionToNext:{type:'none', duration:0}} : c));
+                  lightLeaksRef.current={}; setLightLeaks({});
                   setFogLengthPickerId(null);
-                  setClips(prev=>prev.map(c=> ({...c, _transitionToNext:{type:'none', duration:0}})));
+                  clipsRef.current=next; setClips(next);
+                  const maxEnd=next.length ? Math.max(...next.map(x=>x.timelineStart+x.duration)) : 3;
+                  setDuration(maxEnd); durationRef.current=maxEnd;
+                  recordEdit(before,{allowIdentityChange:true,label:'霧のつなぎを外す'});
                 }
               },
               className: hasFog
@@ -25009,66 +25066,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                       e.stopPropagation();
                       e.preventDefault();
                       if(i===clips.length-1){ openConnection(c.id); return; }
-                      const currentClips = clipsRef.current;
-                      const targetClip = currentClips.find(x=> x.id===c.id);
-                      if(!targetClip) return;
-                      const currentTrans = targetClip._transitionToNext;
-                      const newType = prompt('トランジション種類: none, fade, white, slide-left, slide-right, zoom, black, iris, wipe, slide-up, page, fold\n現在: ' + (currentTrans?currentTrans.type:'none'), currentTrans?currentTrans.type:'none');
-                      if(newType===null) return;
-                      const valid=['none','fade','white','slide-left','slide-right','zoom','black','iris','wipe','slide-up','page','fold'];
-                      if(!valid.includes(newType)){ alert('無効な種類です: ' + valid.join(', ')); return; }
-                      let newClips;
-                      if(newType==='none'){
-                        newClips = currentClips.map(x=> x.id===c.id ? (()=>{
-                          const { _transitionToNext, ...rest } = x;
-                          return rest;
-                        })() : x);
-                      } else {
-                        const durStr = prompt('長さを秒で (0.1〜2.0)', currentTrans?currentTrans.duration:0.5);
-                        if(durStr===null) return;
-                        const dur = Math.max(0.1, Math.min(2.0, parseFloat(durStr)||0.5));
-                        newClips = currentClips.map(x=> x.id===c.id ? {...x, _transitionToNext:{type:newType, duration:dur}} : x);
-                      }
-                      let cur=0;
-                      const recomputed = newClips.map((clip,i)=>{
-                        const n={...clip,timelineStart:cur};
-                        const transDur = (clip._transitionToNext && clip._transitionToNext.type!=='none') ? (clip._transitionToNext.duration||0.5) : 0;
-                        if(i < newClips.length-1 && transDur>0){
-                          cur+= Math.max(0.1, clip.duration - transDur);
-                        } else {
-                          cur+=clip.duration;
-                        }
-                        return n;
-                      });
-                      setClips(recomputed);
-                      clipsRef.current = recomputed;
-                      const maxEnd = recomputed.length ? Math.max(...recomputed.map(x=>x.timelineStart+x.duration)) : 3;
-                      setDuration(maxEnd);
-                      durationRef.current=maxEnd;
-                      setTimeout(()=> {
-                        try{
-                          const canvas = canvasRef.current;
-                          if(canvas){
-                            const cctx = canvas.getContext('2d');
-                            if(cctx){ cctx.filter='none'; cctx.globalAlpha=1; }
-                            canvas.style.filter='none';
-                          }
-                        }catch{}
-                        const idx = recomputed.findIndex(x=> x.id===c.id);
-                        if(idx>=0){
-                          const clip = recomputed[idx];
-                          if(newType==='none'){
-                            timeRef.current = clip.timelineStart;
-                            setCurrentTime(clip.timelineStart);
-                          } else {
-                            const transDur = clip._transitionToNext ? clip._transitionToNext.duration : 0.5;
-                            const safeTime = clip.timelineStart + Math.max(0.1, clip.duration - transDur - 0.3);
-                            timeRef.current = safeTime;
-                            setCurrentTime(safeTime);
-                          }
-                          drawFrameRef.current(timeRef.current);
-                        }
-                      },10);
+                      setRowTransPickerId(id=> id===c.id ? null : c.id);
                     },
                     className:`w-8 h-6 rounded-full text-[10px] flex items-center justify-center ${hasTrans?'bg-green-600/30 border border-green-500/40 text-green-200':'bg-white/10 text-white/40'}`,
                     title:i===clips.length-1 ? 'このカットのラストを見て次を撮る' : 'トランジションを設定'
@@ -25111,6 +25109,13 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   }, '🗑')
                 )
               ),
+              rowTransPickerId===c.id && React.createElement('div',{className:'grid grid-cols-4 gap-1 px-1 pb-2','aria-label':`${c.name}から次へのつなぎ`},
+                [['none','カット','✂️'],['fade','フェード','◐'],['white','ホワイト','◑'],['black','ブラック','●'],['slide-left','スライド','→'],['slide-right','左へ','←'],
+                 ['zoom','ズーム','◎'],['iris','丸く開く','○'],['wipe','ワイプ','⇥'],['slide-up','上へ','↑'],['page','めくる','📄'],['fold','折る','📖']].map(([id,name,icon])=>
+                  React.createElement('button',{key:id,type:'button',onClick:()=>applyRowTransition(c.id,id),
+                    'aria-pressed':(c._transitionToNext?.type||'none')===id,
+                    className:`h-10 rounded-lg border text-[10px] flex flex-col items-center justify-center ${(c._transitionToNext?.type||'none')===id?'bg-violet-600 border-violet-500 text-white':'bg-[#111113] border-white/10'}`},
+                    React.createElement('span',null,icon),name))),
               isFocused && React.createElement('div',{className:'flex flex-col gap-1.5 px-1 pb-1'},
                 React.createElement('span',{className:'text-[10px] text-emerald-100 break-all'},
                   `${i+1}/${clips.length} · ${c.name} · ${c.timelineStart.toFixed(1)}秒`),
