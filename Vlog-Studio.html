@@ -12510,7 +12510,7 @@ function App(){
   const setModeDialEl = useCallback(el=>{ modeDialElRef.current=el; if(!el) setModeDialPast(false); },[]);
   useEffect(()=>{
     if(!undoToast) return;
-    const timer=setTimeout(()=>setUndoToast(t=>t?.key===undoToast.key?null:t),10000);
+    const timer=setTimeout(()=>setUndoToast(t=>t?.key===undoToast.key?null:t),4000);
     return()=>clearTimeout(timer);
   },[undoToast?.key]);
   const [editNotice, setEditNotice] = useState('');
@@ -12521,6 +12521,9 @@ function App(){
   const [reorderOpen, setReorderOpen] = useState(false);
   const [reorderInitialId, setReorderInitialId] = useState(null);
   const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
+  // 上のバーの「おまかせ」で開く選択シート。
+  const [omakaseOpen, setOmakaseOpen] = useState(false);
+  const [omakaseLengthSec, setOmakaseLengthSec] = useState(30);
   const [photoFocusClipId, setPhotoFocusClipId] = useState(null);
   const [coverOpen, setCoverOpen] = useState(false);
   const [coverTitle, setCoverTitle] = useState('');
@@ -19303,7 +19306,7 @@ const recomputeStarts=(arr)=>{
       afterIdentity:options.allowIdentityChange ? editIdentity() : null};
     editHistoryRef.current=[...editHistoryRef.current,entry].slice(-20);
     setEditHistoryCount(editHistoryRef.current.length);
-    // 操作した直後に「やったこと」と戻すを下に10秒出す。
+    // 操作した直後に「やったこと」と戻すを下に4秒出す。
     setUndoToast({key:Date.now(),message:`✓ ${label}`,canUndo:true});
   };
   const undoEdit=()=>{
@@ -20793,7 +20796,7 @@ const recomputeStarts=(arr)=>{
     setAnalyzeText(`${clip.name} の${clip.type==='photo'?'表示時間':'使う範囲'}を ${length.toFixed(1)}秒に変更しました。↶ 戻すで元に戻せます`);
   };
 
-    const handleApplyTemplate = useCallback((tpl)=>{
+    const handleApplyTemplate = useCallback((tpl, label='使う範囲の調整')=>{
     if(!tpl) return;
     const before=editSnapshot(true);
     const targetFilter = tpl.filter && tpl.filter!=='none' ? tpl.filter : activeFilterRef.current;
@@ -20858,7 +20861,7 @@ const recomputeStarts=(arr)=>{
       setTexts(newTexts);
       textsRef.current = newTexts;
     }
-    recordEdit(before,{allowIdentityChange:true,label:'使う範囲の調整'});
+    recordEdit(before,{allowIdentityChange:true,label});
     setShowTemplateModal(false);
     setPendingTemplateId(null);
     setTimeout(()=> drawFrameRef.current(timeRef.current), 50);
@@ -21238,156 +21241,179 @@ const recomputeStarts=(arr)=>{
     }
   },[fiveShotMode, fiveShotType, handleFiveShotFilter, handleFiveShotSmart, handleStop, cleanupClipAudioResources, syncCanvasSize]);
 
-  const handleOmakaseEdit = useCallback(async ()=>{
-    if(clipsRef.current.length===0){
-      alert('動画を追加してください');
-      return;
-    }
-    if(isAnalyzing || isFiveShotAnalyzing || analysisBusyRef.current){
-      return;
-    }
-    // おまかせ編集: いいとこ3秒 + フィルター自動選択 + BGM + テンプレート適用
+  // おまかせ: 1こま分の明るさとコントラストを読む（読めなければ null）。
+  const omakaseSampleLuma = (media)=>{
+    try{
+      const canvas=document.createElement('canvas');
+      canvas.width=32; canvas.height=32;
+      const ctx=canvas.getContext('2d',{willReadFrequently:true});
+      ctx.drawImage(media,0,0,32,32);
+      const data=ctx.getImageData(0,0,32,32).data;
+      let sum=0,sumSq=0,count=0;
+      for(let p=0;p<data.length;p+=4){
+        const y=0.299*data[p]+0.587*data[p+1]+0.114*data[p+2];
+        sum+=y; sumSq+=y*y; count++;
+      }
+      const avg=sum/count;
+      return {avg, contrast:Math.sqrt(Math.max(0,sumSq/count-avg*avg))};
+    }catch{ return null; }
+  };
+  // おまかせで長さを変えずに残す素材（写真・分割画面・速さを変えた素材）。
+  const omakaseKeepsLength = c=> c.type==='photo' || c._splitScreen || c._cutGroupId || c._motion || vlogClipSourceRate(c)!==1;
+  const omakaseRestoreVideos = (list)=>{
+    playingRef.current=false;
+    setIsPlaying(false);
+    cancelAnimationFrame(rafTickRef.current);
+    setTimeout(()=>{
+      list.forEach(nc=>{
+        const v=videoRefs.current.get(nc.id);
+        if(v){ try{ v.pause(); v.currentTime=nc.trimStart||0; v.preload='auto'; }catch{} }
+      });
+      drawFrameRef.current(0);
+    },50);
+    setTimeout(()=>{ drawFrameRef.current(0); syncCanvasSize(true); },400);
+  };
+
+  // おまかせ（雰囲気）: 素材の明るさから物語を選び、色・つなぎを付ける。長さと自分の文字は変えない。
+  const handleOmakaseLook = useCallback(async ()=>{
+    if(clipsRef.current.length===0){ alert('動画か写真を追加してください'); return; }
+    if(isAnalyzing || isFiveShotAnalyzing || analysisBusyRef.current) return;
     analysisBusyRef.current=true;
     handleStop();
     setIsAnalyzing(true);
     setAnalyzeProgress(0);
-    setAnalyzeText('おまかせ編集中... 最高の瞬間を探しています');
+    setAnalyzeText('素材の明るさを見ています...');
     try{
-      // 1. いいとこ3秒を実行（選択なしなら全件）
-      const targetClips = clipsRef.current;
-      const newClipsMap = new Map();
-      clipsRef.current.forEach(c=> newClipsMap.set(c.id, {...c}));
-      let brightCount=0, darkCount=0, vividCount=0, unreadable=0;
-      for(let idx=0; idx<targetClips.length; idx++){
-        const c = targetClips[idx];
-        const v = videoRefs.current.get(c.id);
-        setAnalyzeText(`おまかせ編集中 ${idx+1}/${targetClips.length}: 解析中...`);
-        setAnalyzeProgress(Math.round((idx/targetClips.length)*40));
-        if(c._splitScreen || c.type==='photo' || c.duration<=3.1){
-          newClipsMap.set(c.id, {...c, _analyzeReason:'short'});
-          continue;
-        }
-        if(!v){ unreadable++; newClipsMap.set(c.id,{...c,_analyzeReason:'read-failed'}); continue; }
-        try{
-          const result = await analyzeGood3SecClip(v,c,()=>{});
-          const candidate=result.candidates[0];
-          if(!candidate){
-            unreadable++;
-            newClipsMap.set(c.id,{...c,_analyzeReason:'read-failed'});
-            continue;
+      const list=clipsRef.current;
+      let brightCount=0, darkCount=0, vividCount=0;
+      for(let idx=0; idx<list.length; idx++){
+        const c=list[idx];
+        setAnalyzeProgress(Math.round((idx/list.length)*90));
+        const shots=[];
+        if(c.type==='photo'){
+          const img=photoRefs.current.get(c.id);
+          const s=img && omakaseSampleLuma(img);
+          if(s) shots.push(s);
+        } else {
+          const v=videoRefs.current.get(c.id);
+          if(v){
+            for(const f of [0.2,0.5,0.8]){
+              await seekVideo(v,(c.trimStart||0)+c.duration*vlogClipSourceRate(c)*f);
+              const s=omakaseSampleLuma(v);
+              if(s) shots.push(s);
+            }
           }
-          newClipsMap.set(c.id, {...c, trimStart:candidate.start, duration:3,
-            _good3SourceRange:{start:c.trimStart||0,end:(c.trimStart||0)+c.duration},
-            _good3Candidates:[{start:candidate.start,reason:candidate.reason}],
-            _analyzeReason:candidate.reason});
-          if(candidate.avg>130) brightCount++;
-          else if(candidate.avg<70) darkCount++;
-          if(candidate.contrast>30) vividCount++;
-        }catch(e){
-          unreadable++;
-          newClipsMap.set(c.id, {...c, _analyzeReason:'read-failed'});
+        }
+        if(!shots.length) continue;
+        const avg=shots.reduce((a,s)=>a+s.avg,0)/shots.length;
+        const contrast=shots.reduce((a,s)=>a+s.contrast,0)/shots.length;
+        if(avg>130) brightCount++;
+        else if(avg<70) darkCount++;
+        if(contrast>30) vividCount++;
+      }
+      const pick=(a,b)=> Math.random()>0.5 ? a : b;
+      const templateId = brightCount>darkCount && vividCount>0 ? pick('oshi_event','marche')
+        : brightCount>darkCount ? pick('photo_airy','town_walk')
+        : darkCount>brightCount ? pick('night_cafe','travel_bookmark')
+        : 'photo_film';
+      const tpl=STORY_TEMPLATES.find(t=>t.id===templateId) || STORY_TEMPLATES[0];
+      setAnalyzeProgress(100);
+      const label=`雰囲気「${tpl.shortName||tpl.name}」を付けました`;
+      // 写真の長さは変えないので photoDuration は渡さない。
+      handleApplyTemplate({...tpl, photoDuration:undefined}, label);
+      setAnalyzeText(label);
+      omakaseRestoreVideos(clipsRef.current);
+    }catch(e){
+      console.error('おまかせ（雰囲気）エラー', e);
+      setAnalyzeText('おまかせでエラーが発生しました');
+    }finally{
+      setTimeout(()=> setIsAnalyzing(false), 400);
+      analysisBusyRef.current=false;
+    }
+  },[isAnalyzing, isFiveShotAnalyzing, seekVideo, syncCanvasSize, handleStop, handleApplyTemplate]);
+
+  // おまかせ（長さ）: 合計が targetSec になるよう各動画のよい部分を切り出し、間にフェードを付ける。自分の文字は変えない。
+  const handleOmakaseLength = useCallback(async (targetSec)=>{
+    if(clipsRef.current.length===0){ alert('動画か写真を追加してください'); return; }
+    if(isAnalyzing || isFiveShotAnalyzing || analysisBusyRef.current) return;
+    analysisBusyRef.current=true;
+    handleStop();
+    setIsAnalyzing(true);
+    setAnalyzeProgress(0);
+    setAnalyzeText(`${targetSec}秒にまとめています...`);
+    try{
+      const before=editSnapshot(true);
+      const fadeSec=0.5;
+      // つなぎ: 何も付いていない境目だけにフェードを足す。
+      let list=clipsRef.current.map((c,i,arr)=>{
+        const t=c._transitionToNext;
+        if(i<arr.length-1 && (!t || t.type==='none')) return {...c,_transitionToNext:{type:'fade',duration:fadeSec}};
+        return {...c,_transitionToNext:t ? {...t} : undefined};
+      });
+      const overlap=list.slice(0,-1).reduce((a,c)=>a+(c._transitionToNext && c._transitionToNext.type!=='none' ? (c._transitionToNext.duration||0.5) : 0),0);
+      const fixedSec=list.filter(omakaseKeepsLength).reduce((a,c)=>a+c.duration,0);
+      const cuttable=list.filter(c=>!omakaseKeepsLength(c));
+      const cuttableSec=cuttable.reduce((a,c)=>a+c.duration,0);
+      const budget=Math.max(0, targetSec+overlap-fixedSec);
+      let unreadable=0, cutCount=0;
+      if(cuttable.length && cuttableSec>budget){
+        const minSec=1.5;
+        const plan=new Map(cuttable.map(c=>[c.id, Math.round(Math.min(c.duration, Math.max(minSec, c.duration*budget/cuttableSec))*10)/10]));
+        for(let idx=0; idx<cuttable.length; idx++){
+          const c=cuttable[idx];
+          const len=plan.get(c.id);
+          setAnalyzeText(`${targetSec}秒にまとめています ${idx+1}/${cuttable.length}`);
+          setAnalyzeProgress(Math.round((idx/cuttable.length)*90));
+          if(len>=c.duration-0.05) continue;
+          const v=videoRefs.current.get(c.id);
+          const start=c.trimStart||0;
+          let bestT=0;
+          if(v){
+            const step=Math.max(0.2, c.duration/50);
+            const samples=[];
+            for(let t=0; t<c.duration; t+=step){
+              await seekVideo(v, start+t);
+              const s=omakaseSampleLuma(v);
+              samples.push(s ? s.avg*0.6+s.contrast*1.2+(s.avg*s.contrast/100)*0.5 : 0);
+            }
+            if(samples.every(s=>s===0)) unreadable++;
+            // len 秒の窓で点数の平均がいちばん高い位置を選ぶ。
+            const win=Math.max(1, Math.round(len/step));
+            let bestScore=-1;
+            for(let i=0; i+win<=samples.length; i++){
+              let sc=0; for(let j=i;j<i+win;j++) sc+=samples[j];
+              if(sc>bestScore){ bestScore=sc; bestT=i*step; }
+            }
+            bestT=Math.min(bestT, c.duration-len);
+          } else unreadable++;
+          cutCount++;
+          list=list.map(x=>x.id===c.id ? {...x, trimStart:start+bestT, duration:len} : x);
         }
       }
-      const updatedList = clipsRef.current.map(c=> newClipsMap.get(c.id) || c);
-      let recomputed = recomputeStarts(updatedList);
-      
-      // 2. フィルター自動選択（明るさに基づく）
-      setAnalyzeText('フィルターを選んでいます...');
-      setAnalyzeProgress(60);
-      let chosenFilter = 'clean';
-      let chosenFilterIntensity = 100;
-      let chosenBgm = 'none';
-      if(brightCount>darkCount && vividCount>0){
-        chosenFilter = Math.random()>0.5 ? 'tokimeki_heart' : 'tokimeki_prism';
-        chosenFilterIntensity = 110;
-        chosenBgm = 'none';
-      } else if(brightCount>darkCount){
-        chosenFilter = 'clean';
-        chosenFilterIntensity = 100;
-        chosenBgm = 'none';
-      } else if(darkCount>brightCount){
-        chosenFilter = Math.random()>0.5 ? 'night' : 'cinema';
-        chosenFilterIntensity = 95;
-        chosenBgm = 'none';
-      } else {
-        chosenFilter = 'tokimeki';
-        chosenFilterIntensity = 100;
-        chosenBgm = 'none';
-      }
-      setActiveFilter(chosenFilter);
-      activeFilterRef.current = chosenFilter;
-      setFilterIntensity(chosenFilterIntensity);
-      filterIntensityRef.current = chosenFilterIntensity;
-      setBgmTrack(chosenBgm);
-
-      // 3. テンプレート自動選択（フィルターに合わせて）
-      setAnalyzeText('テキストとBGMを追加中...');
-      setAnalyzeProgress(80);
-      const templateMap = {
-        'clean': 'morning_window',
-        'tokimeki': 'tokimeki',
-        'tokimeki_heart': 'tokimeki_heart',
-        'tokimeki_prism': 'tokimeki_prism',
-        'tokimeki_angel': 'tokimeki_angel',
-        'night': 'night_walk',
-        'cinema': 'cinema_story'
-      };
-      const templateId = templateMap[chosenFilter] || 'tokimeki';
-      const tpl = STORY_TEMPLATES.find(t=> t.id===templateId) || STORY_TEMPLATES[0];
-      if(tpl){
-        const newTexts = tpl.texts.map(t=> ({
-          id: Math.random().toString(36).slice(2),
-          anim:'fade',
-          outline:true,
-          strokeColor:'rgba(0,0,0,0.8)',
-          align:'center',
-          bgColor: t.bgColor||'transparent',
-          ...t
-        }));
-        setTexts(newTexts);
-        setActiveTemplateId(tpl.id);
-        setFiveShotType(tpl.fiveShot||'smart');
-      }
-
-      setClips(recomputed);
-      const maxEnd=recomputed.length ? Math.max(0, ...recomputed.map(c=>c.timelineStart+c.duration)) : 3; // バグ修正: NaN/-Infinity防止
+      list=recomputeStarts(list);
+      const maxEnd=list.length ? Math.max(0, ...list.map(c=>c.timelineStart+c.duration)) : 3;
+      clipsRef.current=list;
+      setClips(list);
       setDuration(maxEnd);
       durationRef.current=maxEnd;
       timeRef.current=0;
       setCurrentTime(0);
       lastFrameHasVideoRef.current=false;
-
       setAnalyzeProgress(100);
-      setAnalyzeText(`おまかせ編集完了: ${chosenFilter} + ${chosenBgm} BGM${unreadable?`（映像未確認 ${unreadable}件は元のまま）`:''}`);
-      playingRef.current=false;
-      setIsPlaying(false);
-      cancelAnimationFrame(rafTickRef.current);
-      setTimeout(()=> { 
-        recomputed.forEach(nc=>{
-          const v = videoRefs.current.get(nc.id);
-          if(v){
-            try{
-              v.pause();
-              v.currentTime = nc.trimStart||0;
-              v.preload='auto';
-            }catch{}
-          }
-        });
-        drawFrameRef.current(0);
-      }, 50);
-      setTimeout(()=> { 
-        drawFrameRef.current(0);
-        syncCanvasSize(true);
-        setIsAnalyzing(false);
-      }, 400);
+      const label = cutCount
+        ? `${Math.round(maxEnd)}秒にまとめました（${cutCount}本を短く）`
+        : `つなぎを付けました（もともと${Math.round(maxEnd)}秒）`;
+      recordEdit(before,{allowIdentityChange:true,label});
+      setAnalyzeText(`${label}${unreadable?`（映像を読めない ${unreadable}件は頭から使用）`:''}`);
+      omakaseRestoreVideos(list);
     }catch(e){
-      console.error('おまかせ編集エラー', e);
-      setAnalyzeText('おまかせ編集でエラーが発生しました');
-      setIsAnalyzing(false);
+      console.error('おまかせ（長さ）エラー', e);
+      setAnalyzeText('おまかせでエラーが発生しました');
     }finally{
+      setTimeout(()=> setIsAnalyzing(false), 400);
       analysisBusyRef.current=false;
     }
-  },[isAnalyzing, isFiveShotAnalyzing, analyzeGood3SecClip, syncCanvasSize, handleStop]);
+  },[isAnalyzing, isFiveShotAnalyzing, seekVideo, syncCanvasSize, handleStop]);
 
 
 
@@ -23168,7 +23194,7 @@ const recomputeStarts=(arr)=>{
             React.createElement('span',{className:'truncate'},label));
         })()),
       React.createElement('button', {
-        onClick:()=> handleOmakaseEdit && handleOmakaseEdit(),
+        onClick:()=> setOmakaseOpen(true), 'aria-label':'おまかせを選ぶ',
         className:'camera-key shrink-0 px-3 h-8 rounded-full border border-white/20 bg-white/10 text-[11px] whitespace-nowrap active:bg-violet-600/50'
       }, '✨ おまかせ'),
       React.createElement('button', {onClick:()=>{
@@ -23282,6 +23308,28 @@ const recomputeStarts=(arr)=>{
       onCommit:reorderMaterial,
       onSortByCapture:()=>{setReorderOpen(false);setReorderInitialId(null);sortClipsByCapture();}
     }),
+    omakaseOpen && React.createElement('div', {className:'fixed inset-0 z-[1000] bg-black/75 flex items-end justify-center', role:'dialog', 'aria-modal':'true', 'aria-label':'おまかせを選ぶ',
+      onClick:e=>{ if(e.target===e.currentTarget && !isAnalyzing) setOmakaseOpen(false); }},
+      React.createElement('div', {className:'w-full max-w-md rounded-t-2xl bg-[#17171a] border border-white/20 p-5 pb-[max(20px,env(safe-area-inset-bottom))] shadow-2xl'},
+        React.createElement('div', {className:'text-base font-bold mb-1'}, '✨ おまかせ'),
+        React.createElement('div', {className:'text-xs text-white/60 mb-4'}, '自分で入れた文字はそのまま残ります。あとから「↶ 戻す」で取り消せます。'),
+        React.createElement('button', {type:'button', disabled:isAnalyzing||clips.length===0,
+          onClick:async()=>{ await handleOmakaseLook(); setOmakaseOpen(false); },
+          className:'w-full text-left px-4 py-3 mb-3 rounded-xl border border-white/20 bg-white/5 disabled:opacity-40'},
+          React.createElement('div', {className:'text-sm font-bold'}, '🎨 雰囲気をおまかせ'),
+          React.createElement('div', {className:'text-[11px] text-white/60 mt-1'}, '素材に合う雰囲気を選んで、色とつなぎを付けます。長さはそのまま。')),
+        React.createElement('div', {className:'px-4 py-3 rounded-xl border border-white/20 bg-white/5'},
+          React.createElement('div', {className:'text-sm font-bold'}, '✂️ 長さをおまかせ'),
+          React.createElement('div', {className:'text-[11px] text-white/60 mt-1 mb-3'}, '動画のよい部分を選んで、選んだ長さにまとめ、間にフェードを付けます。写真の長さは変えません。'),
+          React.createElement('div', {className:'grid grid-cols-3 gap-2 mb-3'},
+            [15,30,60].map(sec=>React.createElement('button', {key:sec, type:'button', 'aria-pressed':omakaseLengthSec===sec, onClick:()=>setOmakaseLengthSec(sec),
+              className:`h-9 rounded-full border text-[12px] ${omakaseLengthSec===sec?'border-violet-400 bg-violet-500/20':'border-white/20 bg-white/5'}`}, `${sec}秒`))),
+          React.createElement('button', {type:'button', disabled:isAnalyzing||clips.length===0,
+            onClick:async()=>{ await handleOmakaseLength(omakaseLengthSec); setOmakaseOpen(false); },
+            className:'w-full h-10 rounded-full bg-white text-black text-[13px] font-bold disabled:opacity-40'}, `${omakaseLengthSec}秒にまとめる`)),
+        isAnalyzing && React.createElement('div', {className:'text-[11px] text-white/80 mt-3', role:'status'}, `${analyzeProgress}% ${analyzeText}`),
+        React.createElement('button', {type:'button', disabled:isAnalyzing, onClick:()=>setOmakaseOpen(false),
+          className:'w-full mt-3 text-xs text-white/60 py-2 disabled:opacity-40'}, 'やめる'))),
     exportChoiceOpen && React.createElement('div', {className:'camera-export-dialog fixed inset-0 z-[1000] bg-black/75 flex items-center justify-center p-5', role:'dialog', 'aria-modal':'true', 'aria-label':'書き出す素材の選択'},
       React.createElement('div', {className:'camera-export-panel w-full max-w-sm max-h-[88dvh] overflow-y-auto rounded-2xl bg-[#17171a] border border-white/20 p-5 shadow-2xl'},
         React.createElement('div', {className:'text-base font-bold mb-2'}, '書き出す素材を選ぶ'),
