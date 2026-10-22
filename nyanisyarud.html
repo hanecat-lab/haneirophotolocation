@@ -5775,6 +5775,31 @@ function loadHarborKit(){
   }).catch(()=>{harborKitLoading=null;});
   return harborKitLoading;
 }
+// 港町の建物・小物と地面の区画は、霧の向こう(カメラから霧の遠さ+15mより先)では描かない。建物と小物は、カメラの後ろ(向きから100°より外で60mより先)も描かない。
+// カメラが10m動くか15°向きを変えるたびに選び直す。建物と小物は、描く物だけを前に詰めて数を減らす(描く回数は変わらない)
+const townCull={x:Infinity,z:Infinity,dx:0,dz:1},townLook=new THREE.Vector3();
+function cullTownMesh(mesh,list){mesh.userData.allMatrices=mesh.instanceMatrix.array.slice();if(mesh.instanceColor)mesh.userData.allColors=mesh.instanceColor.array.slice();mesh.userData.spots=Float32Array.from(list.flatMap(o=>[o.x,o.z]));townCull.x=Infinity;}
+function updateTownCulling(){
+  if(!cityScenery||cityScenery.name!=='harborScenery')return;
+  camera.getWorldDirection(townLook);townLook.y=0;townLook.normalize();
+  const cx=camera.position.x,cz=camera.position.z;if((cx-townCull.x)**2+(cz-townCull.z)**2<100&&townLook.x*townCull.dx+townLook.z*townCull.dz>Math.cos(THREE.MathUtils.degToRad(15)))return;
+  townCull.x=cx;townCull.z=cz;townCull.dx=townLook.x;townCull.dz=townLook.z;const R=(scene.fog?.far||420)+15,R2=R*R,side=Math.cos(THREE.MathUtils.degToRad(100));
+  for(const o of cityScenery.children){
+    const all=o.userData.allMatrices;
+    if(all){
+      const spots=o.userData.spots,colors=o.userData.allColors,m=o.instanceMatrix.array,c=o.instanceColor?.array;let n=0;
+      for(let i=0;i<spots.length/2;i++){const dx=spots[i*2]-cx,dz=spots[i*2+1]-cz,d2=dx*dx+dz*dz;if(d2>R2||d2>3600&&dx*townLook.x+dz*townLook.z<side*Math.sqrt(d2))continue;m.set(all.subarray(i*16,i*16+16),n*16);if(c)c.set(colors.subarray(i*3,i*3+3),n*3);n++;}
+      o.count=n;o.visible=n>0;o.instanceMatrix.needsUpdate=true;if(c)o.instanceColor.needsUpdate=true;
+    }else if(o.name==='harborLand')for(const tile of o.children){const t=tile.userData.reach;tile.visible=(t.x-cx)**2+(t.z-cz)**2<(R+t.r)**2;}
+  }
+}
+// URLに ?perf を付けると、右上に1秒ごとのフレーム数・いちばん長かったコマの時間・1コマに描いた回数と三角形の数を出す(実機で重さを見るため)
+const perfHud=(()=>{
+  if(!new URLSearchParams(location.search).has('perf'))return null;
+  const el=document.createElement('div');el.style.cssText='position:fixed;right:6px;top:52px;z-index:9999;padding:4px 7px;border-radius:6px;background:rgba(0,0,0,.6);color:#fff;font:700 11px/1.45 monospace;pointer-events:none;white-space:pre';document.body.appendChild(el);
+  let frames=0,worst=0,time=0;
+  return dt=>{frames++;worst=Math.max(worst,dt);time+=dt;if(time<1)return;const i=renderer.info.render;el.textContent=`${Math.round(frames/time)} fps  最長${Math.round(worst*1000)}ms\n描画${i.calls}回  三角形${Math.round(i.triangles/1000)}k`;frames=0;worst=0;time=0;};
+})();
 // にゃん港の地面の高さ(街の地面からの高さ。地面の三角形と同じ補間)
 function harborGroundHeight(g,x,z){
   const fx=THREE.MathUtils.clamp((x-g.x0)/g.step,0,g.nx-1e-6),fz=THREE.MathUtils.clamp((z-g.z0)/g.step,0,g.nz-1e-6),i=Math.floor(fx),j=Math.floor(fz),u=fx-i,v=fz-j,H=(a,b)=>g.h[b*(g.nx+1)+a];
@@ -5897,14 +5922,14 @@ function placeHarborKit(){
     const list=pieces.filter(o=>o.kind===kind);if(!list.length)continue;
     const mesh=new THREE.InstancedMesh(pk[kind].geometry,pk[kind].material,list.length);mesh.name='harbor_prop_'+kind;
     list.forEach((o,i)=>{pq.setFromAxisAngle(up2,o.yaw);mesh.setMatrixAt(i,pm.compose(pp.set(o.x,o.y,o.z),pq,ps));if(o.color)mesh.setColorAt(i,pc.set(o.color));});
-    mesh.instanceMatrix.needsUpdate=true;if(mesh.instanceColor)mesh.instanceColor.needsUpdate=true;mesh.computeBoundingSphere();cityScenery.add(mesh);
+    mesh.instanceMatrix.needsUpdate=true;if(mesh.instanceColor)mesh.instanceColor.needsUpdate=true;mesh.computeBoundingSphere();cullTownMesh(mesh,list);cityScenery.add(mesh);
   }
   const placements={};for(const r of records)(placements[r.name]??=[]).push(r);
   const matrix=new THREE.Matrix4(),q=new THREE.Quaternion(),up=new THREE.Vector3(0,1,0),p=new THREE.Vector3(),one=new THREE.Vector3(1,1,1);
   for(const [name,list] of Object.entries(placements))for(const part of items[name].parts){
     const mesh=new THREE.InstancedMesh(part.geometry,part.material,list.length);mesh.name='harbor_'+name;
     list.forEach((o,i)=>{q.setFromAxisAngle(up,o.yaw);mesh.setMatrixAt(i,matrix.compose(p.set(o.x,o.y,o.z),q,one));});
-    mesh.instanceMatrix.needsUpdate=true;mesh.computeBoundingSphere();cityScenery.add(mesh);
+    mesh.instanceMatrix.needsUpdate=true;mesh.computeBoundingSphere();cullTownMesh(mesh,list);cityScenery.add(mesh);
   }
   // 石垣：斜面に建てた建物の四角の4辺を、床から地面の下までふさぎ、上を石の台にする(軒下も台になる)
   if(walls.length){
@@ -5980,7 +6005,16 @@ function buildHarborScenery(def){
   for(let j=0;j<=nz;j++)for(let i=0;i<=nx;i++){const v=h[at(i,j)];positions.push(x0+i*step,CITY_GROUND+v,z0+j*step);c.copy(paved).lerp(grass,THREE.MathUtils.smoothstep(v,1.5,3.5));colors.push(c.r,c.g,c.b);}
   for(let j=0;j<nz;j++)for(let i=0;i<nx;i++){const a=at(i,j),b=a+1,d=at(i,j+1);indices.push(a,d,b,b,d,d+1);}
   const ground=new THREE.BufferGeometry();ground.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));ground.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));ground.setIndex(indices);ground.computeVertexNormals();
-  const land=new THREE.Mesh(ground,new THREE.MeshLambertMaterial({vertexColors:true}));land.receiveShadow=true;land.name='harborLand';group.add(land);
+  // 地面は128m四方の区画に分ける(霧の向こうの区画は描かない)。法線は全体で求めてから分けるので、区画の境目で光り方が変わらない
+  const land=new THREE.Group(),landMat=new THREE.MeshLambertMaterial({vertexColors:true}),TILE=32,P=ground.attributes.position.array,C=ground.attributes.color.array,N=ground.attributes.normal.array;land.name='harborLand';
+  for(let tj=0;tj<nz;tj+=TILE)for(let ti=0;ti<nx;ti+=TILE){
+    const i1=Math.min(nx,ti+TILE),j1=Math.min(nz,tj+TILE),w=i1-ti+1,pos=[],col=[],nor=[],idx=[];
+    for(let j=tj;j<=j1;j++)for(let i=ti;i<=i1;i++){const k=at(i,j)*3;pos.push(P[k],P[k+1],P[k+2]);col.push(C[k],C[k+1],C[k+2]);nor.push(N[k],N[k+1],N[k+2]);}
+    for(let j=0;j<j1-tj;j++)for(let i=0;i<i1-ti;i++){const a=j*w+i,b=a+1,d=a+w;idx.push(a,d,b,b,d,d+1);}
+    const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));g.setAttribute('color',new THREE.Float32BufferAttribute(col,3));g.setAttribute('normal',new THREE.Float32BufferAttribute(nor,3));g.setIndex(idx);g.computeBoundingSphere();
+    const tile=new THREE.Mesh(g,landMat);tile.receiveShadow=true;tile.name='harborLandTile';tile.userData.reach={x:g.boundingSphere.center.x,z:g.boundingSphere.center.z,r:g.boundingSphere.radius};land.add(tile);
+  }
+  ground.dispose();group.add(land);townCull.x=Infinity;
   // 海：波を描いた板を敷きつめる
   const canvas=document.createElement('canvas');canvas.width=canvas.height=256;const g=canvas.getContext('2d');g.fillStyle='#4f9fc4';g.fillRect(0,0,256,256);
   g.strokeStyle='rgba(235,248,255,.55)';g.lineWidth=3;g.lineCap='round';
@@ -13971,7 +14005,7 @@ function advanceGameFrame(realDelta){
     tick(step);
   }
 }
-function animate(){requestAnimationFrame(animate);const frameDelta=clock.getDelta();advanceGameFrame(frameDelta);updateGhostPlayback(Math.min(frameDelta,.1));renderGhostSplitHUD();updateMini();if(debugEnabled)updateDebugPanel();updateRoadsideVisibility();syncCardboardCat();syncRoboCat(Math.min(frameDelta,.1));updateGoalBanner(Math.min(frameDelta,.033));updateBonusStreaks();faceRoadsideTrees();renderer.render(scene,camera);renderCountdownPaw(Math.min(frameDelta,.1));}
+function animate(){requestAnimationFrame(animate);const frameDelta=clock.getDelta();advanceGameFrame(frameDelta);updateGhostPlayback(Math.min(frameDelta,.1));renderGhostSplitHUD();updateMini();if(debugEnabled)updateDebugPanel();updateRoadsideVisibility();updateTownCulling();syncCardboardCat();syncRoboCat(Math.min(frameDelta,.1));updateGoalBanner(Math.min(frameDelta,.033));updateBonusStreaks();faceRoadsideTrees();renderer.render(scene,camera);perfHud?.(frameDelta);renderCountdownPaw(Math.min(frameDelta,.1));}
 
 
 // === スマホ向けトップバー修正 - startupクラスを確実に解除 ===
