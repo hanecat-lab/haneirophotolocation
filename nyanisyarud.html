@@ -3755,6 +3755,8 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
 #btnCatLight small{font:900 9px/1.1 'Zen Maru Gothic',sans-serif;margin-top:2px;color:#ffe9a8}
 #btnCatLight[data-mode="off"]{border-color:rgba(255,255,255,.35)}#btnCatLight[data-mode="off"] small{color:#c8cbd8}
 #btnCatLight[data-mode="high"]{box-shadow:0 0 10px rgba(255,226,140,.8)}
+/* 夜はミニマップを紺地にして、画面で一番明るい物にしない */
+#app[data-night="on"] .minimap{background:rgba(10,16,36,.78);border-color:rgba(150,170,230,.35)}
 </style>
 </head>
 <body>
@@ -10157,6 +10159,7 @@ function readyFlyoverPose(d){
 }
 function readyFlyoverCamera(tr,roadY,dt){
   if(isPracticeActive())return false;
+  readyFlyover.seen=true;
   readyFlyover.t+=dt;
   const time=readyFlyover.t,ease=readyFlyover.ease,d=readyFlyover.speed*(time<ease?time*time/(2*ease):time-ease/2)%totalLength;
   readyFlyoverPose(d);
@@ -13298,7 +13301,7 @@ function updateMini(){
   const w=miniCanvas.width, h=miniCanvas.height;
   const ctx=miniCtx;
   ctx.clearRect(0,0,w,h);
-  ctx.fillStyle='#dbefc9'; ctx.fillRect(0,0,w,h);
+  ctx.fillStyle=nightMode?'#141d36':'#dbefc9'; ctx.fillRect(0,0,w,h);
 
   if(miniMode===0){
     // === 全体モード: 動的AABBで最大化表示 ===
@@ -14779,7 +14782,7 @@ new ResizeObserver(measureCameraGuideDock).observe(document.getElementById('mini
 addEventListener('resize',measureCameraGuideDock);
 // 夜モード：空を濃紺に月と星、霧をほぼ黒にして目の光の届く距離に合わせる(オフ・ロー・ハイ)、太陽を青白い月明かりにして影を描かない。
 // 光で陰が付かない素材(港町の建物など、絵のある物)は夜だけ光で陰が付く素材に替え、目の光で照らされるようにする。タイムには影響しない
-const NIGHT={sky:0x0a1230,fog:0x05070d,ambient:0x7f8fc8,ambientPower:.15,moon:0xa9bbff,moonPower:.1,tint:.14};
+const NIGHT={sky:0x0a1230,fog:0x05070d,ambient:0x7f8fc8,ambientPower:.15,moon:0xa9bbff,moonPower:.1,tint:.14,catGlow:.25};
 const CAT_LIGHTS={off:{power:0,reach:0,angle:.5,pitch:-.1,beam:0,glow:.11,fog:[6,30],label:'オフ'},low:{power:75,reach:50,angle:.75,pitch:-.12,beam:9,glow:.24,fog:[15,80],label:'ロー'},high:{power:150,reach:120,angle:.36,pitch:-.035,beam:18,glow:.34,fog:[25,170],label:'ハイ'}};
 // 夜の明るさ：環境光・月明かり・目の光の強さだけを変える(霧の距離は変えない)
 const NIGHT_LEVELS=[{scale:.6,label:'とても暗い'},{scale:.8,label:'暗い'},{scale:1,label:'ふつう'},{scale:1.25,label:'明るい'},{scale:1.5,label:'とても明るい'}];
@@ -14787,6 +14790,9 @@ let nightLevel=2;
 try{const v=localStorage.getItem('nyanisyarud_night_level_v1');if(v!==null&&NIGHT_LEVELS[Number(v)])nightLevel=Number(v);}catch(e){}
 // 昼の素材ごとに夜用の素材を1つ作って使い回す。透ける素材(煙・足跡など、濃さを毎コマ変える物)は替えずに色だけ暗くする
 const nightMaterials=new Map(),nightTinted=new Set();
+// 目の光は前にしか当たらないので、後ろから見ると猫が真っ黒になる。夜は猫だけ毛の色の少しを自分で光らせる(元から光る素材はそのまま)
+const nightCatGlow=new Set();
+let nightTintTimer=0;
 function nightMaterialOf(day){
   let m=nightMaterials.get(day);
   if(!m){m=new THREE.MeshLambertMaterial({map:day.map,color:day.color,transparent:day.transparent,opacity:day.opacity,alphaTest:day.alphaTest,side:day.side,depthWrite:day.depthWrite,vertexColors:day.vertexColors});nightMaterials.set(day,m);}
@@ -14811,14 +14817,32 @@ const catEyeLight=(()=>{
   const beam=new THREE.Mesh(new THREE.ConeGeometry(1,1,24,1,true).translate(0,-.5,0).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({map:new THREE.CanvasTexture(bc),blending:THREE.AdditiveBlending,transparent:true,depthWrite:false,side:THREE.DoubleSide,fog:false}));beam.material.userData.glow=true;beam.name='catEyeBeam';
   const group=new THREE.Group();group.name='catEyes';group.add(light,light.target,beam,...eyes);return {group,light,beam,eyes};
 })();
+// ?nightlab：目の光の強さ・広がり・下向き・届く距離・ふちのぼかし・遠くでの弱まり方を、実機で動かして決めるための表示。
+// 動かすのは今のライト(オフ・ロー・ハイ)の値。下に3つ全部の値を出すので、決まったら画面を撮って送ってもらう
+const nightLab=(()=>{
+  if(!new URLSearchParams(location.search).has('nightlab'))return null;
+  const ROWS=[['power','強さ',0,400,5],['angle','広がり',.1,1.2,.01],['pitch','下向き',-.4,0,.005],['reach','届く距離',0,200,5]],LIGHT_ROWS=[['penumbra','ふちのぼかし',0,1,.05],['decay','遠くでの弱まり方',0,2,.1]];
+  const el=document.createElement('div');el.style.cssText='position:fixed;left:6px;top:120px;z-index:9999;padding:6px 8px;border-radius:8px;background:rgba(0,0,0,.72);color:#fff;font:700 11px/1.5 monospace;width:210px';document.body.appendChild(el);
+  const head=document.createElement('button');head.type='button';head.textContent='光の調整 ▲';head.style.cssText='width:100%;font:inherit;color:#fff;background:#334;border:0;border-radius:6px;padding:3px';el.appendChild(head);
+  const body=document.createElement('div');el.appendChild(body);head.addEventListener('click',()=>{body.hidden=!body.hidden;head.textContent='光の調整 '+(body.hidden?'▼':'▲');});
+  const title=document.createElement('div');body.appendChild(title);
+  const inputs=[...ROWS,...LIGHT_ROWS].map(([key,label,min,max,step])=>{const row=document.createElement('label');row.style.cssText='display:block';const name=document.createElement('span');const input=document.createElement('input');Object.assign(input,{type:'range',min,max,step});input.style.cssText='width:100%';row.append(name,input);body.appendChild(row);return {key,label,input,name,own:LIGHT_ROWS.some(r=>r[0]===key)};});
+  const out=document.createElement('pre');out.style.cssText='margin:4px 0 0;white-space:pre-wrap;font:inherit';body.appendChild(out);
+  let shown=null;
+  const target=row=>row.own?catEyeLight.light:CAT_LIGHTS[catLightMode];
+  const show=()=>{title.textContent='今のライト：'+CAT_LIGHTS[catLightMode].label;for(const row of inputs){const v=target(row)[row.key];row.input.value=v;row.name.textContent=row.label+' '+(+v.toFixed(3));}
+    out.textContent=['off','low','high'].map(m=>{const c=CAT_LIGHTS[m];return `${c.label} 強さ${c.power} 広がり${c.angle} 下向き${c.pitch} 距離${c.reach}`;}).join('\n')+`\nふち${catEyeLight.light.penumbra} 弱まり${catEyeLight.light.decay}`;};
+  for(const row of inputs)row.input.addEventListener('input',()=>{target(row)[row.key]=Number(row.input.value);show();});
+  return ()=>{if(shown!==catLightMode){shown=catLightMode;show();}};
+})();
 function syncCatLightButton(){
   const button=document.getElementById('btnCatLight'),mode=CAT_LIGHTS[catLightMode]?catLightMode:'low';button.hidden=!nightMode;button.dataset.mode=mode;
   document.getElementById('catLightLabel').textContent=CAT_LIGHTS[mode].label;button.setAttribute('aria-label','目の光：'+CAT_LIGHTS[mode].label);
 }
-function syncNightToggle(){const b=document.getElementById('btnNightToggle');b.textContent='夜モード '+(nightMode?'ON':'OFF');b.setAttribute('aria-pressed',String(nightMode));syncCatLightButton();}
+function syncNightToggle(){document.getElementById('app').dataset.night=nightMode?'on':'off';const b=document.getElementById('btnNightToggle');b.textContent='夜モード '+(nightMode?'ON':'OFF');b.setAttribute('aria-pressed',String(nightMode));syncCatLightButton();}
 function cycleCatLight(){catLightMode={off:'low',low:'high',high:'off'}[catLightMode]||'low';try{localStorage.setItem('nyanisyarud_cat_light_v1',catLightMode);}catch(e){}townCull.x=Infinity;syncCatLightButton();}
 function syncNightLevel(){const b=document.getElementById('btnNightLevel');b.textContent='夜の明るさ：'+NIGHT_LEVELS[nightLevel].label;b.disabled=!nightMode;}
-function applyNightLevel(){const k=NIGHT_LEVELS[nightLevel].scale;ambientLight.intensity=NIGHT.ambientPower*k;sun.intensity=NIGHT.moonPower*k;syncNightLevel();}
+function applyNightLevel(){const k=NIGHT_LEVELS[nightLevel].scale;ambientLight.intensity=NIGHT.ambientPower*k;sun.intensity=NIGHT.moonPower*k;nightTintTimer=0;syncNightLevel();}
 // コースの空と霧を決めた後に呼ぶ。夜は夜の空・霧・光にし、昼は環境光と影を戻す
 function applyTimeOfDay(){
   nightMaterials.clear();
@@ -14831,24 +14855,27 @@ function applyTimeOfDay(){
     ambientLight.color.setHex(0xffffff);ambientLight.intensity=.88;sun.castShadow=true;scene.remove(nightSky);scene.remove(catEyeLight.group);
     scene.traverse(o=>{if(o.userData.dayMaterial){o.material=o.userData.dayMaterial;delete o.userData.dayMaterial;}});townCull.far=0;syncNightLevel();
     for(const m of nightTinted){m.color.copy(m.userData.dayColor);}nightTinted.clear();
+    for(const m of nightCatGlow){m.emissive.copy(m.userData.dayEmissive);}nightCatGlow.clear();
   }
   syncNightToggle();
 }
 // 毎コマ：夜の空をカメラに付いていかせ、目の光を猫の目に合わせ、霧の距離を目の光に合わせて0.4秒ほどで寄せる。
-// 1秒ごとに、まだ替えていない絵のある素材(光で陰が付かない物)を夜用の素材に替える
-let nightTintTimer=0;
+// 1秒ごとに、まだ替えていない絵のある素材(光で陰が付かない物)を夜用の素材に替え、猫の光り方を合わせる
 const nightEyeA=new THREE.Vector3(),nightEyeB=new THREE.Vector3(),nightLook=new THREE.Vector3();
 function updateNightLights(dt){
   if(!nightMode)return;
   nightSky.position.copy(camera.position);
   nightTintTimer-=dt;
-  if(nightTintTimer<=0){nightTintTimer=1;scene.traverse(o=>{const m=o.material;if(!o.isMesh||!m||Array.isArray(m)||!m.isMeshBasicMaterial||!m.map||m.userData.glow)return;if(!m.transparent){o.userData.dayMaterial=m;o.material=nightMaterialOf(m);}else if(!nightTinted.has(m)){m.userData.dayColor??=m.color.clone();m.color.copy(m.userData.dayColor).multiplyScalar(NIGHT.tint);nightTinted.add(m);}});}
+  if(nightTintTimer<=0){nightTintTimer=1;scene.traverse(o=>{const m=o.material;if(!o.isMesh||!m||Array.isArray(m)||!m.isMeshBasicMaterial||!m.map||m.userData.glow)return;if(!m.transparent){o.userData.dayMaterial=m;o.material=nightMaterialOf(m);}else if(!nightTinted.has(m)){m.userData.dayColor??=m.color.clone();m.color.copy(m.userData.dayColor).multiplyScalar(NIGHT.tint);nightTinted.add(m);}});
+    catRoot.traverse(o=>{const m=o.material;if(!o.isMesh||!m?.isMeshLambertMaterial)return;m.userData.dayEmissive??=m.emissive.clone();if(m.userData.dayEmissive.getHex()===0){m.emissive.copy(m.color).multiplyScalar(NIGHT.catGlow*NIGHT_LEVELS[nightLevel].scale);nightCatGlow.add(m);}});}
   const spec=CAT_LIGHTS[catLightMode]||CAT_LIGHTS.low,{light,beam,eyes}=catEyeLight;
-  // 町の間引きは、霧が広がっている途中でも行き先の距離で行う
-  if(scene.fog){const ease=1-Math.exp(-dt/.13);scene.fog.near+=(spec.fog[0]-scene.fog.near)*ease;scene.fog.far+=(spec.fog[1]-scene.fog.far)*ease;townCull.far=spec.fog[1];}
+  // READY前のコース紹介は上空から遠くを映すので、その間だけ霧をハイと同じ距離にする。町の間引きは、霧が広がっている途中でも行き先の距離で行う
+  const fogRange=readyFlyover.seen?CAT_LIGHTS.high.fog:spec.fog;readyFlyover.seen=false;
+  if(scene.fog){const ease=1-Math.exp(-dt/.13);scene.fog.near+=(fogRange[0]-scene.fog.near)*ease;scene.fog.far+=(fogRange[1]-scene.fog.far)*ease;townCull.far=fogRange[1];}
   chai.eyes[0].getWorldPosition(nightEyeA);chai.eyes[1].getWorldPosition(nightEyeB);
   const yaw=catRoot.rotation.y,fx=Math.sin(yaw),fz=Math.cos(yaw),mid=nightEyeA.clone().add(nightEyeB).multiplyScalar(.5);
   eyes[0].position.copy(nightEyeA).addScaledVector(nightLook.set(fx,0,fz),.04);eyes[1].position.copy(nightEyeB).addScaledVector(nightLook,.04);for(const e of eyes)e.scale.setScalar(spec.glow);
+  nightLab?.();
   light.intensity=spec.power*NIGHT_LEVELS[nightLevel].scale;light.distance=spec.reach;light.angle=spec.angle;light.position.copy(mid);
   light.target.position.set(mid.x+fx*20,mid.y+Math.tan(spec.pitch)*20,mid.z+fz*20);light.target.updateMatrixWorld();
   // 光の筋は猫目線では出さない(目の前が光で埋まるので)
