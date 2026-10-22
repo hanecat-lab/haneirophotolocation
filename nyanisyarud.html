@@ -5416,9 +5416,11 @@ function roadsideChunks(ranges){
 function updateRoadsideVisibility(){
   if(!roadMesh)return;
   const range=(scene.fog?.far||420)+12;
-  for(const group of roadMesh.children)if(group.name==='roadsideFurniture'||group.name==='roadsideBanks')for(const mesh of group.children){
+  // 分岐のあるコースの右の道のガードレールも同じように扱う
+  for(const group of [...roadMesh.children,...(roadMesh.getObjectByName('branchRoad')?.children||[])])if(group.name==='roadsideFurniture'||group.name==='roadsideBanks')for(const mesh of group.children){
     if(!mesh.userData.roadsideChunk)continue;
-    const sphere=mesh.geometry.boundingSphere;mesh.visible=sphere.center.distanceTo(camera.position)-sphere.radius<=range;
+    // ボルトのように小さい物(userData.near)は、その距離までしか描かない
+    const sphere=mesh.isInstancedMesh?mesh.boundingSphere:mesh.geometry.boundingSphere;mesh.visible=sphere.center.distanceTo(camera.position)-sphere.radius<=(mesh.userData.near??range);
   }
 }
 function roadsideTexture(wood,aged){
@@ -5435,15 +5437,16 @@ function roadsideTexture(wood,aged){
   if(aged){ctx.fillStyle='rgba(109,103,79,.075)';for(let i=0;i<11;i++)ctx.fillRect((i*59)%256,(i*31)%128,1.5,5+i%4);}
   const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;t.wrapS=THREE.RepeatWrapping;t.anisotropy=Math.min(4,renderer.capabilities.getMaxAnisotropy());return t;
 }
-function roadsideProfileMesh(range,side,profile,material,name){
+// open：断面を閉じずに1枚の面にする(表だけ。両面に描く材質で使う)
+function roadsideProfileMesh(range,side,profile,material,name,open=false){
   const [from,to]=range,count=Math.max(1,Math.ceil((to-from)/1.2)),n=profile.length,positions=[],uvs=[],indices=[];
   for(let i=0;i<=count;i++){
     const distance=THREE.MathUtils.lerp(from,to,i/count),tr=getTrackAtDist(distance);
     for(const [offset,height] of profile){positions.push(tr.p.x+tr.n.x*offset*side,tr.p.y+ROAD_Y+height,tr.p.z+tr.n.z*offset*side);uvs.push(distance/4,height);}
   }
-  for(let i=0;i<count;i++)for(let j=0;j<n;j++){const a=i*n+j,b=i*n+(j+1)%n,c=a+n,d=b+n;indices.push(a,c,b,b,c,d);}
-  const caps=THREE.ShapeUtils.triangulateShape(profile.map(p=>new THREE.Vector2(p[0],p[1])),[]);
-  for(const triangle of caps){indices.push(...triangle);indices.push(...triangle.map(j=>count*n+j).reverse());}
+  for(let i=0;i<count;i++)for(let j=0;j<(open?n-1:n);j++){const a=i*n+j,b=i*n+(j+1)%n,c=a+n,d=b+n;indices.push(a,c,b,b,c,d);}
+  if(!open){const caps=THREE.ShapeUtils.triangulateShape(profile.map(p=>new THREE.Vector2(p[0],p[1])),[]);
+    for(const triangle of caps){indices.push(...triangle);indices.push(...triangle.map(j=>count*n+j).reverse());}}
   const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));g.setAttribute('uv',new THREE.Float32BufferAttribute(uvs,2));g.setIndex(indices);g.computeVertexNormals();
   g.computeBoundingSphere();const mesh=new THREE.Mesh(g,material);mesh.name=name;mesh.receiveShadow=true;mesh.castShadow=false;mesh.userData={side,from,to,roadsideChunk:true};return mesh;
 }
@@ -5462,16 +5465,17 @@ function buildRoadsideFurniture(def){
     const [from,to]=range;group.userData.ranges.push({side,from,to});
     if(wood){for(const chunk of roadsideChunks([range]))for(const y of [.34,.74])group.add(roadsideProfileMesh(chunk,side,woodenRailProfile(y),beamMat,'woodenRail'));}
     else{
+      // 波形の板は道の側の面だけを作る(裏側は作らない。両面に描くので外から見ても板に見える)
       const wave=[[.055,.44],[.015,.49],[-.035,.55],[.005,.62],[.065,.69],[.005,.76],[-.035,.83],[.015,.9],[.055,.94]];
-      const profile=wave.map(([x,y])=>[ROADSIDE.face+x,y]).concat(wave.slice().reverse().map(([x,y])=>[ROADSIDE.face+x+.045,y]));
-      for(const chunk of roadsideChunks([range]))group.add(roadsideProfileMesh(chunk,side,profile,beamMat,'metalGuardrail'));
+      const profile=wave.map(([x,y])=>[ROADSIDE.face+x,y]);
+      for(const chunk of roadsideChunks([range]))group.add(roadsideProfileMesh(chunk,side,profile,beamMat,'metalGuardrail',true));
     }
     const postCount=Math.max(1,Math.ceil((to-from)/ROADSIDE.postSpacing));
     for(let i=0;i<=postCount;i++){
       const distance=THREE.MathUtils.lerp(from,to,i/postCount),tr=getTrackAtDist(distance),yaw=Math.atan2(tr.t.x,tr.t.z);
       positions.push({tr,yaw,side});
       if(i%4===0)reflectors.push({tr,yaw,side});
-      if(!wood&&i%2===0)joints.push({tr,yaw,side});
+      if(!wood&&i%2===0)joints.push({tr,yaw,side,distance});
     }
     ends.push({distance:from,side},{distance:to,side});
   }
@@ -5484,7 +5488,12 @@ function buildRoadsideFurniture(def){
   if(wood)instances('woodPostCaps',new THREE.BoxGeometry(.21,.045,.21),new THREE.MeshLambertMaterial({color:0xb3a58b}),positions,ROADSIDE.post,.94);
   instances('reflectorMounts',new THREE.BoxGeometry(.09,.14,.16),new THREE.MeshLambertMaterial({color:0x757d73}),reflectors,ROADSIDE.face-.045,.84);
   instances('roadReflectors',new THREE.BoxGeometry(.015,.085,.095),new THREE.MeshBasicMaterial({color:0xf5d394}),reflectors,ROADSIDE.face-.097,.85);
-  if(!wood)instances('railBolts',new THREE.SphereGeometry(.025,6,4),new THREE.MeshLambertMaterial({color:0x8c9691}),joints,ROADSIDE.face-.035,.69);
+  // ボルトは64mごと・左右ごとにまとめ、カメラから70m以内の物だけ描く(遠くでは見えないほど小さいので)
+  if(!wood){
+    const boltGeo=new THREE.SphereGeometry(.025,6,4),boltMat=new THREE.MeshLambertMaterial({color:0x8c9691}),buckets=new Map();
+    for(const row of joints){const k=row.side+':'+Math.floor(row.distance/64);if(!buckets.has(k))buckets.set(k,[]);buckets.get(k).push(row);}
+    for(const rows of buckets.values()){const mesh=instances('railBolts',boltGeo,boltMat,rows,ROADSIDE.face-.035,.69);mesh.userData.roadsideChunk=true;mesh.userData.near=70;}
+  }
   // Closed, softened ends preserve the shortcut's open slot, without a rail
   // or support ever spanning its flight path.
   const endRows=ends.map(({distance,side})=>{const tr=getTrackAtDist(distance);return {tr,side,yaw:Math.atan2(tr.t.x,tr.t.z)};});
