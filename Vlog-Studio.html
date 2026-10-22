@@ -12523,7 +12523,9 @@ function App(){
   const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
   // 上のバーの「おまかせ」で開く選択シート。
   const [omakaseOpen, setOmakaseOpen] = useState(false);
-  const [omakaseLengthSec, setOmakaseLengthSec] = useState(30);
+  // 素材タブの「いいとこ」で開く長さの選択（3 は1本3秒＝いいとこ3秒、ほかは合計の秒数）。
+  const [goodLengthOpen, setGoodLengthOpen] = useState(false);
+  const [goodLengthSec, setGoodLengthSec] = useState(3);
   const [photoFocusClipId, setPhotoFocusClipId] = useState(null);
   const [coverOpen, setCoverOpen] = useState(false);
   const [coverTitle, setCoverTitle] = useState('');
@@ -20255,14 +20257,14 @@ const recomputeStarts=(arr)=>{
   },[seekVideo]);
 
   // いいとこ3秒専用: 画面に提示された時刻を確認してから画素を読む。
-  const analyzeGood3SecClip = useCallback(async (video, clip, onProgress)=>{
+  const analyzeGood3SecClip = useCallback(async (video, clip, onProgress, windowSec=3)=>{
     const sourceStart=clip.trimStart||0;
     const cutRate=clip._cutGroupId?(clip._playbackRate||1):1;
     const realDuration=Number.isFinite(video.duration) && video.duration>0 ? video.duration : sourceStart+clip.duration;
     const span=Math.min(clip.duration,(realDuration-sourceStart)/cutRate,
       clip._cutGroupId?((clip._good3SourceRange?.end??realDuration)-sourceStart)/cutRate:Infinity);
     if(!Number.isFinite(span) || span<=0) return {status:'error',reason:'動画の再生範囲を確認できません',candidates:[],attempted:0,valid:0,verified:0};
-    if(span<=3.1) return {status:'short',reason:'3秒以下のため現在の長さを維持',candidates:[],attempted:0,valid:0,verified:0};
+    if(span<=windowSec+0.1) return {status:'short',reason:`${windowSec}秒以下のため現在の長さを維持`,candidates:[],attempted:0,valid:0,verified:0};
     if(video.error || !(video.currentSrc || video.src)) return {status:'error',reason:'動画を読み込めません',candidates:[],attempted:0,valid:0,verified:0};
     const canvas=document.createElement('canvas');
     canvas.width=32; canvas.height=32;
@@ -20407,12 +20409,12 @@ const recomputeStarts=(arr)=>{
       const medianDetail=sortedDetail[Math.floor(sortedDetail.length/2)];
       const sortedContrast=coarse.map(s=>s.contrast).sort((a,b)=>a-b);
       const medianContrast=sortedContrast[Math.floor(sortedContrast.length/2)];
-      const maxStart=span-3;
+      const maxStart=span-windowSec;
       const marks=(clip._finderMarks||[]).filter(mark=>Number.isFinite(mark.sourceTime) &&
         mark.sourceTime>=sourceStart && mark.sourceTime<sourceStart+span*cutRate);
       const markStarts=marks.map(mark=>Math.max(0,Math.min(maxStart,(mark.sourceTime-sourceStart)/cutRate-1.5)));
       const rank=(samples,starts,minCount)=>starts.map(start=>{
-        const frames=samples.filter(s=>s && s.t>=start-0.01 && s.t<start+3-0.01).sort((a,b)=>a.t-b.t);
+        const frames=samples.filter(s=>s && s.t>=start-0.01 && s.t<start+windowSec-0.01).sort((a,b)=>a.t-b.t);
         if(frames.length<minCount) return null;
         const average=(field)=>frames.reduce((sum,s)=>sum+s[field],0)/frames.length;
         const clipped=average('clipped'), detail=average('detail');
@@ -20431,7 +20433,7 @@ const recomputeStarts=(arr)=>{
         const brightnessDrift=Math.abs(avg-medianBrightness);
         const score=contrast*0.8+detail*0.6-clipped*60-brightnessDrift*0.18+
           Math.min(motion,25)*0.12-Math.max(0,motion-45)*0.35-abrupt*15;
-        const marked=marks.some(mark=>mark.sourceTime>=sourceStart+(start+0.1)*cutRate && mark.sourceTime<=sourceStart+(start+2.9)*cutRate);
+        const marked=marks.some(mark=>mark.sourceTime>=sourceStart+(start+0.1)*cutRate && mark.sourceTime<=sourceStart+(start+windowSec-0.1)*cutRate);
         // 急な切り替わりの疑いがある窓は上で除外済み。全候補共通の条件を理由にしない。
         const traits=[];
         if(marked) traits.push('♡の瞬間を含む');
@@ -20448,18 +20450,18 @@ const recomputeStarts=(arr)=>{
       }).filter(Boolean).sort((a,b)=>b.score-a.score);
       const coarseStarts=coarseTimes.filter(t=>t<=maxStart+0.001);
       coarseStarts.push(maxStart,...markStarts);
-      const coarseRank=rank(coarse,coarseStarts,Math.max(3,Math.floor(3/coarseStep*0.5)));
+      const coarseRank=rank(coarse,coarseStarts,Math.max(3,Math.floor(windowSec/coarseStep*0.5)));
       const seeds=[];
       for(const candidate of [...coarseRank.filter(c=>c.marked),...coarseRank]){
         if(seeds.every(s=>Math.abs(s-candidate.start)>0.7)) seeds.push(candidate.start);
         if(seeds.length>=3) break;
       }
-      if(!seeds.length) return {...stats,status:'error',reason:'3秒続けて確認できる映像がありません',candidates:[]};
+      if(!seeds.length) return {...stats,status:'error',reason:`${windowSec}秒続けて確認できる映像がありません`,candidates:[]};
       const refinedStarts=[];
       for(const seed of seeds){
         const lower=Math.max(0,seed-0.4),upper=Math.min(maxStart,seed+0.4);
         for(let start=lower;start<=upper+0.01;start+=0.2) refinedStarts.push(Math.min(maxStart,start));
-        for(let t=lower;t<upper+3;t+=0.2){
+        for(let t=lower;t<upper+windowSec;t+=Math.max(0.2,windowSec/15)){
           await readAt(t);
           if(consecutiveFailures>=3) return {...stats,status:'error',reason:`映像フレームを取得できません: ${lastFailure}`,candidates:[]};
         }
@@ -20467,7 +20469,7 @@ const recomputeStarts=(arr)=>{
       refinedStarts.push(...seeds,...markStarts);
       const all=[...cache.values()].filter(Boolean);
       const ranked=rank(all,refinedStarts,8);
-      if(!ranked.length) return {...stats,status:'error',reason:'候補の3秒間を十分に読み取れません',candidates:[]};
+      if(!ranked.length) return {...stats,status:'error',reason:`候補の${windowSec}秒間を十分に読み取れません`,candidates:[]};
       const chosen=[];
       for(const candidate of [...ranked.filter(c=>c.marked),...ranked]){
         if(chosen.every(c=>Math.abs(c.start-candidate.start)>0.8)) chosen.push(candidate);
@@ -21367,27 +21369,16 @@ const recomputeStarts=(arr)=>{
           if(len>=c.duration-0.05) continue;
           const v=videoRefs.current.get(c.id);
           const start=c.trimStart||0;
-          let bestT=0;
-          if(v){
-            const step=Math.max(0.2, c.duration/50);
-            const samples=[];
-            for(let t=0; t<c.duration; t+=step){
-              await seekVideo(v, start+t);
-              const s=omakaseSampleLuma(v);
-              samples.push(s ? s.avg*0.6+s.contrast*1.2+(s.avg*s.contrast/100)*0.5 : 0);
-            }
-            if(samples.every(s=>s===0)) unreadable++;
-            // len 秒の窓で点数の平均がいちばん高い位置を選ぶ。
-            const win=Math.max(1, Math.round(len/step));
-            let bestScore=-1;
-            for(let i=0; i+win<=samples.length; i++){
-              let sc=0; for(let j=i;j<i+win;j++) sc+=samples[j];
-              if(sc>bestScore){ bestScore=sc; bestT=i*step; }
-            }
-            bestT=Math.min(bestT, c.duration-len);
-          } else unreadable++;
+          let bestStart=start;
+          // いいとこ3秒と同じ判定を len 秒の窓で使う。読めないときは頭から使う。
+          try{
+            const result=v ? await analyzeGood3SecClip(v,c,()=>{},len) : null;
+            const candidate=result?.candidates?.[0];
+            if(candidate) bestStart=Math.min(candidate.start, start+c.duration-len);
+            else unreadable++;
+          }catch{ unreadable++; }
           cutCount++;
-          list=list.map(x=>x.id===c.id ? {...x, trimStart:start+bestT, duration:len} : x);
+          list=list.map(x=>x.id===c.id ? {...x, trimStart:bestStart, duration:len} : x);
         }
       }
       list=recomputeStarts(list);
@@ -21413,7 +21404,7 @@ const recomputeStarts=(arr)=>{
       setTimeout(()=> setIsAnalyzing(false), 400);
       analysisBusyRef.current=false;
     }
-  },[isAnalyzing, isFiveShotAnalyzing, seekVideo, syncCanvasSize, handleStop]);
+  },[isAnalyzing, isFiveShotAnalyzing, analyzeGood3SecClip, syncCanvasSize, handleStop]);
 
 
 
@@ -23315,18 +23306,9 @@ const recomputeStarts=(arr)=>{
         React.createElement('div', {className:'text-xs text-white/60 mb-4'}, '自分で入れた文字はそのまま残ります。あとから「↶ 戻す」で取り消せます。'),
         React.createElement('button', {type:'button', disabled:isAnalyzing||clips.length===0,
           onClick:async()=>{ await handleOmakaseLook(); setOmakaseOpen(false); },
-          className:'w-full text-left px-4 py-3 mb-3 rounded-xl border border-white/20 bg-white/5 disabled:opacity-40'},
+          className:'w-full text-left px-4 py-3 rounded-xl border border-white/20 bg-white/5 disabled:opacity-40'},
           React.createElement('div', {className:'text-sm font-bold'}, '🎨 雰囲気をおまかせ'),
           React.createElement('div', {className:'text-[11px] text-white/60 mt-1'}, '素材に合う雰囲気を選んで、色とつなぎを付けます。長さはそのまま。')),
-        React.createElement('div', {className:'px-4 py-3 rounded-xl border border-white/20 bg-white/5'},
-          React.createElement('div', {className:'text-sm font-bold'}, '✂️ 長さをおまかせ'),
-          React.createElement('div', {className:'text-[11px] text-white/60 mt-1 mb-3'}, '動画のよい部分を選んで、選んだ長さにまとめ、間にフェードを付けます。写真の長さは変えません。'),
-          React.createElement('div', {className:'grid grid-cols-3 gap-2 mb-3'},
-            [15,30,60].map(sec=>React.createElement('button', {key:sec, type:'button', 'aria-pressed':omakaseLengthSec===sec, onClick:()=>setOmakaseLengthSec(sec),
-              className:`h-9 rounded-full border text-[12px] ${omakaseLengthSec===sec?'border-violet-400 bg-violet-500/20':'border-white/20 bg-white/5'}`}, `${sec}秒`))),
-          React.createElement('button', {type:'button', disabled:isAnalyzing||clips.length===0,
-            onClick:async()=>{ await handleOmakaseLength(omakaseLengthSec); setOmakaseOpen(false); },
-            className:'w-full h-10 rounded-full bg-white text-black text-[13px] font-bold disabled:opacity-40'}, `${omakaseLengthSec}秒にまとめる`)),
         isAnalyzing && React.createElement('div', {className:'text-[11px] text-white/80 mt-3', role:'status'}, `${analyzeProgress}% ${analyzeText}`),
         React.createElement('button', {type:'button', disabled:isAnalyzing, onClick:()=>setOmakaseOpen(false),
           className:'w-full mt-3 text-xs text-white/60 py-2 disabled:opacity-40'}, 'やめる'))),
@@ -24470,15 +24452,25 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
             React.createElement('span', null, '👉'), 'スワイプ選別'
           ),
           React.createElement('button', {
-            onClick:handleGood3Sec,
-            disabled:isAnalyzing,
+            onClick:()=>setGoodLengthOpen(o=>!o),
+            disabled:isAnalyzing, 'aria-expanded':goodLengthOpen,
             className:`h-[56px] rounded-full border text-[14px] flex items-center justify-center gap-2 active:bg-white/10 ${isAnalyzing?'bg-violet-600/50 border-violet-500/50':'bg-[#111113] border-white/10'}`
           },
             React.createElement('span', null, isAnalyzing?'🔍':'✨'),
-            isAnalyzing ? `${analyzeProgress}% ${analyzeText.slice(0,14)}` : 'いいとこ3秒',
-            !isAnalyzing && React.createElement('span', {className:'text-[10px] text-white/50 ml-1'}, selectedClipIds.length>0 ? `${selectedClipIds.length}件のみ解析` : '映像と♡')
+            isAnalyzing ? `${analyzeProgress}% ${analyzeText.slice(0,14)}` : 'いいとこ',
+            !isAnalyzing && React.createElement('span', {className:'text-[10px] text-white/50 ml-1'}, '長さを選ぶ')
           )
         ),
+        goodLengthOpen && React.createElement('div', {className:'mb-3 p-3 rounded-xl bg-[#111113] border border-white/10'},
+          React.createElement('div', {className:'grid grid-cols-4 gap-2 mb-2'},
+            [[3,'1本3秒'],[15,'15秒'],[30,'30秒'],[60,'60秒']].map(([sec,label])=>React.createElement('button', {key:sec, type:'button', 'aria-pressed':goodLengthSec===sec, onClick:()=>setGoodLengthSec(sec),
+              className:`h-9 rounded-full border text-[12px] ${goodLengthSec===sec?'border-violet-400 bg-violet-500/20':'border-white/20 bg-white/5'}`}, label))),
+          React.createElement('div', {className:'text-[10px] text-white/60 mb-2'}, goodLengthSec===3
+            ? `映像と♡を見て、動画を1本3秒ずつに切り出します。候補を見て選び直せます。${selectedClipIds.length>0?`（丸で選んだ${selectedClipIds.length}件のみ）`:''}`
+            : `映像と♡を見て、全部の動画のよい部分を選び、合計${goodLengthSec}秒にまとめて間にフェードを付けます。写真の長さは変えません。`),
+          React.createElement('button', {type:'button', disabled:isAnalyzing||clips.length===0,
+            onClick:async()=>{ setGoodLengthOpen(false); if(goodLengthSec===3) await handleGood3Sec(); else await handleOmakaseLength(goodLengthSec); },
+            className:'w-full h-10 rounded-full bg-white text-black text-[13px] font-bold disabled:opacity-40'}, goodLengthSec===3 ? '1本3秒に切り出す' : `${goodLengthSec}秒にまとめる`)),
         analysisReview.length>0 && React.createElement('div', {className:'mb-3 p-3 rounded-xl bg-[#111113] border border-violet-500/30', 'aria-label':'いいとこ3秒の解析結果'},
           React.createElement('div', {className:'flex items-center justify-between mb-2'},
             React.createElement('div', {className:'text-[12px] font-bold'}, 'いいとこ3秒の候補'),
