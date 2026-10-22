@@ -4774,6 +4774,10 @@ function makeTakadaiCourse(){
   const A=route(left),B=route(trace('grip',pb)),m=A.marks;
   return {name:'にゃん港 高台くだり',sub:'高台の神社→漁港｜ドリフトの谷とクランクの旧市街に分かれる｜高低差200m',points:A.points,cornerRanges:A.cornerRanges,sectionStarts:[],finishRatio:1,courseRecordVersion:'v1',curveType:'centripetal',
     gravity:true,autoGuide:true,harbor:true,harborSlope:true,coastZones:['port'],
+    // 漁港の箱：すき間(2.2〜2.8m)を左右交互に。155mと390mは細いすき間(1.4〜1.5m)を抜けるか、発泡スチロールに当たるか。S字は内側に1つずつ
+    portBoxes:[[40,-2.9,'wood'],[40,-1.3,'wood'],[40,.3,'foam',2],[80,3,'foam',3],[80,1.4,'wood'],[80,-.2,'wood'],[120,-.8,'wood'],[120,.8,'wood'],
+      [155,-3,'foam'],[155,0,'foam',2],[155,3,'foam'],[205,3,'foam'],[258,-3,'foam'],[310,1.6,'wood'],[310,3.2,'wood'],[310,-.7,'foam',2],
+      [350,-1.6,'wood'],[350,-3.2,'wood'],[350,.7,'foam',2],[390,0,'wood'],[390,-3.1,'foam',2],[390,3.1,'foam',2],[420,-1.9,'foam'],[420,1.9,'foam']],
     branch:{points:B.points,cornerRanges:B.cornerRanges,forkIndex:m.fork,mergeIndex:B.marks.merge,mainMergeIndex:m.merge,side:'right'},
     cityZones:[[0,'shrine'],[m.descent,'upper'],[m.fork,'drift'],[m.merge,'lower'],[m.port,'port']],
     corners:['START 高台の神社',...A.cornerRanges.map(c=>c.label),'GOAL 漁港']};
@@ -6556,6 +6560,43 @@ function buildBranchVisuals(def,roadMaterial){
   for(const k of [-1.3,1.3]){const post=new THREE.Mesh(new THREE.BoxGeometry(.12,3.5,.12),new THREE.MeshLambertMaterial({color:0x8a8f8c}));const sx=Math.cos(sign.rotation.y)*k,sz=-Math.sin(sign.rotation.y)*k;post.position.set(m.x+sx,m.y+ROAD_Y+1.75,m.z+sz);group.add(post);}
   return group;
 }
+// 漁港の箱(def.portBoxes)：[漁港の始まりからの距離, 横の位置, 種類(foam=発泡スチロール・wood=木箱), 段の数]。道の上に並べ、すき間を左右交互にしてよけて走らせる。
+// 当たると、発泡スチロールは少し減速(壁をこすった時と同じ)、木箱は壁にぶつかった時と同じだけ減速して水が減る。当たった箱ははね飛び、スタートとやり直しで元に戻る。
+// 当たり判定は猫の位置(半径0.55m)と箱を上から見た四角で、走る道(左右)に関係なく同じ
+const PORT_BOX={foam:{w:1.6,d:1.1,h:.72},wood:{w:1.6,d:1.6,h:1.35}};
+let portBoxes=null;
+function portBoxTexture(kind){
+  const c=document.createElement('canvas');c.width=128;c.height=64;const g=c.getContext('2d');
+  if(kind==='foam'){g.fillStyle='#f4f6f5';g.fillRect(0,0,128,64);g.fillStyle='rgba(0,0,0,.08)';g.fillRect(0,0,128,6);g.fillRect(0,58,128,6);g.fillStyle='#2f6fb3';g.font="900 26px 'Zen Maru Gothic',sans-serif";g.textAlign='center';g.textBaseline='middle';g.fillText('鮮魚',64,33);}
+  else{g.fillStyle='#b98a55';g.fillRect(0,0,128,64);g.fillStyle='rgba(70,42,18,.35)';for(let y=0;y<64;y+=16)g.fillRect(0,y,128,2);g.fillRect(0,0,6,64);g.fillRect(122,0,6,64);g.fillStyle='rgba(60,30,10,.55)';g.font="900 16px 'Zen Maru Gothic',sans-serif";g.textAlign='center';g.textBaseline='middle';g.fillText('にゃん漁協',64,33);}
+  const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;return t;
+}
+function buildPortBoxes(def){
+  const from=def.cityZoneRanges.find(z=>z.kind==='port').from,list=[],group=new THREE.Group();group.name='portBoxes';
+  for(const [d,lat,kind,stack=1] of def.portBoxes){
+    const tr=getTrackAtDist(from+d),size=PORT_BOX[kind],yaw=Math.atan2(tr.t.x,tr.t.z),t=new THREE.Vector2(tr.t.x,tr.t.z).normalize();
+    list.push({kind,stack,home:new THREE.Vector3(tr.p.x+tr.n.x*lat,tr.p.y+ROAD_Y,tr.p.z+tr.n.z*lat),yaw,tx:t.x,tz:t.y,hw:size.w/2,hd:size.d/2,h:size.h,hit:false});
+  }
+  const meshes={};
+  for(const kind of Object.keys(PORT_BOX)){
+    const count=list.filter(o=>o.kind===kind).reduce((a,o)=>a+o.stack,0);if(!count)continue;const size=PORT_BOX[kind];
+    const mesh=new THREE.InstancedMesh(new THREE.BoxGeometry(size.w,size.h,size.d),new THREE.MeshLambertMaterial({map:portBoxTexture(kind)}),count);mesh.name='portBox_'+kind;mesh.castShadow=true;
+    meshes[kind]=mesh;group.add(mesh);
+  }
+  let index={};for(const o of list){o.mesh=meshes[o.kind];o.first=index[o.kind]=(index[o.kind]||0);index[o.kind]+=o.stack;}
+  portBoxes={list,group};resetPortBoxes();return group;
+}
+const portBoxMatrix=new THREE.Matrix4(),portBoxQuat=new THREE.Quaternion(),portBoxEuler=new THREE.Euler(),portBoxPos=new THREE.Vector3(),portBoxOne=new THREE.Vector3(1,1,1),portBoxLift=new THREE.Vector3();
+function placePortBox(o){
+  portBoxQuat.setFromEuler(portBoxEuler.set(o.rx,o.ry,o.rz));
+  for(let k=0;k<o.stack;k++){portBoxLift.set(0,o.h*(k+.5),0).applyQuaternion(portBoxQuat);o.mesh.setMatrixAt(o.first+k,portBoxMatrix.compose(portBoxPos.copy(o.pos).add(portBoxLift),portBoxQuat,portBoxOne));}
+  o.mesh.instanceMatrix.needsUpdate=true;
+}
+function resetPortBoxes(){
+  if(!portBoxes)return;
+  for(const o of portBoxes.list){o.hit=false;o.vel=null;o.pos=o.home.clone();o.rx=0;o.ry=o.yaw;o.rz=0;placePortBox(o);}
+  for(const m of portBoxes.group.children)m.computeBoundingSphere();
+}
 function rebuildTrack(key){
   currentKey=key; window.currentTrackKey=key;
   const def=TRACKS[key];
@@ -6661,6 +6702,7 @@ function rebuildTrack(key){
   const roadside=buildRoadsideFurniture(def);
   roadMesh.add(roadside);wallMeshes.push(roadside);
   if(branchRun)roadMesh.add(buildBranchVisuals(def,roadMesh.material));
+  portBoxes=null;if(def.portBoxes)roadMesh.add(buildPortBoxes(def));
   if(!def.harbor)roadMesh.add(buildRoadsideBanks(def));
   if(def.city){roadMesh.add(buildCityStructures(def));buildCityScenery(def);}
   if(def.harbor)buildHarborScenery(def);
@@ -9524,6 +9566,25 @@ function resetSlideExit(){slideDriveCorner=findDriveCorner();slideNeutralTime=0;
 // Shared handling budget. Steering never removes sustained overspeed push.
 const TOP_SPEED=210/3.6; // 最高速210km/h(全コース共通)
 let activeGripLimit=TOP_SPEED;
+// 毎コマ：猫が箱に当たったか調べ、はね飛んだ箱を動かす
+function updatePortBoxes(dt){
+  const tr=getTrackAtDist(s),px=tr.p.x+tr.n.x*lateral,pz=tr.p.z+tr.n.z*lateral,r=.55;
+  for(const o of portBoxes.list){
+    if(o.vel){o.vel.y-=9.8*dt;o.pos.addScaledVector(o.vel,dt);o.rx+=o.spin.x*dt;o.rz+=o.spin.z*dt;o.ry+=o.spin.y*dt;
+      if(o.pos.y<o.home.y&&o.vel.y<0){o.pos.y=o.home.y;o.vel=null;}placePortBox(o);continue;}
+    if(o.hit)continue;
+    const dx=px-o.home.x,dz=pz-o.home.z,along=dx*o.tx+dz*o.tz,across=dx*-o.tz+dz*o.tx;
+    if(Math.abs(along)>o.hd+r||Math.abs(across)>o.hw+r)continue;
+    // 当たった：猫の進む向きへ速度の6割で、猫から離れる横向きと上へはね飛ばす
+    o.hit=true;const side=Math.sign(-across)||1,light=o.kind==='foam';
+    o.vel=new THREE.Vector3(tr.t.x*speed*(light?.7:.35)+tr.n.x*side*(light?3:1.2),light?5:2.5,tr.t.z*speed*(light?.7:.35)+tr.n.z*side*(light?3:1.2));
+    o.spin=new THREE.Vector3((Math.random()-.5)*(light?14:5),(Math.random()-.5)*(light?10:3),(Math.random()-.5)*(light?14:5));
+    const hp=new THREE.Vector3(o.home.x,o.home.y+.5,o.home.z);
+    if(light){speed*=.94;spawnHit(hp,0xffffff);if(navigator.vibrate)navigator.vibrate([15]);}
+    else{stopWallDrive();wallHitCooldown=.65;speed=Math.max(speed*.32,Math.min(speed*.75,20,activeGripLimit*.9));lastWallHitTime=performance.now()/1000;
+      spawnHit(hp,0xffaa44);waterLevel=Math.max(0,waterLevel-18);updateCup();spawnSplash(hp);triggerCupHit();showDriveNotice('木箱にぶつかった','減速 · 水 −18%');if(navigator.vibrate)navigator.vibrate([60,40,60]);}
+  }
+}
 let lastWallContact=-Infinity,lastWallWaterLoss=18;
 let wallContactEpisode=null;
 function stopWallDrive(){
@@ -9954,7 +10015,7 @@ function resetRace(){
   try{ setupIrohaCurves(); }catch(e){}
   try{ setupIrohaAssist(); }catch(e){ console.warn('assist setup failed', e); }
   resetGutterRun();
-  resetBranchRoute();s=2; lateral=0; bank=0; relYaw=0; speed=0; isSliding=false; slideTime=0; isBrakingActive=false; brakeTime=0; isBrakingDrift=false; brakeDriftTime=0; wallHitCooldown=0; elapsed=0; waterLevel=100; boostTimer=0; skidTimer=0; smokeTimer=0; weightTransferRatio=0; exitBoostTimer=0; exitBoostPower=0; wasBraking=false; lineHoldTLat=0; lineHoldInitialized=false; resetSteeredLine(); resetSlideExit(); resetCornerDrive(); activeGripLimit=TOP_SPEED;lastWallContact=-Infinity;lastWallWaterLoss=18;wallContactEpisode=null;
+  resetBranchRoute();resetPortBoxes();s=2; lateral=0; bank=0; relYaw=0; speed=0; isSliding=false; slideTime=0; isBrakingActive=false; brakeTime=0; isBrakingDrift=false; brakeDriftTime=0; wallHitCooldown=0; elapsed=0; waterLevel=100; boostTimer=0; skidTimer=0; smokeTimer=0; weightTransferRatio=0; exitBoostTimer=0; exitBoostPower=0; wasBraking=false; lineHoldTLat=0; lineHoldInitialized=false; resetSteeredLine(); resetSlideExit(); resetCornerDrive(); activeGripLimit=TOP_SPEED;lastWallContact=-Infinity;lastWallWaterLoss=18;wallContactEpisode=null;
   resetLinkPracticeRun();
   t_opt=0; brakeChargeRatio=0; speedoSmoothedKmh=0; speedoNeedleAngle=Math.PI*0.78;
   gameState='ready';
@@ -10180,7 +10241,7 @@ syncSoundToggle();
 function startRace(){
   if(!document.getElementById('launchTitle').hidden||gameState!=='ready') return;
   raceRecordScope=recordScopeForMode();
-  resetBranchRoute();s=isPracticeActive()?currentPracticeSpawn().s:2;lateral=0;relYaw=0;speed=isPracticeActive()?currentPracticeSpawn().speed:9;resetSteeredLine();
+  resetBranchRoute();resetPortBoxes();s=isPracticeActive()?currentPracticeSpawn().s:2;lateral=0;relYaw=0;speed=isPracticeActive()?currentPracticeSpawn().speed:9;resetSteeredLine();
   gameState='racing';elapsed=0;simulationElapsed=0;
   resetLapRun();
   beginGhostRun();
@@ -12398,6 +12459,7 @@ function tick(dt){
     }
   }
   lateral=THREE.MathUtils.clamp(lateral,walls.left-0.8,walls.right+0.8);
+  if(portBoxes)updatePortBoxes(dt);
 
   // 着地演出中は確定したsに固定する
   let dtEffective = dt;
