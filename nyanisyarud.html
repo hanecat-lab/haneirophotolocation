@@ -5502,6 +5502,8 @@ function buildRoadsideFurniture(def){
   if(wood)instances('woodPostCaps',new THREE.BoxGeometry(.21,.045,.21),new THREE.MeshLambertMaterial({color:0xb3a58b}),positions,ROADSIDE.post,.94);
   instances('reflectorMounts',new THREE.BoxGeometry(.09,.14,.16),new THREE.MeshLambertMaterial({color:0x757d73}),reflectors,ROADSIDE.face-.045,.84);
   instances('roadReflectors',new THREE.BoxGeometry(.015,.085,.095),new THREE.MeshBasicMaterial({color:0xf5d394}),reflectors,ROADSIDE.face-.097,.85);
+  // 夜に反射板を光らせる位置(反射板と同じ所)
+  group.userData.reflectorSpots=Float32Array.from(reflectors.flatMap(({tr,side})=>[tr.p.x+tr.n.x*(ROADSIDE.face-.097)*side,tr.p.y+ROAD_Y+.85,tr.p.z+tr.n.z*(ROADSIDE.face-.097)*side]));
   // ボルトは64mごと・左右ごとにまとめ、カメラから70m以内の物だけ描く(遠くでは見えないほど小さいので)
   if(!wood){
     const boltGeo=new THREE.SphereGeometry(.025,6,4),boltMat=new THREE.MeshLambertMaterial({color:0x8c9691}),buckets=new Map();
@@ -14859,6 +14861,46 @@ function applyTimeOfDay(){
   }
   syncNightToggle();
 }
+// 反射板：目の光が当たった物ほど強く光り、光った物は霧の先でも半分の明るさで見える。光が当たらなくても霧の中ではうっすら光る。
+// 反射板は光をそのまま返すので、照らす距離の2倍まで光る。粒は近くで大きくなりすぎず、遠くでも消えない大きさにする(画面の点の数で2〜22。高精細の画面ではその倍率を掛ける)
+const REFLECTOR_GLOW={color:new THREE.Color(0xffd98a),base:.18,size:.45,minPx:2,maxPx:22,rangeScale:2};
+function nightReflectorGlow(group){
+  if(group.userData.nightGlow)return group.userData.nightGlow;
+  const spots=group.userData.reflectorSpots,geometry=new THREE.BufferGeometry();
+  geometry.setAttribute('position',new THREE.BufferAttribute(spots,3));geometry.setAttribute('color',new THREE.BufferAttribute(new Float32Array(spots.length),3));
+  const material=new THREE.PointsMaterial({map:catEyeLight.eyes[0].material.map,size:REFLECTOR_GLOW.size,vertexColors:true,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,fog:false});
+  material.userData.glow=true;
+  const pr=renderer.getPixelRatio();
+  material.onBeforeCompile=shader=>{shader.vertexShader=shader.vertexShader.replace('#include <logdepthbuf_vertex>',`gl_PointSize=clamp(gl_PointSize,${(REFLECTOR_GLOW.minPx*pr).toFixed(1)},${(REFLECTOR_GLOW.maxPx*pr).toFixed(1)});\n#include <logdepthbuf_vertex>`);};
+  const points=new THREE.Points(geometry,material);points.name='nightReflectorGlow';points.frustumCulled=false;group.add(points);group.userData.nightGlow=points;return points;
+}
+const nightBeamDir=new THREE.Vector3();
+function updateNightReflectors(spec,mid,fx,fz){
+  if(!roadMesh||!scene.fog)return;
+  const {near,far}=scene.fog,cam=camera.position,{color,base,rangeScale}=REFLECTOR_GLOW,range=spec.reach*rangeScale;
+  const cosOuter=Math.cos(spec.angle),cosInner=Math.cos(spec.angle*(1-catEyeLight.light.penumbra));nightBeamDir.set(fx,Math.tan(spec.pitch),fz).normalize();
+  for(const top of roadMesh.children)for(const group of top.name==='branchRoad'?top.children:[top]){
+    if(group.name!=='roadsideFurniture'||!group.userData.reflectorSpots?.length)continue;
+    const points=nightReflectorGlow(group),pos=points.geometry.attributes.position.array,attr=points.geometry.attributes.color,col=attr.array;
+    for(let i=0;i<pos.length;i+=3){
+      const x=pos[i],y=pos[i+1],z=pos[i+2],seen=1-THREE.MathUtils.smoothstep(Math.hypot(x-cam.x,y-cam.y,z-cam.z),near,far);
+      let lit=0;
+      if(range>0){const lx=x-mid.x,ly=y-mid.y,lz=z-mid.z,d=Math.hypot(lx,ly,lz);if(d<range&&d>.01)lit=THREE.MathUtils.smoothstep((lx*nightBeamDir.x+ly*nightBeamDir.y+lz*nightBeamDir.z)/d,cosOuter,cosInner)*(1-d/range);}
+      const k=Math.min(1,base*seen+lit*Math.max(seen,.5));col[i]=color.r*k;col[i+1]=color.g*k;col[i+2]=color.b*k;
+    }
+    attr.needsUpdate=true;
+  }
+}
+// ゴーストの目：夜は目の2つの光だけ霧に関係なく見える(体は霧で消える)。画面の上で一定の大きさにして、遠くでも点で分かるようにする
+chai.eyes.forEach((eye,i)=>{eye.name='chaiEye'+i;});
+const nightGhostEyes=GHOST_TINTS.map(tint=>[0,1].map(()=>{const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:catEyeLight.eyes[0].material.map,color:tint.color,blending:THREE.AdditiveBlending,depthWrite:false,transparent:true,fog:false,sizeAttenuation:false}));sp.material.userData.glow=true;sp.scale.setScalar(.014);sp.visible=false;catEyeLight.group.add(sp);return sp;}));
+function updateNightGhostEyes(){
+  ghostPlayers.forEach((player,index)=>{
+    const model=player.model,shown=!!(model?.visible&&player.material),eyes=nightGhostEyes[index];if(!eyes)return;
+    const nodes=shown?(model.userData.eyeNodes??=[0,1].map(i=>model.getObjectByName('chaiEye'+i))):[];
+    eyes.forEach((sp,i)=>{sp.visible=shown;if(!shown)return;const node=nodes[i];if(!node){sp.visible=false;return;}node.getWorldPosition(sp.position);sp.material.opacity=Math.min(1,player.material.opacity/.25)*.9;});
+  });
+}
 // 毎コマ：夜の空をカメラに付いていかせ、目の光を猫の目に合わせ、霧の距離を目の光に合わせて0.4秒ほどで寄せる。
 // 1秒ごとに、まだ替えていない絵のある素材(光で陰が付かない物)を夜用の素材に替え、猫の光り方を合わせる
 const nightEyeA=new THREE.Vector3(),nightEyeB=new THREE.Vector3(),nightLook=new THREE.Vector3();
@@ -14881,6 +14923,7 @@ function updateNightLights(dt){
   // 光の筋は猫目線では出さない(目の前が光で埋まるので)
   beam.visible=spec.beam>0&&cameraMode!=='cat';
   if(beam.visible){beam.position.copy(mid);beam.lookAt(mid.x+fx,mid.y+Math.tan(spec.pitch),mid.z+fz);const r=Math.tan(spec.angle*.35)*spec.beam;beam.scale.set(r,r,spec.beam);}
+  updateNightReflectors(spec,mid,fx,fz);updateNightGhostEyes();
 }
 document.getElementById('btnNightToggle').addEventListener('click',()=>{nightMode=!nightMode;try{localStorage.setItem('nyanisyarud_night_v1',String(nightMode));}catch(e){}window.switchTrack(currentKey);});
 document.getElementById('btnCatLight').addEventListener('click',()=>cycleCatLight());
