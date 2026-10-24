@@ -14949,32 +14949,70 @@ const COURSE_GHOST_BUTTONS=Object.fromEntries(Object.entries(COURSES).map(([k,c]
 const PERFECT_KEY='nyanisyarud_perfect_v1';
 function perfectKeys(){try{const v=JSON.parse(localStorage.getItem(PERFECT_KEY)||'[]');return new Set(Array.isArray(v)?v:[]);}catch{return new Set();}}
 function addPerfectKey(key){const set=perfectKeys(),first=!set.has(key);set.add(key);try{localStorage.setItem(PERFECT_KEY,JSON.stringify([...set]));}catch{/* 保存できなくても演出は出す */}return first;}
-// 鳥居に降らせる光の雨：LivehouseX の光の雨と同じ作り。1粒＝四角形1枚の筋で、位置は頂点シェーダが粒の番号(seed)と時刻から決める(CPUは毎コマ時刻だけ渡す)。
+// ノーミスの光の雨：LivehouseX の光の雨と同じ作り。1粒＝四角形1枚の筋で、位置は頂点シェーダが粒の番号(seed)と時刻から決める(CPUは毎コマ時刻と中心だけ渡す)。
+// 降らせる範囲はカメラの前方を中心にした箱(size)で、カメラに見えている所全体に降る。粒の位置は世界に固定し、箱からはみ出した粒は反対側へ回り込ませる
+// (カメラを指で回しても雨がカメラと一緒に滑らない)。カメラから2.5〜6mの粒は薄く(目の前の太い筋を出さない)、26〜40m先も薄くする。
 // 粒ごとに落ちる速さを変え(粒の大きさの違い)、筋は頭が明るく尾が薄い。色は水色を主に、ときどき桃色。
 // 最初の約5秒は全部の粒で降り、最後の1.5秒で後ろ半分の粒だけ消す。そのあとは残りの半分でゴール画面にいる間ずっと降り続ける(電池と発熱を抑える)
-const PERFECT_RAIN={count:1400,duration:5,fadeIn:.3,fadeOut:1.5,speed:7,streak:.55,width:.035};
+const PERFECT_RAIN={count:4000,duration:5,fadeIn:.3,fadeOut:1.5,speed:7,streak:.55,width:.035,size:[30,16,28],ahead:13,above:5};
+const perfectRainCorner=[[-1,0],[1,0],[1,1],[-1,0],[1,1],[-1,1]];
+// 四角形count枚の形と、粒の番号(1〜count)
+function perfectQuadGeometry(count){
+  const pos=new Float32Array(count*18),seed=new Float32Array(count*6);
+  for(let i=0;i<count;i++)for(let v=0;v<6;v++){const k=i*6+v;pos[k*3]=perfectRainCorner[v][0];pos[k*3+1]=perfectRainCorner[v][1];seed[k]=i+1;}
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(pos,3));g.setAttribute('aSeed',new THREE.BufferAttribute(seed,1));return g;
+}
 const perfectRain=(()=>{
-  const corner=[[-1,0],[1,0],[1,1],[-1,0],[1,1],[-1,1]],pos=new Float32Array(PERFECT_RAIN.count*18),seed=new Float32Array(PERFECT_RAIN.count*6);
-  for(let i=0;i<PERFECT_RAIN.count;i++)for(let v=0;v<6;v++){const k=i*6+v;pos[k*3]=corner[v][0];pos[k*3+1]=corner[v][1];seed[k]=i+1;}
-  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(pos,3));g.setAttribute('aSeed',new THREE.BufferAttribute(seed,1));
+  const g=perfectQuadGeometry(PERFECT_RAIN.count);
   const material=new THREE.ShaderMaterial({transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,side:THREE.DoubleSide,
-    uniforms:{uTime:{value:0},uOpacity:{value:0},uHalf:{value:PERFECT_RAIN.count/2},uThin:{value:1},uX:{value:8},uZ:{value:3},uH:{value:12},uSpeed:{value:PERFECT_RAIN.speed},uStreak:{value:PERFECT_RAIN.streak},uWidth:{value:PERFECT_RAIN.width},
+    uniforms:{uTime:{value:0},uOpacity:{value:0},uHalf:{value:PERFECT_RAIN.count/2},uThin:{value:1},uCenter:{value:new THREE.Vector3()},uSize:{value:new THREE.Vector3(...PERFECT_RAIN.size)},
+      uSpeed:{value:PERFECT_RAIN.speed},uStreak:{value:PERFECT_RAIN.streak},uWidth:{value:PERFECT_RAIN.width},
       uColorA:{value:new THREE.Color(0x9fe6ff)},uColorB:{value:new THREE.Color(0xffb8dc)}},
-    vertexShader:`attribute float aSeed;uniform float uTime,uX,uZ,uH,uSpeed,uStreak,uWidth,uHalf,uThin;varying vec2 vC;varying float vTint,vKeep;
+    vertexShader:`attribute float aSeed;uniform float uTime,uSpeed,uStreak,uWidth,uHalf,uThin;uniform vec3 uCenter,uSize;varying vec2 vC;varying float vTint,vKeep,vFade;
       float h(float n){return fract(sin(n*12.9898)*43758.5453);}
       void main(){
         vC=position.xy;vTint=h(aSeed+3.3);vKeep=aSeed>uHalf?uThin:1.;float kf=.7+.6*h(aSeed+19.3);
-        float y=uH-mod(h(aSeed+13.7)*uH+uTime*uSpeed*kf,uH);
-        vec3 p=vec3(mix(-uX,uX,h(aSeed))+.05*(uH-y),y,mix(-uZ,uZ,h(aSeed+7.1)));
-        vec4 c=modelViewMatrix*vec4(p,1.);vec3 up=normalize((modelViewMatrix*vec4(.05,1.,0.,0.)).xyz),side=normalize(cross(up,vec3(0.,0.,1.)));
+        vec3 q=vec3(h(aSeed),h(aSeed+13.7),h(aSeed+7.1))*uSize;q.y-=uTime*uSpeed*kf;
+        vec3 p=uCenter+mod(q-uCenter,uSize)-uSize*.5;p.x+=.05*(uCenter.y+uSize.y*.5-p.y);
+        float d=distance(p,cameraPosition);vFade=smoothstep(2.5,6.,d)*(1.-smoothstep(26.,40.,d));
+        vec4 c=viewMatrix*vec4(p,1.);vec3 up=normalize((viewMatrix*vec4(.05,1.,0.,0.)).xyz),side=normalize(cross(up,vec3(0.,0.,1.)));
         c.xyz+=side*position.x*uWidth+up*position.y*uStreak*kf;gl_Position=projectionMatrix*c;
       }`,
-    fragmentShader:`uniform float uOpacity;uniform vec3 uColorA,uColorB;varying vec2 vC;varying float vTint,vKeep;
-      void main(){float a=(1.-abs(vC.x))*(1.-vC.y*.9)*uOpacity*vKeep;gl_FragColor=vec4(mix(uColorA,uColorB,step(.82,vTint)),a);
+    fragmentShader:`uniform float uOpacity;uniform vec3 uColorA,uColorB;varying vec2 vC;varying float vTint,vKeep,vFade;
+      void main(){float a=(1.-abs(vC.x))*(1.-vC.y*.9)*uOpacity*vKeep*vFade;gl_FragColor=vec4(mix(uColorA,uColorB,step(.82,vTint)),a);
       #include <colorspace_fragment>
       }`});
   material.userData.glow=true;const mesh=new THREE.Mesh(g,material);mesh.name='perfectRain';mesh.frustumCulled=false;mesh.visible=false;
   return {mesh,material,time:-1,lit:false};
+})();
+// ノーミスの噴水：記念写真の猫の少し後ろ(鳥居の側へback m)の両脇(side m)から、水を吹き上げて外側へ放物線で落とす。1粒＝四角形1枚の筋(進む向きに伸ばす)。
+// 粒ごとに打ち上げの速さ(上up・外out)を変え、落ちて元の高さに戻るまでを1回として繰り返す(位置は頂点シェーダが時刻から計算)。番号が奇数は左、偶数は右。
+// 雨と同じく、5秒後に4割の粒を消す
+const PERFECT_FOUNTAIN={count:1000,back:2.5,side:1.5,up:[9.5,11],out:[.3,.9],streak:.3,width:.04,keep:.6};
+const perfectFountain=(()=>{
+  const g=perfectQuadGeometry(PERFECT_FOUNTAIN.count),F=PERFECT_FOUNTAIN;
+  const material=new THREE.ShaderMaterial({transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,side:THREE.DoubleSide,
+    uniforms:{uTime:{value:0},uOpacity:{value:0},uThin:{value:1},uKeepFrom:{value:F.count*F.keep},uBaseL:{value:new THREE.Vector3()},uBaseR:{value:new THREE.Vector3()},
+      uOut:{value:new THREE.Vector3(1,0,0)},uFwd:{value:new THREE.Vector3(0,0,1)},uUp:{value:new THREE.Vector2(...F.up)},uSpread:{value:new THREE.Vector2(...F.out)},
+      uStreak:{value:F.streak},uWidth:{value:F.width},uColorA:{value:new THREE.Color(0x9fe6ff)},uColorB:{value:new THREE.Color(0xffb8dc)}},
+    vertexShader:`attribute float aSeed;uniform float uTime,uThin,uKeepFrom,uStreak,uWidth;uniform vec3 uBaseL,uBaseR,uOut,uFwd;uniform vec2 uUp,uSpread;varying vec2 vC;varying float vTint,vKeep,vFade;
+      float h(float n){return fract(sin(n*12.9898)*43758.5453);}
+      void main(){
+        vC=position.xy;vTint=h(aSeed+3.3);vKeep=aSeed>uKeepFrom?uThin:1.;
+        bool left=mod(aSeed,2.)>.5;vec3 base=left?uBaseL:uBaseR,away=left?-uOut:uOut;
+        float vy=mix(uUp.x,uUp.y,h(aSeed+1.7)),T=2.*vy/9.8,t=mod(uTime+h(aSeed+4.2)*T,T);
+        vec3 v0=away*mix(uSpread.x,uSpread.y,h(aSeed+8.8))+uFwd*(h(aSeed+2.9)-.5)*.8+vec3(0.,vy,0.);
+        vec3 p=base+v0*t+vec3(0.,-4.9*t*t,0.),vel=v0+vec3(0.,-9.8*t,0.);
+        vFade=smoothstep(0.,.08,t)*(1.-smoothstep(T-.12,T,t));
+        vec4 c=viewMatrix*vec4(p,1.);vec3 dir=normalize((viewMatrix*vec4(vel,0.)).xyz),sd=cross(dir,vec3(0.,0.,1.));sd=length(sd)<.01?vec3(1.,0.,0.):normalize(sd);
+        c.xyz+=sd*position.x*uWidth+dir*(position.y-.5)*uStreak;gl_Position=projectionMatrix*c;
+      }`,
+    fragmentShader:`uniform float uOpacity;uniform vec3 uColorA,uColorB;varying vec2 vC;varying float vTint,vKeep,vFade;
+      void main(){float a=(1.-abs(vC.x))*(.4+.6*vC.y)*uOpacity*vKeep*vFade;gl_FragColor=vec4(mix(uColorA,uColorB,step(.86,vTint)),a);
+      #include <colorspace_fragment>
+      }`});
+  material.userData.glow=true;const mesh=new THREE.Mesh(g,material);mesh.name='perfectFountain';mesh.frustumCulled=false;mesh.visible=false;
+  return {mesh,material,placedAt:-1};
 })();
 // 紙吹雪の肉球の絵(水色)
 let perfectPawTexture=null;
@@ -15105,11 +15143,10 @@ function startPerfectFinish(first){
   const cup=document.getElementById('cupWrap');cup.classList.remove('perfect');void cup.offsetWidth;cup.classList.add('perfect');
   if(navigator.vibrate)setTimeout(()=>navigator.vibrate([25,60,25]),450);
   if(!appAnimationsEnabled||!gateGroup)return;
-  // 光の雨を鳥居の大きさに合わせる(鳥居を置いた向きで、幅は柱の外まで・高さは笠木の上3m)
-  const torii=gateGroup.getObjectByName('goalTorii')||gateGroup.getObjectByName('fallbackGate');gateGroup.updateMatrixWorld(true);
-  const b=new THREE.Box3().setFromObject(torii),size=b.getSize(new THREE.Vector3()),u=perfectRain.material.uniforms;
-  u.uX.value=Math.max(size.x,size.z)*.55;u.uZ.value=3;u.uH.value=size.y+3;u.uThin.value=1;perfectRain.mesh.geometry.setDrawRange(0,Infinity);
-  if(perfectRain.mesh.parent!==gateGroup)gateGroup.add(perfectRain.mesh);perfectRain.mesh.visible=true;perfectRain.time=0;perfectRain.lit=true;
+  // 光の雨はカメラに見えている所全体(中心は毎コマカメラに合わせる)。噴水は記念写真の猫の位置が決まってから置く
+  perfectRain.material.uniforms.uThin.value=1;perfectRain.mesh.geometry.setDrawRange(0,Infinity);placePerfectRain();
+  if(perfectRain.mesh.parent!==scene)scene.add(perfectRain.mesh);perfectRain.mesh.visible=true;perfectRain.time=0;perfectRain.lit=true;
+  perfectFountain.placedAt=-1;perfectFountain.mesh.visible=false;perfectFountain.mesh.removeFromParent();perfectFountain.material.uniforms.uThin.value=1;perfectFountain.mesh.geometry.setDrawRange(0,Infinity);
   // 紙吹雪：水色の水玉と肉球
   const gt=gateGroup.position;
   for(let i=0;i<28;i++){
@@ -15122,19 +15159,38 @@ function startPerfectFinish(first){
 function stopPerfectFinish(){
   document.getElementById('perfectFinish').hidden=true;document.getElementById('cupWrap').classList.remove('perfect');
   perfectRain.time=-1;perfectRain.lit=false;perfectRain.mesh.visible=false;perfectRain.mesh.removeFromParent();setPerfectLightUp(0);
+  perfectFountain.placedAt=-1;perfectFountain.mesh.visible=false;perfectFountain.mesh.removeFromParent();
+}
+// 雨の箱の中心：カメラの前方(水平)ahead m、カメラの高さからabove m上
+const perfectRainForward=new THREE.Vector3();
+function placePerfectRain(){
+  camera.getWorldDirection(perfectRainForward);perfectRainForward.y=0;if(perfectRainForward.lengthSq()<1e-6)perfectRainForward.set(0,0,-1);perfectRainForward.normalize();
+  perfectRain.material.uniforms.uCenter.value.copy(camera.position).addScaledVector(perfectRainForward,PERFECT_RAIN.ahead).setY(camera.position.y+PERFECT_RAIN.above);
+}
+// 噴水を置く：猫から鳥居の向き(水平)にback m、その左右にside m。外向きは左右の向き
+function placePerfectFountain(time){
+  const u=perfectFountain.material.uniforms,F=PERFECT_FOUNTAIN,fwd=gateGroup.position.clone().sub(goalPhoto.cat).setY(0);if(fwd.lengthSq()<1e-6)fwd.set(0,0,1);fwd.normalize();
+  const side=new THREE.Vector3(-fwd.z,0,fwd.x),base=goalPhoto.cat.clone().addScaledVector(fwd,F.back);
+  u.uBaseL.value.copy(base).addScaledVector(side,-F.side);u.uBaseR.value.copy(base).addScaledVector(side,F.side);u.uOut.value.copy(side);u.uFwd.value.copy(fwd);
+  perfectFountain.placedAt=time;if(perfectFountain.mesh.parent!==scene)scene.add(perfectFountain.mesh);perfectFountain.mesh.visible=true;
 }
 // 夜のライトアップの光の筋と灯りを、水色へ寄せる(0〜1)
 const PERFECT_AQUA=new THREE.Color(0x7fe0ff);
 function setPerfectLightUp(k){
   gateGroup?.getObjectByName('goalLightUp')?.traverse(o=>{const m=o.material;if(!m?.color)return;m.userData.baseColor??=m.color.clone();m.color.copy(m.userData.baseColor).lerp(PERFECT_AQUA.clone().multiplyScalar(Math.max(1,m.userData.baseColor.r)),k);});
 }
-// 毎コマ：光の雨の時刻と濃さ、夜のライトアップの色(ライトアップは最初の2.6秒だけ)
+// 毎コマ：光の雨の時刻・濃さ・中心、噴水の時刻と濃さ、夜のライトアップの色(ライトアップは最初の2.6秒だけ)
 function updatePerfectFinish(dt){
   if(perfectRain.time<0)return;
-  const t=perfectRain.time+=dt,{duration,fadeIn,fadeOut}=PERFECT_RAIN,u=perfectRain.material.uniforms;
-  u.uTime.value=t;u.uOpacity.value=Math.min(1,t/fadeIn);u.uThin.value=1-THREE.MathUtils.smoothstep(t,duration-fadeOut,duration);
+  const t=perfectRain.time+=dt,{duration,fadeIn,fadeOut}=PERFECT_RAIN,u=perfectRain.material.uniforms,thin=1-THREE.MathUtils.smoothstep(t,duration-fadeOut,duration);
+  u.uTime.value=t;u.uOpacity.value=Math.min(1,t/fadeIn);u.uThin.value=thin;placePerfectRain();
   // 消えた後ろ半分の粒は描かない(1粒＝6頂点)
   if(t>=duration&&perfectRain.mesh.geometry.drawRange.count===Infinity)perfectRain.mesh.geometry.setDrawRange(0,PERFECT_RAIN.count/2*6);
+  if(perfectFountain.placedAt<0&&goalPhoto.ready&&gateGroup)placePerfectFountain(t);
+  if(perfectFountain.placedAt>=0){
+    const f=perfectFountain.material.uniforms;f.uTime.value=t;f.uOpacity.value=Math.min(1,(t-perfectFountain.placedAt)/.4);f.uThin.value=thin;
+    if(t>=duration&&perfectFountain.mesh.geometry.drawRange.count===Infinity)perfectFountain.mesh.geometry.setDrawRange(0,Math.floor(PERFECT_FOUNTAIN.count*PERFECT_FOUNTAIN.keep)*6);
+  }
   if(perfectRain.lit){setPerfectLightUp(nightMode?Math.min(1,t/.4)*(1-THREE.MathUtils.smoothstep(t,1.8,2.6)):0);if(t>=2.6)perfectRain.lit=false;}
 }
 // コース選択：そのコースで今のルールのノーミス完走があれば💧
