@@ -5029,7 +5029,9 @@ function makeFutamataCourse(){
   return {name:'猫又の里 二股峠',sub:'峠の茶屋→千本鳥居→二股の分かれ道→最高速の坂→猫又の里｜夜がおすすめ(昼は演出なし)｜高低差150m',points:A.points,cornerRanges:A.cornerRanges,sectionStarts:[],finishRatio:1,courseRecordVersion:'v1',curveType:'centripetal',
     gravity:true,autoGuide:true,
     // 妖怪の里の区間(点の番号)：千本鳥居・最高速の坂・狐の嫁入り・里の通り
-    yokai:{torii:[m.torii,m.toriiEnd],slope:[m.slope,m.slopeEnd],kitsune:[m.kitsune,m.kitsuneEnd],village:m.village},
+    yokai:{torii:[m.torii,m.toriiEnd],slope:[m.slope,m.slopeEnd],kitsune:[m.kitsune,m.kitsuneEnd],village:m.village,
+      // 化け提灯：[里の入口からの距離, 横の位置の並び]。すき間を左右交互に空け、130mと275mはまん中に寄せて左右どちらでも抜けられる
+      lanterns:[[40,[-3,-2,-1,0]],[85,[3,2,1,0]],[130,[-1.2,0,1.2]],[200,[0]],[240,[3,2,1,0]],[275,[-1.2,0,1.2]],[320,[-3,-2,-1,0]]]},
     branch:{points:B.points,cornerRanges:B.cornerRanges,forkIndex:m.fork,mergeIndex:B.marks.merge,mainMergeIndex:m.merge,side:'right'},
     corners:['START 峠の茶屋',...A.cornerRanges.map(c=>c.label),'GOAL 猫又の里']};
 }
@@ -7157,6 +7159,7 @@ function buildYokai(def){
       if(name==='lanternCat')o.traverse(c=>{if(c.isMesh&&c.material.emissive){c.material=c.material.clone();y.spectators.at(-1)?.glow.push(c.material);}});
     }).catch(()=>{});
   }
+  if(Y.lanterns)group.add(buildYokaiLanterns(y,Y.lanterns));
   return group;
 }
 // 毎コマ：千本鳥居の灯り(夜だけ。猫がlight m手前に来た鳥居から順に0.3秒で灯る)、提灯の猫の光(夜だけ)、近くを猫が通る観客は跳ねて揺れる
@@ -7183,6 +7186,56 @@ function updateYokai(dt){
     const near=gameState==='racing'&&branchRun?.route!=='B'?1-THREE.MathUtils.smoothstep(Math.abs(sp.d-s),10,30):0,t=y.time*7+sp.phase;
     sp.o.position.y=sp.base+Math.max(0,Math.sin(t))*.25*near*quiet;sp.o.rotation.z=(sp.flag?Math.sin(t)*.18:Math.sin(t*.5)*.06)*near*quiet;
   }
+}
+// === 化け提灯(夜だけ)：里の通りの道の上でその場で跳ねる紙の提灯。当たると発泡スチロールの箱と同じく、はね飛んで減速しドリフトが切れる(HAZARD.lantern) ===
+const LANTERN={r:.45,h:1.1,hop:.45,hopSpeed:5};
+function lanternTexture(){
+  const c=document.createElement('canvas');c.width=256;c.height=128;const g=c.getContext('2d');
+  g.fillStyle='#ffb347';g.fillRect(0,0,256,128);g.fillStyle='rgba(190,60,20,.35)';for(let y=14;y<114;y+=11)g.fillRect(0,y,256,2);
+  g.fillStyle='#1c1410';g.fillRect(0,0,256,10);g.fillRect(0,118,256,10);
+  // 正面(u=0.5)：大きな一つ目と、裂けた口から長い舌
+  g.fillStyle='#fff';g.beginPath();g.ellipse(128,46,20,16,0,0,7);g.fill();g.fillStyle='#111';g.beginPath();g.arc(131,47,8,0,7);g.fill();
+  g.strokeStyle='#5a1a10';g.lineWidth=4;g.beginPath();g.moveTo(98,80);g.quadraticCurveTo(128,94,158,78);g.stroke();
+  g.fillStyle='#e8304a';g.beginPath();g.moveTo(120,86);g.quadraticCurveTo(116,116,128,122);g.quadraticCurveTo(140,116,136,86);g.fill();
+  const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;return t;
+}
+function buildYokaiLanterns(y,rows){
+  const L=LANTERN,list=[];
+  for(const [dd,lats] of rows){const d=y.villageFrom+dd;if(d>totalLength-20)continue;
+    const tr=getTrackAtDist(d),t=new THREE.Vector2(tr.t.x,tr.t.z).normalize(),yaw=Math.atan2(tr.t.x,tr.t.z);
+    lats.forEach((lat,i)=>list.push({row:dd,home:new THREE.Vector3(tr.p.x+tr.n.x*lat,tr.p.y+ROAD_Y,tr.p.z+tr.n.z*lat),yaw,tx:t.x,tz:t.y,phase:dd*.7+i*1.9,hit:false}));}
+  const prof=[[.18,0],[.3,.04],[.4,.2],[.45,.5],[.4,.8],[.3,.96],[.18,1]].map(([r,h])=>new THREE.Vector2(r*L.r/.45,h*L.h));
+  const mesh=new THREE.InstancedMesh(new THREE.LatheGeometry(prof,20),new THREE.MeshBasicMaterial({map:lanternTexture()}),list.length);mesh.name='bakeLanterns';mesh.material.userData.glow=true;mesh.frustumCulled=false;
+  list.forEach((o,i)=>o.index=i);y.lanterns={list,mesh};resetYokaiLanterns();return mesh;
+}
+const lanternMatrix=new THREE.Matrix4(),lanternQuat=new THREE.Quaternion(),lanternEuler=new THREE.Euler(),lanternOne=new THREE.Vector3(1,1,1),lanternPos=new THREE.Vector3();
+function placeYokaiLantern(mesh,o,lift=0){
+  lanternQuat.setFromEuler(lanternEuler.set(o.rx,o.ry,o.rz));mesh.setMatrixAt(o.index,lanternMatrix.compose(lanternPos.copy(o.pos).setY(o.pos.y+lift),lanternQuat,lanternOne));
+}
+function resetYokaiLanterns(){
+  const ls=yokaiRun?.lanterns;if(!ls)return;
+  ls.struck=new Set();for(const o of ls.list){o.hit=false;o.vel=null;o.pos=o.home.clone();o.rx=0;o.ry=o.yaw;o.rz=0;placeYokaiLantern(ls.mesh,o);}
+  ls.mesh.instanceMatrix.needsUpdate=true;
+}
+// 毎コマ(走りの計算の中)：昼は消して当たらない。夜は跳ねさせ、猫が当たったらはね飛ばす
+function updateYokaiLanterns(dt){
+  const ls=yokaiRun?.lanterns;if(!ls)return;ls.mesh.visible=nightMode;if(!nightMode)return;
+  // 同じ列の提灯にいくつ触れても、減速は1回分だけ
+  const L=LANTERN,tr=getTrackAtDist(s),px=tr.p.x+tr.n.x*lateral,pz=tr.p.z+tr.n.z*lateral,r=.55,now=simulationElapsed;
+  for(const o of ls.list){
+    if(o.vel){o.vel.y-=9.8*dt;o.pos.addScaledVector(o.vel,dt);o.rx+=o.spin.x*dt;o.rz+=o.spin.z*dt;o.ry+=o.spin.y*dt;
+      if(o.pos.y<o.home.y&&o.vel.y<0){o.pos.y=o.home.y;o.vel=null;}placeYokaiLantern(ls.mesh,o);continue;}
+    if(o.hit){placeYokaiLantern(ls.mesh,o);continue;}
+    placeYokaiLantern(ls.mesh,o,Math.abs(Math.sin(now*L.hopSpeed+o.phase))*L.hop);
+    const dx=px-o.home.x,dz=pz-o.home.z,along=dx*o.tx+dz*o.tz,across=dx*-o.tz+dz*o.tx;
+    if(Math.abs(along)>L.r+r||Math.abs(across)>L.r+r||gameState!=='racing')continue;
+    o.hit=true;const side=Math.sign(-across)||1;
+    o.vel=new THREE.Vector3(tr.t.x*speed*.7+tr.n.x*side*3,5,tr.t.z*speed*.7+tr.n.z*side*3);
+    o.spin=new THREE.Vector3((Math.random()-.5)*14,(Math.random()-.5)*10,(Math.random()-.5)*14);
+    if(ls.struck.has(o.row))continue;ls.struck.add(o.row);
+    const lost=hitHazard('lantern');spawnHit(new THREE.Vector3(o.home.x,o.home.y+.6,o.home.z),0xffb347);showDriveNotice('化け提灯に当たった',`減速 −${lost}km/h`);if(navigator.vibrate)navigator.vibrate([15]);
+  }
+  ls.mesh.instanceMatrix.needsUpdate=true;
 }
 let tunnelRun=null;
 // 床・壁・天井・反射板の材質。lampLight(焼き込んだライトの明るさ)・dayLight(入口から差し込む昼の光)と、目の光(スポットライトと同じ円すい)で照らす。
@@ -10929,7 +10982,7 @@ function kitsuneAmount(ramp=KITSUNE.ramp){
 }
 function kitsuneGripScale(){return THREE.MathUtils.lerp(1,KITSUNE.grip,kitsuneAmount());}
 function kitsuneBrakeScale(){return THREE.MathUtils.lerp(1,KITSUNE.brake,kitsuneAmount());}
-const HAZARD={foam:{rate:[.88,.8,.7],min:7,cut:true,slip:0},hole:{rate:[.85],min:8,cut:true,slip:0},puddle:{rate:[.97],min:2,cut:false,slip:1}};
+const HAZARD={foam:{rate:[.88,.8,.7],min:7,cut:true,slip:0},hole:{rate:[.85],min:8,cut:true,slip:0},puddle:{rate:[.97],min:2,cut:false,slip:1},lantern:{rate:[.88],min:7,cut:true,slip:0}};
 let hazardSlipUntil=-1;
 // 減速して、落とした速さ(km/h)を返す
 function hitHazard(kind,stack=1){
@@ -10944,7 +10997,7 @@ function hitHazard(kind,stack=1){
 // 下に全部の値を出すので、決まったら画面を撮って送ってもらう
 const hazardLab=(()=>{
   if(!new URLSearchParams(location.search).has('hazardlab'))return null;
-  const NAMES={foam:'発泡スチロール',hole:'穴',puddle:'水たまり'};
+  const NAMES={foam:'発泡スチロール',hole:'穴',puddle:'水たまり',lantern:'化け提灯'};
   const el=document.createElement('div');el.style.cssText='position:fixed;left:6px;top:120px;z-index:9999;padding:6px 8px;border-radius:8px;background:rgba(0,0,0,.72);color:#fff;font:700 11px/1.5 monospace;width:220px';document.body.appendChild(el);
   const head=document.createElement('button');head.type='button';head.textContent='減速の調整 ▲';head.style.cssText='width:100%;font:inherit;color:#fff;background:#334;border:0;border-radius:6px;padding:3px';el.appendChild(head);
   const body=document.createElement('div');el.appendChild(body);head.addEventListener('click',()=>{body.hidden=!body.hidden;head.textContent='減速の調整 '+(body.hidden?'▼':'▲');});
@@ -11459,7 +11512,7 @@ function resetRace(){
   try{ setupIrohaCurves(); }catch(e){}
   try{ setupIrohaAssist(); }catch(e){ console.warn('assist setup failed', e); }
   resetGutterRun();
-  resetBranchRoute();resetPortBoxes();hazardSlipUntil=-1;resetCornerGrades();if(yokaiRun){yokaiRun.fired=false;yokaiRun.kitsuneShown=false;}s=2; lateral=0; bank=0; relYaw=0; speed=0; isSliding=false; slideTime=0; isBrakingActive=false; brakeTime=0; isBrakingDrift=false; brakeDriftTime=0; wallHitCooldown=0; elapsed=0; waterLevel=100; boostTimer=0; skidTimer=0; smokeTimer=0; weightTransferRatio=0; exitBoostTimer=0; exitBoostPower=0; wasBraking=false; lineHoldTLat=0; lineHoldInitialized=false; resetSteeredLine(); resetSlideExit(); resetCornerDrive(); activeGripLimit=TOP_SPEED;lastWallContact=-Infinity;lastWallWaterLoss=18;wallContactEpisode=null;
+  resetBranchRoute();resetPortBoxes();hazardSlipUntil=-1;resetCornerGrades();if(yokaiRun){yokaiRun.fired=false;yokaiRun.kitsuneShown=false;resetYokaiLanterns();}s=2; lateral=0; bank=0; relYaw=0; speed=0; isSliding=false; slideTime=0; isBrakingActive=false; brakeTime=0; isBrakingDrift=false; brakeDriftTime=0; wallHitCooldown=0; elapsed=0; waterLevel=100; boostTimer=0; skidTimer=0; smokeTimer=0; weightTransferRatio=0; exitBoostTimer=0; exitBoostPower=0; wasBraking=false; lineHoldTLat=0; lineHoldInitialized=false; resetSteeredLine(); resetSlideExit(); resetCornerDrive(); activeGripLimit=TOP_SPEED;lastWallContact=-Infinity;lastWallWaterLoss=18;wallContactEpisode=null;
   resetLinkPracticeRun();
   t_opt=0; brakeChargeRatio=0; speedoSmoothedKmh=0; speedoNeedleAngle=Math.PI*0.78;
   gameState='ready';
@@ -11687,7 +11740,7 @@ syncSoundToggle();
 function startRace(){
   if(!document.getElementById('launchTitle').hidden||gameState!=='ready') return;
   raceRecordScope=recordScopeForMode();
-  resetBranchRoute();resetPortBoxes();hazardSlipUntil=-1;resetCornerGrades();if(yokaiRun){yokaiRun.fired=false;yokaiRun.kitsuneShown=false;}s=isPracticeActive()?currentPracticeSpawn().s:2;lateral=0;relYaw=0;speed=isPracticeActive()?currentPracticeSpawn().speed:9;resetSteeredLine();
+  resetBranchRoute();resetPortBoxes();hazardSlipUntil=-1;resetCornerGrades();if(yokaiRun){yokaiRun.fired=false;yokaiRun.kitsuneShown=false;resetYokaiLanterns();}s=isPracticeActive()?currentPracticeSpawn().s:2;lateral=0;relYaw=0;speed=isPracticeActive()?currentPracticeSpawn().speed:9;resetSteeredLine();
   gameState='racing';elapsed=0;simulationElapsed=0;
   resetLapRun();
   beginGhostRun();
@@ -13908,6 +13961,7 @@ function tick(dt){
   }
   lateral=THREE.MathUtils.clamp(lateral,walls.left-0.8,walls.right+0.8);
   if(portBoxes)updatePortBoxes(dt);
+  updateYokaiLanterns(dt);
   if(tunnelRun?.rocks)updateTunnelRocks();
   updateCornerGrades();
 
