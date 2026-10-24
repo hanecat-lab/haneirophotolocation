@@ -10264,6 +10264,8 @@ function pathGripSpeed(distance=s,offset=lateral){return cornerGripSpeed(pathSur
 // はるにゃ山の溝走りの入口(ドリフト中)と、ねころん坂の右の抜け道の前後60mでは効かせない。?assistdiagで実機調整する
 const ASSIST_WALL={zone:.5,turn:1.6};
 let assistWallGuide=0,accelPath='';
+// ?assistdiag用：加速ボーナスの計算の途中の値(出口の位置phase・向きの揃いroom・効き始めblend・強さauth)と、ボーナスが出なかった理由
+const cornerDriveTrace={why:'',phase:0,room:0,blend:0,auth:0};
 function stepPathSteering(dt,requested,oldLateral,braking){
   if(gutterRun.active)return stepGutterSteering(dt,oldLateral);
   const state=pathHandling;
@@ -10434,8 +10436,11 @@ const assistDiag=(()=>{
       const t=simulationElapsed;if(t<lastT){samples=[];hits=[];wings=[];awards=[];count={hit:0,scrape:0};render();}lastT=t;
       samples.push({t,rescue:cornerRescue.active?cornerRescue.decel:0,guide:assistWallGuide});while(samples.length&&samples[0].t<t-1)samples.shift();
       // ドリフト・溝の判定が出てから加速ボーナスが始まるまでの間、速さを決めた枝を数える。始まらずに判定が終わったら内訳を羽の記録に出す
-      if(pending&&pending.receipt!==cornerDrive){if(!pending.receipt.exitReleased)wings.push('始まらず：'+Object.entries(pending.paths).sort((a,b)=>b[1]-a[1]).map(([k,n])=>k+n).join(' '));pending=null;render();}
-      if(cornerDrive&&cornerDrive.level>0&&!cornerDrive.exitReleased){pending??={receipt:cornerDrive,paths:{}};pending.paths[accelPath]=(pending.paths[accelPath]||0)+1;}
+      if(pending&&pending.receipt!==cornerDrive){if(!pending.receipt.exitReleased){const top=o=>Object.entries(o).sort((a,b)=>b[1]-a[1]).map(([k,n])=>k+n).join(' '),m=pending.max;
+        wings.push(`始まらず(${pending.receipt.gutter?'溝':pending.receipt.method})：${top(pending.paths)}｜位置max${m.phase.toFixed(2)} 向きmax${m.room.toFixed(2)} 効きmax${m.blend.toFixed(2)} 強さmax${m.auth.toFixed(2)}｜${top(pending.whys)||'-'} ${kmh(pending.v)}km/h`);}pending=null;render();}
+      if(cornerDrive&&cornerDrive.level>0&&!cornerDrive.exitReleased){
+        pending??={receipt:cornerDrive,paths:{},whys:{},max:{phase:0,room:0,blend:0,auth:0},v:0};pending.paths[accelPath]=(pending.paths[accelPath]||0)+1;pending.v=speed;
+        const tr=cornerDriveTrace;if(tr.why)pending.whys[tr.why]=(pending.whys[tr.why]||0)+1;for(const k of ['phase','room','blend','auth'])pending.max[k]=Math.max(pending.max[k],tr[k]);}
       else if(pending&&cornerDrive?.exitReleased)pending=null;
       if((clock-=1)>0)return;clock=8;
       const walls=roadWallsAt(s),room=Math.min(walls.right-.12-lateral,lateral-(walls.left+.12));
@@ -11092,17 +11097,17 @@ function getCornerDriveProfile(corner){
   profiles.set(corner,profile);return profile;
 }
 function stepCornerDrive(dt,isBraking,envBase,factor,weight,gradient,assistFloor=0,rotationTarget=0){
-  const receipt=cornerDrive;
-  if(gutterRun.active||!receipt)return null;
+  const receipt=cornerDrive,trace=cornerDriveTrace;trace.auth=0;
+  if(gutterRun.active||!receipt){trace.why=gutterRun.active?'溝の中':'';return null;}
   const c=receipt.corner;
-  if(receipt.curve!==curve||s<c.start-45||s>c.end+18||findDriveCorner()!==c){resetCornerDrive(true);return null;}
-  if(receipt.blocked||!receipt.level||assistBonusBlocked(c))return null;
+  if(receipt.curve!==curve||s<c.start-45||s>c.end+18||findDriveCorner()!==c){trace.why='範囲外で終了';resetCornerDrive(true);return null;}
+  if(receipt.blocked||!receipt.level||assistBonusBlocked(c)){trace.why='取消';return null;}
   const profile=getCornerDriveProfile(c),samples=profile.samples;
   if(isBraking&&(receipt.gutter?(receipt.exitReleased&&!receipt.exitCancelled):(!globalIsAssist&&s>=profile.apex))){
     receipt.exitCancelled=true;receipt.blend=0;receipt.target=null;linkAccelerationCaption();
     exitBoostPower=0;exitBoostTimer=0;meatLinkContext=null;resetExitBonusVisual();
   }
-  if((!globalIsAssist||receipt.gutter)&&receipt.exitCancelled)return null;
+  if((!globalIsAssist||receipt.gutter)&&receipt.exitCancelled){trace.why='ブレーキで終了';return null;}
   const sampleAt=d=>{
     const pos=THREE.MathUtils.clamp((d-c.start)/(c.end-c.start)*(samples.length-1),0,samples.length-1);
     const i=Math.floor(pos),j=Math.min(i+1,samples.length-1),f=pos-i;
@@ -11125,6 +11130,7 @@ function stepCornerDrive(dt,isBraking,envBase,factor,weight,gradient,assistFloor
   const unavailable=isBraking||wallHitCooldown>0||irohaOnJumpCurve||irohaJumpReserved||isLandingLocked||landingPhase!=='none';
   const wanted=unavailable?0:phase*(globalIsAssist?trajectoryRoom:1);
   receipt.blend+=(wanted-receipt.blend)*(1-Math.exp(-dt/(wanted > receipt.blend ? .09 : .06)));
+  Object.assign(trace,{phase,room:trajectoryRoom,blend:receipt.blend,why:unavailable?(isBraking?'ブレーキ中':wallHitCooldown>0?'壁の直後':'着地・ジャンプ'):receipt.blend<.001?'効き始めが0':''});
   if(unavailable){receipt.target=null;return null;}
   const blend=receipt.blend;
   if(blend<.001)return null;
@@ -13433,6 +13439,7 @@ function tick(dt){
       const release=THREE.MathUtils.smoothstep(cornerLaunch.blend,.12,.65);
       const authority=cornerLaunch.fade*highSpeedFade*cornerLaunch.effectScale*release;
       const launchAccel=Math.max(ordinaryAcceleration(speed)*(1+.06*cornerLaunch.level)*cornerLaunch.yawRoom,launchPeak*onset*cornerLaunch.yawRoom*(.85+.15*cornerLaunch.level));
+      cornerDriveTrace.auth=authority;
       if(authority>.02)accelPath=launchAccel>accel?'通常(ボーナス)':'通常(普段の方が強い)';
       if(authority>.02&&launchAccel>accel)recordExitAcceleration();
       accel=THREE.MathUtils.lerp(accel,launchAccel,authority);
