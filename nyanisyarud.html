@@ -5083,14 +5083,22 @@ function placeSnowProps(def,group){
 // 曲がる力とブレーキの倍率は狐の嫁入りと同じ所(kitsuneGripScale/kitsuneBrakeScale)に掛ける
 const SNOW_GRIP={pond:.55,pondBrake:.55,lap2:.75,lap2Brake:.75,ramp:20,blizzardFog:.4,lightThin:.3,patches:520,patchOpacity:.75};
 function snowSurface(){
-  const def=TRACKS[currentKey];if(!snowRun||!def?.snow||gameState!=='racing')return {ice:0,blizzard:0};
+  const def=TRACKS[currentKey];
+  // 雪原越えの大雪原：アスファルト(ROAD_HALF)の外の雪の上は滑る(縁から edgeRamp m で効き始める)
+  if(snowfieldWide&&gameState==='racing')return {ice:0,blizzard:0,field:THREE.MathUtils.smoothstep(Math.abs(lateral)-ROAD_HALF,0,SNOWFIELD.edgeRamp)};
+  if(!snowRun||!def?.snow||gameState!=='racing')return {ice:0,blizzard:0,field:0};
   const sn=def.snow,lap=def.lapLength,at=i=>i/sn.lap*lap,sl=((s%lap)+lap)%lap,from=at(sn.pond),to=at(sn.iceTo),R=SNOW_GRIP.ramp;
   const ice=Math.min(THREE.MathUtils.smoothstep(sl,from-R,from),1-THREE.MathUtils.smoothstep(sl,to,to+R));
   const blizzard=THREE.MathUtils.smoothstep(s,lap-30,lap+30);
-  return {ice,blizzard};
+  return {ice,blizzard,field:0};
 }
-function snowGripScale(){const {ice,blizzard}=snowSurface();return THREE.MathUtils.lerp(1,SNOW_GRIP.pond,ice)*THREE.MathUtils.lerp(1,SNOW_GRIP.lap2,blizzard);}
-function snowBrakeScale(){const {ice,blizzard}=snowSurface();return THREE.MathUtils.lerp(1,SNOW_GRIP.pondBrake,ice)*THREE.MathUtils.lerp(1,SNOW_GRIP.lap2Brake,blizzard);}
+function snowGripScale(){const {ice,blizzard,field}=snowSurface();return THREE.MathUtils.lerp(1,SNOW_GRIP.pond,ice)*THREE.MathUtils.lerp(1,SNOW_GRIP.lap2,blizzard)*THREE.MathUtils.lerp(1,SNOWFIELD.grip,field);}
+function snowBrakeScale(){const {ice,blizzard,field}=snowSurface();return THREE.MathUtils.lerp(1,SNOW_GRIP.pondBrake,ice)*THREE.MathUtils.lerp(1,SNOW_GRIP.lap2Brake,blizzard)*THREE.MathUtils.lerp(1,SNOWFIELD.brake,field);}
+// 雪原越えの大雪原(第2段階)：大雪原の区間は壁を片側 widen m 外へ広げ(前後 ramp m で広げ・戻す)、広げた所は木の柵。
+// アスファルトの幅は変えず、外側の雪の上は曲がる力とブレーキを grip・brake 倍にする。snowfieldWide は大雪原の区間(道の距離)、ほかのコースは null
+const SNOWFIELD={widen:8,ramp:30,grip:.55,brake:.55,edgeRamp:.6};
+let snowfieldWide=null;
+function snowfieldWidenAt(d){const w=snowfieldWide;if(!w)return 0;return SNOWFIELD.widen*Math.min(THREE.MathUtils.smoothstep(d,w.from,w.from+SNOWFIELD.ramp),1-THREE.MathUtils.smoothstep(d,w.to-SNOWFIELD.ramp,w.to));}
 function updateSnow(dt){
   const y=snowRun;if(!y)return;y.time+=dt;const u=y.fall.material.uniforms;u.uTime.value=y.time;placePerfectRain(y.fall,SNOW.fall);
   // 1周目は小雪(粒の一部だけ)、2周目は吹雪：粒を全部出して速く降らせ、霧を近づける
@@ -5101,9 +5109,10 @@ function updateSnow(dt){
   if(gameState==='racing'){
     if(ice>.5&&!y.pondShown&&blizzard<.5){y.pondShown=true;showBridgeFeedback('凍った池','路面が凍っていて滑る',1.8);}
     if(blizzard>.5&&!y.lap2Shown){y.lap2Shown=true;showBridgeFeedback('2周目 吹雪','雪が積もって全体が滑りやすい',2);}
+    if(snowfieldWide&&s>snowfieldWide.from+SNOWFIELD.ramp*.5&&s<snowfieldWide.to&&!y.fieldShown){y.fieldShown=true;showBridgeFeedback('大雪原','道の外の雪の上は滑る',1.8);}
   }
 }
-function resetSnowRun(){if(snowRun){snowRun.pondShown=false;snowRun.lap2Shown=false;}}
+function resetSnowRun(){if(snowRun){snowRun.pondShown=false;snowRun.lap2Shown=false;snowRun.fieldShown=false;}}
 // かまくら村 雪の8の字(2周)：かまくら村の通りをスタートし、雪灯籠の並ぶ大きな右回りで上って、さっき走った村の通りの真上を雪の橋で渡る。
 // 凍った池の大きな左回り→雪だるまのS字を下り、橋の下をくぐって村の通りへ戻る。右270°と左270°で8の字になる。
 // 輪が閉じるように、橋の直線と村へ戻る直線の長さを数値で解く(2つの直線の長さで終点の東西・南北を合わせる)
@@ -6016,11 +6025,12 @@ function roadsideTexture(wood,aged){
   const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;t.wrapS=THREE.RepeatWrapping;t.anisotropy=Math.min(4,renderer.capabilities.getMaxAnisotropy());return t;
 }
 // open：断面を閉じずに1枚の面にする(表だけ。両面に描く材質で使う)
-function roadsideProfileMesh(range,side,profile,material,name,open=false){
+function roadsideProfileMesh(range,side,profile,material,name,open=false,widen=null){
   const [from,to]=range,count=Math.max(1,Math.ceil((to-from)/1.2)),n=profile.length,positions=[],uvs=[],indices=[];
   for(let i=0;i<=count;i++){
     const distance=THREE.MathUtils.lerp(from,to,i/count),tr=getTrackAtDist(distance);
-    for(const [offset,height] of profile){positions.push(tr.p.x+tr.n.x*offset*side,tr.p.y+ROAD_Y+height,tr.p.z+tr.n.z*offset*side);uvs.push(distance/4,height);}
+    const w=widen?widen(distance):0;
+    for(const [offset,height] of profile){positions.push(tr.p.x+tr.n.x*(offset+w)*side,tr.p.y+ROAD_Y+height,tr.p.z+tr.n.z*(offset+w)*side);uvs.push(distance/4,height);}
   }
   for(let i=0;i<count;i++)for(let j=0;j<(open?n-1:n);j++){const a=i*n+j,b=i*n+(j+1)%n,c=a+n,d=b+n;indices.push(a,c,b,b,c,d);}
   if(!open){const caps=THREE.ShapeUtils.triangulateShape(profile.map(p=>new THREE.Vector2(p[0],p[1])),[]);
@@ -6032,7 +6042,7 @@ function woodenRailProfile(y){
   const x=ROADSIDE.face+.055,w=.095,h=.095,b=.025;
   return [[x-w+b,y-h],[x+w-b,y-h],[x+w,y-h+b],[x+w,y+h-b],[x+w-b,y+h],[x-w+b,y+h],[x-w,y+h-b],[x-w,y-h+b]];
 }
-// opt.wood：木の柵にする。opt.ranges(side)：作る区間を指定する(雪の8の字の氷の区間だけ木の柵にする時に使う)
+// opt.wood：木の柵にする。opt.ranges(side)：作る区間を指定する(雪の8の字の氷の区間だけ木の柵にする時に使う)。opt.widen(d)：柵を道の距離dで外へずらす幅(雪原越えの大雪原)
 function snowIceRange(def){const sn=def.snow,L=def.lapLength||totalLength;return sn?[sn.pond/sn.lap*L,sn.iceTo/sn.lap*L]:null;}
 function buildRoadsideFurniture(def,opt={}){
   const group=new THREE.Group();group.name='roadsideFurniture';
@@ -6041,10 +6051,10 @@ function buildRoadsideFurniture(def,opt={}){
   const beamMat=new THREE.MeshStandardMaterial({map:texture,color:0xffffff,roughness:wood?.95:.74,metalness:wood?0:.16,side:THREE.DoubleSide});
   const postMat=new THREE.MeshLambertMaterial({color:wood?0x8f826c:aged?0xaaa99e:0x9da9a7});
   const positions=[],reflectors=[],joints=[],ends=[];
-  const ice=snowIceRange(def),rangesOf=side=>opt.ranges?opt.ranges(side):ice?cutRanges(roadsideRanges(def,side),ice):roadsideRanges(def,side);
+  const ice=snowIceRange(def),wide=snowfieldWide&&[snowfieldWide.from,snowfieldWide.to],rangesOf=side=>opt.ranges?opt.ranges(side):ice?cutRanges(roadsideRanges(def,side),ice):wide?cutRanges(roadsideRanges(def,side),wide):roadsideRanges(def,side),widen=opt.widen||(()=>0);
   for(const side of [-1,1])for(const range of rangesOf(side)){
     const [from,to]=range;group.userData.ranges.push({side,from,to});
-    if(wood){for(const chunk of roadsideChunks([range]))for(const y of [.34,.74])group.add(roadsideProfileMesh(chunk,side,woodenRailProfile(y),beamMat,'woodenRail'));}
+    if(wood){for(const chunk of roadsideChunks([range]))for(const y of [.34,.74])group.add(roadsideProfileMesh(chunk,side,woodenRailProfile(y),beamMat,'woodenRail',false,opt.widen));}
     else{
       // 波形の板は道の側の面だけを作る(裏側は作らない。両面に描くので外から見ても板に見える)
       const wave=[[.055,.44],[.015,.49],[-.035,.55],[.005,.62],[.065,.69],[.005,.76],[-.035,.83],[.015,.9],[.055,.94]];
@@ -6054,15 +6064,15 @@ function buildRoadsideFurniture(def,opt={}){
     const postCount=Math.max(1,Math.ceil((to-from)/ROADSIDE.postSpacing));
     for(let i=0;i<=postCount;i++){
       const distance=THREE.MathUtils.lerp(from,to,i/postCount),tr=getTrackAtDist(distance),yaw=Math.atan2(tr.t.x,tr.t.z);
-      positions.push({tr,yaw,side});
-      if(i%4===0)reflectors.push({tr,yaw,side});
+      const w=widen(distance);positions.push({tr,yaw,side,w});
+      if(i%4===0)reflectors.push({tr,yaw,side,w});
       if(!wood&&i%2===0)joints.push({tr,yaw,side,distance});
     }
     ends.push({distance:from,side},{distance:to,side});
   }
   function instances(name,geometry,material,rows,offset,height){
     const mesh=new THREE.InstancedMesh(geometry,material,rows.length),dummy=new THREE.Object3D();mesh.name=name;mesh.receiveShadow=true;
-    rows.forEach(({tr,yaw,side},i)=>{dummy.position.copy(tr.p).addScaledVector(tr.n,offset*side);dummy.position.y+=ROAD_Y+height;dummy.rotation.set(0,yaw,0);dummy.updateMatrix();mesh.setMatrixAt(i,dummy.matrix);});
+    rows.forEach(({tr,yaw,side,w=0},i)=>{dummy.position.copy(tr.p).addScaledVector(tr.n,(offset+w)*side);dummy.position.y+=ROAD_Y+height;dummy.rotation.set(0,yaw,0);dummy.updateMatrix();mesh.setMatrixAt(i,dummy.matrix);});
     mesh.instanceMatrix.needsUpdate=true;mesh.computeBoundingSphere();group.add(mesh);return mesh;
   }
   instances('roadsidePosts',new THREE.BoxGeometry(wood?.18:.12,ROADSIDE.height+.10,wood?.18:.13),postMat,positions,ROADSIDE.post,(ROADSIDE.height-.10)/2);
@@ -6070,7 +6080,7 @@ function buildRoadsideFurniture(def,opt={}){
   instances('reflectorMounts',new THREE.BoxGeometry(.09,.14,.16),new THREE.MeshLambertMaterial({color:0x757d73}),reflectors,ROADSIDE.face-.045,.84);
   instances('roadReflectors',new THREE.BoxGeometry(.015,.085,.095),new THREE.MeshBasicMaterial({color:0xf5d394}),reflectors,ROADSIDE.face-.097,.85);
   // 夜に反射板を光らせる位置(反射板と同じ所)
-  group.userData.reflectorSpots=Float32Array.from(reflectors.flatMap(({tr,side})=>[tr.p.x+tr.n.x*(ROADSIDE.face-.097)*side,tr.p.y+ROAD_Y+.85,tr.p.z+tr.n.z*(ROADSIDE.face-.097)*side]));
+  group.userData.reflectorSpots=Float32Array.from(reflectors.flatMap(({tr,side,w})=>[tr.p.x+tr.n.x*(ROADSIDE.face-.097+w)*side,tr.p.y+ROAD_Y+.85,tr.p.z+tr.n.z*(ROADSIDE.face-.097+w)*side]));
   // ボルトは64mごと・左右ごとにまとめ、カメラから70m以内の物だけ描く(遠くでは見えないほど小さいので)
   if(!wood){
     const boltGeo=new THREE.SphereGeometry(.025,6,4),boltMat=new THREE.MeshLambertMaterial({color:0x8c9691}),buckets=new Map();
@@ -6079,7 +6089,7 @@ function buildRoadsideFurniture(def,opt={}){
   }
   // Closed, softened ends preserve the shortcut's open slot, without a rail
   // or support ever spanning its flight path.
-  const endRows=ends.map(({distance,side})=>{const tr=getTrackAtDist(distance);return {tr,side,yaw:Math.atan2(tr.t.x,tr.t.z)};});
+  const endRows=ends.map(({distance,side})=>{const tr=getTrackAtDist(distance);return {tr,side,yaw:Math.atan2(tr.t.x,tr.t.z),w:widen(distance)};});
   instances('roadsideEndCaps',new THREE.BoxGeometry(.15,wood?.18:.48,.16),new THREE.MeshLambertMaterial({color:wood?0xa7997d:aged?0xcfcbbb:0xd7dfd9}),endRows,ROADSIDE.face+.055,wood?.74:.69);
   group.userData.postCount=positions.length;group.userData.reflectorCount=reflectors.length;return group;
 }
@@ -7204,7 +7214,7 @@ function setupBranch(def,br=def.branch){
 function roadWallsAt(d){
   // 右の道を走っている時は、合流の側の距離を左の道の距離に直して比べる
   const b=branchRun;if(b&&b.route==='B'&&d>b.F+(b.MB-b.F)/2)d-=b.delta;
-  if(!b||d<b.noseF||d>b.noseM){const w=narrowRoadAt(d);if(w>=ROAD_HALF)return ROAD_WALLS;narrowWalls.left=-w;narrowWalls.right=w;return narrowWalls;}
+  if(!b||d<b.noseF||d>b.noseM){const w=narrowRoadAt(d)+snowfieldWidenAt(d);if(w===ROAD_HALF)return ROAD_WALLS;narrowWalls.left=-w;narrowWalls.right=w;return narrowWalls;}
   const w=Math.min(ROAD_HALF,Math.max(.6,b.half[THREE.MathUtils.clamp(Math.round(d-Math.floor(b.F)),0,b.half.length-1)]+.15));
   branchWalls.left=b.route==='B'?-w:-ROAD_HALF;branchWalls.right=b.route==='A'?w:ROAD_HALF;return branchWalls;
 }
@@ -8407,9 +8417,14 @@ function rebuildTrack(key){
   const centerGeo=new THREE.BufferGeometry(); centerGeo.setAttribute('position', new THREE.Float32BufferAttribute(centerLineVerts,3));
   const centerLine=new THREE.Line(centerGeo, new THREE.LineDashedMaterial({color:0xe5dfcf, dashSize:1.6, gapSize:1.6})); centerLine.computeLineDistances(); centerLine.userData.isWall=true; scene.add(centerLine); if(def.oni)centerLine.visible=false;
 
+  // 雪原越え：大雪原の区間(点の番号から道の距離に直す)。ガードレールより先に決める(ガードレールはこの区間を切り、木の柵にする)
+  snowfieldWide=null;
+  if(def.snowfield){const lengths=curve.getLengths(),at=index=>{const pos=index/(def.points.length-1)*(lengths.length-1),lo=Math.floor(pos),hi=Math.min(lengths.length-1,lo+1);return THREE.MathUtils.lerp(lengths[lo],lengths[hi],pos-lo);};
+    snowfieldWide={from:at(def.snowfield.field),to:at(def.snowfield.alley)};}
   const roadside=def.oni?new THREE.Group():buildRoadsideFurniture(def);
   roadMesh.add(roadside);wallMeshes.push(roadside);
   // 雪の8の字：氷の区間(池〜7番コーナー)は木の柵
+  if(snowfieldWide){const {from:a,to:b}=snowfieldWide,fence=buildRoadsideFurniture(def,{wood:true,widen:snowfieldWidenAt,ranges:side=>roadsideRanges(def,side).map(([f,t])=>[Math.max(f,a),Math.min(t,b)]).filter(([f,t])=>t-f>.5)});roadMesh.add(fence);wallMeshes.push(fence);}
   if(def.snow){const [a,b]=snowIceRange(def),fence=buildRoadsideFurniture(def,{wood:true,ranges:side=>roadsideRanges(def,side).map(([f,t])=>[Math.max(f,a),Math.min(t,b)]).filter(([f,t])=>t-f>.5)});roadMesh.add(fence);wallMeshes.push(fence);}
   for(const b of branchRuns){branchRun=b;roadMesh.add(buildBranchVisuals(def,roadMesh.material));}branchRun=branchRuns[0]||null;
   portBoxes=null;if(def.portBoxes)roadMesh.add(buildPortBoxes(def));
@@ -8509,6 +8524,8 @@ function rebuildTrack(key){
         const j=THREE.MathUtils.clamp(i+Math.round((Math.random()-.5)*6),0,samples.length-1),wj=widths[side][j];
         if(wj<6)continue;
         const a=samples[j],t=THREE.MathUtils.clamp(center+(Math.random()-.5)*6,edge+3,edge+wj-2)*side;
+        // 雪原越えの大雪原：広げた壁の内側には木を置かない
+        if(Math.abs(t)<edge+3+snowfieldWidenAt(a.d))continue;
         addTreeSpot(a.p.x+a.n.x*t,a.p.z+a.n.z*t,.9+Math.random()*.7,a.p.y+ROAD_Y-.05,color,Math.abs(t)-edge<=6.5);
       }
     }
@@ -10969,11 +10986,11 @@ function rescueRoadHeading(distance){
 }
 function predictCornerClearance(decel=0,delay=0,initialSpeed=speed,horizon=1.8,stopDistance=Infinity){
   let predictedGutter=null;
-  const initialClearance=narrowRoadAt(s)-.12-Math.abs(lateral);
+  const initialClearance=narrowRoadAt(s)+snowfieldWidenAt(s)-.12-Math.abs(lateral);
   let d=s,l=lateral,v=initialSpeed,heading=pathHandling.ready?pathHandling.heading:rescueRoadHeading(s),minimum=initialClearance,near=initialClearance,at=s,impactTime=Infinity;
   const command=THREE.MathUtils.clamp(steeredLineVelocity||0,-4,4),step=.075;
   const observe=time=>{
-    const clearance=narrowRoadAt(d)-.12-Math.abs(l);
+    const clearance=narrowRoadAt(d)+snowfieldWidenAt(d)-.12-Math.abs(l);
     if(clearance<minimum){minimum=clearance;at=d;}
     if(time<=.45+1e-6)near=Math.min(near,clearance);
     if(clearance<=.06&&impactTime===Infinity)impactTime=time;
@@ -11120,11 +11137,11 @@ function manualCornerExit(c=findDriveCorner()){
   const measured=THREE.MathUtils.clamp(pathHandling.lateralAcceleration,-12,12);
   const acceleration=Math.abs(unmet)>Math.abs(measured)?unmet:measured,tau=.22;
   const horizon=Math.min(.48,Math.max(.06,(c.end-s)/Math.max(2,speed*.62)));
-  let clearance=ROAD_HALF-.12-Math.abs(lateral);
+  const half=ROAD_HALF+snowfieldWidenAt(s);let clearance=half-.12-Math.abs(lateral);
   for(let i=1;i<=6;i++){
     const t=horizon*i/6;
     const l=lateral+velocity*t+acceleration*tau*(t-tau*(1-Math.exp(-t/tau)));
-    clearance=Math.min(clearance,ROAD_HALF-.12-Math.abs(l));
+    clearance=Math.min(clearance,half-.12-Math.abs(l));
   }
   const space=THREE.MathUtils.smoothstep(clearance,.025,.22);
   const ready=phase*Math.min(direction,space);
@@ -11202,16 +11219,16 @@ function exitCoachRoad(){
 function predictExitLine(corner,releaseAfter=0,horizon=.9){
   const road=exitCoachRoad(),step=.06,velocity=Math.max(2,speed),travel=velocity*.62;
   let d=s,l=lateral,heading=pathHandling.ready?pathHandling.heading:road(s),command=steeredLineVelocity;
-  let clearance=ROAD_HALF-.12-Math.abs(l),outer=ROAD_HALF-.12+corner.dir*l,inside=corner.dir*l;
+  const half=ROAD_HALF+snowfieldWidenAt(s);let clearance=half-.12-Math.abs(l),outer=half-.12+corner.dir*l,inside=corner.dir*l;
   for(let time=0;time<horizon;time+=step){
-    const held=time<releaseAfter?steerInput:0,room=Math.max(0,3.05-Math.sign(held)*l);
+    const held=time<releaseAfter?steerInput:0,room=Math.max(0,3.05+snowfieldWidenAt(s)-Math.sign(held)*l);
     const target=held*consistentSteeringRate()*THREE.MathUtils.smoothstep(room,0,.9),tau=Math.abs(held)>.02?.10:.045,gain=1-Math.exp(-step/tau);
     const wanted=target+(command-target)*tau*gain/step;command+=(target-command)*gain;
     const k=pathAngle(road(d),road(d+2))/2,metric=THREE.MathUtils.clamp(1-k*l,.3,1.8),middle=road(d+travel*step/(2*metric));
     const lateralVelocity=THREE.MathUtils.clamp(wanted,-travel*.82,travel*.82),desired=middle+Math.atan2(lateralVelocity,Math.sqrt(Math.max(.01,travel*travel-lateralVelocity*lateralVelocity)));
     const turn=20*.62/Math.max(velocity,3)*step;heading+=THREE.MathUtils.clamp(pathAngle(heading,desired),-turn,turn);
     const relative=pathAngle(middle,heading);l+=travel*Math.sin(relative)*step;d+=travel*Math.max(.1,Math.cos(relative))*step/metric;
-    clearance=Math.min(clearance,ROAD_HALF-.12-Math.abs(l));outer=Math.min(outer,ROAD_HALF-.12+corner.dir*l);inside=Math.max(inside,corner.dir*l);
+    clearance=Math.min(clearance,half-.12-Math.abs(l));outer=Math.min(outer,half-.12+corner.dir*l);inside=Math.max(inside,corner.dir*l);
   }
   return {clearance,outer,inside,end:l,s:d};
 }
@@ -11336,9 +11353,11 @@ function stepSteeredLine(inputValue,rate,limit,dt,correction,response,externalVe
   }
   steeredCommandRate=rate;steeredCommandLimit=limit;
   const input=Math.abs(inputValue)>.02?inputValue:0;
+  // 雪原越えの大雪原は、広げた壁の分だけ外へ寄れる
+  const wide=snowfieldWidenAt(s);limit+=wide;
   if(!pathHandlingExcluded()){
-    const room=Math.max(0,3.05-Math.sign(input)*lineHoldTLat);
-    rate=consistentSteeringRate()*THREE.MathUtils.smoothstep(room,0,.9);limit=3.05;
+    const room=Math.max(0,3.05+wide-Math.sign(input)*lineHoldTLat);
+    rate=consistentSteeringRate()*THREE.MathUtils.smoothstep(room,0,.9);limit=3.05+wide;
   }
   const target=input*rate,tau=input ? .10 : .045;
   const gain=1-Math.exp(-step/tau);
@@ -11442,7 +11461,8 @@ const hazardLab=(()=>{
   // 雪の8の字：凍った池と2周目の滑りやすさ
   {const box=group('雪の路面');
     for(const row of [{label:'池の曲がる力',get:()=>SNOW_GRIP.pond,set:v=>{SNOW_GRIP.pond=v;}},{label:'池のブレーキ',get:()=>SNOW_GRIP.pondBrake,set:v=>{SNOW_GRIP.pondBrake=v;}},
-      {label:'2周目の曲がる力',get:()=>SNOW_GRIP.lap2,set:v=>{SNOW_GRIP.lap2=v;}},{label:'2周目のブレーキ',get:()=>SNOW_GRIP.lap2Brake,set:v=>{SNOW_GRIP.lap2Brake=v;}}]){
+      {label:'2周目の曲がる力',get:()=>SNOW_GRIP.lap2,set:v=>{SNOW_GRIP.lap2=v;}},{label:'2周目のブレーキ',get:()=>SNOW_GRIP.lap2Brake,set:v=>{SNOW_GRIP.lap2Brake=v;}},
+      {label:'雪原の曲がる力',get:()=>SNOWFIELD.grip,set:v=>{SNOWFIELD.grip=v;}},{label:'雪原のブレーキ',get:()=>SNOWFIELD.brake,set:v=>{SNOWFIELD.brake=v;}}]){
       Object.assign(row,{min:.2,max:1,step:.05});const label=document.createElement('label');label.style.cssText='display:block';const name=document.createElement('span');const input=document.createElement('input');
       Object.assign(input,{type:'range',min:row.min,max:row.max,step:row.step,value:row.get()});input.style.cssText='width:100%';
       input.addEventListener('input',()=>{row.set(Number(input.value));show();});label.append(name,input);box.appendChild(label);rows.push({...row,name});}}
@@ -11521,7 +11541,7 @@ function stopWallDrive(){
 function updateWallSeparation(dt){
   if(!wallContactEpisode)return;
   if(irohaJumpReserved||irohaOnJumpCurve||isLandingLocked){wallContactEpisode=null;return;}
-  const clearance=ROAD_HALF-.12-wallContactEpisode.side*lateral;
+  const clearance=ROAD_HALF+snowfieldWidenAt(s)-.12-wallContactEpisode.side*lateral;
   wallContactEpisode.clearTime=clearance>=.55?wallContactEpisode.clearTime+dt:0;
   if(wallContactEpisode.clearTime>=.18)wallContactEpisode=null;
 }
@@ -13415,7 +13435,7 @@ function tick(dt){
   }
   if(wasBraking && !isBraking && isBrakingDrift && !shortcutOwnsInput()){
     // V234：PERFECT連発修正 - 最低保証撤廃、厳しめ係数、閾値上げ
-    const lateralFactor = THREE.MathUtils.clamp(Math.abs(lateral)/ROAD_HALF, 0, 1);
+    const lateralFactor = THREE.MathUtils.clamp(Math.abs(lateral)/(ROAD_HALF+snowfieldWidenAt(s)), 0, 1);
     const yawFactor = THREE.MathUtils.clamp(Math.abs(relYaw)/0.7, 0, 1);
     const wt = weightTransferRatio;
     const angleBoost = THREE.MathUtils.clamp(upcomingCornerAngle/170, 0.5, 1);
@@ -15040,7 +15060,7 @@ function tick(dt){
   // V227 旧「BRAKING DRIFT」「DRIFT」文字は新演出と被るため非表示、壁警告のみ残す
   if(wallHitCooldown>0){ ind.classList.remove('on'); ind.textContent=''; ind.classList.remove('brake-drift','drift','brake-active'); warnL.classList.remove('on'); warnR.classList.remove('on'); joy.classList.remove('nearWall'); }
   else if(isBrakingDrift){
-    const distToWall = ROAD_HALF - Math.abs(lateral);
+    const distToWall = ROAD_HALF + snowfieldWidenAt(s) - Math.abs(lateral);
     if(distToWall<1.0){ ind.classList.remove('on'); joy.classList.add('nearWall'); if(lateral>0){ warnR.classList.add('on'); warnL.classList.remove('on'); } else { warnL.classList.add('on'); warnR.classList.remove('on'); } }
     else {
       // 新判定演出に移行したため旧文字は出さない
@@ -15055,7 +15075,7 @@ function tick(dt){
     warnL.classList.remove('on'); warnR.classList.remove('on'); joy.classList.remove('nearWall');
   }
   else if(isSliding){
-    const distToWall = ROAD_HALF - Math.abs(lateral);
+    const distToWall = ROAD_HALF + snowfieldWidenAt(s) - Math.abs(lateral);
     if(distToWall<1.2){ ind.classList.remove('on'); joy.classList.add('nearWall'); if(lateral>0){ warnR.classList.add('on'); warnL.classList.remove('on'); } else { warnL.classList.add('on'); warnR.classList.remove('on'); } }
     else {
       // 旧DRIFT文字は新NIKUKYU演出に移行したため非表示
