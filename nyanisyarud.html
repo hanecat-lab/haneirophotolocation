@@ -3088,6 +3088,9 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
 #brakeChargeHUD[data-timing-phase="release"] .timingArc{stroke:#a5ffd0;}
 #app #brakeChargeHUD[data-timing="on"] #brakeTextRow{display:none!important;}
 #brakeChargeHUD #brakeChargeWrap,#brakeChargeHUD #brakeStageLabels{max-width:100%;box-sizing:border-box;}
+/* ため量バー：走行ガイドOFFの時は、ブレーキを押している間(と離して0.4秒)だけ出す。場所は空けたままにして、ほかの表示を動かさない */
+#brakeChargeHUD :is(#brakeChargeWrap,#brakeStageLabels){transition:opacity .2s}
+#app #brakeChargeHUD[data-brake-bar="hide"] :is(#brakeChargeWrap,#brakeStageLabels){opacity:0;visibility:hidden;transition:opacity .2s,visibility 0s linear .2s}
 @media(min-width:821px) and (pointer:fine){#app #brakeChargeHUD[data-timing="on"] #shortcutTiming{left:50%;transform:translateX(-50%);}}
 @media(min-width:600px) and (max-height:480px){
   #app #brakeAlertHUD{left:50%!important;transform:translateX(-50%)!important;width:300px!important;}
@@ -9123,7 +9126,7 @@ function switchBranchRoute(route,shift=0){
   const a=getTrackAtDist(s),pos=a.p.clone().addScaledVector(a.n,lateral),yaw=Math.atan2(a.t.x,a.t.z);useBranchRoute(route);s+=shift;const q=getTrackAtDist(s);
   lateral=pos.sub(q.p).dot(q.n)/q.n.lengthSq();relYaw=Math.atan2(Math.sin(relYaw+yaw-Math.atan2(q.t.x,q.t.z)),Math.cos(relYaw+yaw-Math.atan2(q.t.x,q.t.z)));resetSteeredLine();
 }
-let t_opt=0, brakeChargeRatio=0;
+let t_opt=0, brakeChargeRatio=0, brakeBarShownAt=-Infinity;
 let slideEntrySpeed=0, slideEntryTime=0, slideFailTimer=0, slideQualityTimer=0, slideLastQuality='', slideEntryR=999, slideWasBad=false
 let isSliding=false, slideDir=0, slideTime=0, slidePower=0, isBrakingActive=false, brakeTime=0, isBrakingDrift=false, brakeDriftDir=0, brakeDriftTime=0, brakeDriftPower=0, lastBrakeReleaseTime=0, brakeJustType='', upcomingCornerAngle=0, wallHitCooldown=0, lastWallHitTime=0, elapsed=0, bestTime=null, waterLevel=100, boostTimer=0;
 // V205 荷重移動変数
@@ -15307,6 +15310,10 @@ function tick(dt){
     if(brakeChargeText&&brakeChargeText.textContent)brakeChargeText.textContent='';
     if(brakeOptimalMarker)brakeOptimalMarker.style.display='none';
     const row=document.getElementById('brakeTextRow');if(row.hidden===holding)row.hidden=!holding;
+    // ため量バーは、走行ガイドONと連携練習の間はいつも出し、ガイドOFFの時はブレーキを押している間と離して0.4秒だけ出す
+    if(holding||chargePct>0)brakeBarShownAt=performance.now();
+    const showBar=drivingGuideEnabled[driveMode]||linkPractice.active||performance.now()-brakeBarShownAt<400,hud=document.getElementById('brakeChargeHUD'),want=showBar?'show':'hide';
+    if(hud&&hud.dataset.brakeBar!==want)hud.dataset.brakeBar=want;
   }
 
   
@@ -17524,9 +17531,11 @@ function buildOniGuides(def){
   for(const m of [y.fireCore,y.fireHalo]){m.frustumCulled=false;m.material.userData.glow=true;group.add(m);}
   list.forEach((f,i)=>{const tr=getTrackAtDist(f.d);f.pos=new THREE.Vector3(tr.p.x+tr.n.x*f.lat,tr.p.y+ROAD_Y+1.3,tr.p.z+tr.n.z*f.lat);y.fireCore.setColorAt(i,new THREE.Color(f.color));y.fireHalo.setColorAt(i,new THREE.Color(f.color));});
   y.fires=list;y.fireMixers=[];
+  // 誘導の鬼火の光の玉(updateOniで鬼火と一緒に上下させ、明滅させる)
+  list.forEach(f=>{f.glow=oniGlowSprite(f.color,ONI_GLOW.guide.size);f.glow.position.copy(f.pos);f.glow.name='oniFireGlow';group.add(f.glow);});
   // 誘導の鬼火(GLB)：コーナーのきつさで3色(青緑・青白・赤紫)を使い分ける。3色とも読み込めたら芯の玉と入れ替える
   Promise.all(['guideEasy','guideNormal','guideHard'].map(k=>loadOniModel(k).then(src=>[k,src]))).then(pairs=>{if(oniRun!==y)return;const srcs=Object.fromEntries(pairs);
-    list.forEach(f=>{const src=srcs[f.kind],clip=src.userData.animations?.[0],wrap=new THREE.Group(),m=src.clone();m.traverse(c=>{if(c.isMesh)c.castShadow=false;});wrap.add(m);group.add(wrap);f.model=wrap;
+    list.forEach(f=>{const src=srcs[f.kind],clip=src.userData.animations?.[0],wrap=new THREE.Group(),m=src.clone();litOniModel(m);wrap.add(m);group.add(wrap);f.model=wrap;
       if(clip){const mixer=new THREE.AnimationMixer(m);const act=mixer.clipAction(clip);act.play();act.time=(f.phase/6.28*clip.duration)%clip.duration;y.fireMixers.push({mixer,f});}});
     y.fireCore.visible=false;}).catch(()=>{});
   // 闇の直線のガラスの横線
@@ -17569,7 +17578,8 @@ function updateOni(dt){
   y.fires.forEach((f,i)=>{const bob=Math.sin(y.time*2.2+f.phase)*.18,fl=1+Math.sin(y.time*7.3+f.phase*3)*.12;
     oniFireS.setScalar(ONI.fire.size*fl);oniFireM.compose(oniFireS.clone().set(0,0,0).add(f.pos).setY(f.pos.y+bob),new THREE.Quaternion(),oniFireS);y.fireCore.setMatrixAt(i,oniFireM);
     oniFireS.setScalar(ONI.fire.size*2.6*fl);oniFireM.compose(new THREE.Vector3(f.pos.x,f.pos.y+bob,f.pos.z),new THREE.Quaternion(),oniFireS);y.fireHalo.setMatrixAt(i,oniFireM);
-    if(f.model){f.model.position.set(f.pos.x,f.pos.y-.9+bob,f.pos.z);f.model.lookAt(camera.position.x,f.model.position.y,camera.position.z);}});
+    if(f.model){f.model.position.set(f.pos.x,f.pos.y-.9+bob,f.pos.z);f.model.lookAt(camera.position.x,f.model.position.y,camera.position.z);}
+    if(f.glow){f.glow.position.set(f.pos.x,f.pos.y+bob,f.pos.z);f.glow.material.opacity=ONI_GLOW.guide.opacity*fl;}});
   // 誘導の鬼火の炎のゆらめきは、猫から200m以内だけ動かす
   for(const {mixer,f} of y.fireMixers||[])if(Math.abs(f.d-s)<200)mixer.update(dt);
   y.fireCore.instanceMatrix.needsUpdate=true;y.fireHalo.instanceMatrix.needsUpdate=true;
@@ -17604,6 +17614,14 @@ function loadOniModel(name){
 // 動く鬼火：参道に count 個。左右へ amp m・往復 period 秒で動く(レースの経過時間で決まるので毎回同じ動き)。隣どうしは位相をずらす
 // 鬼火の輪：S字と螺旋の頂点の少し内側に浮かぶ輪。くぐると boostKmh だけ加速
 // 鬼の御殿の置き方：大きさ scale(元の約9×10×7m)、ゴールから dist m 先・道の延長から angle°ずらした所、道の終わりより drop m 低い浮島(半径 island m)。glow：光らせる材質[色, 強さ]
+// 鬼火のやわらかい光の玉の絵(御殿・誘導の鬼火・動く鬼火で共通)。ONI_GLOW：光の玉の大きさ(m)と濃さ、鬼火のGLB自体の光り方(lit)
+let oniGlowTex=null;
+function oniGlowTexture(){if(oniGlowTex)return oniGlowTex;const c=document.createElement('canvas');c.width=c.height=64;const g=c.getContext('2d'),gr=g.createRadialGradient(32,32,1,32,32,31);gr.addColorStop(0,'rgba(255,255,255,1)');gr.addColorStop(.25,'rgba(255,255,255,.75)');gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.fillRect(0,0,64,64);return oniGlowTex=new THREE.CanvasTexture(c);}
+const ONI_GLOW={guide:{size:5,opacity:.8},hazard:{size:6.5,opacity:.85},lit:.7};
+// 光の玉(霧に消えないので、遠くからも鬼火の場所が分かる)
+function oniGlowSprite(color,size){const mat=new THREE.SpriteMaterial({map:oniGlowTexture(),color,fog:false,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false});mat.userData.glow=true;const sp=new THREE.Sprite(mat);sp.scale.setScalar(size);return sp;}
+// 鬼火のGLBを、絵に沿って自分で光らせる(材質は同じ鬼火どうしで共有なので1回だけ)
+function litOniModel(root){root.traverse(c=>{if(!c.isMesh)return;c.castShadow=false;const m=c.material;if(m.emissive&&!m.userData.oniLit){m.emissive.setHex(0xffffff);if(m.map)m.emissiveMap=m.map;m.emissiveIntensity=ONI_GLOW.lit;m.userData.oniLit=true;}});}
 // 封印の浮岩の光らせる材質[色, 強さ]
 const ONI_SEAL_GLOW={seal:[0xffd060,1.2],rope:[0xffc070,.6],paper:[0xfff0c0,.8]};
 // fires：御殿のまわりに浮かぶ鬼火(count個。色は colors を順に、建物の幅×radius の輪の上を高さ height[0]〜[1](建物の高さの割合)でゆっくり漂う)。
@@ -17646,8 +17664,7 @@ function buildOniProps(def){
     m.name='oniManor';group.add(m);
     // 御殿のまわりに浮かぶ鬼火と、その光(updateOniで漂わせる)
     {const F=M.fires,box=new THREE.Box3().setFromObject(m),size=box.getSize(new THREE.Vector3());
-      const c=document.createElement('canvas');c.width=c.height=64;const g=c.getContext('2d'),gr=g.createRadialGradient(32,32,1,32,32,31);gr.addColorStop(0,'rgba(255,255,255,1)');gr.addColorStop(.25,'rgba(255,255,255,.75)');gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.fillRect(0,0,64,64);
-      const tex=new THREE.CanvasTexture(c),face=Math.atan2(end.p.x-pos.x,end.p.z-pos.z);run.manorFires=[];
+      const tex=oniGlowTexture(),face=Math.atan2(end.p.x-pos.x,end.p.z-pos.z);run.manorFires=[];
       for(let i=0;i<F.count;i++){const mat=new THREE.SpriteMaterial({map:tex,color:F.colors[i%F.colors.length],fog:false,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false});mat.userData.glow=true;
         const sp=new THREE.Sprite(mat),sz=THREE.MathUtils.lerp(F.size[0],F.size[1],(i*.37)%1);sp.scale.setScalar(sz);sp.name='oniManorFire';group.add(sp);
         run.manorFires.push({sp,center:box.getCenter(new THREE.Vector3()).setY(box.min.y),r:size.x*F.radius,h:size.y*THREE.MathUtils.lerp(F.height[0],F.height[1],(i*.61)%1),ang:face-.9+i/F.count*Math.PI*2,phase:i*1.7,light:null});}
@@ -17670,11 +17687,13 @@ function buildOniHazards(def){
   const tex=oniFaceTexture();run.hazards=[];
   for(let i=0;i<H.count;i++){const d=palace+H.from+i*H.step;if(d>totalLength-25)break;
     const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,color:H.color,fog:false,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false}));sp.scale.setScalar(2.4);sp.material.userData.glow=true;group.add(sp);
-    run.hazards.push({d,phase:i*H.phase*Math.PI*2,sp,cool:0,lat:0,model:null});}
+    // 動く鬼火の光の玉
+    const glow=oniGlowSprite(H.color,ONI_GLOW.hazard.size);glow.name='oniHazardGlow';group.add(glow);
+    run.hazards.push({d,phase:i*H.phase*Math.PI*2,sp,glow,cool:0,lat:0,model:null});}
   // 鬼火の番人(GLB・炎のゆらめきのアニメーション付き)が読み込めたら、光の板と入れ替える。アニメーションは自分の位置も動かすので、外側の入れ物で位置を決める
   run.mixers=[];
   loadOniModel('onibi').then(src=>{if(oniRun!==run)return;const clip=src.userData.animations?.[0];
-    run.hazards.forEach((h,i)=>{const wrap=new THREE.Group(),m=src.clone();m.scale.setScalar(H.modelScale);m.traverse(c=>{if(c.isMesh)c.castShadow=false;});wrap.add(m);group.add(wrap);h.model=wrap;h.sp.visible=false;
+    run.hazards.forEach((h,i)=>{const wrap=new THREE.Group(),m=src.clone();m.scale.setScalar(H.modelScale);litOniModel(m);wrap.add(m);group.add(wrap);h.model=wrap;h.sp.visible=false;
       if(clip){const mixer=new THREE.AnimationMixer(m);const act=mixer.clipAction(clip);act.play();act.time=(i*.37*clip.duration)%clip.duration;run.mixers.push(mixer);}});}).catch(()=>{});
   // 鬼火の輪：S字と螺旋のコーナーの頂点の、内側1.6m
   const ringMat=new THREE.MeshBasicMaterial({color:H.ringColor,fog:false,transparent:true,opacity:.85,blending:THREE.AdditiveBlending,depthWrite:false});ringMat.userData.glow=true;
@@ -17695,6 +17714,7 @@ function resetOniRun(){const y=oniRun;if(!y)return;for(const h of y.hazards||[])
 function updateOniHazards(dt){
   const y=oniRun;if(!y?.hazards)return;const H=ONI_HAZARD,tm=gameState==='racing'?elapsed:0;
   for(const h of y.hazards){h.lat=H.amp*Math.sin(tm*Math.PI*2/H.period+h.phase);const tr=getTrackAtDist(h.d);h.sp.position.set(tr.p.x+tr.n.x*h.lat,tr.p.y+ROAD_Y+1.1,tr.p.z+tr.n.z*h.lat);
+    if(h.glow){h.glow.position.copy(h.sp.position);h.glow.material.opacity=ONI_GLOW.hazard.opacity*(h.cool>0?.4:1);}
     if(h.model){h.model.position.set(tr.p.x+tr.n.x*h.lat,tr.p.y+ROAD_Y+.15,tr.p.z+tr.n.z*h.lat);h.model.rotation.y=Math.atan2(-tr.t.x,-tr.t.z);h.model.visible=h.cool<=0||Math.floor(h.cool*10)%2===0;}
     if(h.cool>0){h.cool-=dt;h.sp.material.opacity=.35;continue;}h.sp.material.opacity=1;
     if(gameState!=='racing')continue;
