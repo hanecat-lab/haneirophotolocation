@@ -17678,6 +17678,19 @@ const catEyeLight=(()=>{
   const beam=new THREE.Mesh(new THREE.ConeGeometry(1,1,24,1,true).translate(0,-.5,0).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({map:new THREE.CanvasTexture(bc),blending:THREE.AdditiveBlending,transparent:true,depthWrite:false,side:THREE.DoubleSide,fog:false}));beam.material.userData.glow=true;beam.name='catEyeBeam';
   const group=new THREE.Group();group.name='catEyes';group.add(light,light.target,beam,...eyes);return {group,light,beam,eyes};
 })();
+// 猫又・赤鬼侍・雪女は、目ではなく顔の横に浮かぶ火の玉から照らす(夜だけ。照らす向きと範囲は目の光と同じ)。
+// 火の玉は顔(両目の真ん中)から右へ side・上へ up・前へ front m(猫の大きさ scale 倍)。color：火の玉と光の筋の色、道を照らす光は白に mix だけ混ぜる。
+// 大きさはライトの設定ごと(size)、上下に bob[高さ m, 速さ]で揺れ、曲がる時は外へ sway[曲がる速さあたり, 最大 m]だけ遅れる。後ろに trail 個の小さな炎を引く
+const CAT_FOXFIRE={nekomata:{color:0xb060ff,scale:1},akaoni:{color:0xff3a28,scale:1.15},yukionna:{color:0x6fe2ff,scale:1},side:.75,up:.3,front:0,mix:.4,
+  size:{off:.22,low:.34,high:.46},bob:[.05,2.2],sway:[.15,.25],trail:3,ghost:.6};
+const catFoxfire=(()=>{
+  const c=document.createElement('canvas');c.width=c.height=64;const g=c.getContext('2d'),grad=g.createRadialGradient(32,32,1,32,32,31);
+  grad.addColorStop(0,'rgba(255,255,255,1)');grad.addColorStop(.28,'rgba(255,255,255,.9)');grad.addColorStop(.55,'rgba(255,255,255,.35)');grad.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=grad;g.fillRect(0,0,64,64);
+  const tex=new THREE.CanvasTexture(c),sprite=()=>{const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,blending:THREE.AdditiveBlending,depthWrite:false,transparent:true,fog:false}));sp.material.userData.glow=true;return sp;};
+  const group=new THREE.Group();group.name='catFoxfire';group.visible=false;const core=sprite(),halo=sprite(),trail=Array.from({length:CAT_FOXFIRE.trail},sprite);group.add(halo,core,...trail);catEyeLight.group.add(group);
+  return {group,core,halo,trail,tex,sprite,pos:new THREE.Vector3(),t:0,sway:0,lastYaw:null};
+})();
+const foxfireWhite=new THREE.Color(0xfff1c8),foxfireTmp=new THREE.Color(),foxfireRight=new THREE.Vector3();
 // ?nightlab：目の光の強さ・広がり・下向き・届く距離・ふちのぼかし・遠くでの弱まり方を、実機で動かして決めるための表示。
 // 動かすのは今のライト(オフ・ロー・ハイ)の値。下に3つ全部の値を出すので、決まったら画面を撮って送ってもらう
 const nightLab=(()=>{
@@ -18292,13 +18305,20 @@ chai.eyes.forEach((eye,i)=>{eye.name='chaiEye'+i;});
 function catEyeNodes(shape){return shape==='robo'&&roboCat.eyes||shape==='cardboard'&&cardboardCat.eyes||shape==='maneki'&&manekiCat.eyes||shape==='nekomata'&&nekomataCat.eyes||shape==='yukionna'&&yukionnaCat.eyes||shape==='akaoni'&&akaoniCat.eyes||chai.eyes;}
 const nightGhostEyes=GHOST_TINTS.map(tint=>[0,1].map(()=>{const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:catEyeLight.eyes[0].material.map,color:tint.color,blending:THREE.AdditiveBlending,depthWrite:false,transparent:true,fog:false,sizeAttenuation:false}));sp.material.userData.glow=true;sp.scale.setScalar(.014);sp.visible=false;catEyeLight.group.add(sp);return sp;}));
 const ghostEyeFwd=new THREE.Vector3(),ghostEyeTo=new THREE.Vector3(),ghostEyeQ=new THREE.Quaternion();
+const nightGhostFires=GHOST_TINTS.map(()=>{const sp=catFoxfire.sprite();sp.visible=false;catEyeLight.group.add(sp);return sp;});
 function updateNightGhostEyes(){
   ghostPlayers.forEach((player,index)=>{
     const model=player.model,shown=!!(model?.visible&&player.material),eyes=nightGhostEyes[index];if(!eyes)return;
     const prefix=player.shape==='robo'?'roboEye':player.shape==='cardboard'?'cardboardEye':player.shape==='maneki'?'manekiEye':player.shape==='nekomata'?'nekomataEye':player.shape==='yukionna'?'yukionnaEye':player.shape==='akaoni'?'akaoniEye':'chaiEye',nodes=shown?(model.userData.eyeNodes??=[0,1].map(i=>model.getObjectByName(prefix+i)||model.getObjectByName('chaiEye'+i))):[];
     // 目の光は体に隠れないので、ゴーストがカメラに背中を向けている時は出さない(後ろから目が透けて、こちらを向いているように見えるため)
     let facing=0;if(shown){const root=player.nodes[0],fw=ghostEyeFwd.set(0,0,1).applyQuaternion(root.getWorldQuaternion(ghostEyeQ));root.getWorldPosition(ghostEyeTo);ghostEyeTo.subVectors(camera.position,ghostEyeTo).setY(0).normalize();facing=THREE.MathUtils.smoothstep(fw.setY(0).normalize().dot(ghostEyeTo),.05,.35);}
-    eyes.forEach((sp,i)=>{sp.visible=shown&&facing>0;if(!sp.visible)return;const node=nodes[i];if(!node){sp.visible=false;return;}node.getWorldPosition(sp.position);sp.material.opacity=Math.min(1,player.material.opacity/.25)*.9*facing;});
+    // 火の玉の猫のゴーストは、目の光の代わりに同じ色の小さな火の玉を顔の横に出す(照らさない。背中側からも見える)
+    const fire=CAT_FOXFIRE[player.shape],ball=nightGhostFires[index];
+    eyes.forEach((sp,i)=>{sp.visible=shown&&facing>0&&!fire;if(!sp.visible)return;const node=nodes[i];if(!node){sp.visible=false;return;}node.getWorldPosition(sp.position);sp.material.opacity=Math.min(1,player.material.opacity/.25)*.9*facing;});
+    ball.visible=shown&&!!fire&&nodes.length===2&&!!nodes[0]&&!!nodes[1];
+    if(ball.visible){nodes[0].getWorldPosition(ghostEyeTo);nodes[1].getWorldPosition(ball.position);ball.position.add(ghostEyeTo).multiplyScalar(.5);const fw=ghostEyeFwd.set(0,0,1).applyQuaternion(player.nodes[0].getWorldQuaternion(ghostEyeQ)).setY(0).normalize();
+      ball.position.addScaledVector(foxfireRight.set(-fw.z,0,fw.x),CAT_FOXFIRE.side*fire.scale).addScaledVector(fw,CAT_FOXFIRE.front*fire.scale);ball.position.y+=CAT_FOXFIRE.up*fire.scale;
+      ball.material.color.set(fire.color);ball.material.opacity=Math.min(1,player.material.opacity/.25)*.8;ball.scale.setScalar(CAT_FOXFIRE.size.low*CAT_FOXFIRE.ghost*fire.scale*2);}
   });
 }
 // にゃん港の遠くの灯り：建物ごとの灯りの点を全部まとめて描く。霧を無視して遠くから見え、本物の窓が見える近くでは消す
@@ -18423,6 +18443,19 @@ function updateNightFireflies(dt){
 // 毎コマ：夜の空をカメラに付いていかせ、目の光を猫の目に合わせ、霧の距離を目の光に合わせて0.4秒ほどで寄せる。
 // 1秒ごとに、まだ替えていない絵のある素材(光で陰が付かない物)を夜用の素材に替え、猫の光り方を合わせる
 const nightEyeA=new THREE.Vector3(),nightEyeB=new THREE.Vector3(),nightLook=new THREE.Vector3();
+// 毎コマ：火の玉を顔の横に置き(上下に揺れ、曲がる時は外へ遅れる。画面の動きを抑える設定では揺らさない)、色と大きさを合わせる。光を出す位置を返す
+function updateCatFoxfire(fire,spec,mid,fx,fz,dt){
+  const F=catFoxfire,C=CAT_FOXFIRE,k=fire.scale,still=pawMotionQuery.matches,yaw=catRoot.rotation.y;F.t+=dt;
+  let rate=0;if(F.lastYaw!==null&&dt>0){let d=yaw-F.lastYaw;d=Math.atan2(Math.sin(d),Math.cos(d));rate=d/dt;}F.lastYaw=yaw;
+  const want=still?0:THREE.MathUtils.clamp(-rate*C.sway[0],-C.sway[1],C.sway[1]);F.sway+=(want-F.sway)*(1-Math.exp(-dt*6));
+  const bob=still?0:Math.sin(F.t*C.bob[1])*C.bob[0];foxfireRight.set(-fz,0,fx);
+  F.pos.copy(mid).addScaledVector(foxfireRight,(C.side+F.sway)*k).addScaledVector(nightLook.set(fx,0,fz),C.front*k);F.pos.y+=(C.up+bob)*k;
+  const size=(C.size[catLightMode]??C.size.low)*k,flick=still?1:1+.08*Math.sin(F.t*13)+.05*Math.sin(F.t*29+1);
+  F.core.position.copy(F.pos);F.core.scale.setScalar(size*flick);F.core.material.color.set(0xffffff).lerp(foxfireTmp.set(fire.color),.35);
+  F.halo.position.copy(F.pos);F.halo.scale.setScalar(size*2.6*flick);F.halo.material.color.set(fire.color);F.halo.material.opacity=.85;
+  F.trail.forEach((sp,i)=>{const j=i+1;sp.position.copy(F.pos).addScaledVector(nightLook,-.09*j*k);sp.position.y+=(.05*j+(still?0:.02*Math.sin(F.t*9+j)))*k;sp.scale.setScalar(size*(1-.22*j)*flick);sp.material.color.set(fire.color);sp.material.opacity=.7-.18*j;});
+  return F.pos;
+}
 function updateNightLights(dt){
   if(!nightMode)return;
   nightSky.position.copy(camera.position);
@@ -18436,13 +18469,16 @@ function updateNightLights(dt){
   if(scene.fog){const ease=1-Math.exp(-dt/.13);scene.fog.near+=(fogRange[0]-scene.fog.near)*ease;scene.fog.far+=(fogRange[1]-scene.fog.far)*ease;townCull.far=fogRange[1];}
   const eyeNodes=catEyeNodes(shownCatModel());eyeNodes[0].getWorldPosition(nightEyeA);eyeNodes[1].getWorldPosition(nightEyeB);
   const yaw=catRoot.rotation.y,fx=Math.sin(yaw),fz=Math.cos(yaw),mid=nightEyeA.clone().add(nightEyeB).multiplyScalar(.5);
-  eyes[0].position.copy(nightEyeA).addScaledVector(nightLook.set(fx,0,fz),.04);eyes[1].position.copy(nightEyeB).addScaledVector(nightLook,.04);for(const e of eyes){e.scale.setScalar(lit.glow);e.visible=cameraMode!=='cat';}
+  // 火の玉の猫(猫又・赤鬼侍・雪女)は、目の輝きを出さず、顔の横の火の玉から照らす
+  const fire=CAT_FOXFIRE[shownCatModel()],origin=fire?updateCatFoxfire(fire,spec,mid,fx,fz,dt):mid;catFoxfire.group.visible=!!fire&&cameraMode!=='cat';
+  eyes[0].position.copy(nightEyeA).addScaledVector(nightLook.set(fx,0,fz),.04);eyes[1].position.copy(nightEyeB).addScaledVector(nightLook,.04);for(const e of eyes){e.scale.setScalar(lit.glow);e.visible=cameraMode!=='cat'&&!fire;}
   nightLab?.();
-  light.intensity=lit.power*NIGHT_LEVELS[nightLevel].scale;light.distance=lit.reach;light.angle=lit.angle;light.position.copy(mid);
-  light.target.position.set(mid.x+fx*20,mid.y+Math.tan(lit.pitch)*20,mid.z+fz*20);light.target.updateMatrixWorld();
+  light.color.copy(fire?foxfireTmp.copy(foxfireWhite).lerp(new THREE.Color(fire.color),CAT_FOXFIRE.mix):foxfireWhite);beam.material.color.set(fire?fire.color:0xffffff);
+  light.intensity=lit.power*NIGHT_LEVELS[nightLevel].scale;light.distance=lit.reach;light.angle=lit.angle;light.position.copy(origin);
+  light.target.position.set(origin.x+fx*20,origin.y+Math.tan(lit.pitch)*20,origin.z+fz*20);light.target.updateMatrixWorld();
   // 光の筋と目の輝きは猫目線では出さない(カメラが目の位置にあり、目の前が光で埋まるので)
   beam.visible=lit.beam>0&&cameraMode!=='cat';
-  if(beam.visible){beam.position.copy(mid);beam.lookAt(mid.x+fx,mid.y+Math.tan(lit.pitch),mid.z+fz);const r=Math.tan(lit.angle*.35)*lit.beam;beam.scale.set(r,r,lit.beam);}
+  if(beam.visible){beam.position.copy(origin);beam.lookAt(origin.x+fx,origin.y+Math.tan(lit.pitch),origin.z+fz);const r=Math.tan(lit.angle*.35)*lit.beam;beam.scale.set(r,r,lit.beam);}
   updateNightReflectors(lit,mid,fx,fz);updateNightGhostEyes();updateNightHarbor(dt);updateNightMoonPath(dt);nightCityLamps();updateNightFireflies(dt);
 }
 // 昼・夜を切り替えると今のコースを最初から作り直す(作り直すとメニューが閉じる)。メニューから切り替えた時は開き直して、続けてコースを選べるようにする
