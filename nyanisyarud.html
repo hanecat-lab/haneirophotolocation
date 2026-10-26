@@ -4833,8 +4833,9 @@ function makeCourseTracer(){
     const n=Math.max(1,Math.ceil(length/1.5)),ds=length/n;
     for(let i=0;i<n;i++){t.x+=Math.cos(t.yaw)*ds;t.z+=Math.sin(t.yaw)*ds;t.traced.push([t.x,t.z]);}
   };
-  t.bend=(degrees,radius,direction,kind,grade=0)=>{
-    const total=degrees*Math.PI/180,ease=Math.min(10,radius*total*.25),length=radius*total+ease;
+  // easeLength：曲がりの始めと終わりのなめらかなつなぎの長さ(省くと半径×角度の1/4・最大10m。0なら真円の弧)
+  t.bend=(degrees,radius,direction,kind,grade=0,easeLength)=>{
+    const total=degrees*Math.PI/180,ease=easeLength??Math.min(10,radius*total*.25),length=radius*total+ease;
     const count=Math.max(8,Math.ceil(length/.75)),ds=length/count;
     const weights=Array.from({length:count},(_,i)=>{const d=(i+.5)*ds;return d<ease?.5*(1-Math.cos(Math.PI*d/ease)):d>length-ease?.5*(1-Math.cos(Math.PI*(length-d)/ease)):1;});
     const sum=weights.reduce((a,b)=>a+b,0),startIndex=t.traced.length-1;
@@ -4844,7 +4845,7 @@ function makeCourseTracer(){
       const turn=direction*total*weights[i]/sum;t.x+=Math.cos(t.yaw+turn/2)*ds;t.z+=Math.sin(t.yaw+turn/2)*ds;t.yaw+=turn;turned+=Math.abs(turn);
       t.traced.push([t.x,t.z]);if(apexIndex===startIndex&&turned>=total/2)apexIndex=t.traced.length-1;
     }
-    t.corners.push({startIndex,endIndex:t.traced.length-1,apexIndex,degrees,kind,radius});
+    t.corners.push({startIndex,endIndex:t.traced.length-1,apexIndex,degrees,kind,radius,direction});
   };
   t.mark=name=>{t.marks[name]=t.traced.length-1;};
   return t;
@@ -4861,13 +4862,13 @@ function traceHeightEnd(t){
   return h;
 }
 // 下りの片道コースの高さ：区間ごとの高低差に合わせて、区間の中の決めた範囲(scaleFrom〜scaleTo)の勾配を一律に伸縮する。
-// 勾配の切り替わりを前後12mでならし(縦のカーブ)、区間の終わりの高さの端数は同じ範囲に直線で配る。flatFromより先は平ら
-function downhillHeights(t,top,sections,flatFrom){
+// 勾配の切り替わりを前後 smooth m(省くと12m)でならし(縦のカーブ)、区間の終わりの高さの端数は同じ範囲に直線で配る。flatFromより先は平ら
+function downhillHeights(t,top,sections,flatFrom,smooth=12){
   const T=t.traced,n=T.length,distance=[0];for(let i=1;i<n;i++)distance.push(distance[i-1]+Math.hypot(T[i][0]-T[i-1][0],T[i][1]-T[i-1][1]));
   const seg=distance.map((d,i)=>i?d-distance[i-1]:0),grade=traceGrades(t);
   for(const s of sections){let fixed=0,flex=0;for(let i=s.from+1;i<=s.to;i++){const d=-grade[i]*seg[i];if(i>s.scaleFrom&&i<=s.scaleTo)flex+=d;else fixed+=d;}const k=(s.drop-fixed)/flex;for(let i=s.scaleFrom+1;i<=s.scaleTo;i++)grade[i]*=k;}
-  const smooth=grade.map((_,i)=>{let sum=0,weight=0;for(let j=i;j>0&&distance[i]-distance[j]<=12;j--){sum+=grade[j]*seg[j];weight+=seg[j];}for(let j=i+1;j<n&&distance[j]-distance[i]<=12;j++){sum+=grade[j]*seg[j];weight+=seg[j];}return weight?sum/weight:grade[i];});
-  const height=[top];for(let i=1;i<n;i++)height.push(height[i-1]+smooth[i]*seg[i]);
+  const smoothed=grade.map((_,i)=>{let sum=0,weight=0;for(let j=i;j>0&&distance[i]-distance[j]<=smooth;j--){sum+=grade[j]*seg[j];weight+=seg[j];}for(let j=i+1;j<n&&distance[j]-distance[i]<=smooth;j++){sum+=grade[j]*seg[j];weight+=seg[j];}return weight?sum/weight:grade[i];});
+  const height=[top];for(let i=1;i<n;i++)height.push(height[i-1]+smoothed[i]*seg[i]);
   let target=top;
   for(const s of sections){target-=s.drop;const err=height[s.to]-target,span=distance[s.scaleTo]-distance[s.scaleFrom];for(let i=s.scaleFrom+1;i<n;i++)height[i]-=err*Math.min(1,(distance[i]-distance[s.scaleFrom])/span);}
   for(let i=flatFrom+1;i<n;i++)height[i]=height[flatFrom];
@@ -5366,22 +5367,32 @@ function makeOniCourse(){
 // 百間御殿(片道・猫妖怪シリーズ その4)：鬼の御殿の中。障子の廊下と座敷が上下左右に入り組んで続く。
 // 大門と長廊下(障子が次々に開く)→迷い座敷(直角のクランク)→捻れ廊下→逆さ座敷(天井を走る・重力が逆：上りで加速)→逆さの大階段(下るのに減速)→元に戻る捻れ→奥の間(大広間)。
 // 天井を走る区間の画面の反転と重力の反転・捻れは第2・3段階。勾配は決めたとおりに使う(鬼の隠れ家と同じ作り)
+// 逆さの大階段の先：踊り場で元に戻り、螺旋大階段(曲がり90°の階段を spiral.scale 倍・左回り・laps 周。周の間に landing m の踊り場。
+// 2・3周目は逆さ)→九十九折り階段(折り返し180°の階段を zigzag.scale 倍で3回。1本 flight m・右左右)→奥の間。
+// 階段の部品に段を合わせるため、螺旋と折り返しは真円の弧(つなぎなし)にし、勾配のならしは前後 smooth m にする。
+// cam：螺旋の間は上の周の階段にカメラが入らないよう、道からの高さと猫の後ろの距離を下げる(前後 ramp m でなめらかに)
+const HYAKKEN_STAIRS={smooth:4,spiral:{scale:1.5,radius:6.35*1.5,laps:4,grade:.08,landing:6},zigzag:{scale:2,radius:4,flight:11,grade:[.093,.125],turns:[1,-1,1]},cam:{height:2.6,dist:7,ramp:20}};
 function makeHyakkenCourse(){
-  const t=makeCourseTracer(),{straight,bend,mark}=t;
+  const t=makeCourseTracer(),{straight,bend,mark}=t,P=HYAKKEN_STAIRS.spiral,Z=HYAKKEN_STAIRS.zigzag;
   mark('gate');straight(60,-.02);mark('corridor');straight(400,-.03);mark('corridorEnd');
   mark('maze');bend(90,14,1,'crank',-.02);straight(25,-.02);bend(90,14,-1,'crank',-.02);straight(45,-.02);bend(90,14,-1,'crank',-.02);straight(25,-.02);bend(90,14,1,'crank',-.02);straight(50,-.02);
-  mark('twist');straight(150,-.04);mark('invert');bend(60,50,1,'sweep',.06);straight(60,.06);bend(60,50,-1,'sweep',.06);straight(60,.06);mark('stairs');straight(160,-.12);mark('untwist');straight(150,-.03);
+  mark('twist');straight(150,-.04);mark('level');straight(40,-.02);mark('invert');bend(60,50,1,'sweep',.06);straight(60,.06);bend(60,50,-1,'sweep',.06);straight(60,.06);mark('stairs');straight(160,-.12);mark('stairsEnd');straight(12,0);
+  // 螺旋：1周を1つの曲がりにする。周の間の踊り場は同じ円の上の平らな弧(曲がりには数えない)
+  mark('spiral');for(let lap=0;lap<P.laps;lap++){if(lap){bend(P.landing/P.radius*180/Math.PI,P.radius,-1,'landing',0,0);t.corners.pop();}mark('lap'+lap);bend(360,P.radius,-1,'spiral',-P.grade,0);}
+  mark('spiralEnd');straight(30,-.02);
+  mark('zigzag');for(const turn of Z.turns){straight(Z.flight,-Z.grade[0]);bend(180,Z.radius,turn,'hairpin',0,0);straight(Z.flight,-Z.grade[1]);}mark('zigzagEnd');straight(15,-.02);
   mark('hall');straight(150,-.01);mark('goal');straight(60,-.01);
   const T=t.traced,grade=traceGrades(t);let drop=0;for(let i=1;i<T.length;i++)drop-=grade[i]*Math.hypot(T[i][0]-T[i-1][0],T[i][1]-T[i-1][1]);
-  const TOP=Math.ceil(drop)+20,last=T.length-1,heights=downhillHeights(t,TOP,[{from:0,to:last,drop,scaleFrom:0,scaleTo:last}],last);
+  const TOP=Math.ceil(drop)+20,last=T.length-1,heights=downhillHeights(t,TOP,[{from:0,to:last,drop,scaleFrom:0,scaleTo:last}],last,HYAKKEN_STAIRS.smooth);
   const points=T.map((q,i)=>new THREE.Vector3(q[0],heights[i],q[1])),m=t.marks;
-  const kindLabel={crank:' クランク',sweep:' 大回り'};
+  const kindLabel={crank:' クランク',sweep:' 大回り',spiral:' 螺旋',hairpin:' 折り返し'};
+  // 曲がる向きは道を引いた向きのまま(1周の螺旋は形からは決まらないため)
   const cornerRanges=t.corners.map((c,n)=>{
-    const a=points[c.apexIndex].clone().sub(points[c.startIndex]),b=points[c.endIndex].clone().sub(points[c.apexIndex]),direction=Math.sign(a.x*b.z-a.z*b.x)||1;
+    const direction=c.direction;
     return {number:n+1,startIndex:c.startIndex,endIndex:c.endIndex,apexIndex:c.apexIndex,direction,degrees:c.degrees,radius:c.radius,label:(n+1)+'番 '+(direction>0?'右':'左')+kindLabel[c.kind],brakeFocus:c.radius<=20};
   });
-  return {name:'百間御殿',sub:'大門と長廊下→迷い座敷→捻れ廊下→逆さ座敷→逆さの大階段→奥の間｜猫妖怪シリーズ その4',points,cornerRanges,sectionStarts:[],finishRatio:1,courseRecordVersion:'v1',curveType:'centripetal',
-    gravity:true,autoGuide:true,hyakken:{gate:m.gate,corridor:m.corridor,corridorEnd:m.corridorEnd,maze:m.maze,twist:m.twist,invert:m.invert,stairs:m.stairs,untwist:m.untwist,hall:m.hall,goal:m.goal},
+  return {name:'百間御殿',sub:'大門と長廊下→迷い座敷→捻れ廊下→逆さ座敷→逆さの大階段→螺旋大階段→九十九折り→奥の間｜猫妖怪シリーズ その4',points,cornerRanges,sectionStarts:[],finishRatio:1,courseRecordVersion:'v2',curveType:'centripetal',
+    gravity:true,autoGuide:true,hyakken:{gate:m.gate,corridor:m.corridor,corridorEnd:m.corridorEnd,maze:m.maze,twist:m.twist,level:m.level,invert:m.invert,stairs:m.stairs,stairsEnd:m.stairsEnd,spiral:m.spiral,laps:Array.from({length:P.laps},(_,i)=>m['lap'+i]),spiralEnd:m.spiralEnd,zigzag:m.zigzag,zigzagEnd:m.zigzagEnd,hall:m.hall,goal:m.goal},
     corners:['START 大門',...cornerRanges.map(c=>c.label),'GOAL 奥の間']};
 }
 // 猫又の里 二股峠(片道・分岐1回・夜がおすすめ)：峠の茶屋から千本鳥居(道が2/3の幅に細くなる)を抜け、九十九折りを下って二股に分かれ、
@@ -15242,7 +15253,8 @@ function tick(dt){
   }catch(e){
     try{ camera.fov=FOLLOW_FOV; camera.updateProjectionMatrix(); }catch(e2){}
   }
-  const camDist=10.5 - speed*0.03; const camHeight=4.8;
+  // 百間御殿の螺旋大階段では、上の周の階段に入らないよう低く近くに
+  const spiralCam=hyakkenSpiralCam(s),camDist=THREE.MathUtils.lerp(10.5 - speed*0.03,HYAKKEN_STAIRS.cam.dist,spiralCam); const camHeight=THREE.MathUtils.lerp(4.8,HYAKKEN_STAIRS.cam.height,spiralCam);
   camTarget.copy(worldPos).add(new THREE.Vector3(0,0.45,0)).add(track.t.clone().multiplyScalar(6));
   camPos.copy(track.p).add(track.t.clone().multiplyScalar(-camDist)).add(new THREE.Vector3(0,camHeight,0)).add(track.n.clone().multiplyScalar(lateral*0.18));
   camPos.y=roadY+camHeight;
@@ -17738,16 +17750,18 @@ const HYAKKEN={wallScale:1.6,wallOff:ROAD_HALF+.6,ceiling:7.2,upper:0x3a2a20,lan
   stairDrop:.075,stairMargin:6,
   // ゴールの鳥居の大きさ(ふだんは17倍。天井7.2mの下では笠木が少し天井にめり込む)
   goalTorii:12,photoHeight:3.2,
-  models:{kaidan:'nyanisyarud-hyakken-kaidan.glb',landing:'nyanisyarud-hyakken-landing.glb',zashiki:'nyanisyarud-hyakken-zashiki.glb',zashikiMoon:'nyanisyarud-hyakken-zashiki-moon.glb',shoji:'nyanisyarud-hyakken-shoji.glb',fusuma:'nyanisyarud-hyakken-fusuma.glb',lantern:'nyanisyarud-hyakken-lantern.glb',andon:'nyanisyarud-hyakken-andon.glb',stairs:'nyanisyarud-hyakken-stairs.glb',byobu:'nyanisyarud-hyakken-byobu.glb',taiko:'nyanisyarud-hyakken-taiko.glb'}};
+  models:{kaidan:'nyanisyarud-hyakken-kaidan.glb',landing:'nyanisyarud-hyakken-landing.glb',zashiki:'nyanisyarud-hyakken-zashiki.glb',zashikiMoon:'nyanisyarud-hyakken-zashiki-moon.glb',shoji:'nyanisyarud-hyakken-shoji.glb',fusuma:'nyanisyarud-hyakken-fusuma.glb',lantern:'nyanisyarud-hyakken-lantern.glb',andon:'nyanisyarud-hyakken-andon.glb',stairs:'nyanisyarud-hyakken-stairs.glb',corner:'nyanisyarud-hyakken-kaidan-corner.glb',hairpin:'nyanisyarud-hyakken-kaidan-hairpin.glb',byobu:'nyanisyarud-hyakken-byobu.glb',taiko:'nyanisyarud-hyakken-taiko.glb'}};
 let hyakkenRun=null;
 const hyakkenModelCache={};
 function loadHyakkenModel(name){return hyakkenModelCache[name]??=import('three/addons/loaders/GLTFLoader.js').then(({GLTFLoader})=>new GLTFLoader().loadAsync(HYAKKEN.models[name])).then(g=>{g.scene.updateMatrixWorld(true);
   // 障子の紙は奥に灯りがあるように少し光らせる
   g.scene.traverse(o=>{if(o.isMesh&&o.material.name==='paper'&&o.material.emissive){o.material.emissive.setHex(HYAKKEN.paperGlow[0]);o.material.emissiveIntensity=HYAKKEN.paperGlow[1];if(o.material.map)o.material.emissiveMap=o.material.map;}});return g.scene;}).catch(e=>{delete hyakkenModelCache[name];throw e;});}
-// GLBを部品ごとにまとめて、places([位置, 向き, 大きさ])の数だけ描く
-function hyakkenInstances(src,places,group,name){
+// GLBを部品ごとにまとめて、places([位置, 向き, 大きさ])の数だけ描く。mirrorなら左右を裏返した形で描く(面の向きも直す)
+function hyakkenInstances(src,places,group,name,mirror=false){
   const q=new THREE.Quaternion(),m4=new THREE.Matrix4(),up=new THREE.Vector3(0,1,0);
-  src.traverse(o=>{if(!o.isMesh||!places.length)return;const geo=o.geometry.clone().applyMatrix4(o.matrixWorld),inst=new THREE.InstancedMesh(geo,o.material,places.length);
+  src.traverse(o=>{if(!o.isMesh||!places.length)return;const geo=o.geometry.clone().applyMatrix4(o.matrixWorld);
+    if(mirror){geo.applyMatrix4(new THREE.Matrix4().makeScale(-1,1,1));if(!geo.index)geo.setIndex([...Array(geo.attributes.position.count).keys()]);const ix=geo.index.array;for(let i=0;i<ix.length;i+=3){const k=ix[i+1];ix[i+1]=ix[i+2];ix[i+2]=k;}geo.index.needsUpdate=true;}
+    const inst=new THREE.InstancedMesh(geo,o.material,places.length);
     places.forEach(([pos,yaw,sc],i)=>{q.setFromAxisAngle(up,yaw);inst.setMatrixAt(i,m4.compose(pos,q,sc));});inst.instanceMatrix.needsUpdate=true;inst.computeBoundingSphere();inst.name=name;group.add(inst);});
 }
 function hyakkenFloorTexture(){
@@ -17758,7 +17772,8 @@ function hyakkenFloorTexture(){
 }
 function buildHyakken(def){
   const group=new THREE.Group();group.name='hyakkenInterior';const H=HYAKKEN,h=def.hyakken,at=i=>indexDistance(curve,def.points,i);
-  const run=hyakkenRun={group,gates:[],maze:[at(h.maze),at(h.twist)],hall:[at(h.hall),totalLength],invert:[at(h.invert),at(h.untwist)],open:[at(h.twist),at(h.hall)],stairs:[at(h.stairs),at(h.untwist)],roll:0,trans:null};hyakkenShojiEl()?.classList.remove('closed');
+  const run=hyakkenRun={group,gates:[],maze:[at(h.maze),at(h.twist)],hall:[at(h.hall),totalLength],invert:[[at(h.invert),at(h.stairsEnd)+6,'逆さ座敷'],[at(h.laps[1])-HYAKKEN_STAIRS.spiral.landing/2,at(h.laps[3])-HYAKKEN_STAIRS.spiral.landing/2,'逆さ螺旋']],open:[at(h.twist),at(h.hall)],stairs:[at(h.stairs),at(h.stairsEnd)],
+    spiral:[at(h.spiral),at(h.spiralEnd)],laps:h.laps.map(at),zigzag:[at(h.zigzag),at(h.zigzagEnd)],roll:0,trans:null};hyakkenShojiEl()?.classList.remove('closed');
   // 室内はスタートの後ろ(back m)とゴールの先(ahead m)まで延ばし、両端は閉じた襖でふさぐ(待機やゴールのカメラから外が見えないように)。道の外の位置は端の向きのまま延長する
   const back=26,ahead=12,pose=d=>{if(d>=0&&d<=totalLength)return getTrackAtDist(d);const e=getTrackAtDist(d<0?0:totalLength),t=new THREE.Vector3(e.t.x,0,e.t.z).normalize(),k=d<0?d:d-totalLength;return {p:e.p.clone().addScaledVector(t,k),t:e.t,n:e.n};};
   // 床：板張り
@@ -17784,9 +17799,11 @@ function buildHyakken(def){
     loadHyakkenModel('lantern').then(src=>{if(hyakkenRun===run)hyakkenInstances(src,list,group,'hyakkenLantern');}).catch(()=>{});}
   // 渡り廊下の欄干：柱と上の横木(赤い漆の色)
   {const posts=[],rails=[],[a,b]=run.open,mat=new THREE.MeshLambertMaterial({color:H.railColor}),m4=new THREE.Matrix4(),q=new THREE.Quaternion(),one=new THREE.Vector3(1,1,1),up=new THREE.Vector3(0,1,0);
-    for(let d=a;d<=b;d+=H.railStep){if(d>run.stairs[0]-H.stairMargin-.5&&d<run.stairs[1]+H.stairMargin+.5)continue;const tr=getTrackAtDist(d),n=new THREE.Vector3(tr.n.x,0,tr.n.z).normalize(),yaw=Math.atan2(tr.t.x,tr.t.z);
+    // 階段の区間(部品に手すりがある)は外す
+    const skip=d=>d>run.stairs[0]-H.stairMargin-.5&&d<run.stairs[1]+H.stairMargin+.5||d>run.spiral[0]-.5&&d<run.zigzag[1]+.5;
+    for(let d=a;d<=b;d+=H.railStep){if(skip(d))continue;const tr=getTrackAtDist(d),n=new THREE.Vector3(tr.n.x,0,tr.n.z).normalize(),yaw=Math.atan2(tr.t.x,tr.t.z);
       for(const side of [-1,1]){const p=new THREE.Vector3(tr.p.x+n.x*(ROAD_HALF+.3)*side,tr.p.y+ROAD_Y,tr.p.z+n.z*(ROAD_HALF+.3)*side);posts.push(p.clone().setY(p.y+H.railH/2));
-        if(d+H.railStep<=b&&!(d+H.railStep>run.stairs[0]-H.stairMargin-.5&&d+H.railStep<run.stairs[1]+H.stairMargin+.5)){const tr2=getTrackAtDist(d+H.railStep),p2=new THREE.Vector3(tr2.p.x+tr2.n.x*(ROAD_HALF+.3)*side,tr2.p.y+ROAD_Y,tr2.p.z+tr2.n.z*(ROAD_HALF+.3)*side);rails.push([p,p2]);}}}
+        if(d+H.railStep<=b&&!skip(d+H.railStep)){const tr2=getTrackAtDist(d+H.railStep),p2=new THREE.Vector3(tr2.p.x+tr2.n.x*(ROAD_HALF+.3)*side,tr2.p.y+ROAD_Y,tr2.p.z+tr2.n.z*(ROAD_HALF+.3)*side);rails.push([p,p2]);}}}
     const pm=new THREE.InstancedMesh(new THREE.BoxGeometry(.14,H.railH,.14),mat,posts.length);posts.forEach((p,i)=>pm.setMatrixAt(i,m4.compose(p,q.identity(),one)));pm.name='hyakkenRailPosts';group.add(pm);
     const rm=new THREE.InstancedMesh(new THREE.BoxGeometry(.1,.1,1),mat,rails.length),dir=new THREE.Vector3(),mid=new THREE.Vector3(),scl=new THREE.Vector3();
     rails.forEach(([p,p2],i)=>{dir.subVectors(p2,p);const len=dir.length();mid.addVectors(p,p2).multiplyScalar(.5).setY(mid.y+H.railH);q.setFromUnitVectors(new THREE.Vector3(0,0,1),dir.normalize());rm.setMatrixAt(i,m4.compose(mid,q,scl.set(1,1,len)));});
@@ -17799,6 +17816,21 @@ function buildHyakken(def){
     const top=getTrackAtDist(a+M),topBack=getTrackAtDist(a+M-6),bot=getTrackAtDist(a+M+list.length*10),botFwd=getTrackAtDist(a+M+list.length*10+6);
     const landings=[[topBack.p,top.p],[bot.p,botFwd.p]].map(([p,q])=>[new THREE.Vector3(p.x,Math.max(p.y,q.y)+ROAD_Y-.2,p.z),Math.atan2(q.x-p.x,q.z-p.z),one]);
     loadHyakkenModel('landing').then(src=>{if(hyakkenRun===run)hyakkenInstances(src,landings,group,'hyakkenLanding');}).catch(()=>{});}
+  // 螺旋大階段と九十九折り階段。部品は下りの向きに置く：低い端(部品の原点側)を区切りの先、来た方を部品の+Zへ。
+  // 段の上面が道をはさむように、部品の高さ(y)と縦の大きさは両端の道の高さから決める(低い端の段の真ん中・高い端の段の真ん中が道に来る)
+  {const S=HYAKKEN_STAIRS,yawOf=v=>Math.atan2(v.x,v.z),corners=[],landings=[],pins=[[],[]];
+    // 螺旋：曲がり90°の部品(1倍で半径6.35m・8段で1.2m)を、1周に4つ。周の間と螺旋の出口に踊り場
+    const quarter=S.spiral.radius*Math.PI/2;
+    for(const lap of run.laps)for(let k=0;k<4;k++){const hi=getTrackAtDist(lap+k*quarter),lo=getTrackAtDist(lap+(k+1)*quarter),ys=(hi.p.y-lo.p.y)/1.05;
+      corners.push([new THREE.Vector3(lo.p.x,lo.p.y+ROAD_Y-.075*ys,lo.p.z),yawOf(lo.t.clone().negate()),new THREE.Vector3(S.spiral.scale,ys,S.spiral.scale)]);}
+    for(const d of [...run.laps.slice(1).map(l=>l-S.spiral.landing),run.spiral[1]]){const p=getTrackAtDist(d).p,q=getTrackAtDist(d+S.spiral.landing).p;landings.push([new THREE.Vector3(p.x,Math.max(p.y,q.y)+ROAD_Y-.2,p.z),yawOf(q.clone().sub(p)),new THREE.Vector3(S.spiral.scale,1,1)]);}
+    // 九十九折り：折り返し180°の部品(1倍で1本の幅3.5m・折り返しの中心の間4m・1.35m)。原点は行きと帰りの真ん中。右回りはそのまま、左回りは裏返す
+    const turn=S.zigzag.radius*Math.PI,len=2*S.zigzag.flight+turn;
+    S.zigzag.turns.forEach((dir,k)=>{const d0=run.zigzag[0]+k*len,a=getTrackAtDist(d0),b=getTrackAtDist(d0+len),ys=(a.p.y-b.p.y)/1.2;
+      pins[dir>0?0:1].push([new THREE.Vector3((a.p.x+b.p.x)/2,b.p.y+ROAD_Y-.075*ys,(a.p.z+b.p.z)/2),yawOf(a.t),new THREE.Vector3(S.zigzag.scale,ys,S.zigzag.scale)]);});
+    loadHyakkenModel('corner').then(src=>{if(hyakkenRun===run)hyakkenInstances(src,corners,group,'hyakkenSpiral');}).catch(()=>{});
+    loadHyakkenModel('landing').then(src=>{if(hyakkenRun===run)hyakkenInstances(src,landings,group,'hyakkenSpiralLanding');}).catch(()=>{});
+    loadHyakkenModel('hairpin').then(src=>{if(hyakkenRun!==run)return;hyakkenInstances(src,pins[0],group,'hyakkenZigzag');hyakkenInstances(src,pins[1],group,'hyakkenZigzag',true);}).catch(()=>{});}
   // まわりの宙に浮かぶ座敷(2種類。部品ごとにまとめて描く)
   {const R=H.rooms,road=[];for(let d=0;d<=totalLength;d+=6)road.push(getTrackAtDist(d).p);
     const spots=k=>{const list=[];let tries=0;while(list.length<R.count&&tries<5000){tries++;const d=THREE.MathUtils.lerp(run.open[0]-80,run.open[1]+80,Math.random()),tr=getTrackAtDist(THREE.MathUtils.clamp(d,0,totalLength)),side=Math.random()<.5?-1:1,off=THREE.MathUtils.lerp(...R.dist,Math.random());
@@ -17823,22 +17855,25 @@ function buildHyakken(def){
     run.flames=list.map((c,i)=>{const sp=oniGlowSprite(C.color,C.flame);sp.position.copy(c.pos).setY(c.pos.y+c.h+.08);sp.name='hyakkenCandleFlame';group.add(sp);return {sp,base:sp.position.y,phase:i*1.3};});}).catch(()=>{});
   return group;
 }
-// 逆さの区間(逆さ座敷〜元に戻る捻れの手前)：画面を180°回し、重力を逆にする。境目は画面全体の障子で隠して切り替える
+// 逆さの区間(逆さ座敷〜大階段の下の踊り場、螺旋の2・3周目)：画面を180°回し、重力を逆にする。境目は画面全体の障子で隠して切り替える
 // (猫が境目まで shoji.lead 秒の所で閉じ始め、閉じきったら回転を切り替えて開く)。重力は境目の前後 gravityRamp m でなめらかに入れ替える
 // 境目の3・2・1秒前から数字を出し、障子を count[n] だけ閉じてくる(急に障子が出て驚かないように)
 const HYAKKEN_INVERT={shoji:{lead:.3,close:.22,open:.28},count:{3:'10%',2:'22%',1:'36%'},gravityRamp:8};
-function hyakkenGravitySign(d){const y=hyakkenRun;if(!y)return 1;const [a,b]=y.invert,R=HYAKKEN_INVERT.gravityRamp;return 1-2*Math.min(THREE.MathUtils.smoothstep(d,a-R,a+R),1-THREE.MathUtils.smoothstep(d,b-R,b+R));}
+function hyakkenGravitySign(d){const y=hyakkenRun;if(!y)return 1;const R=HYAKKEN_INVERT.gravityRamp;let k=0;for(const [a,b] of y.invert)k=Math.max(k,Math.min(THREE.MathUtils.smoothstep(d,a-R,a+R),1-THREE.MathUtils.smoothstep(d,b-R,b+R)));return 1-2*k;}
+function hyakkenInvertAt(d){return hyakkenRun?.invert.find(([a,b])=>d>=a&&d<b);}
+// 螺旋の間だけカメラを低く近くにする割合(0〜1)
+function hyakkenSpiralCam(d){const r=hyakkenRun?.spiral;if(!r)return 0;const R=HYAKKEN_STAIRS.cam.ramp;return Math.min(THREE.MathUtils.smoothstep(d,r[0]-R,r[0]),1-THREE.MathUtils.smoothstep(d,r[1],r[1]+R));}
 function hyakkenShojiEl(){return document.getElementById('hyakkenShoji');}
 function updateHyakkenInvert(dt){
-  const y=hyakkenRun,S=HYAKKEN_INVERT.shoji,[a,b]=y.invert,want=s>=a&&s<b?Math.PI:0,el=hyakkenShojiEl();
+  const y=hyakkenRun,S=HYAKKEN_INVERT.shoji,want=hyakkenInvertAt(s)?Math.PI:0,el=hyakkenShojiEl();
   const countEl=document.getElementById('hyakkenCount'),setCount=(n,label)=>{const text=n?n+'':'';if(countEl&&countEl.dataset.n!==text){countEl.dataset.n=text;countEl.innerHTML=n?n+'<small>'+label+'</small>':'';}el?.style.setProperty('--p',n?HYAKKEN_INVERT.count[n]:'0%');};
   if(y.trans){setCount(0);y.trans.t+=dt;if(!y.trans.switched&&y.trans.t>=S.close){y.trans.switched=true;y.roll=y.trans.target;el?.classList.remove('closed');
-      if(y.trans.target)showBridgeFeedback('逆さ座敷','天井を走る · 重力が逆さ',1.6);}
+      if(y.trans.target)showBridgeFeedback(y.trans.name,'天井を走る · 重力が逆さ',1.6);}
     if(y.trans.t>=S.close+S.open)y.trans=null;return;}
   if(gameState!=='racing'){setCount(0);if(y.roll!==want)y.roll=want;return;}
   // 次の境目へ lead 秒で届くなら障子を閉じ始める。境目を過ぎても向きが違っていれば(やり直し・飛び越し)すぐに合わせる
-  const next=s<a?a:s<b?b:null,target=s<a?Math.PI:0,lead=Math.max(2,speed*.62*S.lead);
-  if(next!==null&&next-s<lead&&y.roll!==target){setCount(0);y.trans={t:0,target,switched:false};el?.classList.add('closed');return;}
+  const next=y.invert.flat().find(e=>typeof e==='number'&&e>s)??null,range=next!==null?hyakkenInvertAt(next):null,target=range?Math.PI:0,lead=Math.max(2,speed*.62*S.lead);
+  if(next!==null&&next-s<lead&&y.roll!==target){setCount(0);y.trans={t:0,target,switched:false,name:range?.[2]};el?.classList.add('closed');return;}
   // 境目まで3秒を切ったら3・2・1
   {const T=next!==null&&y.roll!==target?(next-s)/Math.max(.5,speed*.62):Infinity;setCount(T<=1?1:T<=2?2:T<=3?3:0,target?'逆さになる':'元に戻る');}
   if(y.roll!==want&&!(next!==null&&next-s<lead))y.roll=want;
