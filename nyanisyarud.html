@@ -2722,6 +2722,8 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
 .catNameEdit input{flex:1;min-width:0;min-height:40px;box-sizing:border-box;padding:6px 10px;border:1px solid #e7c789;border-radius:8px;background:#fffaf0;color:#533c28;font:700 16px 'Zen Maru Gothic',sans-serif;}
 /* 走行中は「走り出す」を画面の向き・幅にかかわらず隠す */
 #app:not([data-race-state="ready"]) #btnStart{display:none!important;}
+/* コースの準備中(初めて走る時の読み込みと陰影の準備)は押せない */
+#btnStart[data-warming="on"]{opacity:.55;filter:saturate(.4);cursor:progress;}
 /* 横長の画面：速度計を紙コップと魚の位置(ブレーキの上)へ下げて地図と重ならないようにし、紙コップと魚は速度計の左に置く */
 @media (orientation:landscape){
   #rightBottomCluster .cupRow{position:absolute;right:calc(100% + 8px);top:36px;margin-top:0;}
@@ -8842,6 +8844,7 @@ function rebuildTrack(key){
   if(def.laps){curve=raceCurve;totalLength=raceLength;}
   raceProgressSections=buildRaceProgressSections(def);
   updateRaceProgress(0,false);
+  warmCourse();
 }
 
 
@@ -12213,7 +12216,7 @@ function updateReadyCourse(){
     document.getElementById('readyCourseFeature').textContent=profile.location+'手前の直線から';
     document.getElementById('readyCourseDirection').textContent='毎回'+profile.speed+'km/h';document.getElementById('readyCourseAltitude').textContent='タイム計測なし';
   }
-  document.getElementById('btnStart').textContent=isPracticeActive()?'▶ 練習を始める':'▶ 走り出す';
+  document.getElementById('btnStart').textContent=courseWarm.ready?startButtonLabel():'準備中…';
 }
 function resetRace(){
   cancelCountdown();resetLapRun();
@@ -12349,8 +12352,33 @@ function prepareSound(){
   if(!gutterAudio){const Audio=window.AudioContext||window.webkitAudioContext;if(Audio)try{gutterAudio=new Audio();}catch(e){}}
   if(gutterAudio?.state==='suspended')gutterAudio.resume().catch(()=>{});
 }
+// コースの準備(初めて走る時の重さを走り出す前に済ませる)：コースを作り直したら、
+// B：GLBの読み込みが終わるのを待つ(まだ始まっていない読み込みもあるので、idle ms 何も読み込んでいない状態が続いたら終わりとみなす。最長 maxWait ms)。
+// A：陰影の計算の準備(シェーダー)を並行してまとめて済ませ、絵(テクスチャ)をGPUへ送っておく。
+// その間は「走り出す」を「準備中」にして押せなくする。準備中に走り出しを頼まれたら(練習のやり直しなど)、終わった時に走り出す。2回目からは準備済みのものを使うのですぐ終わる
+// compileMax：陰影の準備を待つ最長 ms(準備の途中でコースが作り直されると three.js の中で止まったままになることがあるため、過ぎたら走れるようにする)
+const COURSE_WARM={idle:500,maxWait:15000,compileMax:8000};
+const courseWarm={token:0,ready:true,pending:0,queued:false};
+{const M=THREE.DefaultLoadingManager,start=M.itemStart.bind(M),end=M.itemEnd.bind(M);
+  M.itemStart=url=>{courseWarm.pending++;start(url);};M.itemEnd=url=>{courseWarm.pending=Math.max(0,courseWarm.pending-1);end(url);};}
+function startButtonLabel(){return isPracticeActive()?'▶ 練習を始める':'▶ 走り出す';}
+function setCourseWarmUi(ready){const b=document.getElementById('btnStart');if(!b)return;b.disabled=!ready;b.dataset.warming=ready?'':'on';b.textContent=ready?startButtonLabel():'準備中…';}
+async function warmCourse(){
+  const token=++courseWarm.token,wait=ms=>new Promise(r=>setTimeout(r,ms)),now=()=>performance.now();courseWarm.ready=false;courseWarm.queued=false;setCourseWarmUi(false);
+  // GLBの読み込みは読み込み用の部品(GLTFLoader)が届いてから始まるので、先にそれを待つ
+  try{await import('three/addons/loaders/GLTFLoader.js');}catch(e){}
+  const begin=now();let idleSince=now();
+  while(now()-begin<COURSE_WARM.maxWait){await wait(100);if(token!==courseWarm.token)return;if(courseWarm.pending>0)idleSince=now();else if(now()-idleSince>=COURSE_WARM.idle)break;}
+  try{
+    await Promise.race([renderer.compileAsync(scene,camera),wait(COURSE_WARM.compileMax)]);if(token!==courseWarm.token)return;
+    const done=new Set();scene.traverse(o=>{for(const m of [].concat(o.material||[]))for(const v of Object.values(m))if(v?.isTexture&&!done.has(v)){done.add(v);renderer.initTexture(v);}});
+  }catch(e){console.warn('warmCourse',e);}
+  if(token!==courseWarm.token)return;courseWarm.ready=true;setCourseWarmUi(true);
+  if(courseWarm.queued){courseWarm.queued=false;beginCountdown();}
+}
 function beginCountdown(){
   if(brightAdjust.active)return;
+  if(!courseWarm.ready){courseWarm.queued=true;return;}
   if(!document.getElementById('launchTitle').hidden||gameState!=='ready'||countdown.active)return;
   prepareSound();
   Object.assign(countdown,{active:true,t:0,beat:-1,press:null,awaitAfter:false,boost:0});
