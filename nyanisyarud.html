@@ -7582,9 +7582,15 @@ function setupBranch(def,br=def.branch){
   branchRun.railMB=branchRun.railM+delta;branchRun.noseMB=branchRun.noseM+delta;
   branchRun.bridge=br.bridge?{from:F+br.bridge[0],to:F+br.bridge[1]}:null;
 }
+// 分岐の中央分離帯(白い斜線と寝かせた竹)：斜線の幅 band [最小, 最大] m、竹の半径 log m。またいだ時の跳ね方 hop
+const MEDIAN={band:[.8,3],log:.12,hop:{max:.3,shake:.08,big:false}};
+// 分岐の中で、中央分離帯をまたげる所(分かれ目の側・合流の側のガードレールの無い所)か。d は左の道の距離。昼に通れない右の道(closedByDay)はまたげない
+function medianZone(b,d){if(!b||branchClosed(b))return null;return d>=b.noseF&&d<=b.railF?'fork':d>=b.railM&&d<=b.noseM?'merge':null;}
 function roadWallsAt(d){
   // 右の道を走っている時は、合流の側の距離を左の道の距離に直して比べる
   const b=branchRun;if(b&&b.route==='B'&&d>b.F+(b.MB-b.F)/2)d-=b.delta;
+  // 中央分離帯はまたげるので、その所は自分の道の両端が壁
+  if(medianZone(b,d))return ROAD_WALLS;
   if(!b||d<b.noseF||d>b.noseM){const w=narrowRoadAt(d),l=snowfieldWidenAt(d,-1),r=snowfieldWidenAt(d,1);if(w===ROAD_HALF&&!l&&!r)return ROAD_WALLS;narrowWalls.left=-w-l;narrowWalls.right=w+r;return narrowWalls;}
   const w=Math.min(ROAD_HALF,Math.max(.6,b.half[THREE.MathUtils.clamp(Math.round(d-Math.floor(b.F)),0,b.half.length-1)]+.15));
   branchWalls.left=b.route==='B'?-w:-ROAD_HALF;branchWalls.right=b.route==='A'?w:ROAD_HALF;return branchWalls;
@@ -7617,19 +7623,29 @@ function buildBranchVisuals(def,roadMaterial){
     if(!def.city&&!def.harbor&&!def.tunnel)group.add(buildRoadsideBanks(def));
     b.building='A';
   });
-  // 中央分離帯：2本の中心のまん中に、幅0.5m・高さ0.45mの黄と黒のしま。分離帯の鼻(分かれ目)と合流の側の端
-  const canvas=document.createElement('canvas');canvas.width=128;canvas.height=32;const g=canvas.getContext('2d');g.fillStyle='#f2c230';g.fillRect(0,0,128,32);g.fillStyle='#262626';for(let x=-32;x<128;x+=32){g.beginPath();g.moveTo(x,32);g.lineTo(x+16,32);g.lineTo(x+32,0);g.lineTo(x+16,0);g.fill();}
-  const texture=new THREE.CanvasTexture(canvas);texture.colorSpace=THREE.SRGBColorSpace;texture.wrapS=THREE.RepeatWrapping;
-  const positions=[],uvs=[],quad=(a,c,d,e,u0,u1)=>{positions.push(...a,...c,...d,...a,...d,...e);uvs.push(u0,1,u1,1,u1,0,u0,1,u1,0,u0,0);};
-  for(const [from,to] of [[b.noseF,b.railF+4],[b.railM-4,b.noseM]]){
-    const rows=[];for(let d=from;d<=to;d+=.5){const p=b.curveA.getPointAt(Math.min(1,d/b.lengthA)),q=b.curveB.getPointAt(Math.min(1,(d>b.F+(b.M-b.F)/2?d+b.delta:d)/b.lengthB)),m=p.clone().add(q).multiplyScalar(.5),side=q.clone().sub(p).setY(0).normalize(),y=m.y+ROAD_Y;
-      rows.push({l:[m.x-side.x*.25,y,m.z-side.z*.25],r:[m.x+side.x*.25,y,m.z+side.z*.25],d});}
-    const up=v=>[v[0],v[1]+.45,v[2]];
-    for(let i=1;i<rows.length;i++){const a=rows[i-1],c=rows[i],u0=a.d/1.5,u1=c.d/1.5;quad(up(a.l),up(c.l),c.l,a.l,u0,u1);quad(up(c.r),up(a.r),a.r,c.r,u0,u1);quad(up(a.r),up(c.r),up(c.l),up(a.l),u0,u1);}
-    for(const e of [rows[0],rows.at(-1)])quad(up(e.l),up(e.r),e.r,e.l,0,.33);
+  // 中央分離帯(分かれ目の側と合流の側の、ガードレールの無い所)：2本の中心のまん中の路面に白い斜線(導流帯。幅は2本の間に合わせて MEDIAN.band [最小, 最大] m)を描き、
+  // その中心に低く寝かせた竹(迷い竹林。ほかのコースは木材の丸太。半径 MEDIAN.log m)を1本通す。壁ではなく、またぐと軽く跳ねて隣の道へ移る(updateBranchRoute)
+  const M=MEDIAN,paint=document.createElement('canvas');paint.width=64;paint.height=64;{const g=paint.getContext('2d');g.fillStyle='rgba(245,242,230,.92)';for(let x=-64;x<128;x+=24){g.beginPath();g.moveTo(x,64);g.lineTo(x+10,64);g.lineTo(x+74,0);g.lineTo(x+64,0);g.fill();}g.fillRect(0,0,4,64);g.fillRect(60,0,4,64);}
+  const paintTex=new THREE.CanvasTexture(paint);paintTex.colorSpace=THREE.SRGBColorSpace;paintTex.wrapS=THREE.RepeatWrapping;
+  // 迷い竹林は青竹(節の輪)、ほかのコースは木材(茶色の丸太に木目の筋)
+  const bark=document.createElement('canvas');bark.width=64;bark.height=16;{const g=bark.getContext('2d'),gr=g.createLinearGradient(0,0,0,16);
+    if(def.bamboo){gr.addColorStop(0,'#9fbf6a');gr.addColorStop(.5,'#5f8a3a');gr.addColorStop(1,'#3d5d26');g.fillStyle=gr;g.fillRect(0,0,64,16);g.fillStyle='#d8d2a8';g.fillRect(30,0,3,16);g.fillStyle='rgba(0,0,0,.25)';g.fillRect(33,0,2,16);}
+    else{gr.addColorStop(0,'#b58a5a');gr.addColorStop(.5,'#8a6238');gr.addColorStop(1,'#5e4024');g.fillStyle=gr;g.fillRect(0,0,64,16);g.strokeStyle='rgba(60,38,18,.45)';g.lineWidth=1;for(const y of [3,6.5,10,13]){g.beginPath();g.moveTo(0,y);for(let x=0;x<=64;x+=8)g.lineTo(x,y+Math.sin(x*.3+y)*.8);g.stroke();}}}
+  const barkTex=new THREE.CanvasTexture(bark);barkTex.colorSpace=THREE.SRGBColorSpace;barkTex.wrapS=THREE.RepeatWrapping;
+  const band=[],bandUv=[],logPos=[],logUv=[],logIdx=[];
+  for(const [from,to] of [[b.noseF,b.railF],[b.railM,b.noseM]]){
+    const rows=[];for(let d=from;d<=to;d+=.5){const p=b.curveA.getPointAt(Math.min(1,d/b.lengthA)),q=b.curveB.getPointAt(Math.min(1,(d>b.F+(b.M-b.F)/2?d+b.delta:d)/b.lengthB)),m=p.clone().add(q).multiplyScalar(.5),gap=p.distanceTo(q),side=q.clone().sub(p).setY(0).normalize();
+      rows.push({m,side,w:THREE.MathUtils.clamp(gap*.6,M.band[0],M.band[1])/2,y:m.y+ROAD_Y,d});}
+    for(let i=1;i<rows.length;i++){const a=rows[i-1],c=rows[i],v=(r,k)=>[r.m.x+r.side.x*r.w*k,r.y+.03,r.m.z+r.side.z*r.w*k];band.push(...v(a,-1),...v(c,-1),...v(c,1),...v(a,-1),...v(c,1),...v(a,1));const u0=a.d/2,u1=c.d/2;bandUv.push(u0,0,u1,0,u1,1,u0,0,u1,1,u0,1);}
+    // 寝かせた竹：中心線に沿った8角の筒
+    const base=logPos.length/3,ring=8;rows.forEach((r,i)=>{const t=i?r.m.clone().sub(rows[i-1].m).setY(0).normalize():(rows[1]?rows[1].m.clone().sub(r.m).setY(0).normalize():new THREE.Vector3(0,0,1));
+      for(let k=0;k<=ring;k++){const a=k/ring*Math.PI*2,c=Math.cos(a)*M.log,sn=Math.sin(a)*M.log;logPos.push(r.m.x+r.side.x*c,r.y+M.log+sn,r.m.z+r.side.z*c);logUv.push(r.d/1.2,k/ring);}});
+    for(let i=1;i<rows.length;i++)for(let k=0;k<ring;k++){const a=base+(i-1)*(ring+1)+k,c=base+i*(ring+1)+k;logIdx.push(a,c,a+1,a+1,c,c+1);}
   }
-  const mg=new THREE.BufferGeometry();mg.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));mg.setAttribute('uv',new THREE.Float32BufferAttribute(uvs,2));mg.computeVertexNormals();
-  const median=new THREE.Mesh(mg,new THREE.MeshLambertMaterial({map:texture,side:THREE.DoubleSide}));median.name='branchMedian';group.add(median);
+  const bg=new THREE.BufferGeometry();bg.setAttribute('position',new THREE.Float32BufferAttribute(band,3));bg.setAttribute('uv',new THREE.Float32BufferAttribute(bandUv,2));bg.computeVertexNormals();
+  const bandMesh=new THREE.Mesh(bg,new THREE.MeshLambertMaterial({map:paintTex,transparent:true,depthWrite:false,side:THREE.DoubleSide,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-2}));bandMesh.name='branchMedianPaint';group.add(bandMesh);
+  const lg2=new THREE.BufferGeometry();lg2.setAttribute('position',new THREE.Float32BufferAttribute(logPos,3));lg2.setAttribute('uv',new THREE.Float32BufferAttribute(logUv,2));lg2.setIndex(logIdx);lg2.computeVertexNormals();
+  const median=new THREE.Mesh(lg2,new THREE.MeshLambertMaterial({map:barkTex}));median.name='branchMedian';group.add(median);
   // 案内板：分離帯の鼻の3m先に、走ってくる側へ向けて「← ドリフト ｜ クランク →」(下の端は道から3.4m)。文字は分岐ごとに branch.sign で替えられる(長い文字は枠に収まるよう縮める)
   const words=b.br.sign||{left:'ドリフト',right:'クランク',leftSub:'谷',rightSub:'旧市街'},fit=b.br.sign?236:undefined;
   const sc=document.createElement('canvas');sc.width=512;sc.height=160;const sg=sc.getContext('2d');sg.fillStyle='#1d5f3a';sg.fillRect(0,0,512,160);sg.strokeStyle='#fff';sg.lineWidth=6;sg.strokeRect(6,6,500,148);sg.fillStyle='#fff';
@@ -8990,7 +9006,7 @@ function startRoadHop(o){
   if(o.big&&appAnimationsEnabled)countdown.fovKick=7;
 }
 function updateRoadHop(dt){
-  const tn=tunnelRun;if(!tn?.roadRuins&&!bambooRun){roadHop.t=-1;return 0;}
+  const tn=tunnelRun;
   if(tn?.roadRuins&&gameState==='racing'&&roadHop.t<0)for(const o of tn.roadRuins.hops)if(roadHop.lastS<o.d&&s>=o.d&&speed>6)startRoadHop(o);
   roadHop.lastS=s;roadHop.land=Math.max(0,roadHop.land-dt);roadHop.shake=Math.max(0,roadHop.shake-dt);
   if(roadHop.t<0){roadHop.y=0;return 0;}
@@ -9819,6 +9835,11 @@ function updateBranchRoute(){
   for(let next=branchRuns[branchRuns.indexOf(branchRun)+1];next&&s>(branchRun.route==='B'?branchRun.MB:branchRun.M)+2;next=branchRuns[branchRuns.indexOf(branchRun)+1]){if(branchRun.route==='B')switchBranchRoute('A',-branchRun.delta);branchRun=next;}
   // 右の道が左と1m より長さの違う分岐は、合流を過ぎたら左の道に戻し、距離を左の道の距離に直す(合流の先の区間・ゴールは左の道の距離で決めてあるので)
   if(branchRun?.route==='B'&&Math.abs(branchRun.delta)>1&&s>branchRun.MB+2)switchBranchRoute('A',-branchRun.delta);
+  // 中央分離帯(寝かせた竹)をまたいだら、軽く跳ねて隣の道へ移る(合流の側は、右の道の距離と左の道の距離の差 delta を直す)
+  {const b=branchRun;if(b?.decided){const dA=b.route==='B'&&s>b.F+(b.MB-b.F)/2?s-b.delta:s,zone=medianZone(b,dA);
+    if(zone){const h=b.half[THREE.MathUtils.clamp(Math.round(dA-Math.floor(b.F)),0,b.half.length-1)];
+      if(b.route==='A'&&lateral>h){switchBranchRoute('B',zone==='merge'?b.delta:0);startRoadHop(MEDIAN.hop);}
+      else if(b.route==='B'&&lateral<-h){switchBranchRoute('A',zone==='merge'?-b.delta:0);startRoadHop(MEDIAN.hop);}}}}
   const b=branchRun;if(!b||b.decided||s<b.noseF)return;
   b.decided=true;
   const h=b.half[THREE.MathUtils.clamp(Math.round(s-Math.floor(b.F)),0,b.half.length-1)];
