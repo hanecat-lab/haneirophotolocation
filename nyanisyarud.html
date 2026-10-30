@@ -7844,10 +7844,11 @@ const BAMBOO={step:4.2,edge:ROAD_HALF+WALL_OFFSET+1.8,rows:[4.4,8.8],scale:1.25,
   // 倒れた竹(分岐3の左「倒竹の近道」)：分かれ目と合流から margin m 内側に count 本、道を横切るように置く(根元は道の外 root m・左右交互・大きさ scale)。
   // 当たり判定は竹の線・太さ r m。越えると猫が跳ねて(hop)、少しだけ減速する(HAZARD.fallen)
   fallen:{margin:60,count:4,root:ROAD_HALF+.4,scale:1.2,r:.35,hop:{max:.6,shake:.15,big:false}},
-  // 転がる樽(分岐2の右「からかさの坂」)：右の道を走っていて坂の入口の lead m 手前に来たら、every 秒おきに猫の ahead m 先(坂の中)へ出し、
-  // speed m/秒で坂を転がり下りながら、左右へ amp m の幅で wave m ごとに振れる(同時に max 個まで)。坂の下を過ぎたら止まって消える。
-  // 当たると減速してドリフトが切れ(HAZARD.barrel)、樽ははね飛ぶ。半径 r m
-  barrel:{lead:80,every:1.6,ahead:[60,90],speed:9,amp:2.6,wave:26,max:6,r:.64}};
+  // 転がる樽(分岐2の右「からかさの坂」)：右の道を走っていて坂の入口の lead m 手前に来たら、猫の ahead m 先から gap m おきに rows 列を出す。
+  // 1列は横 lats m(中心と片側)の2個で、空いた側(通れる所)が列ごとに左右入れ替わる。樽はまっすぐ speed m/秒で転がり下りる(みな同じ速さなので間は変わらない)。
+  // 猫は列ごとに左右へ振ってよける
+  // 猫に追い越されたら消え、坂の下の先 past m まで行ったら消える。当たると減速してドリフトが切れ(HAZARD.barrel)、樽ははね飛ぶ。半径 r m
+  barrel:{lead:80,ahead:60,gap:24,rows:5,lats:[0,2.4],speed:9,past:150,r:.64}};
 let bambooRun=null;
 const bambooBoards={};
 // 少しずつ出し入れする網目：x,y=本物から竹の板へ入れ替わる距離(カメラからのまっすぐの距離)、z,w=遠くで消え始める・消え切る奥行き
@@ -7952,7 +7953,7 @@ function buildBamboo(def){
 }
 // 倒竹の束・倒れた竹は置いた所の当たり判定の棒(a〜b・太さr)にし、転がる樽は坂の範囲(右の道の距離)だけ決めておく
 function buildBambooHazards(def,run,place,q,up){
-  const H={segs:[],barrels:[],spawn:0,slope:null,barrelSrc:null},BU=BAMBOO.bundle,FA=BAMBOO.fallen,group=run.group,bundle=[],fallen=[];
+  const H={segs:[],barrels:[],spawned:false,slope:null,barrelSrc:null},BU=BAMBOO.bundle,FA=BAMBOO.fallen,group=run.group,bundle=[],fallen=[];
   const seg=(m,a,b,r,kind,hop)=>{const pa=a.clone().applyMatrix4(m),pb=b.clone().applyMatrix4(m);H.segs.push({a:pa,b:pb,y:(pa.y+pb.y)/2,r,kind,hop,armed:true});};
   const b0=branchRuns[0],b1=branchRuns[1],b2=branchRuns[2];
   if(b0)withRoute(b0.curveB,b0.lengthB,()=>{let side=1,k=0;for(let d=b0.F+BU.from;d<=b0.MB-BU.to;d+=BU.every,side=-side,k++){const turn=(k%3-1)*.2,sd=side;
@@ -7972,7 +7973,7 @@ function buildBambooHazards(def,run,place,q,up){
 const bambooCat=new THREE.Vector3(),bambooAB=new THREE.Vector3(),bambooAP=new THREE.Vector3();
 function updateBambooHazards(dt){
   const run=bambooRun,H=run?.hazards;if(!H)return;
-  const clearBarrels=()=>{for(const b of H.barrels)b.obj.removeFromParent();H.barrels.length=0;H.spawn=0;};
+  const clearBarrels=()=>{for(const b of H.barrels)b.obj.removeFromParent();H.barrels.length=0;H.spawned=false;};
   if(gameState!=='racing'){if(H.barrels.length)clearBarrels();for(const o of H.segs)o.armed=true;return;}
   const tr=getTrackAtDist(s),cat=.55;bambooCat.set(tr.p.x+tr.n.x*lateral,tr.p.y,tr.p.z+tr.n.z*lateral);
   for(const o of H.segs){
@@ -7986,22 +7987,19 @@ function updateBambooHazards(dt){
   // 転がる樽：右の道の坂(分岐2)を走っている間だけ出す
   const S=H.slope,BA=BAMBOO.barrel;if(!S||!H.barrelSrc)return;
   const onSlope=branchRun===S.branch&&S.branch.route==='B';
-  if(!onSlope){if(H.barrels.length)clearBarrels();return;}
-  H.spawn-=dt;
-  if(H.spawn<=0&&s>S.from-BA.lead&&s<S.to-20&&H.barrels.length<BA.max){
-    H.spawn=BA.every;const d=Math.min(S.to-5,Math.max(S.from,s+THREE.MathUtils.lerp(...BA.ahead,Math.random())));
-    if(d>s+30){const obj=H.barrelSrc.clone();obj.traverse(o=>{if(o.isMesh)o.castShadow=false;});run.group.add(obj);
-      H.barrels.push({obj,roll:obj.getObjectByName('Barrel roll around X'),d,phase:Math.random()*Math.PI*2,hit:false,vy:0,y:0,side:0,t:0,stop:0});}
-  }
+  if(!onSlope){if(H.barrels.length||H.spawned)clearBarrels();return;}
+  // 坂の手前で1回だけ、全部の列を出す(最初の列は右をふさぎ、左が空く)
+  if(!H.spawned&&s>S.from-BA.lead&&s<S.to){H.spawned=true;
+    for(let k=0;k<BA.rows;k++)for(const l of BA.lats){const obj=H.barrelSrc.clone();obj.traverse(o=>{if(o.isMesh)o.castShadow=false;});run.group.add(obj);
+      H.barrels.push({obj,roll:obj.getObjectByName('Barrel roll around X'),d:s+BA.ahead+k*BA.gap,lat:l*(k%2?-1:1),hit:false,vy:0,t:0});}}
   for(let i=H.barrels.length-1;i>=0;i--){
     const b=H.barrels[i];b.t+=dt;
-    if(b.hit){b.vy-=9.8*dt;b.y+=b.vy*dt;b.side+=dt*6;b.obj.position.addScaledVector(b.fly,dt);b.obj.position.y+=b.vy*dt;b.obj.rotation.z+=dt*8;if(b.t>1.2){b.obj.removeFromParent();H.barrels.splice(i,1);}continue;}
-    const v=b.d<S.to?BA.speed:Math.max(0,BA.speed-(b.d-S.to)*.6);b.d+=v*dt;if(v<=0)b.stop+=dt;
-    const lat=BA.amp*Math.sin(b.phase+b.d/BA.wave*Math.PI*2),slope=BA.amp*Math.cos(b.phase+b.d/BA.wave*Math.PI*2)*Math.PI*2/BA.wave;
+    if(b.hit){b.vy-=9.8*dt;b.obj.position.addScaledVector(b.fly,dt);b.obj.position.y+=b.vy*dt;b.obj.rotation.z+=dt*8;if(b.t>1.2){b.obj.removeFromParent();H.barrels.splice(i,1);}continue;}
+    const v=BA.speed,lat=b.lat;b.d+=v*dt;
     const p=getTrackAtDist(b.d);b.obj.position.set(p.p.x+p.n.x*lat,p.p.y+ROAD_Y,p.p.z+p.n.z*lat);
-    const dx=p.t.x+p.n.x*slope,dz=p.t.z+p.n.z*slope;b.obj.rotation.set(0,Math.atan2(dx,dz),0);if(b.roll)b.roll.rotation.x+=v*dt/BA.r;
-    // 猫に追い越された樽(30m後ろ)と、坂の下で止まった樽は消す
-    if(b.d<s-30||b.stop>1.5){b.obj.removeFromParent();H.barrels.splice(i,1);continue;}
+    b.obj.rotation.set(0,Math.atan2(p.t.x,p.t.z),0);if(b.roll)b.roll.rotation.x+=v*dt/BA.r;
+    // 猫に追い越された樽(30m後ろ)と、坂の下の先まで行った樽は消す
+    if(b.d<s-30||b.d>Math.min(S.to+BA.past,S.branch.MB-10)){b.obj.removeFromParent();H.barrels.splice(i,1);continue;}
     if(Math.hypot(b.obj.position.x-bambooCat.x,b.obj.position.z-bambooCat.z)<BA.r+cat&&Math.abs(b.obj.position.y-bambooCat.y)<2){
       b.hit=true;b.t=0;b.vy=5;const away=Math.sign(lat-lateral)||1;b.fly=new THREE.Vector3(p.n.x*away*6+p.t.x*4,0,p.n.z*away*6+p.t.z*4);
       const lost=hitHazard('barrel');spawnHit(b.obj.position.clone().setY(b.obj.position.y+.7),0xd8b26a);showDriveNotice('樽にぶつかった',`減速 −${lost}km/h · ドリフトが切れた`);if(navigator.vibrate)navigator.vibrate([50,30,40]);
