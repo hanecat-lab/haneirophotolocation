@@ -7822,26 +7822,45 @@ const yokaiLit=new THREE.Color(0xffb84d),yokaiDim=new THREE.Color(0x221108),yoka
 // 道の両側に竹の株(GLB。A：見通しのある5本・B：密な8本。+Zを道へ、Xを道の向きに合わせる)を step m おきに並べる。道に近い列は edge m、奥の列は rows m 外へずらす。
 // 道に近い列は、カメラから near m までだけ本物の形で描く(株の部品ごとに InstancedMesh にまとめ、毎コマ近いものだけ詰め直す。カメラの後ろ behind m より先は描かない)。
 // それより遠い所と奥の列は、同じGLBを正面から絵に描いた板(竹の板。1回だけ描いて使い回す)で描く。far m より遠く(霧の先)は描かない。
+// 出し入れは急に切り替えない：本物の形と竹の板は near の幅 m の間で、画素ごとに少しずつ(4×4の網目で)入れ替わる。遠くは霧と同じく画面の奥行きで測り、
+// 霧が濃くなり切る所(far と霧の遠い方の近い方)の手前 fadeFar m で網目で消す(昼は霧の色に溶けて見えない。夜は暗い空に竹の影が急に出ないように)。
+// 竹の板の絵は色だけ(光を当てない)で描き、板を本物と同じ材質で照らす(昼も夜も、猫のライトでも本物と同じ明るさになる)
 // 他の道や自分の道の曲がりの内側に近すぎる所(道の中心から clear m 未満)には置かない。昼は空と霧を竹林の色(sky)にし、霧の距離は fog。地面(ground の色)は道から floor m まで
-const BAMBOO={step:4.2,edge:ROAD_HALF+WALL_OFFSET+1.8,rows:[4.4,8.8],scale:1.25,jitter:{yaw:.14,scale:.08,shift:.2},near:55,behind:12,far:150,clear:ROAD_HALF+WALL_OFFSET+1.2,
+const BAMBOO={step:4.2,edge:ROAD_HALF+WALL_OFFSET+1.8,rows:[4.4,8.8],scale:1.25,jitter:{yaw:.14,scale:.08,shift:.2},near:[44,58],behind:12,far:170,fadeFar:15,clear:ROAD_HALF+WALL_OFFSET+1.2,
   board:[384,480],floor:40,sky:0xb3c9bb,fog:[18,110],ground:0x3d5539};
 let bambooRun=null;
 const bambooBoards={};
-// 竹の板の絵：GLBを正面(+Z)から平行投影で描く。昼の光(環境光と太陽)と同じ強さで照らす
+// 少しずつ出し入れする網目：x,y=本物から竹の板へ入れ替わる距離(カメラからのまっすぐの距離)、z,w=遠くで消え始める・消え切る奥行き
+const bambooFade={value:new THREE.Vector4()};
+// mode：'glb' 本物の形(近い所だけ)、'near' 道に近い列の竹の板(入れ替わりと遠く)、'back' 奥の列の竹の板(遠くだけ)
+function bambooFadeMaterial(material,mode){
+  const m=material.clone();m.customProgramCacheKey=()=>'bamboo-'+mode;
+  m.onBeforeCompile=shader=>{
+    shader.uniforms.bambooFade=bambooFade;
+    shader.vertexShader='varying float vBambooDist,vBambooDepth;\n'+shader.vertexShader.replace('#include <project_vertex>','#include <project_vertex>\nvBambooDist=length(mvPosition.xyz);vBambooDepth=-mvPosition.z;');
+    const test=mode==='glb'?'s>h':mode==='near'?'s<=h||f<=h':'f<=h';
+    shader.fragmentShader='uniform vec4 bambooFade;\nvarying float vBambooDist,vBambooDepth;\n'+shader.fragmentShader.replace('#include <clipping_planes_fragment>','#include <clipping_planes_fragment>\n'+
+      '{const float B[16]=float[16](0.,8.,2.,10.,12.,4.,14.,6.,3.,11.,1.,9.,15.,7.,13.,5.);ivec2 c=ivec2(mod(gl_FragCoord.xy,4.));float h=(B[c.x+c.y*4]+.5)/16.;'+
+      'float s=smoothstep(bambooFade.x,bambooFade.y,vBambooDist),f=1.-smoothstep(bambooFade.z,bambooFade.w,vBambooDepth);if('+test+')discard;}');
+  };
+  return m;
+}
+// 竹の板の絵：GLBを正面(+Z)から平行投影で、光を当てずに色だけ描く
 function bambooBoard(name,src){
   if(bambooBoards[name])return bambooBoards[name];
   const box=new THREE.Box3().setFromObject(src),[W,H]=BAMBOO.board;
   const rt=new THREE.WebGLRenderTarget(W,H,{generateMipmaps:true,minFilter:THREE.LinearMipmapLinearFilter,colorSpace:THREE.SRGBColorSpace});
   const sc=new THREE.Scene(),cam=new THREE.OrthographicCamera(box.min.x,box.max.x,box.max.y,box.min.y,.1,box.max.z-box.min.z+20);cam.position.set(0,0,box.max.z+10);
-  sc.add(src.clone(),new THREE.AmbientLight(0xffffff,.88));const light=new THREE.DirectionalLight(0xffffff,1);light.position.set(3,8,10);sc.add(light);
+  const flat=src.clone();flat.traverse(o=>{if(o.isMesh)o.material=new THREE.MeshBasicMaterial({map:o.material.map,color:o.material.color,alphaTest:o.material.alphaTest,side:THREE.DoubleSide,vertexColors:o.material.vertexColors});});sc.add(flat);
   const target=renderer.getRenderTarget(),clear=renderer.getClearColor(new THREE.Color()),alpha=renderer.getClearAlpha();
   renderer.setRenderTarget(rt);renderer.setClearColor(0x000000,0);renderer.clear();renderer.render(sc,cam);renderer.setRenderTarget(target);renderer.setClearColor(clear,alpha);
   const geo=new THREE.PlaneGeometry(box.max.x-box.min.x,box.max.y-box.min.y);geo.translate((box.min.x+box.max.x)/2,(box.min.y+box.max.y)/2,0);
-  return bambooBoards[name]={geo,material:new THREE.MeshBasicMaterial({map:rt.texture,alphaTest:.5,side:THREE.DoubleSide})};
+  const material=new THREE.MeshStandardMaterial({map:rt.texture,alphaTest:.5,side:THREE.DoubleSide,roughness:.9,metalness:0});
+  return bambooBoards[name]={geo,near:bambooFadeMaterial(material,'near'),back:bambooFadeMaterial(material,'back')};
 }
 function buildBamboo(def){
   const group=new THREE.Group();group.name='bambooForest';
-  const run=bambooRun={group,spots:[],near:{},boards:{},key:''};
+  const run=bambooRun={group,spots:[],near:{},boards:{},backBoards:{},key:''};
   // 全部の道の中心(2mおき)を8mのマスに分けておき、置く所が道に近すぎないかを調べる
   const cell=8,grid=new Map(),roads=[{curve,length:totalLength,from:0,to:totalLength},...branchRuns.map(b=>({curve:b.curveB,length:b.lengthB,from:b.F,to:b.MB}))];
   for(const r of roads)for(let d=r.from;d<=r.to;d+=2){const p=r.curve.getPointAt(Math.min(1,d/r.length)),k=Math.floor(p.x/cell)+','+Math.floor(p.z/cell);(grid.get(k)||grid.set(k,[]).get(k)).push(p);}
@@ -7879,28 +7898,34 @@ function buildBamboo(def){
     if(bambooRun!==run)return;
     for(const [kind,src] of [['a',a],['b',b]]){
       const spots=run.spots.filter(s=>s.kind===kind),parts=[];src.traverse(o=>{if(o.isMesh)parts.push(o);});
-      run.near[kind]=parts.map(o=>{const inst=new THREE.InstancedMesh(o.geometry,o.material,Math.max(1,spots.filter(s=>s.near).length));inst.name='bambooNear';inst.count=0;inst.frustumCulled=false;inst.userData.local=o.matrixWorld.clone();group.add(inst);return inst;});
-      const board=bambooBoard(kind,src),inst=new THREE.InstancedMesh(board.geo,board.material,spots.length);inst.name='bambooBoard';inst.count=0;inst.frustumCulled=false;group.add(inst);run.boards[kind]=inst;
+      const nearCount=Math.max(1,spots.filter(s=>s.near).length),board=bambooBoard(kind,src),add=(geo,material,count,name)=>{const inst=new THREE.InstancedMesh(geo,material,count);inst.name=name;inst.count=0;inst.frustumCulled=false;group.add(inst);return inst;};
+      run.near[kind]=parts.map(o=>{const inst=add(o.geometry,bambooFadeMaterial(o.material,'glb'),nearCount,'bambooNear');inst.userData.local=o.matrixWorld.clone();return inst;});
+      run.boards[kind]=add(board.geo,board.near,nearCount,'bambooBoard');run.backBoards[kind]=add(board.geo,board.back,Math.max(1,spots.length-nearCount),'bambooBoard');
     }
     run.key='';
   }).catch(()=>{});
   return group;
 }
-// 毎コマ：カメラの近くの道に近い列は本物の形、遠い所と奥の列は竹の板にして詰め直す(選ぶ株が前のコマと同じなら何もしない)
+// 毎コマ：カメラの近くの道に近い列は本物の形、遠い所と奥の列は竹の板にして詰め直す(選ぶ株が前のコマと同じなら何もしない)。
+// 入れ替わりの幅の株は本物と板の両方に入れる(画素ごとの網目でどちらかだけが見える)。株の根元と葉の先は距離が違うので、選ぶ幅は網目の幅より4m広げる。遠くは奥行き(ahead)で選ぶ
 const bambooLook=new THREE.Vector3(),bambooTmp=new THREE.Vector3(),bambooMatrix=new THREE.Matrix4();
 function updateBamboo(){
   const run=bambooRun;if(!run||!run.boards.a)return;
-  const cam=camera.position,far=Math.min(BAMBOO.far,scene.fog?scene.fog.far+10:BAMBOO.far);camera.getWorldDirection(bambooLook);
-  const near={a:[],b:[]},boards={a:[],b:[]};let key='';
+  const cam=camera.position,far=Math.min(BAMBOO.far,scene.fog?scene.fog.far:BAMBOO.far),[n0,n1]=BAMBOO.near;camera.getWorldDirection(bambooLook);
+  bambooFade.value.set(n0,n1,far-BAMBOO.fadeFar,far);
+  const near={a:[],b:[]},boards={a:[],b:[]},back={a:[],b:[]};let key='';
   run.spots.forEach((s,i)=>{
     bambooTmp.subVectors(s.pos,cam);const dist=bambooTmp.length(),ahead=bambooTmp.dot(bambooLook);
-    if(dist>far||ahead<-BAMBOO.behind)return;
-    if(s.near&&dist<BAMBOO.near){near[s.kind].push(s);key+=i+',';}else if(ahead>0||!s.near){boards[s.kind].push(s);key+=i+';';}
+    if(ahead>far+4||ahead<-BAMBOO.behind)return;
+    if(!s.near){back[s.kind].push(s);key+=i+';';return;}
+    if(dist<n1+4){near[s.kind].push(s);key+=i+',';}
+    if(dist>n0-4&&ahead>0){boards[s.kind].push(s);key+=i+':';}
   });
   if(key===run.key)return;run.key=key;
+  const fill=(inst,list,local)=>{list.forEach((s,i)=>inst.setMatrixAt(i,local?bambooMatrix.multiplyMatrices(s.matrix,local):s.matrix));inst.count=list.length;inst.instanceMatrix.needsUpdate=true;};
   for(const kind of ['a','b']){
-    for(const inst of run.near[kind]){near[kind].forEach((s,i)=>inst.setMatrixAt(i,bambooMatrix.multiplyMatrices(s.matrix,inst.userData.local)));inst.count=near[kind].length;inst.instanceMatrix.needsUpdate=true;}
-    const inst=run.boards[kind];boards[kind].forEach((s,i)=>inst.setMatrixAt(i,s.matrix));inst.count=boards[kind].length;inst.instanceMatrix.needsUpdate=true;
+    for(const inst of run.near[kind])fill(inst,near[kind],inst.userData.local);
+    fill(run.boards[kind],boards[kind]);fill(run.backBoards[kind],back[kind]);
   }
 }
 function updateYokai(dt){
