@@ -11271,6 +11271,27 @@ function makeBrakeCoachMemo(r){
   return {number:c.number,label:isHarunaMapKey(currentKey)?c.number+'番コーナー':'第'+c.number+'コーナー',brakeRank:v.rank,rank:r.link?v.rank+' → '+r.link.quality:v.rank,observation,action,issueKey,priority};
 }
 
+// ?coachlab：ブレーキ解説が出なかった理由を実機で調べる表示。通ったコーナーごとに、ブレーキドリフトの記録(判定・ためwt・向きyaw・離した位置distance)、
+// 解説の中身(指摘の種類)と、出たか・出なかった理由(指摘なし・同じ種類は表示済み・記録なし・次のコーナーで消えた など)を新しい順に8件出す。今止められている理由も出す
+const coachLab=(()=>{
+  if(!new URLSearchParams(location.search).has('coachlab'))return null;
+  const el=document.createElement('pre');el.style.cssText='position:fixed;left:6px;top:calc(env(safe-area-inset-top,0px) + 64px);z-index:10000;margin:0;padding:5px 7px;border-radius:7px;background:rgba(0,0,0,.78);color:#fff;font:700 10px/1.35 monospace;pointer-events:none;white-space:pre;max-width:94vw;overflow:hidden';
+  if(document.body)document.body.appendChild(el);else document.addEventListener('DOMContentLoaded',()=>document.body.appendChild(el));
+  const rows=new Map();let blocked='',scope='',shown=0;
+  const row=n=>{if(!rows.has(n))rows.set(n,{n,t:simulationElapsed,text:'',status:''});const r=rows.get(n);r.t=simulationElapsed;return r;};
+  return {
+    finalized(r){const v=r.snapshot,m=r.memo,o=row(r.corner.number);o.text=`${v.rank} ため${v.wt.toFixed(2)} 向き${v.yawFactor.toFixed(2)} 位置${Math.round(v.distance)}m → ${m.observation}`;
+      o.status=!m.issueKey?'出ない:指摘なし':brakeCoachRun.shownAdvice.has(m.issueKey)?'出ない:同じ種類('+m.issueKey+')は表示済み':'待ち('+m.issueKey+')';},
+    shown(memo,kind){const o=row(memo.number);o.status=kind==='reminder'?'前回メモを表示':'表示した('+memo.issueKey+')';},
+    dropped(r,why){const o=row(r.corner.number);o.status='出ない:'+why;},
+    update(why){blocked=why;
+      if(!brakeCoachRun)return;if(brakeCoachRun.scope!==scope){scope=brakeCoachRun.scope;rows.clear();}
+      for(const c of DRIVING_GUIDE_DATA.tracks[currentKey]?.corners||[])if(s>c.end+12&&s<c.end+40&&!rows.has(c.number)&&!brakeCoachRun.records.get(c.number)?.snapshot)row(c.number).status='出ない:ブレーキドリフトの記録なし';
+      if(performance.now()-shown<250)return;shown=performance.now();
+      const list=[...rows.values()].sort((a,b)=>b.t-a.t).slice(0,8).map(o=>`第${o.n} ${o.status}${o.text?'\n   '+o.text:''}`);
+      el.textContent=`ブレーキ解説 ${brakeFeedbackEnabled?'ON':'OFF'}  止めている理由 ${blocked||'なし'}\n`+(list.join('\n')||'まだ記録なし');
+    }};
+})();
 function finalizeBrakeCoach(r){
   if(r.finalized||!r.snapshot)return;
   r.finalized=true;r.completed=s>=r.corner.end;r.memo=makeBrakeCoachMemo(r);
@@ -11279,6 +11300,7 @@ function finalizeBrakeCoach(r){
   memory.set(r.corner.number,{...r.memo});
   if(r.memo.issueKey&&!brakeCoachRun.shownAdvice.has(r.memo.issueKey))brakeCoachRun.pending=r;
   else brakeCoachRun.pending=null;
+  coachLab?.finalized(r);
 }
 function shortBrakeCoachAction(memo){return memo.action;}
 
@@ -11286,7 +11308,7 @@ function showBrakeCoach(memo,kind,record=null){
   document.getElementById('brakeCoachTitle').textContent=innerWidth<600&&innerHeight<640?(kind==='reminder'?'前回'+memo.number:memo.number+'番メモ'):(kind==='reminder'?'前回メモ · 第':'通過後メモ · 第')+memo.number;
   document.getElementById('brakeCoachResult').textContent=memo.rank+' ／ '+memo.observation;
   document.getElementById('brakeCoachAction').textContent=shortBrakeCoachAction(memo);
-  brakeCoachRun.shownAdvice.add(memo.issueKey);
+  brakeCoachRun.shownAdvice.add(memo.issueKey);coachLab?.shown(memo,kind);
   brakeCoachRun.display={kind,record,cornerNumber:memo.number,remaining:kind==='reminder'?2:2.8};
   setBrakeCoachVisible(true);
   if(record)brakeCoachRun.pending=null;
@@ -11295,8 +11317,8 @@ function updateBrakeCoach(dt){
   if(linkPractice.active){hideBrakeCoach();return;}
   if(!brakeCoachRun||brakeCoachRun.scope!==brakeCoachScope()||brakeCoachRun.curve!==curve)resetBrakeCoach();
   const run=brakeCoachRun;
-  if(!brakeFeedbackEnabled||gameState!=='racing'){hideBrakeCoach();return;}
-  if(brakeCoachShortcut()){
+  if(!brakeFeedbackEnabled||gameState!=='racing'){hideBrakeCoach();coachLab?.update(!brakeFeedbackEnabled?'解説OFF':'走っていない');return;}
+  if(brakeCoachShortcut()){coachLab?.update('近道の案内中');
     for(const [id,r]of run.records)if(!r.finalized)run.records.delete(id);
     run.pending=null;hideBrakeCoach();return;
   }
@@ -11307,16 +11329,17 @@ function updateBrakeCoach(dt){
   const shortcutApproach=currentKey==='irohaLocal'&&s>branchS-80&&s<branchS+20;
   const blocked=Boolean(document.hidden||charging||contactNotice||shortcutApproach||
     document.getElementById('courseDropdownMenu').style.display!=='none'||document.getElementById('rankingModal').classList.contains('on')||document.getElementById('app').dataset.raceMenu==='on');
+  coachLab?.update(document.hidden?'画面が隠れている':charging?'ブレーキを押している':contactNotice?'壁の接触の表示中':shortcutApproach?'分かれ道の手前':blocked?'メニュー・ランキングを開いている':'');
   if(blocked){setBrakeCoachVisible(false);return;}
   // Steering, meat input and judgments do not cancel the compact note. During
   // charging/menu use its visible-reading timer pauses, without rebuilding text.
   let display=run.display;
   if(display&&document.getElementById('brakeCoachCard').hidden&&run.pending&&
      (!display.record||run.pending.corner.start>display.record.corner.start)){
-    hideBrakeCoach();display=null; // Keep only the latest pending corner, never an old queue.
+    if(display.record)coachLab?.dropped(display.record,'新しいコーナーの解説に替えた');hideBrakeCoach();display=null; // Keep only the latest pending corner, never an old queue.
   }
   const activeCorner=DRIVING_GUIDE_DATA.tracks[currentKey]?.corners.find(c=>s>=c.start&&s<=c.end);
-  if(display?.kind==='result'&&activeCorner&&activeCorner.number!==display.cornerNumber){hideBrakeCoach();run.cooldown=.6;return;}
+  if(display?.kind==='result'&&activeCorner&&activeCorner.number!==display.cornerNumber){if(display.record&&!display.record.read)coachLab?.dropped(display.record,'次のコーナーに入って途中で消えた');hideBrakeCoach();run.cooldown=.6;return;}
   if(display){
     setBrakeCoachVisible(true);display.remaining-=dt;
     if(display.record)display.record.viewed=(display.record.viewed||0)+dt;
@@ -11327,6 +11350,7 @@ function updateBrakeCoach(dt){
   if(run.pending){
     const r=run.pending;run.pending=null;
     if(r.memo.issueKey&&!run.shownAdvice.has(r.memo.issueKey)&&(!activeCorner||activeCorner.number===r.corner.number||activeCorner.start<r.corner.start)){showBrakeCoach(r.memo,'result',r);return;}
+    coachLab?.dropped(r,run.shownAdvice.has(r.memo.issueKey)?'同じ種類('+r.memo.issueKey+')は表示済み':'出す前に次のコーナーに入った');
   }
   const next=DRIVING_GUIDE_DATA.tracks[currentKey]?.corners.find(c=>c.end>=s);
   const seconds=next?(next.start-s)/Math.max(3,speed*.62):Infinity;
