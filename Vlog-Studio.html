@@ -14995,12 +14995,47 @@ function App(){
       startTrace:diag.start?.trace||null,startEvents:diag.start?.events||null,
       recentEvents:diag.events.slice(-40)},null,2);
   };
-  // 観測用（?diag=1）: AudioContext ごとに 440Hz のピー音を約0.5秒鳴らし、音の出口が生きているかを耳で確かめる。
+  // 観測用（?diag=1）: 440Hz のピー音を約0.5秒鳴らし、音の出口が生きているかを耳で確かめる。
+  // 押した0.3秒後に AudioContext の時計が進んだかも記録する（状態が running でも時計が止まることがあるため）。
+  const previewBeepUrlRef=useRef(null);
+  const previewBeepUrl=()=>{
+    if(previewBeepUrlRef.current) return previewBeepUrlRef.current;
+    const rate=44100,length=Math.round(rate*0.5),buffer=new ArrayBuffer(44+length*2),view=new DataView(buffer);
+    const text=(offset,value)=>{ for(let i=0;i<value.length;i++) view.setUint8(offset+i,value.charCodeAt(i)); };
+    text(0,'RIFF');view.setUint32(4,36+length*2,true);text(8,'WAVE');text(12,'fmt ');
+    view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);
+    view.setUint32(24,rate,true);view.setUint32(28,rate*2,true);view.setUint16(32,2,true);view.setUint16(34,16,true);
+    text(36,'data');view.setUint32(40,length*2,true);
+    for(let i=0;i<length;i++) view.setInt16(44+i*2,Math.round(Math.sin(2*Math.PI*440*i/rate)*0.2*32767),true);
+    previewBeepUrlRef.current=URL.createObjectURL(new Blob([buffer],{type:'audio/wav'}));
+    return previewBeepUrlRef.current;
+  };
   const testPreviewAudioOutput=target=>{
-    const label={preview:'①プレビュー用',fresh:'②新しく作った',export:'③書き出し用'}[target];
+    const label={preview:'①プレビュー用',fresh:'②新しく作った',export:'③書き出し用',
+      restart:'④止めて再開した',element:'⑤普通の audio 要素'}[target];
+    if(target==='element'){
+      try{
+        const audio=new Audio(previewBeepUrl());
+        audio.setAttribute('playsinline','');
+        const played=audio.play();
+        const report=result=>{
+          recordPreviewDiagnostic('audio-out-test',{target,result,paused:audio.paused,
+            time:Number((audio.currentTime||0).toFixed(3))});
+          setPreviewDiagnosticNotice(`${label}でピー音を鳴らしました（${result}）。聞こえたかを教えてください。`);
+        };
+        if(played?.then) played.then(()=>report('played'),error=>report(`rejected:${error?.name||'Error'}`));
+        else report('called');
+        setTimeout(()=>recordPreviewDiagnostic('audio-out-clock',{target,
+          time:Number((audio.currentTime||0).toFixed(3)),paused:audio.paused,ended:audio.ended}),300);
+      }catch(error){
+        recordPreviewDiagnostic('audio-out-test',{target,error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`});
+        setPreviewDiagnosticNotice(`${label}のテストで失敗しました（${error?.name||'Error'}）。`);
+      }
+      return;
+    }
     let context=null,before=null;
     try{
-      if(target==='preview') context=previewAudioContextRef.current;
+      if(target==='preview' || target==='restart') context=previewAudioContextRef.current;
       else if(target==='export') context=exportAudioRef.current.context;
       else{ const Ctx=window.AudioContext || window.webkitAudioContext; if(Ctx) context=new Ctx(); }
       if(!context || context.state==='closed'){
@@ -15009,17 +15044,39 @@ function App(){
         return;
       }
       before=context.state;
+      const beforeTime=context.currentTime;
+      const beep=()=>{
+        const osc=context.createOscillator(),gain=context.createGain();
+        osc.frequency.value=440;gain.gain.value=0.2;
+        osc.connect(gain);gain.connect(context.destination);
+        const at=context.currentTime;
+        osc.start(at);osc.stop(at+0.5);
+        osc.onended=()=>{ try{ osc.disconnect(); gain.disconnect(); }catch{} };
+        setTimeout(()=>{
+          recordPreviewDiagnostic('audio-out-clock',{target,state:context.state,
+            from:Number(at.toFixed(3)),to:Number(context.currentTime.toFixed(3)),advanced:context.currentTime>at});
+          // 時計が止まっていると onended が来ないため、作ったものは時間で閉じる。
+          if(target==='fresh') setTimeout(()=>{ try{ context.close(); }catch{} },700);
+        },300);
+        return at;
+      };
+      if(target==='restart'){
+        const suspended=context.suspend();
+        Promise.resolve(suspended).then(()=>context.resume()).then(()=>{
+          const at=beep();
+          recordPreviewDiagnostic('audio-out-test',{target,before,after:context.state,time:Number(at.toFixed(3)),
+            beforeTime:Number(beforeTime.toFixed(3))});
+          setPreviewDiagnosticNotice(`${label} AudioContext でピー音を鳴らしました（${before} → ${context.state}）。聞こえたかを教えてください。`);
+        }).catch(error=>{
+          recordPreviewDiagnostic('audio-out-test',{target,before,after:context.state,
+            error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`});
+          setPreviewDiagnosticNotice(`${label}のテストで失敗しました（${error?.name||'Error'}）。`);
+        });
+        return;
+      }
       const resumed=context.resume();
       if(resumed?.catch) resumed.catch(()=>{});
-      const osc=context.createOscillator(),gain=context.createGain();
-      osc.frequency.value=440;gain.gain.value=0.2;
-      osc.connect(gain);gain.connect(context.destination);
-      const at=context.currentTime;
-      osc.start(at);osc.stop(at+0.5);
-      osc.onended=()=>{
-        try{ osc.disconnect(); gain.disconnect(); }catch{}
-        if(target==='fresh') try{ context.close(); }catch{}
-      };
+      const at=beep();
       recordPreviewDiagnostic('audio-out-test',{target,before,after:context.state,time:Number(at.toFixed(3))});
       setPreviewDiagnosticNotice(`${label} AudioContext でピー音を鳴らしました（${before} → ${context.state}）。聞こえたかを教えてください。`);
     }catch(error){
@@ -19027,6 +19084,13 @@ const recomputeStarts=(arr)=>{
   ]);
   useEffect(()=>{
     const saveOnVisibilityChange=()=>{
+      // 観測用（?diag=1 の診断に出す）: 画面を離れた・戻ったときの AudioContext の状態と時計。
+      try{
+        const preview=previewAudioContextRef.current,exportContext=exportAudioRef.current.context;
+        recordPreviewDiagnostic('page-visibility',{visibility:document.visibilityState,
+          previewContext:preview?.state||null,previewTime:preview?Number(preview.currentTime.toFixed(3)):null,
+          exportContext:exportContext?.state||null,exportTime:exportContext?Number(exportContext.currentTime.toFixed(3)):null});
+      }catch{}
       if(projectRestoringRef.current || !projectIdRef.current) return;
       if(projectDirtyVersionRef.current>projectSavedVersionRef.current){
         // ダウンロード画面から戻った後にも未保存の編集を再試行する。
@@ -24629,7 +24693,7 @@ const recomputeStarts=(arr)=>{
           React.createElement('div', {className:'text-white/55 pt-3 pb-2'},
             '音の出口テスト: 再生を止めてから押すと、ピー音が約0.5秒鳴ります。それぞれ聞こえたかを教えてください。'),
           React.createElement('div', {className:'flex flex-wrap gap-2'},
-            [['preview','①プレビュー用'],['fresh','②新しく作る'],['export','③書き出し用']].map(([target,text])=>
+            [['preview','①プレビュー用'],['fresh','②新しく作る'],['export','③書き出し用'],['restart','④止めて再開'],['element','⑤普通の audio 要素']].map(([target,text])=>
               React.createElement('button', {key:target,type:'button',onClick:()=>testPreviewAudioOutput(target),
                 className:'min-h-10 rounded-full bg-white/15 px-3'}, text))
           ),
