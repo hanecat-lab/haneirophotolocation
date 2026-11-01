@@ -735,6 +735,73 @@ function ynFaceRef(faces,groups,time,scale,fallback){let size=0;for(const f of f
 // Frame-by-frame export (same approach as Vlog-Studio): seek each frame, compose it, and encode it with WebCodecs into an MP4.
 // MediaRecorder on iPhone stops delivering anything once the page has been in the background; this path does not use it.
 const YN_REALTIME_EXPORT=(()=>{try{return new URLSearchParams(location.search).get('exportengine')==='realtime'}catch{return false}})();
+// Source URL -> original Blob. Re-fetching a blob: URL on iPhone loads the whole video into memory, and a long video then
+// crashes the page (seen in Vlog-Studio). Export reads the original Blob in small slices instead. Removed when the URL is revoked.
+const ynBlobByUrl=new Map();
+if(!URL.__ynTracked){
+ const createUrl=URL.createObjectURL.bind(URL),revokeUrl=URL.revokeObjectURL.bind(URL);
+ URL.createObjectURL=obj=>{const url=createUrl(obj);if(obj instanceof Blob)ynBlobByUrl.set(url,obj);return url};
+ URL.revokeObjectURL=url=>{ynBlobByUrl.delete(url);return revokeUrl(url)};
+ URL.__ynTracked=true;
+}
+// Export stage kept on the device. If the page crashes and reloads, the next start shows where it stopped.
+function ynMarkExportRun(stage,detail={}){
+ try{const prev=JSON.parse(localStorage.getItem('bokasiExportRun')||'null');
+  localStorage.setItem('bokasiExportRun',JSON.stringify({startedAt:stage==='準備開始'?new Date().toISOString():(prev?.startedAt||new Date().toISOString()),stage,at:new Date().toISOString(),...detail}))}catch{}
+}
+function ynClearExportRun(){try{localStorage.removeItem('bokasiExportRun')}catch{}}
+(()=>{
+ let run=null;try{run=JSON.parse(localStorage.getItem('bokasiExportRun')||'null')}catch{}
+ if(!run)return;ynClearExportRun();
+ const bar=document.createElement('div');bar.setAttribute('role','alert');
+ bar.style.cssText='position:fixed;left:8px;right:8px;top:8px;z-index:99999;padding:10px 12px;border-radius:12px;background:#3a2a12;color:#fde7c0;border:1px solid #c9a15a;font:13px/1.5 sans-serif;display:flex;flex-wrap:wrap;gap:8px;align-items:center';
+ const text=document.createElement('span');text.style.flex='1 1 200px';
+ text.textContent=`前回の書き出しは途中で止まりました（段階：${run.stage}${run.mb?` ${run.mb}MB`:''}${run.seconds?` ・動画${run.seconds}秒`:''}${run.from?` ・${run.from}`:''}）`;
+ const btn=(label,fn)=>{const b=document.createElement('button');b.type='button';b.textContent=label;b.style.cssText='padding:4px 10px;border-radius:999px;border:1px solid #c9a15a;background:transparent;color:inherit;font:inherit';b.onclick=fn;return b};
+ bar.append(text,btn('内容をコピー',()=>{try{navigator.clipboard?.writeText?.(JSON.stringify(run))?.catch?.(()=>{})}catch{}}),btn('閉じる',()=>bar.remove()));
+ document.body.appendChild(bar);
+})();
+// Audio settings of the first audio track of an mp4box file. fallbackBytes() is where to look for an AudioSpecificConfig when esds cannot be parsed.
+function ynAudioTrackMeta(file,track,fallbackBytes){
+ const trak=file.getTrackById(track.id),entry=trak?.mdia?.minf?.stbl?.stsd?.entries?.[0];
+ const find=node=>{if(!node)return null;if(node.tag===5&&node.data)return node.data;for(const c of node.descs||[]){const f=find(c);if(f)return f}return null};
+ const specific=find(entry?.esds?.esd)||ynFindAsc(fallbackBytes());
+ const timescale=trak?.mdia?.mdhd?.timescale||track.timescale,edit=trak?.edts?.elst?.entries?.find(e=>e.media_time>=0);
+ const objectType=specific&&specific.length?(new Uint8Array(specific)[0]>>3):2;
+ const codec=/^mp4a\.40\.\d+$/.test(track.codec)?track.codec:track.codec&&track.codec.startsWith('mp4a')?`mp4a.40.${objectType||2}`:track.codec;
+ return {codec,sampleRate:track.audio?.sample_rate,channels:track.audio?.channel_count,mediaTime:edit?edit.media_time/timescale:null,description:specific?new Uint8Array(specific):null,count:track.nb_samples};
+}
+// For long videos: read only the index (moov) and the audio samples with blob.slice, never the whole file. Same result shape as ynDemuxAudio.
+async function ynDemuxAudioFromBlob(MP4Box,blob,mark=()=>{}){
+ let moovPos=-1,moovSize=0;
+ for(let pos=0;pos+8<=blob.size;){
+  const head=new DataView(await blob.slice(pos,pos+16).arrayBuffer());let size=head.getUint32(0);
+  const type=String.fromCharCode(head.getUint8(4),head.getUint8(5),head.getUint8(6),head.getUint8(7));
+  if(size===1&&head.byteLength>=16)size=head.getUint32(8)*4294967296+head.getUint32(12);else if(size===0)size=blob.size-pos;
+  if(size<8)break;if(type==='moov'){moovPos=pos;moovSize=size;break}pos+=size;
+ }
+ if(moovPos<0)return {reason:'no-moov'};if(moovSize>32*1024*1024)return {reason:'moov-too-large'};
+ mark('目次の読み込み',{moovMb:Number((moovSize/1048576).toFixed(2))});
+ const moovBuffer=await blob.slice(moovPos,moovPos+moovSize).arrayBuffer();
+ const file=MP4Box.createFile();let ready=null,error=null;file.onError=e=>{error=e};file.onReady=info=>{ready=info};
+ if(moovPos>0){const head=await blob.slice(0,Math.min(moovPos,64*1024)).arrayBuffer();head.fileStart=0;file.appendBuffer(head)}
+ moovBuffer.fileStart=moovPos;file.appendBuffer(moovBuffer);
+ if(error)return {reason:'demux-error',detail:String(error).slice(0,80)};if(!ready)return {reason:'not-mp4'};
+ const track=ready.audioTracks?.[0];if(!track)return {reason:'no-audio-track'};
+ const meta=ynAudioTrackMeta(file,track,()=>new Uint8Array(moovBuffer));
+ const list=file.getTrackById(track.id)?.samples||[];if(!list.length)return {reason:'no-samples'};
+ // Adjacent samples are read together, up to 1 MB per read.
+ const samples=[];let readBytes=0;
+ for(let i=0;i<list.length;){
+  const start=list[i].offset;let end=start+list[i].size,j=i+1;
+  while(j<list.length&&list[j].offset===end&&end-start<1024*1024){end+=list[j].size;j++}
+  const chunk=await blob.slice(start,end).arrayBuffer();readBytes+=chunk.byteLength;
+  for(let k=i;k<j;k++){const s=list[k];samples.push({data:new Uint8Array(chunk,s.offset-start,s.size),timestamp:Math.round(s.cts*1e6/s.timescale),duration:Math.round(s.duration*1e6/s.timescale)})}
+  i=j;
+ }
+ mark('音のデータ読み込み',{audioMb:Number((readBytes/1048576).toFixed(2)),samples:samples.length});
+ return {...meta,samples};
+}
 // AudioSpecificConfig (tag 5) found in the raw bytes of an esds box. QuickTime .mov keeps esds inside 'wave', which mp4box may not parse.
 function ynFindAsc(bytes){
  for(let i=4;i+8<bytes.length;i++){
@@ -758,13 +825,7 @@ function ynDemuxAudio(MP4Box,arrayBuffer){return new Promise(resolve=>{
   file.onError=e=>done({reason:'demux-error',detail:String(e).slice(0,80)});
   file.onReady=info=>{
    const track=info.audioTracks?.[0];if(!track){done({reason:'no-audio-track'});return}
-   const trak=file.getTrackById(track.id),entry=trak?.mdia?.minf?.stbl?.stsd?.entries?.[0];
-   const find=node=>{if(!node)return null;if(node.tag===5&&node.data)return node.data;for(const c of node.descs||[]){const f=find(c);if(f)return f}return null};
-   const specific=find(entry?.esds?.esd)||ynFindAsc(new Uint8Array(arrayBuffer));
-   const timescale=trak?.mdia?.mdhd?.timescale||track.timescale,edit=trak?.edts?.elst?.entries?.find(e=>e.media_time>=0);
-   const objectType=specific&&specific.length?(new Uint8Array(specific)[0]>>3):2;
-   const codec=/^mp4a\.40\.\d+$/.test(track.codec)?track.codec:track.codec&&track.codec.startsWith('mp4a')?`mp4a.40.${objectType||2}`:track.codec;
-   meta={codec,sampleRate:track.audio?.sample_rate,channels:track.audio?.channel_count,mediaTime:edit?edit.media_time/timescale:null,description:specific?new Uint8Array(specific):null,count:track.nb_samples};
+   meta=ynAudioTrackMeta(file,track,()=>new Uint8Array(arrayBuffer));
    file.setExtractionOptions(track.id,null,{nbSamples:Infinity});file.start();
   };
   file.onSamples=(id,user,list)=>{for(const s of list)samples.push({data:s.data,timestamp:Math.round(s.cts*1e6/s.timescale),duration:Math.round(s.duration*1e6/s.timescale)});if(meta&&samples.length>=meta.count)done({...meta,samples})};
@@ -775,9 +836,14 @@ function ynDemuxAudio(MP4Box,arrayBuffer){return new Promise(resolve=>{
 // The source audio as a 48 kHz stereo buffer covering [0, duration]. {none} without an audio track, {reason} when it cannot be read.
 async function ynFrameAudio(MP4Box,url,duration){
  const rate=48000,Offline=window.OfflineAudioContext||window.webkitOfflineAudioContext;if(!Offline)return {reason:'no-offline-audio'};
- let data;try{data=await (await fetch(url)).arrayBuffer()}catch(e){return {reason:'fetch-error'}}
+ ynMarkExportRun('音の読み込み');
+ let blob=ynBlobByUrl.get(url);const from=blob?'元ファイル':'fetch';
+ if(!blob){try{blob=await (await fetch(url)).blob()}catch(e){return {reason:'fetch-error'}}}
+ const mb=Number((blob.size/1048576).toFixed(1)),mark=(stage,detail={})=>ynMarkExportRun(stage,{mb,from,...detail});
+ mark('音の読み込み');
  const helper=new Offline(2,rate,rate);let decoded=null,method=null;
- const demuxed=await ynDemuxAudio(MP4Box,data).catch(e=>({reason:'demux-error'}));
+ const demuxed=await ynDemuxAudioFromBlob(MP4Box,blob,mark).catch(e=>({reason:'demux-error'}));
+ if(!demuxed.reason)mark('音のデコード');
  if(demuxed.reason==='no-audio-track')return {none:true};
  if(!demuxed.reason&&typeof AudioDecoder==='function'){
   const config={codec:demuxed.codec,sampleRate:demuxed.sampleRate,numberOfChannels:demuxed.channels,...(demuxed.description?{description:demuxed.description}:{})};
@@ -794,14 +860,23 @@ async function ynFrameAudio(MP4Box,url,duration){
   }
  }
  if(!decoded){
-  decoded=await new Promise(res=>{const fail=()=>res(null);try{const r=helper.decodeAudioData(data.slice(0),res,fail);if(r?.then)r.then(res,fail)}catch{fail()}});
+  // Only small files are read whole for decodeAudioData; a long video read whole crashes the page on iPhone.
+  if(blob.size>100*1024*1024)return {reason:'too-large-to-decode:'+(demuxed.reason||demuxed.codec)};
+  mark('音の読み込み（全体）');
+  let data;try{data=await blob.arrayBuffer()}catch(e){return {reason:'fetch-error'}}
+  decoded=await new Promise(res=>{const fail=()=>res(null);try{const r=helper.decodeAudioData(data,res,fail);if(r?.then)r.then(res,fail)}catch{fail()}});data=null;
   if(!decoded)return {reason:demuxed.reason==='not-mp4'?'decode-failed':'decode-failed:'+(demuxed.reason||demuxed.codec)};
   method='decodeAudioData';
  }
  const ctx=new Offline(2,Math.max(1,Math.ceil(duration*rate)),rate),src=ctx.createBufferSource();src.buffer=decoded;src.connect(ctx.destination);src.start(0);
  return {buffer:await ctx.startRendering(),method,sourceRate:decoded.sampleRate};
 }
-async function ynFrameExport({video,canvas,url,draw,bitrate,isCancelled,log}){
+// The stage record stays only while the export runs; finishing, failing or cancelling clears it. A page crash leaves it for the next start.
+async function ynFrameExport(options){
+ ynMarkExportRun('準備開始',{seconds:Number((options.video?.duration||0).toFixed(1))});
+ try{return await ynFrameExportRun(options)}finally{ynClearExportRun()}
+}
+async function ynFrameExportRun({video,canvas,url,draw,bitrate,isCancelled,log}){
  if(typeof VideoEncoder!=='function'||typeof VideoFrame!=='function')return {fallback:'no-video-encoder'};
  let Muxer,ArrayBufferTarget,MP4Box;
  try{({Muxer,ArrayBufferTarget}=await import('https://esm.sh/mp4-muxer@5.1.3'));const m=await import('https://esm.sh/mp4box@0.5.2');MP4Box=m.default||m}catch{return {fallback:'module-load'}}
@@ -828,6 +903,7 @@ async function ynFrameExport({video,canvas,url,draw,bitrate,isCancelled,log}){
   if(m&&Number.isFinite(m.mediaTime)){if(lastMT!=null&&m.mediaTime-lastMT>.004)frameDur=frameDur==null?m.mediaTime-lastMT:Math.min(frameDur,m.mediaTime-lastMT);lastMT=m.mediaTime;return {pic:m.mediaTime,ok:Math.abs(m.mediaTime-t)<.25}}
   return {pic:t,ok:!rvfc?true:null};
  };
+ ynMarkExportRun('映像の書き出し開始');
  log.recStart=performance.now();
  for(let i=0;i<frameCount;i++){
   if(isCancelled())throw Error('cancelled');
