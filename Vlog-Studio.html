@@ -10240,7 +10240,8 @@ const vlogAudioTrackMeta=(file,track,fallbackBytes)=>{
 };
 // 長い素材用: ファイル全体は読まず、目次（moov）と音のデータだけを部分読みして、vlogDemuxAudio と同じ形で返す。
 // iPhone の数百MBの動画を丸ごと読むと、ページが落ちて読み込み直されるため。
-const vlogDemuxAudioFromBlob=async (MP4Box,blob,mark=()=>{})=>{
+// range={from,to}（元の時刻・秒）を渡すと、その範囲にかかるサンプルだけを読む。
+const vlogDemuxAudioFromBlob=async (MP4Box,blob,mark=()=>{},range=null)=>{
   let moovPos=-1,moovSize=0;
   for(let pos=0;pos+8<=blob.size;){
     const head=new DataView(await blob.slice(pos,pos+16).arrayBuffer());
@@ -10272,8 +10273,13 @@ const vlogDemuxAudioFromBlob=async (MP4Box,blob,mark=()=>{})=>{
   const track=ready.audioTracks?.[0];
   if(!track) return {reason:'no-audio-track'};
   const meta=vlogAudioTrackMeta(file,track,()=>new Uint8Array(moovBuffer));
-  const list=file.getTrackById(track.id)?.samples||[];
+  let list=file.getTrackById(track.id)?.samples||[];
   if(!list.length) return {reason:'no-samples'};
+  if(range){
+    const start=Number.isFinite(meta.mediaTime)?meta.mediaTime:list[0].cts/list[0].timescale;
+    list=list.filter(sample=>{ const t=sample.cts/sample.timescale-start; return t+sample.duration/sample.timescale>=range.from && t<=range.to; });
+    if(!list.length) return {reason:'no-samples-in-range'};
+  }
   // 並んでいるサンプルを 1MB までまとめて読む。
   const samples=[];
   let readBytes=0;
@@ -16588,7 +16594,8 @@ function App(){
             return out;
           };
           // 引数は ArrayBuffer（ファイル全体）か、取り出し済みの結果（vlogDemuxAudioFromBlob）。
-          const decodeByDemux=async input=>{
+          // range を渡すと、その範囲だけをデコードする（長い素材を全部デコードするとメモリが足りなくなる）。返す base は音の頭の元の時刻。
+          const decodeByDemux=async (input,range=null)=>{
             const demuxed=input instanceof ArrayBuffer ? await vlogDemuxAudio(MP4Box,input) : input;
             if(demuxed.reason) return demuxed;
             if(typeof AudioDecoder!=='function') return {reason:'no-audio-decoder'};
@@ -16597,15 +16604,18 @@ function App(){
             const support=await AudioDecoder.isConfigSupported(config).catch(()=>({supported:false}));
             if(!support?.supported) return {reason:'unsupported-codec',codec:demuxed.codec};
             const start=Number.isFinite(demuxed.mediaTime)?demuxed.mediaTime:demuxed.samples[0].timestamp/1e6;
-            const lastSample=demuxed.samples[demuxed.samples.length-1];
-            const seconds=Math.max(0.01,(lastSample.timestamp+lastSample.duration)/1e6-start);
+            const base=range?Math.max(0,range.from):0;
+            const list=range ? demuxed.samples.filter(sample=>{ const t=sample.timestamp/1e6-start; return t+sample.duration/1e6>=range.from && t<=range.to; }) : demuxed.samples;
+            if(!list.length) return {reason:'no-samples-in-range'};
+            const lastSample=list[list.length-1];
+            const seconds=Math.max(0.01,(lastSample.timestamp+lastSample.duration)/1e6-start-base);
             const rate=demuxed.sampleRate,length=Math.max(1,Math.ceil(seconds*rate));
             const left=new Float32Array(length),right=new Float32Array(length);
             const write=(target,source,at)=>{ for(let i=0;i<source.length;i++){ const index=at+i; if(index>=0 && index<length) target[index]=source[i]; } };
             let decodeError=null;
             const decoder=new AudioDecoder({output:data=>{
               try{
-                const at=Math.round((data.timestamp/1e6-start)*rate);
+                const at=Math.round((data.timestamp/1e6-start-base)*rate);
                 const first=copyChannel(data,0);
                 write(left,first,at);
                 write(right,data.numberOfChannels>1?copyChannel(data,1):first,at);
@@ -16613,7 +16623,7 @@ function App(){
               finally{ data.close(); }
             },error:error=>{ decodeError=decodeError||error; }});
             decoder.configure(config);
-            for(const sample of demuxed.samples)
+            for(const sample of list)
               decoder.decode(new EncodedAudioChunk({type:'key',timestamp:sample.timestamp,duration:sample.duration,data:sample.data}));
             let timer=0;
             await Promise.race([decoder.flush(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('timeout')),10000);})])
@@ -16622,7 +16632,7 @@ function App(){
             if(decodeError) return {reason:'decoder-error',codec:demuxed.codec,detail:String(decodeError?.message||decodeError?.name||decodeError).slice(0,80)};
             const buffer=helperCtx.createBuffer(2,length,rate);
             buffer.copyToChannel(left,0);buffer.copyToChannel(right,1);
-            return {buffer,method:'demux',codec:demuxed.codec,sampleRate:rate,channels:demuxed.channels,seconds:Number(seconds.toFixed(2))};
+            return {buffer,base,method:'demux',codec:demuxed.codec,sampleRate:rate,channels:demuxed.channels,seconds:Number(seconds.toFixed(2))};
           };
           job.frameDecodeByDemux=decodeByDemux;
           const decodeByAudioData=arrayBuffer=>new Promise(resolve=>{
@@ -16631,7 +16641,7 @@ function App(){
             try{ const result=helperCtx.decodeAudioData(arrayBuffer,ok,fail); if(result?.then) result.then(ok,fail); }catch(error){ fail(error); }
           });
           const decoded=new Map();
-          const decodeUrl=async (url,label)=>{
+          const decodeUrl=async (url,label,range=null)=>{
             if(!decoded.has(url)) decoded.set(url,(async()=>{
               // ファイル全体をメモリに読まない（blob は端末のファイルを指したまま）。目次と音のデータだけを部分読みする。
               vlogMarkExportRun('音の読み込み',{clip:label});
@@ -16643,12 +16653,12 @@ function App(){
               const mb=Number((blob.size/1048576).toFixed(1));
               const mark=(stage,detail={})=>vlogMarkExportRun(stage,{clip:label,mb,from,...detail});
               mark('音の読み込み');
-              const demuxed=await vlogDemuxAudioFromBlob(MP4Box,blob,mark).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
+              const demuxed=await vlogDemuxAudioFromBlob(MP4Box,blob,mark,range).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
               if(demuxed.reason==='no-audio-track') return demuxed;
               let first=demuxed;
               if(!demuxed.reason){
                 mark('音のデコード');
-                first=await decodeByDemux(demuxed).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
+                first=await decodeByDemux(demuxed,range).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
                 if(first.buffer) return first;
               }
               // 取り出せないときだけ全体を読んで decodeAudioData を試す。大きいファイルは落ちるので読まない。
@@ -16664,6 +16674,7 @@ function App(){
             audioReport.sources.push({clip:label,method:result.method||'none',codec:result.codec||null,sampleRate:result.sampleRate||null,
               channels:result.channels||null,seconds:result.seconds||null,reason:result.reason||null,detail:result.detail||null,demux:result.demux||null});
             if(!result.buffer && result.reason!=='no-audio-track') audioReport.decodeFailures.push({clip:label,reason:result.reason});
+            if(result.buffer) result.buffer.vlogBase=result.base||0;
             return result.buffer||null;
           };
           const length=Math.max(1,Math.ceil(total*sampleRate));
@@ -16679,12 +16690,21 @@ function App(){
             source.start(item.start,offset);
             source.stop(item.end);
           };
+          // 素材ごとに、元の動画のどこからどこまでを鳴らすか（同じ素材を何度も使うときはまとめる）。
+          const clipRanges=new Map();
+          for(const item of clipPlan){
+            const from=item.offset,to=item.offset+(item.end-item.start)*item.rate;
+            const prev=clipRanges.get(item.url);
+            clipRanges.set(item.url,prev?{from:Math.min(prev.from,from),to:Math.max(prev.to,to)}:{from,to});
+          }
+          clipRanges.forEach((range,url)=>clipRanges.set(url,{from:Math.max(0,range.from-0.5),to:range.to+0.5}));
           const renderClips=async ctx=>{
             for(const item of clipPlan){
               if(job.cancelled) throw new Error('書き出しを中止しました。');
-              const buffer=await decodeUrl(item.url,item.name);
-              if(!buffer || item.offset>=buffer.duration) continue;
-              schedule(ctx,buffer,item,ctx.destination,{offset:item.offset,rate:item.rate});
+              const buffer=await decodeUrl(item.url,item.name,clipRanges.get(item.url));
+              const offset=buffer ? item.offset-(buffer.vlogBase||0) : 0;
+              if(!buffer || offset<0 || offset>=buffer.duration) continue;
+              schedule(ctx,buffer,item,ctx.destination,{offset,rate:item.rate});
               audioReport.clips++;
             }
           };
