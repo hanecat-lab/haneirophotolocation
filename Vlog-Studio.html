@@ -10209,6 +10209,81 @@ const vlogAudioSpecificConfigFromDescription=bytes=>{
     return bytes.slice(at,at+specific.size);
   }catch{ return null; }
 };
+// mp4box の音のトラックから、デコードに要る設定を取り出す。fallbackBytes は esds が読めないときに AudioSpecificConfig を探す範囲。
+const vlogAudioTrackMeta=(file,track,fallbackBytes)=>{
+  const trak=file.getTrackById(track.id);
+  const entry=trak?.mdia?.minf?.stbl?.stsd?.entries?.[0];
+  const findSpecific=node=>{
+    if(!node) return null;
+    if(node.tag===5 && node.data) return node.data;
+    for(const child of node.descs||[]){ const found=findSpecific(child); if(found) return found; }
+    return null;
+  };
+  const specific=findSpecific(entry?.esds?.esd)||vlogFindAudioSpecificConfig(fallbackBytes());
+  const timescale=trak?.mdia?.mdhd?.timescale||track.timescale;
+  const edit=trak?.edts?.elst?.entries?.find(item=>item.media_time>=0);
+  // 'mp4a' だけのときは AudioSpecificConfig の先頭5ビット（オブジェクトの種類）から mp4a.40.x を作る。
+  const objectType=specific&&specific.length?(new Uint8Array(specific)[0]>>3):2;
+  const codec=/^mp4a\.40\.\d+$/.test(track.codec)?track.codec:track.codec&&track.codec.startsWith('mp4a')?`mp4a.40.${objectType||2}`:track.codec;
+  return {codec,sampleRate:track.audio?.sample_rate,channels:track.audio?.channel_count,
+    timescale,mediaTime:edit?edit.media_time/timescale:null,
+    description:specific?new Uint8Array(specific):null,count:track.nb_samples};
+};
+// 長い素材用: ファイル全体は読まず、目次（moov）と音のデータだけを部分読みして、vlogDemuxAudio と同じ形で返す。
+// iPhone の数百MBの動画を丸ごと読むと、ページが落ちて読み込み直されるため。
+const vlogDemuxAudioFromBlob=async (MP4Box,blob,mark=()=>{})=>{
+  let moovPos=-1,moovSize=0;
+  for(let pos=0;pos+8<=blob.size;){
+    const head=new DataView(await blob.slice(pos,pos+16).arrayBuffer());
+    let size=head.getUint32(0);
+    const type=String.fromCharCode(head.getUint8(4),head.getUint8(5),head.getUint8(6),head.getUint8(7));
+    if(size===1 && head.byteLength>=16) size=head.getUint32(8)*4294967296+head.getUint32(12);
+    else if(size===0) size=blob.size-pos;
+    if(size<8) break;
+    if(type==='moov'){ moovPos=pos; moovSize=size; break; }
+    pos+=size;
+  }
+  if(moovPos<0) return {reason:'no-moov'};
+  if(moovSize>32*1024*1024) return {reason:'moov-too-large'};
+  mark('目次の読み込み',{moovMb:Number((moovSize/1048576).toFixed(2))});
+  const moovBuffer=await blob.slice(moovPos,moovPos+moovSize).arrayBuffer();
+  const file=MP4Box.createFile();
+  let ready=null,error=null;
+  file.onError=e=>{ error=e; };
+  file.onReady=info=>{ ready=info; };
+  if(moovPos>0){
+    const head=await blob.slice(0,Math.min(moovPos,64*1024)).arrayBuffer();
+    head.fileStart=0;
+    file.appendBuffer(head);
+  }
+  moovBuffer.fileStart=moovPos;
+  file.appendBuffer(moovBuffer);
+  if(error) return {reason:'demux-error',detail:String(error).slice(0,80)};
+  if(!ready) return {reason:'not-mp4'};
+  const track=ready.audioTracks?.[0];
+  if(!track) return {reason:'no-audio-track'};
+  const meta=vlogAudioTrackMeta(file,track,()=>new Uint8Array(moovBuffer));
+  const list=file.getTrackById(track.id)?.samples||[];
+  if(!list.length) return {reason:'no-samples'};
+  // 並んでいるサンプルを 1MB までまとめて読む。
+  const samples=[];
+  let readBytes=0;
+  for(let i=0;i<list.length;){
+    const start=list[i].offset;
+    let end=start+list[i].size,j=i+1;
+    while(j<list.length && list[j].offset===end && end-start<1024*1024){ end+=list[j].size; j++; }
+    const chunk=await blob.slice(start,end).arrayBuffer();
+    readBytes+=chunk.byteLength;
+    for(let k=i;k<j;k++){
+      const sample=list[k];
+      samples.push({data:new Uint8Array(chunk,sample.offset-start,sample.size),
+        timestamp:Math.round(sample.cts*1e6/sample.timescale),duration:Math.round(sample.duration*1e6/sample.timescale)});
+    }
+    i=j;
+  }
+  mark('音のデータ読み込み',{audioMb:Number((readBytes/1048576).toFixed(2)),samples:samples.length});
+  return {...meta,samples};
+};
 // 動画ファイル（.mov/.mp4）から音のトラックのサンプルと設定を取り出す。音のトラックがない・読めないときは reason を返す。
 const vlogDemuxAudio=(MP4Box,arrayBuffer)=>new Promise(resolve=>{
   let settled=false;
@@ -10221,23 +10296,7 @@ const vlogDemuxAudio=(MP4Box,arrayBuffer)=>new Promise(resolve=>{
     file.onReady=info=>{
       const track=info.audioTracks?.[0];
       if(!track){ done({reason:'no-audio-track'}); return; }
-      const trak=file.getTrackById(track.id);
-      const entry=trak?.mdia?.minf?.stbl?.stsd?.entries?.[0];
-      const findSpecific=node=>{
-        if(!node) return null;
-        if(node.tag===5 && node.data) return node.data;
-        for(const child of node.descs||[]){ const found=findSpecific(child); if(found) return found; }
-        return null;
-      };
-      const specific=findSpecific(entry?.esds?.esd)||vlogFindAudioSpecificConfig(new Uint8Array(arrayBuffer));
-      const timescale=trak?.mdia?.mdhd?.timescale||track.timescale;
-      const edit=trak?.edts?.elst?.entries?.find(item=>item.media_time>=0);
-      // 'mp4a' だけのときは AudioSpecificConfig の先頭5ビット（オブジェクトの種類）から mp4a.40.x を作る。
-      const objectType=specific&&specific.length?(new Uint8Array(specific)[0]>>3):2;
-      const codec=/^mp4a\.40\.\d+$/.test(track.codec)?track.codec:track.codec&&track.codec.startsWith('mp4a')?`mp4a.40.${objectType||2}`:track.codec;
-      meta={codec,sampleRate:track.audio?.sample_rate,channels:track.audio?.channel_count,
-        timescale,mediaTime:edit?edit.media_time/timescale:null,
-        description:specific?new Uint8Array(specific):null,count:track.nb_samples};
+      meta=vlogAudioTrackMeta(file,track,()=>new Uint8Array(arrayBuffer));
       file.setExtractionOptions(track.id,null,{nbSamples:Infinity});
       file.start();
     };
@@ -16519,8 +16578,9 @@ function App(){
             data.copyTo(out,{planeIndex:channel,format:'f32-planar'});
             return out;
           };
-          const decodeByDemux=async arrayBuffer=>{
-            const demuxed=await vlogDemuxAudio(MP4Box,arrayBuffer);
+          // 引数は ArrayBuffer（ファイル全体）か、取り出し済みの結果（vlogDemuxAudioFromBlob）。
+          const decodeByDemux=async input=>{
+            const demuxed=input instanceof ArrayBuffer ? await vlogDemuxAudio(MP4Box,input) : input;
             if(demuxed.reason) return demuxed;
             if(typeof AudioDecoder!=='function') return {reason:'no-audio-decoder'};
             const config={codec:demuxed.codec,sampleRate:demuxed.sampleRate,numberOfChannels:demuxed.channels,
@@ -16564,14 +16624,25 @@ function App(){
           const decoded=new Map();
           const decodeUrl=async (url,label)=>{
             if(!decoded.has(url)) decoded.set(url,(async()=>{
+              // ファイル全体をメモリに読まない（blob は端末のファイルを指したまま）。目次と音のデータだけを部分読みする。
+              let blob;
+              try{ blob=await (await fetch(url)).blob(); }catch(error){ return {reason:'fetch-error',detail:String(error?.message||error).slice(0,80)}; }
+              const mb=Number((blob.size/1048576).toFixed(1));
+              const mark=(stage,detail={})=>vlogMarkExportRun(stage,{clip:label,mb,...detail});
+              mark('音の読み込み');
+              const demuxed=await vlogDemuxAudioFromBlob(MP4Box,blob,mark).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
+              if(demuxed.reason==='no-audio-track') return demuxed;
+              let first=demuxed;
+              if(!demuxed.reason){
+                mark('音のデコード');
+                first=await decodeByDemux(demuxed).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
+                if(first.buffer) return first;
+              }
+              // 取り出せないときだけ全体を読んで decodeAudioData を試す。大きいファイルは落ちるので読まない。
+              if(blob.size>100*1024*1024) return {reason:'too-large-to-decode',detail:`${mb}MB`,demux:first.reason,codec:first.codec};
+              mark('音の読み込み（全体）');
               let data;
-              vlogMarkExportRun('音の読み込み',{clip:label});
-              try{ data=await (await fetch(url)).arrayBuffer(); }catch(error){ return {reason:'fetch-error',detail:String(error?.message||error).slice(0,80)}; }
-              vlogMarkExportRun('音の取り出し',{clip:label,mb:Number((data.byteLength/1048576).toFixed(1))});
-              // 長い素材はファイルが大きいので、丸ごとの読み込みは1回分だけにする（複製しない）。
-              const first=await decodeByDemux(data).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
-              if(first.buffer || first.reason==='no-audio-track'){ data=null; return first; }
-              // decodeAudioData は渡した中身を使えなくするが、ここが data を使う最後なのでそのまま渡す。
+              try{ data=await blob.arrayBuffer(); }catch(error){ return {reason:'fetch-error',detail:String(error?.message||error).slice(0,80)}; }
               const second=await decodeByAudioData(data);
               data=null;
               return second.buffer?second:{...second,demux:first.reason,codec:first.codec};
