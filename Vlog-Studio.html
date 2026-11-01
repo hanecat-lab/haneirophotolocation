@@ -14995,6 +14995,39 @@ function App(){
       startTrace:diag.start?.trace||null,startEvents:diag.start?.events||null,
       recentEvents:diag.events.slice(-40)},null,2);
   };
+  // 観測用（?diag=1）: AudioContext ごとに 440Hz のピー音を約0.5秒鳴らし、音の出口が生きているかを耳で確かめる。
+  const testPreviewAudioOutput=target=>{
+    const label={preview:'①プレビュー用',fresh:'②新しく作った',export:'③書き出し用'}[target];
+    let context=null,before=null;
+    try{
+      if(target==='preview') context=previewAudioContextRef.current;
+      else if(target==='export') context=exportAudioRef.current.context;
+      else{ const Ctx=window.AudioContext || window.webkitAudioContext; if(Ctx) context=new Ctx(); }
+      if(!context || context.state==='closed'){
+        recordPreviewDiagnostic('audio-out-test',{target,contextState:context?.state||null,error:'no-context'});
+        setPreviewDiagnosticNotice(`${label} AudioContext がありません（${context?.state||'なし'}）。`);
+        return;
+      }
+      before=context.state;
+      const resumed=context.resume();
+      if(resumed?.catch) resumed.catch(()=>{});
+      const osc=context.createOscillator(),gain=context.createGain();
+      osc.frequency.value=440;gain.gain.value=0.2;
+      osc.connect(gain);gain.connect(context.destination);
+      const at=context.currentTime;
+      osc.start(at);osc.stop(at+0.5);
+      osc.onended=()=>{
+        try{ osc.disconnect(); gain.disconnect(); }catch{}
+        if(target==='fresh') try{ context.close(); }catch{}
+      };
+      recordPreviewDiagnostic('audio-out-test',{target,before,after:context.state,time:Number(at.toFixed(3))});
+      setPreviewDiagnosticNotice(`${label} AudioContext でピー音を鳴らしました（${before} → ${context.state}）。聞こえたかを教えてください。`);
+    }catch(error){
+      recordPreviewDiagnostic('audio-out-test',{target,before,after:context?.state||null,
+        error:`${error?.name||'Error'}: ${String(error?.message||'').slice(0,120)}`});
+      setPreviewDiagnosticNotice(`${label} のテストで失敗しました（${error?.name||'Error'}）。`);
+    }
+  };
   const capturePreviewDiagnostic=()=>{
     recordPreviewDiagnostic('manual',{state:previewDiagnosticSnapshot('手動で状態を記録')});
     setPreviewDiagnosticText(formatPreviewDiagnostic());
@@ -16193,6 +16226,7 @@ function App(){
   // 書き出しはプレビューと同じcanvasを描画し、そのフレームと素材の音声を録画する。
   const cancelExport=()=>{
     if(exportJobRef.current){
+      exportJobRef.current.userCancelled=true;
       exportJobRef.current.cancelled=true;
       exportJobRef.current.stopWaiting?.();
     }
@@ -17461,9 +17495,12 @@ function App(){
       // 観測用: 書き出し終了時の2つの AudioContext の状態を残す（?diag=1 の診断に出す）。
       try{
         const exportFinished={at:performance.now(),finishedAt:new Date().toISOString(),
-          previewContext:previewAudioContextRef.current?.state||null,exportContext:exportAudioRef.current.context?.state||null};
+          previewContext:previewAudioContextRef.current?.state||null,exportContext:exportAudioRef.current.context?.state||null,
+          engine:job.stats?.engine||null,phase:job.phase||null,userCancelled:!!job.userCancelled,
+          failure:job.failure?String(job.failure).slice(0,120):null};
         lastExportDiagRef.current=exportFinished;
-        recordPreviewDiagnostic('export-finished',{previewContext:exportFinished.previewContext,exportContext:exportFinished.exportContext});
+        const {at:_finishedAtMs,finishedAt:_finishedAtIso,...exportFinishedDetail}=exportFinished;
+        recordPreviewDiagnostic('export-finished',exportFinishedDetail);
       }catch{}
       for(const {video,muted} of job.videos.values()){ try{ video.pause(); video.muted=muted; }catch{} }
       for(const [id,callback] of job.frameCallbacks){
@@ -24588,6 +24625,13 @@ const recomputeStarts=(arr)=>{
               setPreviewDiagnosticCount(0);setPreviewDiagnosticText('');
               setPreviewDiagnosticNotice('記録を消しました。');
             },className:'min-h-10 rounded-full border border-white/20 px-3'}, '記録を消す')
+          ),
+          React.createElement('div', {className:'text-white/55 pt-3 pb-2'},
+            '音の出口テスト: 再生を止めてから押すと、ピー音が約0.5秒鳴ります。それぞれ聞こえたかを教えてください。'),
+          React.createElement('div', {className:'flex flex-wrap gap-2'},
+            [['preview','①プレビュー用'],['fresh','②新しく作る'],['export','③書き出し用']].map(([target,text])=>
+              React.createElement('button', {key:target,type:'button',onClick:()=>testPreviewAudioOutput(target),
+                className:'min-h-10 rounded-full bg-white/15 px-3'}, text))
           ),
           previewDiagnosticNotice && React.createElement('div', {role:'status',className:'mt-2 text-violet-200'},previewDiagnosticNotice),
           React.createElement('textarea', {ref:previewDiagnosticTextRef,readOnly:true,
