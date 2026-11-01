@@ -6929,6 +6929,15 @@ const VLOG_CODEC_PROBE={done:false};
 // ?audiolab=1 は再生ボタンで音の実験を行う（他の要素への操作ごとに、鳴っている音が止まるかを測る）。
 const PREVIEW_AUDIO_LAB=(()=>{try{return new URLSearchParams(location.search).get('audiolab')==='1';}catch{return false;}})();
 // 「再生診断」の欄は ?diag=1 のときだけ出す（ふだんの画面には出さない）。
+// 書き出しの段階を端末に残す。ページが落ちて読み込み直されても、どこで止まったかを次の起動で読める。
+const vlogMarkExportRun=(stage,detail={})=>{
+  try{
+    const prev=JSON.parse(localStorage.getItem('vlogExportRun')||'null');
+    const run={startedAt:stage==='準備開始'?new Date().toISOString():(prev?.startedAt||new Date().toISOString()),
+      stage,at:new Date().toISOString(),...detail};
+    localStorage.setItem('vlogExportRun',JSON.stringify(run));
+  }catch{}
+};
 const PREVIEW_DIAG_PANEL=(()=>{try{return new URLSearchParams(location.search).get('diag')==='1';}catch{return false;}})();
 const vlogExportProfileMeasure=(name,run)=>{
   const profiler=vlogExportDrawProfiler;
@@ -10237,8 +10246,9 @@ const vlogDemuxAudio=(MP4Box,arrayBuffer)=>new Promise(resolve=>{
         duration:Math.round(sample.duration*1e6/sample.timescale)});
       if(meta && samples.length>=meta.count) done({...meta,samples});
     };
-    const buffer=arrayBuffer.slice(0);buffer.fileStart=0;
-    file.appendBuffer(buffer);
+    // 受け取った buffer をそのまま渡す（長い素材で複製するとメモリが足りなくなる）。
+    arrayBuffer.fileStart=0;
+    file.appendBuffer(arrayBuffer);
     file.flush();
     setTimeout(()=>done(meta?(samples.length?{...meta,samples}:{reason:'no-samples'}):{reason:'not-mp4'}),0);
   }catch(error){ done({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}); }
@@ -12602,9 +12612,14 @@ function App(){
   const [exportProgress, setExportProgress] = useState(0);
   const [exportMessage, setExportMessage] = useState('');
   const [exportFile, setExportFile] = useState(null);
+  // 前回の書き出しが途中で落ちていれば、その記録（起動時に一度だけ読む）。
+  const [lastExportCrash, setLastExportCrash] = useState(()=>{ try{ return JSON.parse(localStorage.getItem('vlogExportRun')||'null'); }catch{ return null; } });
   // 書き出した動画を保存したか（まだなら閉じる前に確かめる）と、保存先の案内。
   const exportSavedUrlRef = useRef(null);
   const [exportSaveNote, setExportSaveNote] = useState('');
+  useEffect(()=>{
+    if(exportStatus==='done'||exportStatus==='error'||exportStatus==='idle'){ try{ localStorage.removeItem('vlogExportRun'); }catch{} }
+  },[exportStatus]);
   // 素材の行で開く、つなぎの種類の選択。
   const [rowTransPickerId, setRowTransPickerId] = useState(null);
   const exportFileRef = useRef(null);
@@ -16269,6 +16284,7 @@ function App(){
     setExportDiagnosticText('');
     setExportDiagnosticVisible(false);
     setExportStatus('preparing');
+    vlogMarkExportRun('準備開始',{seconds:Number(total.toFixed(1)),clips:items.length});
     let bgmVolumeBefore=null;
     try{
       handleStop();
@@ -16549,10 +16565,15 @@ function App(){
           const decodeUrl=async (url,label)=>{
             if(!decoded.has(url)) decoded.set(url,(async()=>{
               let data;
+              vlogMarkExportRun('音の読み込み',{clip:label});
               try{ data=await (await fetch(url)).arrayBuffer(); }catch(error){ return {reason:'fetch-error',detail:String(error?.message||error).slice(0,80)}; }
-              const first=await decodeByDemux(data.slice(0)).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
-              if(first.buffer || first.reason==='no-audio-track') return first;
-              const second=await decodeByAudioData(data.slice(0));
+              vlogMarkExportRun('音の取り出し',{clip:label,mb:Number((data.byteLength/1048576).toFixed(1))});
+              // 長い素材はファイルが大きいので、丸ごとの読み込みは1回分だけにする（複製しない）。
+              const first=await decodeByDemux(data).catch(error=>({reason:'demux-error',detail:String(error?.message||error).slice(0,80)}));
+              if(first.buffer || first.reason==='no-audio-track'){ data=null; return first; }
+              // decodeAudioData は渡した中身を使えなくするが、ここが data を使う最後なのでそのまま渡す。
+              const second=await decodeByAudioData(data);
+              data=null;
               return second.buffer?second:{...second,demux:first.reason,codec:first.codec};
             })());
             const result=await decoded.get(url);
@@ -16611,6 +16632,7 @@ function App(){
           audioReport.mixLevel=audioLevel(mixed);
         }
         job.stats.frameAudio=audioReport;
+        vlogMarkExportRun('映像の書き出し開始');
         // 映像と音をまとめる。
         const target=new ArrayBufferTarget();
         const muxer=new Muxer({target,fastStart:'in-memory',firstTimestampBehavior:'offset',
@@ -23312,6 +23334,10 @@ const recomputeStarts=(arr)=>{
       }, '✨ おまかせ'),
       React.createElement('button', {onClick:openExportChoice, disabled:exportStatus==='preparing'||exportStatus==='recording', className:'camera-key-primary shrink-0 px-4 h-8 rounded-full bg-white text-black text-[12px] font-bold whitespace-nowrap', 'aria-label':'動画を書き出す'}, '書き出し')
     ),
+    lastExportCrash && React.createElement('div',{className:'px-3 py-2 bg-amber-500/15 border-b border-amber-400/25 text-[11px] text-amber-100 flex items-start gap-2',role:'alert'},
+      React.createElement('span',{className:'flex-1'},`前回の書き出しは途中で止まりました（段階：${lastExportCrash.stage}${lastExportCrash.clip?`「${lastExportCrash.clip}」`:''}${lastExportCrash.mb?` ${lastExportCrash.mb}MB`:''}${lastExportCrash.seconds?` ・全体${lastExportCrash.seconds}秒`:''}）`),
+      React.createElement('button',{type:'button',onClick:()=>{ try{ navigator.clipboard?.writeText?.(JSON.stringify(lastExportCrash))?.catch?.(()=>{}); }catch{} },className:'rounded-full border border-amber-300/40 px-2 py-1 shrink-0'},'内容をコピー'),
+      React.createElement('button',{type:'button',onClick:()=>setLastExportCrash(null),className:'rounded-full border border-amber-300/40 px-2 py-1 shrink-0'},'閉じる')),
     ['保存失敗','保存不可','素材読み込み失敗'].includes(projectStatus) && !projectGate && React.createElement('div',{
       className:'px-3 py-2 bg-amber-500/15 border-b border-amber-400/25 text-[10px] text-amber-100 flex items-center gap-2',role:'alert'},
       React.createElement('span',{className:'flex-1'},projectError||'作業を端末内に保存できません。'),
@@ -23336,6 +23362,11 @@ const recomputeStarts=(arr)=>{
         projectIdRef.current && React.createElement('button',{onClick:()=>{setProjectPending(null);setProjectMissing([]);setProjectGate(false);},className:'text-xs rounded-full bg-white/10 px-3 py-2'},'編集中の画面へ')),
       React.createElement('div',{className:'flex-1 overflow-y-auto px-4 py-4'},
         projectError && React.createElement('div',{className:'rounded-xl border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-100 mb-4',role:'alert'},projectError),
+        lastExportCrash && React.createElement('div',{className:'rounded-xl border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-100 mb-4',role:'alert'},
+          `前回の書き出しは途中で止まりました（段階：${lastExportCrash.stage}${lastExportCrash.clip?`「${lastExportCrash.clip}」`:''}${lastExportCrash.mb?` ${lastExportCrash.mb}MB`:''}${lastExportCrash.seconds?` ・全体${lastExportCrash.seconds}秒`:''}）`,
+          React.createElement('div',{className:'flex gap-2 mt-2'},
+            React.createElement('button',{type:'button',onClick:()=>{ try{ navigator.clipboard?.writeText?.(JSON.stringify(lastExportCrash))?.catch?.(()=>{}); }catch{} },className:'rounded-full border border-amber-300/40 px-3 py-1'},'内容をコピー'),
+            React.createElement('button',{type:'button',onClick:()=>setLastExportCrash(null),className:'rounded-full border border-amber-300/40 px-3 py-1'},'閉じる'))),
         projectMissing.length ? React.createElement(React.Fragment,null,
           React.createElement('div',{className:'text-xs text-white/70 mb-3'},'編集情報に元素材は含まれません。写真・動画・追加BGMをまとめて選び、対応を確認してください。'),
           React.createElement('label',{className:'block rounded-xl border border-violet-400/40 bg-violet-500/15 px-4 py-3 mb-3 text-sm text-center'},
