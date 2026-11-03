@@ -108,10 +108,16 @@
   .cell .nm { position: absolute; left: 8px; bottom: 6px; font-size: .7rem; color: rgba(255,255,255,.85); text-shadow: 0 1px 3px rgba(0,0,0,.8); pointer-events: none; }
   .cell .mk { position: absolute; top: 7px; left: 7px; padding: 2px 9px; border-radius: 999px; font-size: .68rem; font-weight: 700; letter-spacing: .08em;
     background: rgba(0,0,0,.55); display: none; pointer-events: none; color: var(--danger); border: 1px solid rgba(255,107,129,.55); }
-  #grid[data-mode=keep] .mk { color: var(--accent); border-color: rgba(92,225,255,.6); }
+  #grid[data-mode=keep] .mk, #cmp[data-mode=keep] .mk { color: var(--accent); border-color: rgba(92,225,255,.6); }
   .cell.mark .mk { display: block; }
   .cell.cur { border-color: rgba(92,225,255,.85); box-shadow: 0 0 0 1px rgba(92,225,255,.85), 0 0 22px rgba(92,225,255,.3); }
   #gridRow { display: flex; align-items: center; gap: 6px; }
+  .cell.burst::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: var(--bc); z-index: 1; pointer-events: none; }
+  .badge.burst { border-color: rgba(155,140,255,.55); color: var(--accent2); }
+  #cmp { position: absolute; inset: 0; display: none; gap: 8px; cursor: grab; touch-action: none; }
+  #cmp.drag { cursor: grabbing; }
+  .pane img { position: absolute; max-width: none; user-select: none; -webkit-user-drag: none; pointer-events: none; }
+  #stage.comparing #zoomTag { display: block; }
   #gridN { width: 104px; accent-color: var(--accent); }
   @media (max-width: 1100px) { #ftime { display: none; } }
   @media (max-width: 820px) { #badges { display: none; } }
@@ -250,6 +256,7 @@
     <div id="zoomTag" class="glass">等倍　Z・Esc・クリックで戻る</div>
     <div id="noimg"></div>
     <div id="grid"></div>
+    <div id="cmp"></div>
   </div>
 
   <div id="topbar" class="glass">
@@ -266,7 +273,7 @@
   <div id="bar" class="glass">
     <div id="pos"><i id="posFill"></i></div>
     <button class="nav" id="prevBtn" aria-label="前へ">‹</button>
-    <div class="side left"><div class="big" id="counter">0 / 0</div><div class="sm" id="gridRow">▦ <input type="range" id="gridN" min="1" max="12" step="1" value="1" title="一度に表示する枚数（Enter で 1枚表示と切り替え）"> <span id="gridLbl">1枚</span></div><div class="sm"><button id="hidBtn" class="linkbtn" style="display:none"></button></div></div>
+    <div class="side left"><div class="big" id="counter">0 / 0</div><div class="sm" id="gridRow">▦ <input type="range" id="gridN" min="1" max="13" step="1" value="1" title="一度に表示する枚数。右端は連写ごとの表示（Enter で 1枚表示と切り替え）"> <span id="gridLbl">1枚</span></div><div class="sm"><button id="hidBtn" class="linkbtn" style="display:none"></button></div></div>
     <button id="dropBtn"><span class="lbl">外す</span><span class="key">Space</span></button>
     <div class="side right"><div class="big" id="keepStat">残す 0枚</div><div class="sm" id="keepSize">0 MB</div><div class="sm" id="bgStat"></div></div>
     <button class="nav" id="nextBtn" aria-label="次へ">›</button>
@@ -407,8 +414,10 @@ let idx=0;
 let view='all';        // 表示: all / kept（残すだけ）/ dropped（外すだけ）
 let pickMode='drop';   // 選び方: drop（すべて残した状態から外す）/ keep（すべて外した状態から残す）
 const prefs=loadState().prefs||{};
-let gridN=Math.min(12,Math.max(1,prefs.gridN|0||1));   // 一度に表示する枚数（1 = 1枚表示）
-let lastGridN=Math.min(12,Math.max(2,prefs.lastGridN|0||6));
+const BURST=13;          // gridN がこの値のときは「連写ごとの表示」
+const BURST_GAP=2000;    // 撮影時刻の間隔がこれ以下なら同じ連写とみなす（ミリ秒）
+let gridN=Math.min(BURST,Math.max(1,prefs.gridN|0||1));   // 一度に表示する枚数（1 = 1枚表示）
+let lastGridN=Math.min(BURST,Math.max(2,prefs.lastGridN|0||6));
 
 // ===== 1. カードを開く =====
 $('openStatus').textContent='';   // スクリプトが動いた印
@@ -477,6 +486,30 @@ function pickerError(e){
     +'（埋め込み表示: '+(framed?'はい':'いいえ')+' / '+location.protocol+'）';
 }
 
+/* 連写の組: 撮影時刻を全写真ぶん読み（JPEG は先頭 72KB だけ）、間隔が BURST_GAP 以下なら同じ組 */
+async function readTimes(list){
+  for(let i=0;i<list.length;i+=8){
+    await Promise.all(list.slice(i,i+8).map(async g=>{
+      const f=g.jpg || g.files[0];
+      try { g.exif=await readExif(f.file, g.jpg?73728:131072); } catch(e){ g.exif=null; }
+    }));
+    $('openStatus').textContent='撮影時刻を読み込み中… '+Math.min(i+8,list.length)+' / '+list.length;
+  }
+}
+function assignBursts(list){
+  let b=0, prev=null;
+  for(const g of list){
+    const t=(g.exif && g.exif.ms!=null) ? g.exif.ms : g.time;
+    if(prev==null || Math.abs(t-prev)>BURST_GAP) b++;
+    g.burst=b; prev=t;
+  }
+}
+let burstMembers=new Map();   // 連写の組の番号 -> 選別の対象になっている写真（並び順）
+function buildBursts(){
+  burstMembers=new Map();
+  for(const g of groups){ let a=burstMembers.get(g.burst); if(!a) burstMembers.set(g.burst,a=[]); a.push(g); }
+}
+
 async function walk(dir,path,out,st){
   for await (const [name,h] of dir.entries()){
     if(name.startsWith('.')) continue;   // 隠しファイル・._ファイル
@@ -531,6 +564,8 @@ async function openCard(){
     cardSig=[dir.name,list.length,list[0].key,list[list.length-1].key,total].join('|');
     clearCache(); clearThumbs(); dateDirs.clear();
     await checkAlready(list);
+    await readTimes(list);
+    assignBursts(list);
     allGroups=list; showAlready=false;
     applyFilter(null);
     let allDone=false;
@@ -632,6 +667,8 @@ function render(){
   showExif(g);
   $('badges').innerHTML=g.files.map(f=>'<span class="badge '+(JPG_EXT.has(f.ext)?'jpg':'raw')+'">'+esc(f.ext.toUpperCase())+'</span>').join('')
     +(g.already?'<span class="badge done">コピー済み</span>':'');
+  const bm=burstMembers.get(g.burst);
+  if(bm && bm.length>1) $('badges').innerHTML+='<span class="badge burst">連写 '+(bm.indexOf(g)+1)+' / '+bm.length+'</span>';
   const hid=allGroups.filter(x=>x.already).length;
   $('hidBtn').style.display=hid?'':'none';
   $('hidBtn').textContent='コピー済み '+hid+'枚を'+(showAlready?'隠す':'表示');
@@ -651,7 +688,7 @@ function render(){
   document.querySelectorAll('#viewSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===view));
   $('modeBtn').textContent=(pickMode==='drop'?'外すを選ぶ':'残すを選ぶ')+' ⇄';
   $('gridN').value=gridN;
-  $('gridLbl').textContent=gridN+'枚';
+  $('gridLbl').textContent=gridN===BURST ? '連写' : gridN+'枚';
   const photo=$('photo'), noimg=$('noimg'), grid=$('grid');
   if(gridN>1){
     photo.style.display='none'; photo.removeAttribute('src'); noimg.style.display='none';
@@ -662,6 +699,8 @@ function render(){
     return;
   }
   grid.style.display='none'; grid.textContent='';
+  if(cmpOn){ cmpOn=false; clearCmp(); }
+  $('zoomTag').textContent='等倍　Z・Esc・クリックで戻る';
   screenKeys=new Set([g.key]); g.seen=true;
   updBg(); bgKick();
   if(g.jpg){
@@ -741,8 +780,8 @@ $('photo').onerror=()=>{
 };
 /* ----- 撮影情報（シャッター速度・絞り・ISO・焦点距離・露出補正） -----
    JPEG（なければ RAW）の先頭 128KB だけを読み、EXIF から取り出す。 */
-async function readExif(file){
-  const buf=await file.slice(0,131072).arrayBuffer();
+async function readExif(file,bytes){
+  const buf=await file.slice(0,bytes||131072).arrayBuffer();
   const dv=new DataView(buf), L=dv.byteLength;
   let tiff=-1;
   if(L>4 && dv.getUint16(0)===0xFFD8){          // JPEG: APP1 "Exif" を探す
@@ -777,10 +816,25 @@ async function readExif(file){
     if(en.type===5){ const d=u32(off+4); return d ? u32(off)/d : null; }
     const d=s32(off+4); return d ? s32(off)/d : null;
   };
+  const str=en=>{
+    if(!en || en.type!==2) return null;
+    const off=en.cnt>4 ? u32(en.vo) : en.vo;
+    if(!ok(off,en.cnt)) return null;
+    let r=''; for(let i=0;i<en.cnt;i++){ const c=dv.getUint8(tiff+off+i); if(!c) break; r+=String.fromCharCode(c); }
+    return r;
+  };
   const ep=val(ifd(u32(4))[0x8769]);   // Exif IFD への位置
   if(!ep) return null;
   const ex=ifd(ep);
-  return { t:val(ex[0x829A]), f:val(ex[0x829D]), iso:val(ex[0x8827]), fl:val(ex[0x920A]), ev:val(ex[0x9204]) };
+  // 撮影時刻（DateTimeOriginal + SubSecTimeOriginal）をミリ秒に
+  let ms=null;
+  const dt=str(ex[0x9003]), m=dt && dt.match(/^(\d{4}):(\d\d):(\d\d) (\d\d):(\d\d):(\d\d)/);
+  if(m){
+    ms=new Date(+m[1],m[2]-1,+m[3],+m[4],+m[5],+m[6]).getTime();
+    const sub=str(ex[0x9291]);
+    if(sub && /^\d+$/.test(sub.trim())) ms+=Math.round(parseFloat('0.'+sub.trim())*1000);
+  }
+  return { t:val(ex[0x829A]), f:val(ex[0x829D]), iso:val(ex[0x8827]), fl:val(ex[0x920A]), ev:val(ex[0x9204]), ms };
 }
 function fmtExif(x){
   if(!x) return '';
@@ -818,17 +872,17 @@ function toggle(){
     const j=findFrom(idx+1,1)>=0 ? findFrom(idx+1,1) : findFrom(idx-1,-1);
     if(j>=0) jump(j);
   }
-  if(idx!==from && gridN===1) showNote(from,prev);   // 次へ進んだときだけ、前の写真の結果を知らせる
+  if(idx!==from && gridN===1) showNote(g.stem+' を'+(g.dropped?'外しました':'残しました'), g.dropped, [{g,prev}], g);   // 次へ進んだときだけ、前の写真の結果を知らせる
 }
 
 /* ----- 前の写真の結果を知らせる通知（3秒で消える・取り消せる） ----- */
 let noteAct=null, noteTimer=0, noteHover=false;
-function showNote(i,prev){
-  const g=groups[i];
-  noteAct={i,prev};
-  $('noteMsg').textContent=g.stem+' を'+(g.dropped?'外しました':'残しました');
+// items: [{g, prev}]（取り消しで戻す写真と元の状態）、back: 取り消したら表示する写真
+function showNote(msg,isDrop,items,back){
+  noteAct={items,back};
+  $('noteMsg').textContent=msg;
   const n=$('note');
-  n.classList.toggle('drop',g.dropped); n.classList.toggle('keep',!g.dropped);
+  n.classList.toggle('drop',isDrop); n.classList.toggle('keep',!isDrop);
   $('toast').classList.remove('on');
   n.classList.add('on');
   armNote();
@@ -839,8 +893,9 @@ function undoNote(){
   const a=noteAct;
   if(!a) return;
   hideNote();
-  groups[a.i].dropped=a.prev;   // 印を元に戻し、その写真へ戻る
-  jump(a.i);
+  for(const it of a.items) it.g.dropped=it.prev;   // 印を元に戻し、その写真へ戻る
+  const j=groups.indexOf(a.back);
+  if(j>=0) jump(j); else { render(); saveSoon(); }
 }
 $('noteUndo').onclick=undoNote;
 $('note').addEventListener('mouseenter',()=>{ noteHover=true; clearTimeout(noteTimer); });
@@ -924,22 +979,35 @@ function pumpThumbs(){
 function renderGrid(){
   const grid=$('grid'), list=visibleList();
   let pos=list.indexOf(idx); if(pos<0) pos=0;
-  const start=Math.floor(pos/gridN)*gridN;
-  const page=list.slice(start,start+gridN);
+  let start, page;
+  if(gridN===BURST){
+    // 1ページ = 1つの連写（13枚以上は12枚ずつに分ける）
+    const b=groups[list[pos]].burst;
+    let s0=pos; while(s0>0 && groups[list[s0-1]].burst===b) s0--;
+    let e0=pos; while(e0+1<list.length && groups[list[e0+1]].burst===b) e0++;
+    start=s0+Math.floor((pos-s0)/12)*12;
+    page=list.slice(start,Math.min(e0+1,start+12));
+  }else{
+    start=Math.floor(pos/gridN)*gridN;
+    page=list.slice(start,start+gridN);
+  }
+  const count=gridN===BURST ? page.length : gridN;
   screenKeys=new Set(page.map(i=>groups[i].key));
   for(const i of page) groups[i].seen=true;
   updBg(); bgKick();
+  if(cmpOn){ grid.style.display='none'; grid.textContent=''; renderCompare(page); return; }
+  $('cmp').style.display='none'; $('stage').classList.remove('comparing');
   // 3:2 の写真が一番大きく見える列数を選ぶ
   const W=$('stage').clientWidth, H=$('stage').clientHeight, gap=8;
   let best=1, bestW=-1;
-  for(let c=1;c<=gridN;c++){
-    const r=Math.ceil(gridN/c);
+  for(let c=1;c<=count;c++){
+    const r=Math.ceil(count/c);
     const w=Math.min((W-(c-1)*gap)/c, (H-(r-1)*gap)/r*1.5);
     if(w>bestW){ bestW=w; best=c; }
   }
   gridCols=best;
   grid.style.gridTemplateColumns='repeat('+best+',minmax(0,1fr))';
-  grid.style.gridTemplateRows='repeat('+Math.ceil(gridN/best)+',minmax(0,1fr))';
+  grid.style.gridTemplateRows='repeat('+Math.ceil(count/best)+',minmax(0,1fr))';
   grid.dataset.mode=pickMode;
   grid.textContent='';
   for(const i of page){
@@ -947,6 +1015,8 @@ function renderGrid(){
     const cell=document.createElement('div');
     cell.className='cell'+(i===idx?' cur':'')+(marked(x)?' mark':'');
     cell.dataset.i=i; cell.dataset.key=x.key;
+    const bm=burstMembers.get(x.burst);
+    if(bm && bm.length>1){ cell.classList.add('burst'); cell.style.setProperty('--bc', x.burst%2 ? 'var(--accent2)' : 'var(--accent)'); }   // 同じ連写は同じ色の線
     const c=thumbs.get(x.key);
     if(c){ thumbs.delete(x.key); thumbs.set(x.key,c); cell.appendChild(c); }   // 使った順に並べ直す
     else{
@@ -960,11 +1030,151 @@ function renderGrid(){
     grid.appendChild(cell);
   }
   // 表示中のページを先に、次のページを後に読み込む
-  queueThumbs(page.concat(list.slice(start+gridN,start+gridN*2)).map(i=>groups[i]));
+  queueThumbs(page.concat(list.slice(start+page.length,start+page.length+12)).map(i=>groups[i]));
+}
+
+/* ----- 並べて等倍で比較（全部の写真が同じ位置を表示し、一緒に動く） -----
+   4枚までは全部、5枚以上は選択中とその次（組の最後なら前）の2枚 */
+let cmpOn=false, cmpIds=[];
+const cmpCache=new Map();   // key -> objectURL
+function setCompare(on){
+  if(on && gridN===1) return;
+  cmpOn=on;
+  if(!on) clearCmp();
+  render();
+}
+function clearCmp(){
+  for(const u of cmpCache.values()) URL.revokeObjectURL(u);
+  cmpCache.clear();
+  cmpIds=[];
+  const c=$('cmp'); c.textContent=''; c.dataset.keys=''; c.style.display='none';
+  $('stage').classList.remove('comparing');
+}
+function renderCompare(page){
+  const pos=page.indexOf(idx);
+  let ids;
+  if(page.length<=4) ids=page.slice();
+  else if(cmpIds.includes(idx) && cmpIds.every(i=>page.includes(i))) ids=cmpIds;   // 2枚の中で選択を移しただけなら並びはそのまま
+  else{
+    const other=page[pos+1]!==undefined ? page[pos+1] : page[pos-1];
+    ids=[idx,other].filter(v=>v!==undefined).sort((a,b)=>a-b);
+  }
+  cmpIds=ids;
+  const cmp=$('cmp');
+  cmp.style.display='grid';
+  $('stage').classList.add('comparing');
+  $('zoomTag').textContent='等倍で比較　ドラッグで全部いっしょに移動　Z・Esc で戻る';
+  const keys=ids.map(i=>groups[i].key).join('|');
+  if(cmp.dataset.keys!==keys){
+    cmp.dataset.keys=keys;
+    const keep=new Set(ids.map(i=>groups[i].key));
+    for(const [k,u] of cmpCache) if(!keep.has(k)){ URL.revokeObjectURL(u); cmpCache.delete(k); }
+    const cols=ids.length<=3 ? ids.length : 2;
+    cmp.style.gridTemplateColumns='repeat('+cols+',minmax(0,1fr))';
+    cmp.style.gridTemplateRows='repeat('+Math.ceil(ids.length/cols)+',minmax(0,1fr))';
+    cmp.textContent='';
+    for(const i of ids){
+      const x=groups[i];
+      const pane=document.createElement('div');
+      pane.className='cell pane'; pane.dataset.i=i;
+      if(x.jpg){
+        let u=cmpCache.get(x.key);
+        if(!u){ u=URL.createObjectURL(x.jpg.file); cmpCache.set(x.key,u); }
+        const im=new Image(); im.draggable=false; im.onload=placePanes; im.src=u;
+        pane.appendChild(im);
+      }else{
+        const ph=document.createElement('div'); ph.className='ph'; ph.textContent='JPEG がないため表示できません'; pane.appendChild(ph);
+      }
+      const nm=document.createElement('div'); nm.className='nm'; nm.textContent=x.stem;
+      const mk=document.createElement('div'); mk.className='mk'; mk.textContent=markWord();
+      pane.append(nm,mk);
+      cmp.appendChild(pane);
+    }
+  }
+  cmp.dataset.mode=pickMode;
+  for(const pane of cmp.querySelectorAll('.pane')){
+    const i=+pane.dataset.i;
+    pane.classList.toggle('cur',i===idx);
+    pane.classList.toggle('mark',marked(groups[i]));
+    pane.querySelector('.mk').textContent=markWord();
+  }
+  placePanes();
+}
+function placePanes(){
+  const dpr=window.devicePixelRatio||1;
+  for(const pane of $('cmp').querySelectorAll('.pane')){
+    const im=pane.querySelector('img');
+    if(!im || !im.naturalWidth) continue;
+    const W=pane.clientWidth, H=pane.clientHeight, iw=im.naturalWidth/dpr, ih=im.naturalHeight/dpr;
+    im.style.width=iw+'px'; im.style.height=ih+'px';
+    const cx=iw<=W ? iw/2 : Math.min(iw-W/2,Math.max(W/2,zoomFx*iw));
+    const cy=ih<=H ? ih/2 : Math.min(ih-H/2,Math.max(H/2,zoomFy*ih));
+    im.style.left=(W/2-cx)+'px'; im.style.top=(H/2-cy)+'px';
+  }
+}
+// 共通の表示中心を、最初の写真で見える範囲に収める（端で引っかからないように）
+function cmpRef(){
+  const pane=$('cmp').querySelector('.pane'), im=pane && pane.querySelector('img');
+  return (im && im.naturalWidth) ? {W:pane.clientWidth,H:pane.clientHeight,iw:im.offsetWidth,ih:im.offsetHeight} : null;
+}
+function cmpMove(fx,fy){
+  const r=cmpRef(); if(!r) return;
+  const cl=(v,half)=>half>=.5 ? .5 : Math.min(1-half,Math.max(half,v));
+  zoomFx=cl(fx,r.W/2/r.iw); zoomFy=cl(fy,r.H/2/r.ih);
+  placePanes();
+}
+let cdrag=null;
+$('cmp').addEventListener('pointerdown',e=>{
+  const r=cmpRef();
+  cdrag={x:e.clientX,y:e.clientY,fx:zoomFx,fy:zoomFy,moved:false,iw:r?r.iw:1,ih:r?r.ih:1,pane:e.target.closest('.pane')};
+  $('cmp').setPointerCapture(e.pointerId); $('cmp').classList.add('drag');
+});
+$('cmp').addEventListener('pointermove',e=>{
+  if(!cdrag) return;
+  const dx=e.clientX-cdrag.x, dy=e.clientY-cdrag.y;
+  if(Math.abs(dx)+Math.abs(dy)>4) cdrag.moved=true;
+  cmpMove(cdrag.fx-dx/cdrag.iw, cdrag.fy-dy/cdrag.ih);
+});
+$('cmp').addEventListener('pointerup',()=>{
+  const d=cdrag; cdrag=null; $('cmp').classList.remove('drag');
+  if(d && !d.moved && d.pane){ const i=+d.pane.dataset.i; if(i!==idx) jump(i); }   // クリックした写真を選択
+});
+$('cmp').addEventListener('pointercancel',()=>{ cdrag=null; $('cmp').classList.remove('drag'); });
+$('cmp').addEventListener('wheel',e=>{   // トラックパッドのスクロールでも一緒に移動
+  e.preventDefault();
+  const r=cmpRef(); if(!r) return;
+  cmpMove(zoomFx+e.deltaX/r.iw, zoomFy+e.deltaY/r.ih);
+},{passive:false});
+
+/* ----- 連写の操作 ----- */
+// Shift + Space: この1枚だけ残し、同じ連写のほかは外す（組の中にとどまる）
+function onlyKeep(){
+  const cur=groups[idx]; if(!cur) return;
+  const mem=burstMembers.get(cur.burst) || [cur];
+  const items=mem.map(g=>({g,prev:g.dropped}));
+  for(const g of mem) g.dropped=(g!==cur);
+  render(); saveSoon();
+  showNote(cur.stem+' だけ残しました（連写 '+mem.length+'枚中 '+(mem.length-1)+'枚を外す）', false, items, cur);
+}
+// Tab / Shift + Tab: 次 / 前の連写の先頭へ
+function nextBurst(dir){
+  const cur=groups[idx]; if(!cur) return;
+  if(dir>0){
+    for(let j=idx+1;j<groups.length;j++) if(groups[j].burst!==cur.burst && match(groups[j])) return jump(j);
+    return;
+  }
+  let j=idx-1;
+  while(j>=0 && (groups[j].burst===cur.burst || !match(groups[j]))) j--;
+  if(j<0) return;
+  const b=groups[j].burst;
+  let first=j;
+  for(let k=j-1;k>=0 && groups[k].burst===b;k--) if(match(groups[k])) first=k;
+  jump(first);
 }
 function setGrid(n){
   if(n>1) hideNote();
-  n=Math.min(12,Math.max(1,n|0));
+  n=Math.min(BURST,Math.max(1,n|0));
+  if(n===1 && cmpOn){ cmpOn=false; clearCmp(); }
   gridN=n; if(n>1) lastGridN=n;
   const st=loadState(); st.prefs=Object.assign(st.prefs||{},{gridN,lastGridN}); saveState(st);
   render();
@@ -997,14 +1207,16 @@ $('nextBtn').onclick=()=>step(1);
 document.querySelectorAll('#viewSeg button').forEach(b=>b.onclick=()=>setView(b.dataset.v));
 $('toCopyBtn').onclick=()=>{ hideNote(); openCopy(); };
 $('hidBtn').onclick=toggleAlready;
-$('closeBtn').onclick=()=>{ hideNote(); stopBg(); clearCache(); clearThumbs(); show('s-open'); updDestUI(); };
+$('closeBtn').onclick=()=>{ hideNote(); stopBg(); cmpOn=false; clearCmp(); clearCache(); clearThumbs(); show('s-open'); updDestUI(); };
 
 document.addEventListener('keydown',e=>{
   if(!$('s-cull').classList.contains('on')) return;
   if(e.metaKey||e.ctrlKey||e.altKey) return;
   const k=e.key;
   if(e.target && e.target.id==='gridN') e.target.blur();
-  if(k===' '||k==='x'||k==='X'||(k==='ArrowDown'&&gridN===1)){ e.preventDefault(); if(!e.repeat) toggle(); }
+  if(k===' ' && e.shiftKey){ e.preventDefault(); if(!e.repeat) onlyKeep(); }
+  else if(k==='Tab'){ e.preventDefault(); nextBurst(e.shiftKey?-1:1); }
+  else if(k===' '||k==='x'||k==='X'||(k==='ArrowDown'&&gridN===1)){ e.preventDefault(); if(!e.repeat) toggle(); }
   else if(k==='ArrowRight'){ e.preventDefault(); step(1); }
   else if(k==='ArrowLeft'){ e.preventDefault(); step(-1); }
   else if(k==='ArrowDown'){ e.preventDefault(); moveBy(gridCols); }
@@ -1013,6 +1225,8 @@ document.addEventListener('keydown',e=>{
   else if(k==='+'||k==='='){ e.preventDefault(); setGrid(gridN+1); }
   else if(k==='-'){ e.preventDefault(); setGrid(gridN-1); }
   else if((k==='z'||k==='Z') && gridN===1){ e.preventDefault(); setZoom(!zoomed); }
+  else if(k==='z'||k==='Z'){ e.preventDefault(); setCompare(!cmpOn); }
+  else if(k==='Escape' && cmpOn){ e.preventDefault(); setCompare(false); }
   else if(k==='Escape' && zoomed){ e.preventDefault(); setZoom(false); }
   else if(k==='Backspace' && noteAct){ e.preventDefault(); undoNote(); }
   else if(k==='Home'){ e.preventDefault(); jump(findFrom(0,1)); }
@@ -1070,6 +1284,7 @@ async function checkAlready(list){
 function applyFilter(keepKey){
   const cur=keepKey ? allGroups.find(g=>g.key===keepKey) : null;
   groups=allGroups.filter(g=>showAlready || !g.already);
+  buildBursts();
   let j=cur ? groups.indexOf(cur) : -1;
   if(j<0 && cur){ j=groups.findIndex(g=>g.time>=cur.time); if(j<0) j=groups.length-1; }
   idx=Math.max(0,j);
