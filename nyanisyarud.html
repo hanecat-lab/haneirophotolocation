@@ -5675,7 +5675,9 @@ Object.assign(SLIDE,{bumps:{small:{at:[40,88,136,184,232,280,328,376,424,472],h:
   // 門を道より下げる量(m)：踏み切りの手前のカメラ枠に JUMP の文字が入るように。カメラが門の面の前後 gateHide m を通る間は門を隠す(梁や看板をカメラが突き抜けて見えないように)
   gateDrop:{takeoff:3,landing:0},
   // 螺旋のバンク(すべり猫以外)：半径 r m のカーブを kmh km/h で曲がれる強さにする。lead：先読みに効かせ始める坂の終わりの手前の距離(m)
-  bank:{kmh:300,r:30,lead:150},gateHide:[3,1.5],
+  bank:{kmh:300,r:30,lead:150},
+  // 螺旋の見た目の傾き(度)。外側を高く、内側を低く。ramp：前後でなめらかに傾ける長さ(m)、maxLat：傾ける横の範囲(m)
+  bankLook:{angle:22,ramp:30,maxLat:7},gateHide:[3,1.5],
   // 大ジャンプのカメラ：踏み切りの pre m 手前から踏み切りまでになめらかに、上へ up m・後ろへ back m 引く(飛ぶ間はそのまま、着地の先 after m で戻す)
   jumpCam:{pre:35,up:3,back:4,after:30},
   // 大ジャンプのランク：踏み切りの速さ(km/h)でもランクを決め、押したタイミングのランクと比べて低い方にする(SS・S・A の下限。それ未満は B)
@@ -5753,6 +5755,22 @@ function slideGoalFinale(splash=true){const F=SLIDE.finale,cat=catRoot.position.
 // 大ジャンプの門の GLB を読み込む(コースを作るたびに読み込む。2回目からはブラウザのキャッシュ)。glow のマテリアルは夜の暗さを掛けない
 function loadSlideGate(kind){return import('three/addons/loaders/GLTFLoader.js').then(({GLTFLoader})=>new GLTFLoader().loadAsync(SLIDE.gates[kind])).then(g=>{
   g.scene.traverse(o=>{if(!o.isMesh)return;o.castShadow=false;if(o.material?.name==='glow')o.material.userData.glow=true;});g.scene.name='slideGate_'+kind;return g.scene;});}
+// 螺旋の見た目の傾き(SLIDE.bankLook)：坂の後のコーナーから螺旋の終わりまで、外側を高く・内側を低く angle 度傾ける(前後 ramp m でなめらかに)。
+// 頂点ごとに一番近い道の点(高さの差 3m 以内)を探し、道の中心からの横の位置に合わせて高さを足す。横 maxLat m より外(景色)は動かさない
+function slideBankMeshes(objs){const L=SLIDE.bankLook,r=slideRun?.pinballRange,sp=TRACKS[currentKey]?.slide?.spiralRange;if(!r||!sp||!L.angle)return;
+  const from=r[1]-L.ramp,to=sp[1]+L.ramp,tan=Math.tan(THREE.MathUtils.degToRad(L.angle)),inner=Math.sign(roadBendAt((sp[0]+sp[1])/2))||1,grid=new Map(),cell=6,samples=[];
+  for(let d=Math.max(0,from);d<=Math.min(totalLength,to);d+=1){const tr=getTrackAtDist(d),n=new THREE.Vector3(tr.n.x,0,tr.n.z).normalize();
+    const w=Math.min(THREE.MathUtils.smoothstep(d,r[1]-L.ramp,r[1]),1-THREE.MathUtils.smoothstep(d,sp[1],sp[1]+L.ramp));if(w<=0)continue;
+    const q={d,p:tr.p.clone(),n,k:-inner*tan*w};samples.push(q);const key=Math.floor(q.p.x/cell)+','+Math.floor(q.p.z/cell);(grid.get(key)||grid.set(key,[]).get(key)).push(q);}
+  const near=v=>{const cx=Math.floor(v.x/cell),cz=Math.floor(v.z/cell);let best=null,bd=Infinity;for(let i=-1;i<=1;i++)for(let j=-1;j<=1;j++)for(const q of grid.get((cx+i)+','+(cz+j))||[]){if(Math.abs(q.p.y-v.y)>3)continue;const dd=(q.p.x-v.x)**2+(q.p.z-v.z)**2;if(dd<bd){bd=dd;best=q;}}return best;};
+  const v=new THREE.Vector3(),m4=new THREE.Matrix4(),inv=new THREE.Matrix4();
+  for(const obj of objs)obj?.traverse(o=>{const pos=o.geometry?.attributes?.position;if(!pos)return;o.updateMatrixWorld(true);
+    if(o.isInstancedMesh){let ch=false;for(let i=0;i<o.count;i++){o.getMatrixAt(i,m4);v.setFromMatrixPosition(m4).applyMatrix4(o.matrixWorld);const q=near(v);if(!q)continue;const lat=(v.x-q.p.x)*q.n.x+(v.z-q.p.z)*q.n.z;if(Math.abs(lat)>L.maxLat)continue;
+      m4.elements[13]+=lat*q.k;o.setMatrixAt(i,m4);ch=true;}if(ch)o.instanceMatrix.needsUpdate=true;return;}
+    inv.copy(o.matrixWorld).invert();let ch=false;
+    for(let i=0;i<pos.count;i++){v.fromBufferAttribute(pos,i).applyMatrix4(o.matrixWorld);const q=near(v);if(!q)continue;const lat=(v.x-q.p.x)*q.n.x+(v.z-q.p.z)*q.n.z;if(Math.abs(lat)>L.maxLat)continue;
+      v.y+=lat*q.k;v.applyMatrix4(inv);pos.setXYZ(i,v.x,v.y,v.z);ch=true;}
+    if(ch){pos.needsUpdate=true;o.geometry.computeBoundingSphere();if(o.isMesh&&o.geometry.attributes.normal)o.geometry.computeVertexNormals();}});}
 // 毎コマ：夜の灯りの色を流す(道の距離と時刻で色相を変える)。アニメーションOFFでは流さない
 function updateSlideFlow(dt){const W=slideRun?.flow;if(!W)return;const F=SLIDE.finale.flow,m4=new THREE.Matrix4(),q=new THREE.Quaternion(),one=new THREE.Vector3(1,1,1),up=new THREE.Vector3(0,1,0),from=slideRun.poolFrom,len=totalLength-from;
   W.list.forEach((o,i)=>{if(appAnimationsEnabled)o.d+=F.speed*dt;if(o.d>totalLength)o.d-=len;const tr=getTrackAtDist(o.d),pos=tr.p.clone().addScaledVector(tr.n,o.l).setY(tr.p.y+ROAD_Y+.07);q.setFromAxisAngle(up,Math.atan2(tr.t.x,tr.t.z));W.mesh.setMatrixAt(i,m4.compose(pos,q,one));});W.mesh.instanceMatrix.needsUpdate=true;}
@@ -9958,7 +9976,9 @@ function rebuildTrack(key){
   portBoxes=null;if(def.portBoxes)roadMesh.add(buildPortBoxes(def));
   if(!def.harbor&&!def.oni&&!def.hyakken&&!def.slide)roadMesh.add(buildRoadsideBanks(def));
   // 大すべり台：滑り台の壁と仕掛け。大ジャンプの区間は道(と路肩)を途切れさせ、中央の線も消す
-  slideRun=null;if(def.slide){const pre=[...roadMesh.children];roadMesh.add(buildSlideWalls(def));const g=slideRun.bridgeRun.bridge;collapseRoadGap([roadMesh,...pre],g.from,g.to);hideCenterLine(g.from,g.to);roadMesh.add(buildSlideScenery(def));}
+  slideRun=null;if(def.slide){const pre=[...roadMesh.children];roadMesh.add(buildSlideWalls(def));const g=slideRun.bridgeRun.bridge;collapseRoadGap([roadMesh,...pre],g.from,g.to);hideCenterLine(g.from,g.to);roadMesh.add(buildSlideScenery(def));
+    // 螺旋の見た目の傾き：道・路肩・壁・灯り・中央の線を傾け、猫が乗る道の面(高さと向き)も作り直す
+    slideBankMeshes([roadMesh,centerLine]);cacheRoadSurface(roadGeo);}
   if(def.city){roadMesh.add(buildCityStructures(def));buildCityScenery(def);}
   if(def.harbor)buildHarborScenery(def);
 
