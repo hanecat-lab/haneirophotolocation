@@ -78,6 +78,8 @@
     height: 54px; border-radius: 16px; display: flex; align-items: center; gap: 12px; padding: 0 10px 0 12px;
   }
   #fname { font-weight: 600; font-size: 1rem; letter-spacing: .02em; }
+  #fblock { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; }
+  #exif { font-size: .72rem; color: var(--text2); white-space: nowrap; font-variant-numeric: tabular-nums; min-height: 1em; }
   #badges { display: flex; gap: 6px; }
   .badge { font-size: .68rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--glass-b); color: var(--text2); }
   .badge.jpg { border-color: rgba(92,225,255,.5); color: var(--accent); }
@@ -232,7 +234,7 @@
 
   <div id="topbar" class="glass">
     <button id="closeBtn" class="small" title="別のカードを開く">‹ カード</button>
-    <span id="fname"></span>
+    <span id="fblock"><span id="fname"></span><span id="exif"></span></span>
     <span id="badges"></span>
     <span id="ftime"></span>
     <span class="spacer"></span>
@@ -544,6 +546,7 @@ function render(){
   const g=groups[idx];
   if(!g) return;
   $('fname').textContent=g.stem;
+  showExif(g);
   $('badges').innerHTML=g.files.map(f=>'<span class="badge '+(JPG_EXT.has(f.ext)?'jpg':'raw')+'">'+esc(f.ext.toUpperCase())+'</span>').join('');
   $('ftime').textContent=fmtTime(g.time);
   if(view==='all') $('counter').textContent=(idx+1)+' / '+groups.length;
@@ -647,6 +650,70 @@ $('photo').onerror=()=>{
   $('noimg').style.display='flex';
   $('noimg').textContent='読み込めませんでした（カードが外れていませんか？）';
 };
+/* ----- 撮影情報（シャッター速度・絞り・ISO・焦点距離・露出補正） -----
+   JPEG（なければ RAW）の先頭 128KB だけを読み、EXIF から取り出す。 */
+async function readExif(file){
+  const buf=await file.slice(0,131072).arrayBuffer();
+  const dv=new DataView(buf), L=dv.byteLength;
+  let tiff=-1;
+  if(L>4 && dv.getUint16(0)===0xFFD8){          // JPEG: APP1 "Exif" を探す
+    let p=2;
+    while(p+10<=L){
+      const m=dv.getUint16(p);
+      if((m&0xFF00)!==0xFF00 || m===0xFFDA) break;
+      if(m===0xFFE1 && dv.getUint32(p+4)===0x45786966){ tiff=p+10; break; }
+      p+=2+dv.getUint16(p+2);
+    }
+  }else tiff=0;                                  // NEF などは TIFF 形式
+  if(tiff<0 || tiff+8>L) return null;
+  const le=dv.getUint16(tiff)===0x4949;
+  const ok=(o,n)=>tiff+o+n<=L;
+  const u16=o=>dv.getUint16(tiff+o,le), u32=o=>dv.getUint32(tiff+o,le), s32=o=>dv.getInt32(tiff+o,le);
+  if(u16(2)!==42) return null;
+  const ifd=off=>{
+    const out={};
+    if(!ok(off,2)) return out;
+    const n=u16(off);
+    for(let i=0;i<n;i++){ const e=off+2+i*12; if(!ok(e,12)) break; out[u16(e)]={type:u16(e+2),cnt:u32(e+4),vo:e+8}; }
+    return out;
+  };
+  const val=en=>{
+    if(!en) return null;
+    const size={3:2,4:4,5:8,10:8}[en.type];
+    if(!size) return null;
+    const off=size*en.cnt>4 ? u32(en.vo) : en.vo;
+    if(!ok(off,size)) return null;
+    if(en.type===3) return u16(off);
+    if(en.type===4) return u32(off);
+    if(en.type===5){ const d=u32(off+4); return d ? u32(off)/d : null; }
+    const d=s32(off+4); return d ? s32(off)/d : null;
+  };
+  const ep=val(ifd(u32(4))[0x8769]);   // Exif IFD への位置
+  if(!ep) return null;
+  const ex=ifd(ep);
+  return { t:val(ex[0x829A]), f:val(ex[0x829D]), iso:val(ex[0x8827]), fl:val(ex[0x920A]), ev:val(ex[0x9204]) };
+}
+function fmtExif(x){
+  if(!x) return '';
+  const a=[];
+  if(x.t) a.push(x.t>=0.3 ? (Math.round(x.t*10)/10)+'秒' : '1/'+Math.round(1/x.t));
+  if(x.f) a.push('f/'+(x.f<10 ? (Math.round(x.f*10)/10) : Math.round(x.f)));
+  if(x.iso) a.push('ISO '+x.iso);
+  if(x.fl) a.push(Math.round(x.fl)+'mm');
+  if(x.ev && Math.abs(x.ev)>=0.05) a.push((x.ev>0?'+':'')+(Math.round(x.ev*10)/10)+'EV');
+  return a.join('　');
+}
+function showExif(g){
+  $('exif').textContent=g.exif ? fmtExif(g.exif) : '';
+  if(g.exif!==undefined || g.exifBusy) return;
+  const f=g.jpg || g.files[0];
+  g.exifBusy=true;
+  readExif(f.file).catch(()=>null).then(x=>{
+    g.exif=x; g.exifBusy=false;
+    if(groups[idx]===g) $('exif').textContent=fmtExif(x);
+  });
+}
+
 function step(dir){
   const j=findFrom(idx+dir,dir);
   if(j>=0){ idx=j; render(); saveSoon(); }
