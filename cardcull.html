@@ -753,6 +753,23 @@
   }
   #stage { top: 92px !important; } :root { --photo-top: 92px !important; }
 
+
+.cell.inRange{ outline:2px solid rgba(92,225,255,.9); outline-offset:-2px; background:rgba(92,225,255,.12); }
+.cell.rangeAnchor{ outline:3px solid #5ce1ff; outline-offset:-3px; box-shadow:0 0 0 2px rgba(92,225,255,.4); }
+#rangeInd{ position:fixed; left:50%; bottom:92px; transform:translateX(-50%); background:rgba(20,20,28,.92); color:#fff; padding:8px 10px 8px 14px; border-radius:24px; font-size:.78rem; display:none; z-index:60; border:1px solid rgba(92,225,255,.3); backdrop-filter:blur(12px); align-items:center; gap:10px; box-shadow:0 8px 24px rgba(0,0,0,.35); }
+#rangeInd.on{ display:flex; }
+#rangeIndText{ white-space:nowrap; }
+#rangeIndActions{ display:flex; gap:6px; align-items:center; }
+.rangeBtn{ border:0; border-radius:14px; padding:5px 12px; font-size:.75rem; cursor:pointer; font-weight:600; transition:transform .12s, opacity .12s; }
+.rangeBtn:active{ transform:scale(.96); }
+#rangeCancelBtn{ background:#ff5a5a; color:#fff; }
+#rangeCancelBtn:hover{ background:#ff3b3b; }
+#rangeCloseBtn{ background:rgba(255,255,255,.12); color:#fff; padding:5px 12px; }
+#rangeCloseBtn:hover{ background:rgba(255,255,255,.2); }
+#singleCancelBtn{ position:fixed; right:16px; bottom:92px; background:rgba(20,20,28,.92); color:#fff; border:1px solid rgba(255,255,255,.18); border-radius:20px; padding:7px 12px; font-size:.76rem; display:none; z-index:60; backdrop-filter:blur(8px); cursor:pointer; box-shadow:0 8px 24px rgba(0,0,0,.25); }
+#singleCancelBtn.on{ display:flex; align-items:center; gap:6px; }
+.dateChips button.inRange{ background:rgba(92,225,255,.18); }
+
 </style>
 </head>
 <body>
@@ -919,7 +936,7 @@
 <div id="note" class="glass"><span class="dot"></span><span id="noteMsg"></span><button id="noteUndo" class="small">取り消す<span class="key">⌫</span></button></div>
 <div id="blockCard" class="glass pop"></div>
 <div id="markPop" class="glass" role="dialog" aria-label="区切りの開始"></div>
-<div id="timeJumpPop" class="glass" role="dialog" aria-label="時間で移動"></div>
+<div id="rangeInd"><span id="rangeIndText"></span><div id="rangeIndActions"><button id="rangeCancelBtn" class="rangeBtn" title="範囲内の選択を全て未確認に戻す (Shift+U)">選択を解除</button><button id="rangeCloseBtn" class="rangeBtn" title="範囲選択を閉じる (Esc)">選択範囲を解除</button></div></div><button id="singleCancelBtn" title="この1枚の選択を解除 (U / Esc)"><span>↩ 選択を解除</span></button><div id="timeJumpPop" class="glass" role="dialog" aria-label="時間で移動"></div>
 <div id="doneCard" class="glass pop" role="dialog" aria-label="選別完了"></div>
 <div id="toast" class="glass"><span id="toastMsg"></span><button id="toastAct" class="small" style="display:none"></button></div>
 
@@ -1086,6 +1103,11 @@ let blocks=[], blockShown=new Set(), lastBlockG=null, scope=null;
 let prevUnrev=null, lastDoneAt=0, doneOpen=false, completedBursts=new Set();
 let showAlready=false; // コピー済みの写真も表示するか
 let idx=0;
+let rangeAnchor=null;
+let rangeAction=null;
+let isShiftDown=false;
+let isDraggingRange=false;
+let dragLastIdx=-1;
 let view='all';        // 表示: all / kept（残すだけ）/ dropped（外すだけ）
 let pickMode='drop';   // 選び方: drop（すべて残した状態から外す）/ keep（すべて外した状態から残す）
 const prefs=loadState().prefs||{};
@@ -1103,6 +1125,41 @@ const DECISION_LABEL={unreviewed:'未確認',hold:'保留',keep:'採用',drop:'�
 function setDecision(g,value){
   g.decision=value;
   g.dropped=value==='drop' || (value==='unreviewed' && pickMode==='keep');
+}
+function cancelDecisionAt(i){
+  const g=groups[i]; if(!g) return 0;
+  if(decision(g)==='unreviewed') return 0;
+  const it=snapshot(g);
+  setDecision(g,'unreviewed');
+  // 単枚解除でもアンカーが同じ位置なら範囲も解除
+  if(rangeAnchor===i) clearRange();
+  decideAndFlip(i,'unreviewed');
+  showNote((g.stem||'')+' の選択を解除しました',false,[it],g,1200);
+  return 1;
+}
+function cancelRangeDecisions(){
+  if(rangeAnchor===null) return cancelDecisionAt(idx);
+  const indices=getRangeIndices(rangeAnchor, idx);
+  if(!indices.length) return 0;
+  const snaps=[];
+  let changed=0;
+  indices.forEach(i=>{
+    const g=groups[i];
+    if(decision(g)!=='unreviewed'){
+      snaps.push(snapshot(g));
+      setDecision(g,'unreviewed');
+      changed++;
+    }
+  });
+  if(changed){
+    pushHistory(snaps, 'unreviewed', rangeAnchor, idx);
+  }
+  // 選択を解除したらアンカーも解除
+  clearRange();
+  render(); saveSoon();
+  if(changed) toast(changed+'枚の選択を解除しました');
+  updateRangeUI();
+  return changed;
 }
 function snapshot(g){ return {g,prev:g.dropped,decision:decision(g)}; }
 function restoreItem(it){
@@ -2341,10 +2398,21 @@ function confirmLeaving(){
   if(gridN===1 && g && g.seen && decision(g)==='unreviewed') setDecision(g,pickMode==='drop'?'keep':'drop');
 }
 function step(dir){
+  const prev=idx;
   const j=findFrom(idx+dir,dir);
   confirmLeaving();
   if(j>=0) idx=j;
-  afterDecision();
+  if(isShiftDown && rangeAnchor===null){
+    rangeAnchor=prev;
+    rangeAction=decision(groups[prev])|| (pickMode==='drop'?'drop':'keep');
+  }
+  if(rangeAnchor!==null){
+    // 範囲選択中は移動先まで適用（Shiftありでもなしでも続く）
+    if(rangeAction) applyRange(rangeAnchor, idx, rangeAction);
+    render(); saveSoon(); updateRangeUI();
+  }else{
+    afterDecision();
+  }
 }
 function jump(j){ if(j>=0 && j<groups.length){ idx=j; render(); saveSoon(); } }
 function afterDecision(){
@@ -2355,6 +2423,109 @@ function afterDecision(){
   }
   render(); saveSoon();
 }
+// ===== 範囲選択 =====
+function setRangeAnchor(i){
+  if(i<0||i>=groups.length) return;
+  rangeAnchor=i;
+  rangeAction=decision(groups[i]);
+  // アンカーが未判定なら現在のpickModeを採用
+  if(!rangeAction || rangeAction==='unreviewed') rangeAction = (pickMode==='drop'?'drop':'keep');
+  updateRangeUI();
+}
+function clearRange(){
+  if(rangeAnchor!==null){
+    rangeAnchor=null;
+    rangeAction=null;
+    updateRangeUI();
+  }
+}
+function getRangeIndices(from, to){
+  const list=visibleList();
+  const fromPos=list.indexOf(from);
+  const toPos=list.indexOf(to);
+  if(fromPos<0 || toPos<0){
+    // visibleListに含まれない場合は groups のインデックスで直接範囲
+    const lo=Math.min(from,to), hi=Math.max(from,to);
+    const out=[];
+    for(let i=lo;i<=hi;i++) if(match(groups[i])) out.push(i);
+    return out;
+  }
+  const lo=Math.min(fromPos,toPos), hi=Math.max(fromPos,toPos);
+  return list.slice(lo, hi+1);
+}
+function applyRange(from, to, action){
+  if(from==null||to==null) return 0;
+  const indices=getRangeIndices(from,to);
+  if(!indices.length) return 0;
+  const snaps=[];
+  let changed=0;
+  indices.forEach(i=>{
+    const g=groups[i];
+    if(!g) return;
+    if(decision(g)!==action){
+      snaps.push(snapshot(g));
+      setDecision(g, action);
+      changed++;
+    }
+  });
+  if(changed){
+    // まとめて履歴に積む
+    pushHistory(snaps, action, from, to);
+    render();
+    saveSoon();
+    toast(changed+'枚を'+(action==='drop'?'外しました':action==='keep'?'残しました':'保留にしました'));
+  }
+  return changed;
+}
+let _rangeHistory = [];
+function pushHistory(snaps, action, from, to){
+  // 既存の履歴機構に合わせて snapshot を使う
+  if(snaps.length){
+    noteAct={type:'range', snaps:snaps, action:action, from:from, to:to};
+  }
+}
+function updateRangeUI(){
+  // グリッドのセルに .inRange を付与
+  document.querySelectorAll('.cell').forEach(cell=>{
+    const i=+cell.dataset.i;
+    cell.classList.remove('inRange','rangeAnchor');
+    if(rangeAnchor!==null){
+      const list=getRangeIndices(rangeAnchor, idx);
+      if(list.includes(i)) cell.classList.add('inRange');
+      if(i===rangeAnchor) cell.classList.add('rangeAnchor');
+    }
+  });
+  // インジケーターとボタン
+  const ind=$('rangeInd');
+  const indText=$('rangeIndText');
+  const singleBtn=$('singleCancelBtn');
+  if(ind && indText){
+    if(rangeAnchor!==null && rangeAnchor!==idx){
+      const cnt=getRangeIndices(rangeAnchor, idx).length;
+      const decidedCnt=getRangeIndices(rangeAnchor, idx).filter(i=>decision(groups[i])!=='unreviewed').length;
+      indText.textContent='範囲選択中: '+cnt+'枚中'+decidedCnt+'枚を選択中';
+      ind.classList.add('on');
+      if(singleBtn) singleBtn.classList.remove('on');
+    }else if(rangeAnchor!==null){
+      indText.textContent='アンカー: '+(rangeAnchor+1)+'枚目  矢印で広げる';
+      ind.classList.add('on');
+      if(singleBtn) singleBtn.classList.remove('on');
+    }else{
+      ind.classList.remove('on');
+      // 単枚選択中なら単枚解除ボタンを出す
+      const g=groups[idx];
+      if(g && decision(g)!=='unreviewed'){
+        if(singleBtn){
+          singleBtn.classList.add('on');
+          singleBtn.querySelector('span').textContent='↩ '+ (decision(g)==='drop'?'外す':'残す') +' を解除';
+        }
+      }else{
+        if(singleBtn) singleBtn.classList.remove('on');
+      }
+    }
+  }
+}
+
 /* ===== F. ペースと残り時間 ===== */
 function noteSeen(list){
   let n=0;
@@ -2603,10 +2774,14 @@ function toggle(){
   const g=groups[idx]; if(!g) return;
   const it=snapshot(g), from=idx;
   const target=pickMode==='drop'?'drop':'keep';
-  setDecision(g,decision(g)===target ? (target==='drop'?'keep':'drop') : target);
+  const newDec=decision(g)===target ? (target==='drop'?'keep':'drop') : target;
+  setDecision(g,newDec);
+  // 単発選択を邪魔しないよう自動アンカーは張らない（Aキー / Shift+操作のみで範囲開始）
+  if(rangeAnchor!==null) rangeAction=newDec;
   if(view==='all' && decision(g)===target){ const j=findFrom(idx+1,1); if(j>=0) idx=j; }
   decideAndFlip(from,decision(g));
-  if(idx!==from && gridN===1) showNote(g.stem+' を'+(g.dropped?'外しました':'残しました'),g.dropped,[it],g,1000);   // 次の写真へ切り替わった後の通知は1秒
+  if(idx!==from && gridN===1) showNote(g.stem+' を'+(g.dropped?'外しました':'残しました'),g.dropped,[it],g,1000);
+  if(rangeAnchor!==null) updateRangeUI();
 }
 function holdCurrent(){
   const g=groups[idx]; if(!g) return;
@@ -2658,6 +2833,9 @@ function undoNote(){
   if(j>=0){ if(!match(a.back)) view='all'; jump(j); } else { render(); saveSoon(); }
 }
 $('noteUndo').onclick=undoNote;
+$('rangeCancelBtn')?.addEventListener('click',e=>{ e.stopPropagation(); cancelRangeDecisions(); });
+$('rangeCloseBtn')?.addEventListener('click',e=>{ e.stopPropagation(); clearRange(); toast('範囲選択を解除しました'); });
+$('singleCancelBtn')?.addEventListener('click',e=>{ e.stopPropagation(); cancelDecisionAt(idx); render(); saveSoon(); updateRangeUI(); });
 $('note').addEventListener('mouseenter',()=>{ noteHover=true; clearTimeout(noteTimer); });
 $('note').addEventListener('mouseleave',()=>{ noteHover=false; if(noteAct) armNote(); });
 function setView(v){
@@ -2965,17 +3143,84 @@ function setGrid(n){
 function moveBy(d){
   const list=visibleList(), pos=list.indexOf(idx);
   if(pos<0) return;
+  const prev=idx;
   const np=Math.max(0,Math.min(list.length-1,pos+d));
-  if(np!==pos) jump(list[np]);
+  if(np!==pos){
+    const target=list[np];
+    if(isShiftDown && rangeAnchor===null){
+      rangeAnchor=prev;
+      rangeAction=decision(groups[prev])|| (pickMode==='drop'?'drop':'keep');
+    }
+    if(rangeAnchor!==null){
+      idx=target;
+      if(rangeAction) applyRange(rangeAnchor, idx, rangeAction);
+      render(); saveSoon(); updateRangeUI();
+    }else{
+      jump(target);
+    }
+  }
 }
 let lastClick={i:-1,t:0};
 $('grid').addEventListener('click',e=>{
   if(e.target.closest('.burst-pick')) return;
   const cell=e.target.closest('.cell'); if(!cell) return;
   const i=+cell.dataset.i, now=Date.now();
-  if(i===lastClick.i && now-lastClick.t<400){ lastClick={i:-1,t:0}; idx=i; setGrid(1); return; }   // ダブルクリックで1枚表示
+  if(e.shiftKey && rangeAnchor!==null){
+    // Shift+クリックで範囲選択
+    e.preventDefault();
+    const action = rangeAction || decision(groups[rangeAnchor]) || (pickMode==='drop'?'drop':'keep');
+    applyRange(rangeAnchor, i, action);
+    idx=i;
+    render();
+    updateRangeUI();
+    return;
+  }
+  if(i===lastClick.i && now-lastClick.t<400){ lastClick={i:-1,t:0}; idx=i; setGrid(1); return; }
   lastClick={i,t:now};
-  if(i!==idx) jump(i);
+  if(e.shiftKey && rangeAnchor===null){
+    // 最初のShift+クリックはアンカー設定
+    setRangeAnchor(idx);
+    const action = rangeAction || (pickMode==='drop'?'drop':'keep');
+    applyRange(rangeAnchor, i, action);
+    idx=i;
+    render(); updateRangeUI();
+    return;
+  }
+  if(i!==idx){
+    jump(i);
+    // 通常クリックでアンカーを更新（Shiftなし）
+    if(!e.shiftKey) setRangeAnchor(i);
+    else updateRangeUI();
+  }
+});
+// ドラッグで範囲選択（グリッド表示時）
+$('grid').addEventListener('mousedown',e=>{
+  const cell=e.target.closest('.cell'); if(!cell) return;
+  if(e.button!==0) return;
+  const i=+cell.dataset.i;
+  if(gridN>1 || e.shiftKey){
+    isDraggingRange=true;
+    dragLastIdx=i;
+    if(rangeAnchor===null) setRangeAnchor(i);
+    e.preventDefault();
+  }
+});
+$('grid').addEventListener('mousemove',e=>{
+  if(!isDraggingRange) return;
+  const cell=e.target.closest('.cell'); if(!cell) return;
+  const i=+cell.dataset.i;
+  if(i===dragLastIdx) return;
+  dragLastIdx=i;
+  const action = rangeAction || decision(groups[rangeAnchor]) || (pickMode==='drop'?'drop':'keep');
+  applyRange(rangeAnchor, i, action);
+  idx=i;
+  render(); updateRangeUI();
+});
+document.addEventListener('mouseup',e=>{
+  if(isDraggingRange){
+    isDraggingRange=false;
+    dragLastIdx=-1;
+  }
 });
 $('grid').addEventListener('change',e=>{
   const box=e.target.closest('input[data-pick]'); if(!box) return;
@@ -3008,9 +3253,13 @@ $('toCopyBtn').onclick=()=>{ hideNote(); openCopy(); };
 $('hidBtn').onclick=toggleAlready;
 $('closeBtn').onclick=async()=>{ saveSoon(); hideNote(); cancelPreparation(); await stopBg(); cmpOn=false; try{ clearCmp(); }catch(e){} clearCache(); clearThumbs(); show('s-open'); updDestUI(); };
 
+let _shiftWasDown=false;
 document.addEventListener('keydown',e=>{
+  if(e.key==='Shift') isShiftDown=true;
   if(!$('s-cull').classList.contains('on')) return;
-  if(e.metaKey||e.ctrlKey||e.altKey) return;
+  if(e.metaKey||e.ctrlKey||e.altKey){
+    if(e.key!=='Shift') return;
+  }
   const k=e.key;
   if(e.target && ['seek','includeHeld','includeUnreviewed'].includes(e.target.id)) return;
   if($('markPop').classList.contains('on')){
@@ -3026,6 +3275,16 @@ document.addEventListener('keydown',e=>{
   if((k==='f'||k==='F') && !e.target?.closest('input,textarea,select,[contenteditable=true]')){ e.preventDefault(); if(!e.repeat) void toggleFullscreen(); }
   else if(k===' ' && e.shiftKey){ e.preventDefault(); if(!e.repeat) onlyKeep(); }
   else if(k==='h'||k==='H'){ e.preventDefault(); if(!e.repeat) holdCurrent(); }
+  else if(k==='a'||k==='A'){ e.preventDefault(); if(rangeAnchor===null){ setRangeAnchor(idx); toast('範囲選択開始: '+ (idx+1) +'枚目をアンカーにしました。矢印で範囲を広げられます'); }else{ clearRange(); toast('範囲選択を解除'); } }
+  else if(k==='u'||k==='U'||k==='c'||k==='C'){ e.preventDefault(); 
+    if(isShiftDown || (rangeAnchor!==null && rangeAnchor!==idx)){
+      // Shift+U または範囲選択中は範囲をキャンセル
+      cancelRangeDecisions();
+    }else{
+      cancelDecisionAt(idx);
+      render(); saveSoon(); updateRangeUI();
+    }
+  }
   else if(k==='n'||k==='N'){ e.preventDefault(); nextUnreviewed(); }
   else if(k==='m'||k==='M'){ e.preventDefault(); if(!e.repeat) markHere(); }
   else if(k==='r'||k==='R'){ e.preventDefault(); if(!e.repeat) confirmVisible(); }
@@ -3043,12 +3302,24 @@ document.addEventListener('keydown',e=>{
   else if(k==='Escape' && cmpOn){ e.preventDefault(); setCompare(false); }
   else if(k==='Escape' && zoomed){ e.preventDefault(); setZoom(false); }
   else if(k==='Escape' && scope){ e.preventDefault(); exitScope(); }
+  else if(k==='Escape' && rangeAnchor!==null){ e.preventDefault(); clearRange(); toast('範囲選択を解除しました'); }
+  else if(k==='Escape'){ 
+    const g=groups[idx];
+    if(g && decision(g)!=='unreviewed'){ e.preventDefault(); cancelDecisionAt(idx); render(); saveSoon(); updateRangeUI(); }
+  }
   else if(k==='Backspace' && noteAct){ e.preventDefault(); undoNote(); }
   else if(k==='Home'){ e.preventDefault(); jump(findFrom(0,1)); }
   else if(k==='End'){ e.preventDefault(); jump(findFrom(groups.length-1,-1)); }
 });
 document.addEventListener('keyup',e=>{
   if(e.key===' ' && $('s-cull').classList.contains('on')) e.preventDefault();
+  if(e.key==='Shift'){
+    isShiftDown=false;
+    _shiftWasDown=false;
+  }
+  if(e.key==='Escape'){
+    // keydownで既に処理しているのでここでは何もしない（重複トースト防止）
+  }
 });
 
 // ===== 3. コピー =====
