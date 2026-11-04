@@ -818,7 +818,7 @@
  #toCopyBtn,#mobileToolsBtn{font-size:.7rem !important;padding:5px 7px !important;flex-shrink:0}
  #bar{padding:6px 10px 8px !important}#bar .bar-main{gap:6px}#bar .side{min-width:0;flex:1}
  #bar .big{font-size:.82rem}#bar .sm{font-size:.65rem}#bar .nav{min-width:36px;width:36px;height:40px;padding:0}
- #gridRow input{max-width:70px}#reviewOverlay{left:8px;right:8px;width:auto}
+ #gridRow input{max-width:70px}#reviewOverlay{left:8px;right:8px;width:auto;transform:none!important}
  #burstFilmstrip,#reviewOverlay{bottom:var(--mobile-panel-bottom,160px) !important}
  #zoomTag{font-size:.7rem;max-width:90%;white-space:normal}
 }
@@ -1005,6 +1005,7 @@ body.time-filter-active #topbar.glass.compact{height:auto !important;min-height:
         <button id="sumBtn" class="small" type="button" title="今いる区切りのまとめを見る（‹ › でほかの区切りへ）" hidden>まとめ</button>
       </div>
       <div class="reviewActions" role="group" aria-label="選別の操作">
+        <button id="summaryAutoBtn" class="small" type="button" aria-pressed="true" title="区切りのまとめ・選別完了の自動表示を切り替えます">まとめ自動：オン</button>
         <button id="originalPreviewBtn" class="small" type="button">原寸確認</button>
         <button id="firstBtn" class="small" title="表示中の一覧の先頭へ（Home）"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3 3v10M12 4 7 8l5 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span>先頭</span></button>
         <button id="holdBtn" class="small" title="保留にして次へ（H）" aria-pressed="false"><span class="btnLabel">保留</span><kbd>H</kbd></button>
@@ -1144,7 +1145,7 @@ body.time-filter-active #topbar.glass.compact{height:auto !important;min-height:
   <div class="import-progress-card glass">
     <span class="import-spinner" aria-hidden="true"></span>
     <h2 id="importProgressTitle">写真を受け取っています</h2>
-    <p id="importProgressDetail" role="status" aria-live="polite"></p>
+    <p id="importElapsed" class="source-note" role="status"></p><p id="importProgressDetail" role="status" aria-live="polite"></p>
     <progress id="importProgress" aria-label="写真の準備状況"></progress>
     <p id="importProgressHelp" class="source-note">写真の選択後、準備が終わると自動で表示します。</p>
     <button id="cancelImportBtn" type="button">中止して戻る</button>
@@ -1333,6 +1334,7 @@ let dragLastIdx=-1;
 let view='all';        // 表示: all / kept（残すだけ）/ dropped（外すだけ）
 let pickMode='drop';   // 選び方: drop（すべて残した状態から外す）/ keep（すべて外した状態から残す）
 const prefs=loadState().prefs||{};
+let summaryAuto=prefs.summaryAuto!==false;
 const BURST=13;          // gridN がこの値のときは「連写ごとの表示」
 const BURST_GAP=2000;    // 撮影時刻の間隔がこれ以下なら同じ連写とみなす（ミリ秒）
 let gridN=Math.min(BURST,Math.max(1,prefs.gridN|0||1));   // 一度に表示する枚数（1 = 1枚表示）
@@ -1398,7 +1400,7 @@ function cancelPreparation(){ prepGeneration++; prepRunning=false; reportPrepara
 function updateReviewUI(){
   syncTimeFilterUI();
   $('mobileViewFilter').value=view;
-  $('toCopyBtn').disabled=readOnlySession() && prepRunning;
+  $('toCopyBtn').disabled=readOnlySession() && prepRunning;if(readOnlySession())$('toCopyBtn').textContent=prepRunning?'保存を準備中':'保存・引き継ぎ';
   const cur=groups[idx];
   const unrev=groups.filter(g=>shown(g)==='unreviewed').length;
   $('paceStat').textContent=paceText(unrev);
@@ -2075,13 +2077,13 @@ async function prepareInBackground(list,token){
     await Promise.all(batch.map(async g=>{
       try{
         const f=g.jpg || g.files[0];
-        const ex=g.exif!==undefined ? g.exif : await readExif(f.file,g.jpg?73728:131072).catch(()=>null);
+        g.prepDeferred=false;const ex=g.exif!==undefined ? g.exif : await preparationLimit(readExif(f.file,g.jpg?73728:131072));
         if(token!==prepGeneration) return;
         g.exif=ex;
         g.time=ex && ex.ms!=null ? ex.ms : g.time;
         g.date=fmtDate(g.time);
         try{
-          g.already=await isAlready(g,getMode());
+          g.already=await preparationLimit(isAlready(g,getMode()));
         }catch(e){
           // BugFix: isAlready failure should not block copying - treat as not already
           g.already=false;
@@ -2091,7 +2093,7 @@ async function prepareInBackground(list,token){
       }catch(e){
         if(token===prepGeneration){
           // BugFix: even on error, mark ready so copy can proceed, only count as failed if truly unreadable
-          const cur=g;
+          const cur=g;cur.prepDeferred=true;
           cur.exif=cur.exif||null;
           cur.already=false;
           cur.ready=true;
@@ -2119,10 +2121,11 @@ async function prepareInBackground(list,token){
   try{
     const curKey=groups[idx]?.key;
     // sort allGroups by time
-    allGroups.sort((a,b)=>a.time-b.time || (a.key<b.key?-1:a.key>b.key?1:0));
+    const sorted=allGroups.slice();await cooperativeSort(sorted,(a,b)=>a.time-b.time || (a.key<b.key?-1:a.key>b.key?1:0),async()=>{await new Promise(r=>setTimeout(r,0));if(token!==prepGeneration)throw new DOMException('Cancelled','AbortError');});if(token!==prepGeneration)return;allGroups=sorted;
     // re-apply filter preserving current key
     applyFilter(curKey||null);
   }catch(e){}
+  if(token!==prepGeneration)return;
   // Only now enable burst actions. No global sorting or automatic hiding during culling.
   assignBursts(allGroups); buildBursts(); computeBlocks(); initBurstDone(); prepRunning=false;
   reportPreparationProgress(list.length,list.length);
@@ -2837,7 +2840,7 @@ function computeBlocks(){
 function checkBlockCross(){
   const cur=groups[idx], prev=lastBlockG;
   lastBlockG=cur;
-  if(!cur || !prev || scope || view!=='all' || doneOpen) return;
+  if(!summaryAuto || !cur || !prev || scope || view!=='all' || doneOpen) return;
   const pi=groups.indexOf(prev);
   if(pi<0 || cur.block!==prev.block+1 || idx-pi<1 || idx-pi>13) return;   // 次の区切りへ進んだときだけ（シークで飛んだときは出さない）
   const b=blocks[prev.block];
@@ -2872,6 +2875,18 @@ function showBlockCard(b){
 }
 function armBlockCard(){ clearTimeout(blockTimer); if(!blockHover) blockTimer=setTimeout(hideBlockCard,3000); }   // 3秒で消える（マウスを乗せている間は消えない）
 // 「まとめ」ボタン: 今いる区切りのまとめを出す
+function syncSummaryAuto(){
+ $('summaryAutoBtn').textContent='まとめ自動：'+(summaryAuto?'オン':'オフ');
+ $('summaryAutoBtn').setAttribute('aria-pressed',String(summaryAuto));
+}
+$('summaryAutoBtn').onclick=()=>{
+ summaryAuto=!summaryAuto;
+ const state=loadState();state.prefs=Object.assign(state.prefs||{},{summaryAuto});saveState(state);
+ if(!summaryAuto){hideBlockCard();closeDone();}
+ lastBlockG=groups[idx]||null;prevUnrev=groups.filter(g=>shown(g)==='unreviewed').length;
+ syncSummaryAuto();
+};
+syncSummaryAuto();
 $('sumBtn').onclick=()=>{ const cur=groups[idx]; const b=cur && blocks[cur.block]; if(b) showBlockCard(b); else toast('まとめはまだありません'); };
 function hideBlockCard(){ clearTimeout(blockTimer); $('blockCard').classList.remove('on'); }
 $('blockCard').addEventListener('mouseenter',()=>{ blockHover=true; clearTimeout(blockTimer); });
@@ -2908,13 +2923,13 @@ $('scopeChip').onclick=()=>exitScope();
 /* ===== G. 完了の演出 ===== */
 function checkDone(unrev){
   const was=prevUnrev; prevUnrev=unrev;
-  if(scope || was==null || was===0 || unrev!==0 || !groups.length) return;
+  if(!summaryAuto || scope || was==null || was===0 || unrev!==0 || !groups.length) return;
   if(Date.now()-lastDoneAt<30000) return;   // 30秒以内には繰り返さない
   lastDoneAt=Date.now();
   setTimeout(showDone,0);   // 表示の更新が済んでから出す
 }
 function showDone(){
-  if(!$('s-cull').classList.contains('on')) return;
+  if(!summaryAuto || !$('s-cull').classList.contains('on')) return;
   const c={keep:0,drop:0,hold:0};
   for(const g of groups){ const d=shown(g); if(c[d]!=null) c[d]++; }
   const el=$('doneCard');
@@ -4180,6 +4195,28 @@ function fileDescription(f){
 function groupDescription(g){
   return {key:g.key,stem:g.stem,files:g.files.map(fileDescription),captureTime:g.exif?.ms??null,decision:decision(g),seen:!!g.seen};
 }
+async function cooperativeSort(list,compare,tick){
+ let source=list.slice(),target=new Array(list.length),steps=0;
+ for(let width=1;width<list.length;width*=2){
+  for(let start=0;start<list.length;start+=2*width){
+   const middle=Math.min(start+width,list.length),end=Math.min(start+2*width,list.length);let a=start,b=middle;
+   for(let k=start;k<end;k++){
+    target[k]=a<middle&&(b>=end||compare(source[a],source[b])<=0)?source[a++]:source[b++];
+    if(++steps%2048===0)await tick();
+   }
+  }
+  [source,target]=[target,source];
+ }
+ for(let i=0;i<list.length;i++){list[i]=source[i];if((i+1)%2048===0)await tick();}
+}
+async function sortImportList(list,compare,job){
+ updateImportProgress(job,'写真の並び順を整理中',list.length+'件を小分けに整理しています');
+ await yieldImportWork(job);await cooperativeSort(list,compare,()=>yieldImportWork(job));
+}
+function preparationLimit(promise,ms=12000){
+ return new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Object.assign(new Error('撮影情報の確認を保留しました'),{name:'PreparationTimeout'})),ms);Promise.resolve(promise).then(v=>{clearTimeout(timer);resolve(v);},e=>{clearTimeout(timer);reject(e);});});
+}
+
 async function buildLocalGroups(files,kind,job){
   const found=[],other=[];
   updateImportProgress(job,'写真を整理しています','受け取り済み '+files.length+'ファイル',0,files.length);
@@ -4197,7 +4234,7 @@ async function buildLocalGroups(files,kind,job){
   }
   updateImportProgress(job,'写真の組み合わせを確認しています','JPEG・RAWの対応と並び順を準備しています');
   await yieldImportWork(job);
-  found.sort((a,b)=>(a.path+a.name).localeCompare(b.path+b.name)||a.file.size-b.file.size||a.file.lastModified-b.file.lastModified);
+  await sortImportList(found,(a,b)=>(a.path+a.name).localeCompare(b.path+b.name)||a.file.size-b.file.size||a.file.lastModified-b.file.lastModified,job);
   const buckets=new Map();
   for(let i=0;i<found.length;i++){
     const f=found[i],key=f.path+f.stem.toUpperCase();if(!buckets.has(key))buckets.set(key,[]);buckets.get(key).push(f);
@@ -4216,7 +4253,7 @@ async function buildLocalGroups(files,kind,job){
       for(let i=0;i<fs.length;i++){const f=fs[i];list.push(group(key+'::'+f.ext+':'+f.file.size+':'+f.file.lastModified+':'+i,[f]));if((++processed)%100===0)await yieldImportWork(job);}
     }else{list.push(group(key,fs));if((++processed)%100===0)await yieldImportWork(job);}
   }
-  list.sort((a,b)=>a.time-b.time||a.key.localeCompare(b.key));
+  await sortImportList(list,(a,b)=>a.time-b.time||a.key.localeCompare(b.key),job);
   const manifest=[];
   for(let i=0;i<found.length;i++){
     const f=found[i];manifest.push([f.path,f.name,f.file.size,f.file.lastModified||0]);
@@ -4256,7 +4293,7 @@ async function openLocalFiles(files,kind,requestedJob){
     list.forEach((g,i)=>{g.burst=i+1;});
     prepRunning=true; prepFailed=0; applyFilter(null);
     const restored=restoreSession();
-    job.committed=true;
+    job.committed=true;if(groups[idx])groups[idx].importFirst=true;
     syncSourceUI(); show('s-cull'); render(); saveSoon();
     finishImportJob(job);
     $('openStatus').textContent=''; $('prepStatus').textContent='撮影情報を確認中…';
@@ -4653,13 +4690,19 @@ for(const radio of document.querySelectorAll('input[name=exportTimeScope]'))radi
 
 /* Keep native-picker waiting separate from work whose progress the page can measure. */
 function beginImportJob(kind,phase='picking'){
-  const job={id:++importJobSequence,kind,phase,cancelled:false,committed:false,painted:false};
+  const job={id:++importJobSequence,kind,phase,cancelled:false,committed:false,painted:false,started:Date.now()};
   currentImportJob=job;sourceBusy(true);
+  job.clock=setInterval(()=>refreshImportClock(job),1000);refreshImportClock(job);
   $('importOverlay').hidden=false;
   $('importOverlay').setAttribute('aria-busy','true');
   $('cancelImportBtn').disabled=false;$('cancelImportBtn').textContent='中止して戻る';
   updateImportProgress(job,phase==='picking'?'写真の受け渡しを待っています':'写真を受け取りました',phase==='picking'?'写真を選び、完了を1回押してください。準備が終わると自動で表示します。':'選別画面を準備しています');
   return job;
+}
+function refreshImportClock(job){
+ if(job!==currentImportJob)return;const seconds=Math.floor((Date.now()-job.started)/1000);
+ $('importElapsed').textContent='開始から '+seconds+'秒'+(seconds>=15?' · 通常より時間がかかっています':'');
+ if(job.phase==='picking'&&seconds>=15)$('importProgressHelp').textContent='端末から写真を受け取るのを待っています。iCloud上の写真は時間がかかる場合があります。完了の押し直しは不要です。待ちを解除して枚数を減らして選び直すこともできます。';
 }
 function updateImportProgress(job,title,detail,done=null,total=null){
   if(!job || job!==currentImportJob || job.cancelled)return;
@@ -4671,7 +4714,7 @@ function updateImportProgress(job,title,detail,done=null,total=null){
 }
 function finishImportJob(job){
   if(job!==currentImportJob)return;
-  currentImportJob=null;$('importOverlay').hidden=true;$('importOverlay').setAttribute('aria-busy','false');sourceBusy(false);
+  clearInterval(job.clock);currentImportJob=null;$('importOverlay').hidden=true;$('importOverlay').setAttribute('aria-busy','false');sourceBusy(false);
 }
 function checkImportJob(job){
   if(job && (job.cancelled || (job!==currentImportJob&&!job.committed)))throw new DOMException('写真の準備を中止しました','AbortError');
@@ -4714,11 +4757,16 @@ function setPhotoLoading(loading){
 }
 
 $('bar').appendChild($('cullPrepStatus'));
+const retryPreparation=document.createElement('button');retryPreparation.id='retryPreparation';retryPreparation.type='button';retryPreparation.className='small';retryPreparation.textContent='情報を再確認';retryPreparation.hidden=true;$('cullPrepStatus').appendChild(retryPreparation);
+retryPreparation.onclick=()=>{if(prepRunning)return;const list=allGroups.filter(g=>g.prepDeferred);if(!list.length)return;for(const g of list)g.exif=undefined;prepRunning=true;const token=++prepGeneration;updateReviewUI();void prepareInBackground(list,token).catch(()=>{if(token===prepGeneration){prepRunning=false;reportPreparationProgress(0,0);updateReviewUI();}});};
+
 function reportPreparationProgress(done,total){
-  const visible=prepRunning&&total>0;
+  const deferred=allGroups.filter(g=>g.prepDeferred).length;const visible=prepRunning&&total>0||!prepRunning&&deferred>0;
   $('cullPrepStatus').hidden=!visible;
   if(visible)$('cullPrepText').textContent='撮影情報を確認中 '+done+' / '+total+'枚 · 選別できます';
-  else $('cullPrepText').textContent='';
+  if(!prepRunning)$('cullPrepText').textContent=deferred?'撮影情報 '+deferred+'枚を保留 · 選別・保存できます':'';
+  if($('retryPreparation'))$('retryPreparation').hidden=prepRunning||!deferred;
+  $('toCopyBtn').title=prepRunning?'撮影情報を確認中です。完了すると保存できます':'';
   schedulePhotoLayout();
 }
 
@@ -4890,7 +4938,7 @@ function showSinglePreviewFailure(g,token,key){
 function markSinglePreviewReady(){
   const photo=$('photo'),g=groups[idx];
   if(gridN!==1||!g||photo.dataset.previewGroup!==g.key||photo.dataset.previewAsset!==singleAssetKey||!photo.complete||!photo.naturalWidth)return;
-  singleReadyKey=g.key;photo.style.visibility='';clearTimeout(previewBusyTimer);setPhotoLoading(false);syncPreviewDecisions();
+  g.importFirst=false;singleReadyKey=g.key;photo.style.visibility='';clearTimeout(previewBusyTimer);setPhotoLoading(false);syncPreviewDecisions();
   if(zoomed)applyZoom();schedulePreviewPrefetch();
 }
 function showLightPreview(g,retry=false){
@@ -4899,7 +4947,7 @@ function showLightPreview(g,retry=false){
   const token=++singlePreviewToken;singleAssetKey=key;singleReadyKey='';singleFailureKey='';
   photo.dataset.previewGroup=g.key;photo.dataset.previewAsset=key;photo.style.visibility='hidden';photo.removeAttribute('src');$('zimg').removeAttribute('src');
   $('noimg').style.display='none';clearTimeout(previewBusyTimer);setPhotoLoading(false);
-  previewBusyTimer=setTimeout(()=>{if(token===singlePreviewToken)setPhotoLoading(true);},160);
+  previewBusyTimer=setTimeout(()=>{if(token===singlePreviewToken){$('photoLoading').lastElementChild.textContent=(g.importFirst?'写真を受け取りました · 最初のプレビューを表示中…':'プレビューを準備しています…');setPhotoLoading(true);}},160);
   const wanted=[key],previous=findFrom(idx-1,-1),next=findFrom(idx+1,1);
   if(previous>=0&&groups[previous].jpg)wanted.push(previewStore.key(groups[previous]));if(next>=0&&groups[next].jpg)wanted.push(previewStore.key(groups[next]));previewStore.want(wanted);
   syncPreviewDecisions();
@@ -5009,6 +5057,45 @@ async function newsDecode(file,edge){
  if(typeof createImageBitmap==='function')try{const m=await inspectPreviewJPEG(file),opts={imageOrientation:'from-image',colorSpaceConversion:'default'};if(m.width&&m.height){const sz=previewFit(m.width,m.height,edge);opts.resizeWidth=sz.width;opts.resizeHeight=sz.height;opts.resizeQuality='high';}const bitmap=await createImageBitmap(file,opts);return {image:bitmap,w:bitmap.width,h:bitmap.height,ow:m.width||bitmap.width,oh:m.height||bitmap.height,close:()=>bitmap.close()};}catch(e){}
  const im=new Image(),url=URL.createObjectURL(file);try{await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{im.removeAttribute('src');reject(new Error('画像の読み込みがタイムアウトしました'));},20000);im.onload=()=>{clearTimeout(timer);resolve();};im.onerror=()=>{clearTimeout(timer);reject(new Error('この画像形式を変換できません'));};im.src=url;});return {image:im,w:im.naturalWidth,h:im.naturalHeight,ow:im.naturalWidth,oh:im.naturalHeight,close:()=>{im.removeAttribute('src');URL.revokeObjectURL(url);}};}catch(e){URL.revokeObjectURL(url);throw e;}
 }
+// Three separable box passes approximate a Gaussian blur. Pixel processing is
+// independent of Canvas filter support, including browsers that ignore ctx.filter.
+// Clamp edges to avoid dark borders; bound the work surface to at most 512px.
+function newsBlurPixels(data,w,h,radius){
+ const tmp=new Uint8ClampedArray(data.length),diameter=2*radius+1;
+ for(let pass=0;pass<3;pass++){
+  for(let y=0;y<h;y++)for(let c=0;c<3;c++){
+   const row=y*w*4;let sum=0;
+   for(let k=-radius;k<=radius;k++)sum+=data[row+Math.min(w-1,Math.max(0,k))*4+c];
+   for(let x=0;x<w;x++){
+    tmp[row+x*4+c]=sum/diameter;
+    sum+=data[row+Math.min(w-1,x+radius+1)*4+c]-data[row+Math.max(0,x-radius)*4+c];
+   }
+  }
+  for(let x=0;x<w;x++)for(let c=0;c<3;c++){
+   let sum=0;
+   for(let k=-radius;k<=radius;k++)sum+=tmp[(Math.min(h-1,Math.max(0,k))*w+x)*4+c];
+   for(let y=0;y<h;y++){
+    data[(y*w+x)*4+c]=sum/diameter;
+    sum+=tmp[(Math.min(h-1,y+radius+1)*w+x)*4+c]-tmp[(Math.max(0,y-radius)*w+x)*4+c];
+   }
+  }
+ }
+ for(let i=3;i<data.length;i+=4)data[i]=255;
+}
+function newsFrostedBackground(src,w,h){
+ const bg=document.createElement('canvas'),scale=Math.min(256/Math.min(w,h),512/Math.max(w,h));
+ bg.width=Math.max(1,Math.round(w*scale));bg.height=Math.max(1,Math.round(h*scale));
+ try{
+  const b=bg.getContext('2d',{colorSpace:'srgb',willReadFrequently:true});if(!b)throw new Error('背景を生成できません');
+  b.fillStyle='#000';b.fillRect(0,0,bg.width,bg.height);b.imageSmoothingEnabled=true;b.imageSmoothingQuality='high';
+  const k=Math.max(bg.width/src.w,bg.height/src.h)*1.15;
+  b.drawImage(src.image,(bg.width-src.w*k)/2,(bg.height-src.h*k)/2,src.w*k,src.h*k);
+  const pixels=b.getImageData(0,0,bg.width,bg.height);
+  newsBlurPixels(pixels.data,bg.width,bg.height,Math.max(1,Math.round(Math.min(bg.width,bg.height)*.047)));
+  b.putImageData(pixels,0,0);return bg;
+ }catch(e){bg.width=bg.height=1;throw e;}
+}
+
 async function newsRender(g,c,preview=false){
  const fixed=newsSize(c),edge=preview?640:(fixed?Math.max(...fixed)*2:2048),src=await newsDecode(g.jpg.file,edge);let cv;
  try{
@@ -5016,8 +5103,8 @@ async function newsRender(g,c,preview=false){
   cv=document.createElement('canvas');cv.width=w;cv.height=h;const ctx=cv.getContext('2d',{colorSpace:'srgb'});if(!ctx)throw new Error('画像処理を開始できません');ctx.imageSmoothingQuality='high';ctx.fillStyle=c.fit==='white'?'#fff':'#000';ctx.fillRect(0,0,w,h);
   const contain=Math.min(w/src.ow,h/src.oh),cover=Math.max(w/src.ow,h/src.oh),p=newsPosition(g);
   if(fixed&&c.fit==='blur'){
-   // Tiny background canvas gives a blur without full-resolution filters.
-   const bg=document.createElement('canvas');bg.width=32;bg.height=Math.max(1,Math.round(32*h/w));const b=bg.getContext('2d');b.filter='blur(2px)';const k=Math.max(bg.width/src.w,bg.height/src.h)*1.15;b.drawImage(src.image,(bg.width-src.w*k)/2,(bg.height-src.h*k)/2,src.w*k,src.h*k);ctx.drawImage(bg,0,0,w,h);ctx.fillStyle='#0003';ctx.fillRect(0,0,w,h);bg.width=bg.height=1;
+   const bg=newsFrostedBackground(src,w,h);
+   try{ctx.imageSmoothingEnabled=true;ctx.drawImage(bg,0,0,w,h);ctx.fillStyle='#0003';ctx.fillRect(0,0,w,h);}finally{bg.width=bg.height=1;}
   }
   // Do not upscale small originals; fixed canvases retain the requested dimensions.
   const previewScale=preview&&fixed?640/Math.max(...fixed):1;const scale=Math.min(previewScale,fixed&&c.fit==='crop'?cover:contain),dw=src.ow*scale,dh=src.oh*scale;
