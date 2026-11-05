@@ -6173,7 +6173,6 @@ const externalFilePaths=new WeakMap();
 function snapshotExternalDrop(dt){
   const records=[];
   for(const item of Array.from(dt?.items||[])){
-    if(item.kind!=='file')continue;
     let entry=null,file=null;try{entry=item.webkitGetAsEntry?.()||item.getAsEntry?.()||null;}catch(e){}try{file=item.getAsFile?.()||null;}catch(e){}
     if(entry||file)records.push({entry,file});
   }
@@ -6209,7 +6208,7 @@ async function collectExternalDrop(records,job){
       }else{
         let file=node.file;
         if(entry?.isFile){try{file=await externalEntryCall(job,(ok,fail)=>entry.file(ok,fail));}catch(e){if(e.name==='AbortError'||!file)throw e;}}
-        if(file){if(hasFolder)externalFilePaths.set(file,node.path);files.push(file);}
+        if(file){if(hasFolder)externalFilePaths.set(file,node.path);files.push(file);job.externalFileCount=files.length;}
       }
     }catch(e){if(e.name==='AbortError')throw e;job.dropErrors.push({name:node.path,message:e.message||'読み取れませんでした'});}
     if(++steps%50===0){updateImportProgress(job,'ファイルアプリから受け取り中',files.length+'ファイルを確認');await yieldImportWork(job);}
@@ -6217,40 +6216,68 @@ async function collectExternalDrop(records,job){
   checkImportJob(job);return {files,kind:hasFolder?'folder':'files'};
 }
 async function receiveExternalDrop(records){
-  if(!records.length){toast('写真やフォルダのデータが届きませんでした');return;}
-  if(copying||openingFiles||prepRunning||currentImportJob&&currentImportJob.phase!=='picking'){toast('現在の取り込み・確認が終わってから追加してください');return;}
-  if(allGroups.length&&!readOnlySession()){toast('カードへのコピー作業を終えてから、写真の読み込み画面で追加してください');return;}
+  if(!records.length){setExternalDropState('写真やフォルダのデータは0件でした。取り込みは始まっていません。');return;}
+  if(copying||openingFiles||prepRunning||currentImportJob&&currentImportJob.phase!=='picking'){setExternalDropState('現在の取り込み・確認が終わるまで、今回の追加は受け付けていません。');toast('現在の取り込み・確認が終わってから追加してください');return;}
+  if(allGroups.length&&!readOnlySession()){setExternalDropState('カードのコピー作業中のため、今回の追加は受け付けていません。');toast('カードへのコピー作業を終えてから、写真の読み込み画面で追加してください');return;}
   if(currentImportJob){currentImportJob.cancelled=true;finishImportJob(currentImportJob);}
   for(const id of ['shootingFolderDialog','importAddDialog'])if($(id).open)$(id).close();
   const job=beginImportJob('folder','collecting');job.receivedAt=Date.now();job.collectingDrop=true;job.dropWaiters=new Set();job.dropErrors=[];job.append=allGroups.length>0&&readOnlySession();
   updateImportProgress(job,'ファイルアプリから受け取り中','フォルダ・写真の一覧を確認しています');
+  setExternalDropState('ドロップを受け付けました。フォルダ・写真の一覧を確認しています。');
   try{
     const result=await collectExternalDrop(records,job);checkImportJob(job);job.collectingDrop=false;job.kind=result.kind;
-    if(!result.files.length){toast(job.dropErrors.length?'読み取れませんでした。ファイルアプリから写真を選んでドラッグするか、「このiPhone内」へコピーしてから選んでください。':'フォルダから写真ファイルを受け取れませんでした');return;}
+    if(!result.files.length){setExternalDropState('写真ファイルの受信は0件でした。読み取りエラー '+job.dropErrors.length+'件。元の写真と選別結果は保持しています。');toast(job.dropErrors.length?'読み取れませんでした。ファイルアプリから写真を選んでドラッグするか、「このiPhone内」へコピーしてから選んでください。':'フォルダから写真ファイルを受け取れませんでした');return;}
+    job.externalFileCount=result.files.length;setExternalDropState(result.files.length+'ファイルを受信しました。写真を整理しています。');
     await openLocalFiles(result.files,result.kind,job);
-  }catch(e){if(e.name!=='AbortError')toast('受け取れませんでした：'+e.message);}
+    if(!job.committed)setExternalDropState(result.files.length+'ファイルを受信しましたが、写真の取り込みは完了していません。画面のメッセージや取り込み結果を確認してください。');
+    else setExternalDropState(job.cancelled?'確認を中止しました。受け取った写真と選別結果は保持しています。':result.files.length+'ファイルを受信し、確認が終わりました。');
+  }catch(e){if(e.name!=='AbortError'){setExternalDropState('受け取れませんでした：'+e.message);toast('受け取れませんでした：'+e.message);}}
   finally{if(job===currentImportJob&&!job.committed){openingFiles=false;finishImportJob(job);}schedulePhotoLayout();}
 }
 function externalDropHasFiles(e){return Array.from(e.dataTransfer?.types||[]).includes('Files')||Array.from(e.dataTransfer?.items||[]).some(i=>i.kind==='file');}
 function externalDropScreen(){return $('s-open').classList.contains('on')||$('s-cull').classList.contains('on');}
-let externalDragDepth=0;
-document.addEventListener('dragenter',e=>{if(!externalDropHasFiles(e)||!externalDropScreen())return;e.preventDefault();externalDragDepth++;$('externalDropCover').hidden=false;});
-document.addEventListener('dragover',e=>{if(!externalDropHasFiles(e)||!externalDropScreen())return;e.preventDefault();if(e.dataTransfer)e.dataTransfer.dropEffect='copy';});
-document.addEventListener('dragleave',()=>{if(--externalDragDepth<=0){externalDragDepth=0;$('externalDropCover').hidden=true;}});
-document.addEventListener('dragend',()=>{externalDragDepth=0;$('externalDropCover').hidden=true;});
+let externalDragDepth=0,externalDragTimer=0,externalDragActive=false;
+const externalDropState=document.createElement('p');externalDropState.id='externalDropState';externalDropState.className='source-note';externalDropState.setAttribute('role','status');externalDropState.setAttribute('aria-live','polite');externalDropState.hidden=true;
+$('s-open').querySelector('.external-drop-help').append(externalDropState);
+function setExternalDropState(message){
+  if($('s-cull').classList.contains('on'))$('topbar').append(externalDropState);else $('s-open').querySelector('.external-drop-help').append(externalDropState);
+  externalDropState.textContent=message;externalDropState.hidden=false;schedulePhotoLayout();
+}
+function clearExternalDrag(){clearTimeout(externalDragTimer);externalDragTimer=0;externalDragDepth=0;externalDragActive=false;$('externalDropCover').hidden=true;}
+function expireExternalDrag(){
+  const wasActive=externalDragActive;clearExternalDrag();
+  if(wasActive&&!currentImportJob)setExternalDropState('ドラッグは検出しましたが、ドロップや写真データはまだ届いていません。取り込みは始まっていません。');
+}
+function keepExternalDragAlive(){
+  externalDragActive=true;$('externalDropCover').hidden=false;clearTimeout(externalDragTimer);externalDragTimer=setTimeout(expireExternalDrag,4000);
+}
+document.addEventListener('dragenter',e=>{if(!externalDropHasFiles(e)||!externalDropScreen())return;e.preventDefault();externalDragDepth++;keepExternalDragAlive();},true);
+document.addEventListener('dragover',e=>{if(!externalDropHasFiles(e)||!externalDropScreen())return;e.preventDefault();keepExternalDragAlive();if(e.dataTransfer)e.dataTransfer.dropEffect='copy';},true);
+document.addEventListener('dragleave',()=>{if(--externalDragDepth<=0){externalDragDepth=0;$('externalDropCover').hidden=true;}},true);
+document.addEventListener('dragend',()=>{
+  const wasActive=externalDragActive;clearExternalDrag();if(wasActive&&!currentImportJob)setExternalDropState('ドラッグが終了しましたが、写真データは届いていません。取り込みは始まっていません。');
+},true);
 document.addEventListener('drop',e=>{
-  if(!externalDropHasFiles(e))return;e.preventDefault();externalDragDepth=0;$('externalDropCover').hidden=true;
+  const wasActive=externalDragActive,claimedFiles=externalDropHasFiles(e);
+  // A folder drop can omit Files/kind metadata. Inspect real entries before deciding.
+  const records=snapshotExternalDrop(e.dataTransfer);clearExternalDrag();
+  if(!wasActive&&!claimedFiles&&!records.length)return;
+  e.preventDefault();
   if(!externalDropScreen()){toast('写真の読み込み画面か選別画面に戻ってから追加してください');return;}
-  // Capture entries/files synchronously: DataTransfer may be protected after this event.
-  const records=snapshotExternalDrop(e.dataTransfer);void receiveExternalDrop(records);
-});
+  if(!records.length){setExternalDropState('ドロップは届きましたが、写真・フォルダのデータは0件でした。取り込みは始まっていません。フォルダの代わりに写真1枚をドラッグして確認できます。');return;}
+  setExternalDropState(records.length+'項目を受信しました。中の写真ファイルを確認しています。');
+  void receiveExternalDrop(records);
+},true);
 const externalCancelBase=$('cancelImportBtn').onclick;
 $('cancelImportBtn').onclick=()=>{
   const job=currentImportJob;if(!job?.collectingDrop)return externalCancelBase();
-  job.cancelled=true;for(const abort of [...job.dropWaiters])abort();finishImportJob(job);toast('受け取りを中止しました。元の写真と選別結果は保持しています');
+  job.cancelled=true;for(const abort of [...job.dropWaiters])abort();finishImportJob(job);setExternalDropState('受け取りを中止しました。元の写真と選別結果は保持しています。');toast('受け取りを中止しました。元の写真と選別結果は保持しています');
 };
 const externalReportBase=renderImportReport;
 renderImportReport=function(){externalReportBase();const errors=lastImportReport?.externalDropErrors||[];if(errors.length){const section=document.createElement('details'),summary=document.createElement('summary');summary.textContent='ファイルアプリから受け取れなかった項目 '+errors.length+'件';section.append(summary);for(const error of errors)section.append(reportLine(error.name,error.message));$('importReportBody').append(section);}};
+
+const externalClockBase=refreshImportClock;
+refreshImportClock=function(job){externalClockBase(job);if(job===currentImportJob&&job.collectingDrop){const n=job.externalFileCount||0;setExternalDropState('フォルダ・写真の受信を確認中 · ファイル '+n+'件 · '+Math.floor((Date.now()-job.receivedAt)/1000)+'秒経過');}};
 
 </script>
 
