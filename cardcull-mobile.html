@@ -2746,7 +2746,7 @@ function photoMetadataFromTags(tags,legacy,format,error){
     iso:number(data.ISO||data.ISOSpeedRatings||data.PhotographicSensitivity)??legacy?.iso??null,
     fl:number(data.FocalLength)??legacy?.fl??null,ev:number(data.ExposureCompensation??data.ExposureBiasValue)??legacy?.ev??null,
     width:number(data.ExifImageWidth||data.ImageWidth)??legacy?.width??null,height:number(data.ExifImageHeight||data.ImageHeight)??legacy?.height??null,
-    subsec,format,metadataError:error||null};
+    subsec,format,orientation:number(data.Orientation)??legacy?.orientation??1,metadataError:error||null};
   const found=Object.keys(data).length>0||!!legacy;
   result.metadataStatus=ms!==null?'ok':found?'no-date':error?'error':'absent';
   return result;
@@ -4736,6 +4736,13 @@ async function importDigest(file,job){
 }
 async function identicalImportFiles(a,b,job){
   if(a===b)return true;if(a.size!==b.size)return false;
+  const sampleSize=4096;
+  for(const start of new Set([0,Math.max(0,Math.floor((a.size-sampleSize)/2)),Math.max(0,a.size-sampleSize)])){
+    const pair=await Promise.all([a.slice(start,start+sampleSize).arrayBuffer(),b.slice(start,start+sampleSize).arrayBuffer()]);
+    const aa=new Uint8Array(pair[0]),bb=new Uint8Array(pair[1]);
+    if(aa.length!==bb.length||aa.some((value,i)=>value!==bb[i]))return false;
+    await yieldImportSlice(job);
+  }
   const da=await importDigest(a,job),db=await importDigest(b,job);
   if(da&&db)return da===db;
   for(let start=0;start<a.size;start+=1048576){
@@ -4772,6 +4779,74 @@ async function importRaster(file,meta,job){
     return {luma,bands,contrast};
   }finally{bitmap?.close();if(img){img.onload=null;img.onerror=null;img.src='';}if(url)URL.revokeObjectURL(url);}
 }
+// Metadata and small headers are enough for the common, non-duplicate case.
+async function importDimensions(file,ex){
+  let meta=await inspectPreviewJPEG(file,65536);
+  if(meta.jpeg){
+    if(!meta.width||!meta.height)meta=await inspectPreviewJPEG(file,262144);
+    return meta;
+  }
+  const h=new Uint8Array(await file.slice(0,40).arrayBuffer()),view=new DataView(h.buffer);
+  if(h.length>=24&&h[0]===137&&h[1]===80&&h[2]===78&&h[3]===71){meta.width=view.getUint32(16);meta.height=view.getUint32(20);}
+  else if(h.length>=10&&h[0]===71&&h[1]===73&&h[2]===70){meta.width=view.getUint16(6,true);meta.height=view.getUint16(8,true);}
+  else if(h.length>=26&&h[0]===66&&h[1]===77){meta.width=Math.abs(view.getInt32(18,true));meta.height=Math.abs(view.getInt32(22,true));}
+  else if(h.length>=30&&String.fromCharCode(...h.slice(0,4))==='RIFF'&&String.fromCharCode(...h.slice(8,12))==='WEBP'){
+    const type=String.fromCharCode(...h.slice(12,16));
+    if(type==='VP8X'){meta.width=1+h[24]+(h[25]<<8)+(h[26]<<16);meta.height=1+h[27]+(h[28]<<8)+(h[29]<<16);}
+    else if(type==='VP8 '&&h[23]===157&&h[24]===1&&h[25]===42){meta.width=view.getUint16(26,true)&16383;meta.height=view.getUint16(28,true)&16383;}
+    else if(type==='VP8L'&&h[20]===47){meta.width=1+h[21]+((h[22]&63)<<8);meta.height=1+(h[22]>>6)+(h[23]<<2)+((h[24]&15)<<10);}
+  }
+  if(!meta.width||!meta.height){meta.width=ex?.width||0;meta.height=ex?.height||0;}
+  if(ex?.orientation>=5)[meta.width,meta.height]=[meta.height,meta.width];
+  return meta;
+}
+async function ensureImportVisual(v,facts,job){
+  if(!v.jpg||facts.visualChecked)return facts;
+  if(facts.visualTask)return facts.visualTask;
+  const task=(async()=>{
+    try{
+      const meta={width:facts.width,height:facts.height};
+      facts.visual=await importRaster(fileOfVersion(v),meta,job);
+      facts.width=meta.width;facts.height=meta.height;facts.pixels=meta.width*meta.height;facts.readable=true;facts.visualChecked=true;
+    }catch(e){
+      if(e.name==='AbortError')throw e;
+      facts.error=e.message||String(e);facts.readable=false;facts.visualChecked=true;
+    }
+    return facts;
+  })();
+  facts.visualTask=task;
+  try{return await task;}finally{delete facts.visualTask;}
+}
+async function yieldImportSlice(job){
+  checkImportJob(job);
+  if(!job||!job.sliceAt||performance.now()-job.sliceAt>=8){await yieldImportWork(job);if(job)job.sliceAt=performance.now();}
+}
+async function warmImportMetadata(versions,job){
+  for(let i=0;i<versions.length;i+=4){
+    updateImportProgress(job,'撮影情報を読み取っています',i+' / '+versions.length+'件',i,versions.length);
+    const batch=await Promise.allSettled(versions.slice(i,i+4).map(v=>importFacts(v,job)));
+    checkImportJob(job);const failure=batch.find(x=>x.status==='rejected');if(failure)throw failure.reason;
+    await yieldImportSlice(job);
+  }
+}
+async function prepareVisualCandidates(index,v,facts,job){
+  const pool=new Set(importCandidates(index,v,facts));
+  // Missing capture metadata still needs visual matching, including renamed edits.
+  for(const item of facts.time===null?index.items.values():index.unknown)pool.add(item);
+  const comparisons=[...pool].filter(item=>v.jpg&&item.v.jpg&&!conflictingShot(item.facts,facts));
+  if(!comparisons.length)return;
+  await ensureImportVisual(v,facts,job);
+  if(!facts.readable)return;
+  for(let i=0;i<comparisons.length;i+=2){
+    const batch=comparisons.slice(i,i+2);
+    const settled=await Promise.allSettled(batch.map(async item=>{
+      await ensureImportVisual(item.v,item.facts,job);indexImportVersion(index,item.g,item.v,item.facts);
+    }));
+    checkImportJob(job);const failure=settled.find(x=>x.status==='rejected');if(failure)throw failure.reason;
+    await yieldImportSlice(job);
+  }
+}
+
 async function importFacts(v,job){
   const file=fileOfVersion(v);
   if(importFactCache.has(file))return importFactCache.get(file);
@@ -4781,12 +4856,12 @@ async function importFacts(v,job){
     if(ex?.metadataStatus==='error')error=ex.metadataError;
     const meta={width:0,height:0};
     if(v.jpg){
-      try{Object.assign(meta,await inspectPreviewJPEG(file));visual=await importRaster(file,meta,job);}catch(e){if(e.name==='AbortError')throw e;error=e.message;}
+      try{Object.assign(meta,await importDimensions(file,ex));if(!meta.width||!meta.height)visual=await importRaster(file,meta,job);}catch(e){if(e.name==='AbortError')throw e;error=e.message;}
     }else{meta.width=ex?.width||0;meta.height=ex?.height||0;}
     checkImportJob(job);
     return {width:meta.width||0,height:meta.height||0,pixels:(meta.width||0)*(meta.height||0),exif:ex||null,
       time:Number.isFinite(ex?.ms)?ex.ms:null,camera:ex?.camera||'',uid:/^[\da-f]{16,}$/i.test(ex?.imageId||'')&&!/^0+$/.test(ex.imageId)?ex.imageId:'',name:normalizedShotName((v.jpg||v.files[0]).name),visual,error,
-      readable:!!visual||!v.jpg,format:(v.jpg||v.files[0]).ext};
+      visualChecked:!!visual,readable:!!visual||!!(meta.width&&meta.height)||!v.jpg,format:(v.jpg||v.files[0]).ext};
   })();
   importFactCache.set(file,task);
   try{const facts=await task;task.resolved=facts;return facts;}catch(e){importFactCache.delete(file);throw e;}
@@ -4821,9 +4896,9 @@ function importRelation(a,b){
   if(distance<.25 || (sameName&&sameTime&&sameCamera))return 'review';
   return null;
 }
-function makeImportIndex(){return {size:new Map(),name:new Map(),time:new Map(),uid:new Map(),bands:new Map()};}
+function makeImportIndex(){return {size:new Map(),name:new Map(),time:new Map(),uid:new Map(),bands:new Map(),items:new Map(),unknown:new Set()};}
 function indexImportVersion(index,g,v,facts){
-  const item={g,v,facts};
+  const file=fileOfVersion(v);let item=index.items.get(file);if(!item){item={g,v,facts};index.items.set(file,item);}if(facts.time===null)index.unknown.add(item);
   function put(map,key){if(key===null||key===''||key===undefined)return;if(!map.has(key))map.set(key,new Set());map.get(key).add(item);}
   put(index.size,fileOfVersion(v).size);put(index.name,facts.name);put(index.time,facts.time);put(index.uid,facts.uid);
   if(facts.visual&&facts.visual.contrast>=.035)facts.visual.bands.forEach((n,i)=>put(index.bands,i+':'+n));
@@ -4854,20 +4929,22 @@ async function planPhotoImport(incoming,append,job){
   const existing=append?allGroups:[],work=[],index=makeImportIndex(),used=new Set(existing.map(g=>g.key));
   const report={addedKeys:[],updatedKeys:[],kept:0,duplicates:0,failed:[],unsupported:[],received:job.received||0,append,pending:[],allKeys:[],date:Date.now()};
   const addSet=new Set(),updateSet=new Set();let processed=0;
+  const versions=existing.flatMap(g=>g.versions||[g]).concat(incoming);
+  await warmImportMetadata(versions,job);
   updateImportProgress(job,'重複を確認しています','既存の写真を確認中',0,existing.length+incoming.length);
   for(const original of existing){
     const g={...original,files:original.files.slice(),versions:(original.versions||[sourceVersion(original)]).slice(),_original:original};
     g.selectedVersionId=original.selectedVersionId||g.versions[0].id;work.push(g);
     for(const v of g.versions){const facts=await importFacts(v,job);indexImportVersion(index,g,v,facts);}
-    updateImportProgress(job,'重複を確認しています','既存 '+(++processed)+' / '+existing.length+'枚',processed,existing.length+incoming.length);await yieldImportWork(job);
+    updateImportProgress(job,'重複を確認しています','既存 '+(++processed)+' / '+existing.length+'枚',processed,existing.length+incoming.length);await yieldImportSlice(job);
   }
   for(let i=0;i<incoming.length;i++){
     const source=incoming[i],v=sourceVersion(source);let facts;
     updateImportProgress(job,'重複を確認しています','追加分 '+(i+1)+' / '+incoming.length+'枚',existing.length+i,existing.length+incoming.length);
     facts=await importFacts(v,job);
-    if(!facts.readable){report.failed.push({name:source.stem,message:facts.error||'画像を確認できませんでした',group:source});await yieldImportWork(job);continue;}
+    if(!facts.readable){report.failed.push({name:source.stem,message:facts.error||'画像を確認できませんでした',group:source});await yieldImportSlice(job);continue;}
     v.exif=facts.exif;v.time=facts.time??v.time;v.date=fmtDate(v.time);
-    const candidates=importCandidates(index,v,facts);let same=null,pair=null,review=null;
+    let candidates=importCandidates(index,v,facts),same=null,pair=null,review=null;
     // Exact bytes win, including renamed files. Size only narrows the comparison.
     for(const candidate of candidates){
       const a=fileOfVersion(candidate.v),b=fileOfVersion(v);
@@ -4875,6 +4952,11 @@ async function planPhotoImport(incoming,append,job){
         try{if(await identicalImportFiles(a,b,job)){same={...candidate,exact:true};break;}}
         catch(e){if(e.name==='AbortError')throw e;report.failed.push({name:source.stem,message:'内容の照合を保留しました',group:null});}
       }
+    }
+    if(!same){
+      await prepareVisualCandidates(index,v,facts,job);
+      if(!facts.readable){report.failed.push({name:source.stem,message:facts.error||'画像を確認できませんでした',group:source});continue;}
+      candidates=importCandidates(index,v,facts);
     }
     if(!same)for(const candidate of candidates){
       const relation=importRelation(candidate.facts,facts);
@@ -4901,7 +4983,7 @@ async function planPhotoImport(incoming,append,job){
       const g={...source,key:uniqueImportKey(source,used),versions:[v],selectedVersionId:v.id};
       installImportVersion(g,v,facts);work.push(g);addSet.add(g.key);indexImportVersion(index,g,v,facts);
     }
-    await yieldImportWork(job);
+    await yieldImportSlice(job);
   }
   report.addedKeys=[...addSet];report.updatedKeys=[...updateSet];
   report.allKeys=[...new Set([...addSet,...updateSet])];
@@ -5305,8 +5387,8 @@ function normalPreviewEdge(){
 function comparisonPreviewEdge(){const n=Math.max(1,cmpIds.length),cols=n<=3?n:2,rows=Math.ceil(n/cols),r=$('stage').getBoundingClientRect(),need=Math.max(r.width/cols,r.height/rows)*Math.min(devicePixelRatio||1,2);return Math.min(isPhonePreview()?1440:2048,need<=480?480:need<=960?960:need<=1440?1440:2048);}
 function previewEdgeFor(tier){return tier==='thumb'?480:tier==='compare'?comparisonPreviewEdge():normalPreviewEdge();}
 function previewFit(width,height,edge){const scale=Math.min(1,edge/Math.max(width,height));return {width:Math.max(1,Math.round(width*scale)),height:Math.max(1,Math.round(height*scale))};}
-async function inspectPreviewJPEG(file){
-  const bytes=new Uint8Array(await file.slice(0,262144).arrayBuffer()),dv=new DataView(bytes.buffer);
+async function inspectPreviewJPEG(file,maxBytes=262144){
+  const bytes=new Uint8Array(await file.slice(0,maxBytes).arrayBuffer()),dv=new DataView(bytes.buffer);
   const meta={width:0,height:0,orientation:1,jpeg:bytes[0]===255&&bytes[1]===216};
   if(!meta.jpeg)return meta;
   let p=2;
