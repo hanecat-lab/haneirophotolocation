@@ -941,9 +941,9 @@ body.readonly-source #topbar.glass.compact > .topbar-row{flex-shrink:0 !importan
     <div class="source-buttons">
       <button id="libraryBtn" class="primary">写真を選ぶ</button>
       <button id="filesBtn">SDカード・ファイルから選ぶ</button>
-      <button id="folderBtn">カード・フォルダを選ぶ</button>
+      <button id="folderBtn">DCIMフォルダを取り込む</button>
     </div>
-    <p class="source-note">SDカードは「SDカード・ファイルから選ぶ」→「ブラウズ」→カード名→「DCIM」内の写真を選択してください。</p>
+    <p class="source-note">SDカード全体の写真は「DCIMフォルダを取り込む」→「ブラウズ」→カード名→DCIM内で「開く」。下の撮影フォルダもまとめて対象になります。写真を個別に選ぶ場合は「SDカード・ファイルから選ぶ」を使ってください。</p>
     <p class="source-note">SnapBridgeから「写真」に保存した画像は、写真ライブラリから選べます。<br>元の写真は削除・変更しません。</p>
     <details id="desktopCopyDetails"><summary>Mac・PCで保存先へ直接コピーする</summary><div id="desktopOptionsSlot"></div>
     <button id="openBtn" class="primary">カードを開いてコピー</button></details>
@@ -1186,7 +1186,7 @@ body.readonly-source #topbar.glass.compact > .topbar-row{flex-shrink:0 !importan
   <p class="source-note">選別結果と現在の写真を維持して追加します。</p>
   <label class="import-preference"><input id="preferLargeImport" type="checkbox" checked> 同じ写真は大きい画像を優先</label>
   <p class="source-note">画素数で比較します。同じ大きさなら現在の画像を維持します。判断が曖昧な写真は、取り込み結果で見比べられます。</p>
-  <div class="source-buttons"><button id="addLibraryPhotos" class="primary" type="button">写真を追加</button><button id="addFilePhotos" type="button">SDカード・ファイルから追加</button><button id="addFolderPhotos" type="button">フォルダから追加</button></div>
+  <div class="source-buttons"><button id="addLibraryPhotos" class="primary" type="button">写真を追加</button><button id="addFilePhotos" type="button">SDカード・ファイルから追加</button><button id="addFolderPhotos" type="button">DCIMフォルダから追加</button></div>
 </dialog>
 <dialog id="importReportDialog" class="import-details-dialog">
   <div class="import-dialog-heading"><h2>取り込み結果</h2><button id="closeImportReport" type="button">閉じる</button></div><div id="importReportBody"></div>
@@ -4344,17 +4344,20 @@ function preparationLimit(promise,ms=12000){
 }
 
 async function buildLocalGroups(files,kind,job){
-  const found=[],other=[];
+  const found=[],other=[],folders=new Set(),roots=new Set();let hiddenCount=0;
   updateImportProgress(job,'写真を整理しています','受け取り済み '+files.length+'ファイル',0,files.length);
   await yieldImportWork(job);
   for(let i=0;i<files.length;i++){
     const file=files[i];
-    const rel=kind==='folder' && file.webkitRelativePath ? file.webkitRelativePath.split('/').slice(1).join('/') : file.name;
+    const relative=file.webkitRelativePath||'',segments=relative.split('/').filter(Boolean);
+    if(kind==='folder'&&segments.length>1)roots.add(segments[0]);
+    const rel=segments.length>1?segments.slice(1).join('/'):file.name;
+    if(kind==='folder'&&segments.some(n=>n.startsWith('.'))){hiddenCount++;if((i+1)%100===0)await yieldImportWork(job);continue;}
     if(!rel.split('/').some(n=>n.startsWith('.'))){
       const path=rel.includes('/')?rel.slice(0,rel.lastIndexOf('/')+1):'';
       const name=file.name,dot=name.lastIndexOf('.'),ext=dot>0?name.slice(dot+1).toLowerCase():'';
-      if(!JPG_EXT.has(ext)&&!RAW_EXT.has(ext))other.push(name);
-      else found.push({path,name,stem:dot>0?name.slice(0,dot):name,ext,file,h:null});
+      if(!JPG_EXT.has(ext)&&!RAW_EXT.has(ext))other.push(rel);
+      else{found.push({path,name,stem:dot>0?name.slice(0,dot):name,ext,file,h:null,folderSource:kind==='folder'});folders.add(path||'（直下）');}
     }
     if((i+1)%100===0 || i+1===files.length){updateImportProgress(job,'写真を整理しています',(i+1)+' / '+files.length+'ファイルを確認',i+1,files.length);await yieldImportWork(job);}
   }
@@ -4385,6 +4388,7 @@ async function buildLocalGroups(files,kind,job){
     const f=found[i];manifest.push([f.path,f.name,f.file.size,f.file.lastModified||0]);
     if((i+1)%100===0)await yieldImportWork(job);
   }
+  if(kind==='folder'&&job)job.folderSummary={roots:[...roots],folders:folders.size,photos:found.length,unsupported:other.length,hidden:hiddenCount,hasPaths:roots.size>0};
   return {list,other,manifest};
 }
 async function openLocalFiles(files,kind,requestedJob){
@@ -4392,14 +4396,13 @@ async function openLocalFiles(files,kind,requestedJob){
 }
 for(const [button,input,kind] of [['libraryBtn','libraryInput','library'],['filesBtn','filesInput','files'],['folderBtn','folderInput','folder']]){
   $(button).onclick=()=>{
-    const useFiles=kind==='folder'&&matchMedia('(pointer:coarse)').matches;
-    launchNativePhotoPicker(useFiles?'filesInput':input,useFiles?'files':kind,false);
+    launchNativePhotoPicker(input,kind,kind==='folder'&&allGroups.length>0&&readOnlySession());
   };
   $(input).onchange=async e=>{
     const job=currentImportJob?.inputId===input?currentImportJob:null;
     if(!job||job.cancelled||job.phase!=='picking')return;
     const files=Array.from(e.target.files||[]);
-    if(!files.length){finishImportJob(job);return;}
+    if(!files.length){finishImportJob(job);$('openStatus').textContent=job.kind==='folder'?'フォルダからファイルを受け取れませんでした。DCIM内で「開く」を押すか、写真ファイルの選択に切り替えてください。':'ファイルが選択されませんでした。';toast('ファイルを受け取れませんでした。選び直せます');return;}
     try{await openLocalFiles(files,job.kind,job);}finally{e.target.value='';}
   };
   $(input).addEventListener('cancel',()=>{
@@ -4769,6 +4772,9 @@ async function warmImportMetadata(versions,job){
 }
 function explicitlySeparatePhotos(a,b){return !!b&&(a.notSamePhotoKeys?.includes(b.key)||b.notSamePhotoKeys?.includes(a.key));}
 function candidateShotConflict(item,facts,source){
+  const other=item.facts;
+  // Reused camera filenames across folders need stronger evidence than resemblance.
+  if(other.folderSource&&facts.folderSource&&other.directory!==facts.directory&&other.name===facts.name&&!(other.uid&&other.uid===facts.uid))return true;
   if(explicitlySeparatePhotos(item.g,source)||conflictingShot(item.facts,facts))return true;
   const g=item.g;
   if(Number.isFinite(g.exif?.ms))return conflictingShot({time:g.exif.ms,camera:g.exif.camera||'',uid:g.importFacts?.uid||'',name:normalizedShotName(g.stem)},facts);
@@ -4805,7 +4811,7 @@ async function importFacts(v,job){
       try{Object.assign(meta,await importDimensions(file,ex));if(!meta.width||!meta.height)visual=await importRaster(file,meta,job);}catch(e){if(e.name==='AbortError')throw e;error=e.message;}
     }else{meta.width=ex?.width||0;meta.height=ex?.height||0;}
     checkImportJob(job);
-    return {width:meta.width||0,height:meta.height||0,pixels:(meta.width||0)*(meta.height||0),exif:ex||null,
+    return {folderSource:!!(v.jpg||v.files[0]).folderSource,directory:(v.jpg||v.files[0]).path||'',width:meta.width||0,height:meta.height||0,pixels:(meta.width||0)*(meta.height||0),exif:ex||null,
       time:Number.isFinite(ex?.ms)?ex.ms:null,camera:ex?.camera||'',uid:/^[\da-f]{16,}$/i.test(ex?.imageId||'')&&!/^0+$/.test(ex.imageId)?ex.imageId:'',name:normalizedShotName((v.jpg||v.files[0]).name),visual,error,
       visualChecked:!!visual,readable:!!visual||!!(meta.width&&meta.height)||!v.jpg,format:(v.jpg||v.files[0]).ext};
   })();
@@ -4992,8 +4998,7 @@ async function openIncrementalPhotosBlocking(files,kind,requestedJob){
 }
 // The picker must be opened directly from the tap gesture, including on iOS.
 function pickMorePhotos(inputId,kind,append){
-  const useFiles=kind==='folder'&&matchMedia('(pointer:coarse)').matches;
-  launchNativePhotoPicker(useFiles?'filesInput':inputId,useFiles?'files':kind,append);
+  launchNativePhotoPicker(inputId,kind,append);
 }
 function launchNativePhotoPicker(inputId,kind,append){
   if(openingFiles||copying)return;
@@ -5005,6 +5010,9 @@ function launchNativePhotoPicker(inputId,kind,append){
   const input=$(inputId);input.value='';
   const job=beginImportJob(kind,'picking');job.inputId=inputId;job.append=append;
   $('nativePickerDirectSlot').append(input);input.hidden=false;
+  if(kind==='folder'&&!('webkitdirectory' in input)){
+    input.hidden=true;$('nativePickerMessage').textContent='このブラウザではフォルダ選択を確認できません。下の「写真ファイルを選ぶ」に切り替えてください。';return;
+  }
   // Keep this synchronous in the user's tap, with no timer/promise boundary.
   try{
     if(typeof input.showPicker==='function')input.showPicker();else input.click();
@@ -5021,6 +5029,7 @@ function importResultText(){
 function syncImportUI(){
   const active=readOnlySession()&&allGroups.length>0;
   $('importControls').hidden=!active;
+  $('folderBtn').textContent=active?'DCIMフォルダから追加':'DCIMフォルダを取り込む';
   $('addPhotosBtn').disabled=!!currentImportJob||openingFiles||prepRunning||copying;
   $('showImportReportBtn').disabled=!lastImportReport;
   $('showAddedPhotosBtn').hidden=!importOnlyKeys&&!lastImportReport?.allKeys.length;
@@ -5047,6 +5056,7 @@ function appendVersionPreview(container,label,v,facts){
 function reportAction(label,handler){const b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=handler;return b;}
 function renderImportReport(){
   const body=$('importReportBody'),r=lastImportReport;body.replaceChildren();clearImportReportImages();if(!r)return;
+  if(r.folderSummary){const f=r.folderSummary;body.append(reportLine('取り込み元',(f.roots.join('、')||'選択したフォルダ')+' · 写真のあるフォルダ '+f.folders+'個'),reportLine('フォルダ内のファイル','写真・RAW '+f.photos+'件 ／ 対象外 '+f.unsupported+'件 ／ 隠しファイル '+f.hidden+'件'));if(!f.hasPaths)body.append(reportLine('フォルダ情報','ブラウザから階層情報が届かなかったため、受け取ったファイルだけを取り込んでいます。'));}
   body.append(reportLine('今回の結果',importResultText()),reportLine('受け取ったファイル',r.received+'件'),reportLine('現在の全写真',allGroups.length+'枚'));
   const keys=new Set(r.allKeys),list=allGroups.filter(g=>keys.has(g.key)),times=list.map(captureTimeOf).filter(t=>t!==null).sort((a,b)=>a-b);
   const waiting=list.filter(g=>captureTimeOf(g)===null&&(g.exif===undefined||g.prepDeferred)).length,unknown=list.filter(g=>g.exif!==undefined&&!g.prepDeferred&&captureTimeOf(g)===null).length;
@@ -5127,7 +5137,7 @@ $('showAddedPhotosBtn').onclick=toggleImportedPhotos;
 for(const [button,input,kind] of [['addLibraryPhotos','libraryInput','library'],['addFilePhotos','filesInput','files'],['addFolderPhotos','folderInput','folder']]){
   $(button).onclick=()=>{$('importAddDialog').close();pickMorePhotos(input,kind,true);};
 }
-$('addFolderPhotos').hidden=!('webkitdirectory' in $('folderInput'));
+$('addFolderPhotos').hidden=false;
 $('preferLargeImport').checked=loadState().prefs?.preferLargeImport!==false;
 $('preferLargeImport').onchange=()=>{const state=loadState();state.prefs={...state.prefs,preferLargeImport:$('preferLargeImport').checked};saveState(state);};
 const syncImportSourceBase=syncSourceUI;syncSourceUI=function(){syncImportSourceBase();syncImportUI();};
@@ -5266,19 +5276,21 @@ for(const radio of document.querySelectorAll('input[name=exportTimeScope]'))radi
 
 
 const nativePickerStatus=document.createElement('div');nativePickerStatus.id='nativePickerStatus';nativePickerStatus.hidden=true;
-nativePickerStatus.innerHTML='<p id="nativePickerMessage" role="status"></p><div class="source-buttons"><button id="retryNativePicker" type="button">選択画面を開き直す</button><button id="releaseNativePicker" type="button">待機を解除</button></div><details><summary>選択画面が開かないとき</summary><p>下の標準ボタンから直接選んでください。</p><div id="nativePickerDirectSlot"></div></details>';
+nativePickerStatus.innerHTML='<p id="nativePickerMessage" role="status"></p><div class="source-buttons"><button id="retryNativePicker" type="button">選択画面を開き直す</button><button id="releaseNativePicker" type="button">待機を解除</button><button id="nativeFolderFallback" type="button" hidden>写真ファイルを選ぶ</button></div><details><summary>選択画面が開かないとき</summary><p>下の標準ボタンから直接選んでください。</p><div id="nativePickerDirectSlot"></div></details>';
 $('openStatus').before(nativePickerStatus);
 function showNativePickerStatus(job){
-  const library=job.kind==='library';
+  const library=job.kind==='library',folder=job.kind==='folder';
+  $('nativeFolderFallback').hidden=!folder;
   if($('s-cull').classList.contains('on'))$('topbar').append(nativePickerStatus);else $('openStatus').before(nativePickerStatus);
-  $('nativePickerMessage').textContent=library?'写真の受け取り待ちです。フォトライブラリで写真を選んでください。画面が開かない場合は、下のボタンで開き直せます。':'ファイルの受け取り待ちです。「ブラウズ」からSDカード→DCIM内の写真を選択してください。画面が開かない場合は、下のボタンで開き直せます。';
+  $('nativePickerMessage').textContent=folder?'フォルダの受け取り待ちです。「ブラウズ」→SDカード→DCIM内へ移動し「開く」を押してください。下位フォルダも対象です。OSの準備中は進捗を取得できません。':library?'写真の受け取り待ちです。フォトライブラリで写真を選んでください。画面が開かない場合は、下のボタンで開き直せます。':'ファイルの受け取り待ちです。「ブラウズ」からSDカード→DCIM内の写真を選択してください。画面が開かない場合は、下のボタンで開き直せます。';
   nativePickerStatus.hidden=false;
   // The page remains usable when the OS picker does not open or sends no cancel event.
   sourceBusy(false);schedulePhotoLayout();
 }
+$('nativeFolderFallback').onclick=()=>{const job=currentImportJob;if(job?.phase==='picking')launchNativePhotoPicker('filesInput','files',job.append);};
 $('retryNativePicker').onclick=()=>{const job=currentImportJob;if(job?.phase==='picking')launchNativePhotoPicker(job.inputId,job.kind,job.append);};
 $('releaseNativePicker').onclick=()=>{const job=currentImportJob;if(job?.phase!=='picking')return;job.cancelled=true;finishImportJob(job);$('openStatus').textContent='選択待ちを解除しました。SDカードや写真を選び直せます。';};
-if(matchMedia('(pointer:coarse)').matches){$('folderBtn').hidden=true;$('addFolderPhotos').hidden=true;}
+$('folderBtn').hidden=false;$('addFolderPhotos').hidden=false;
 
 /* Keep native-picker waiting separate from work whose progress the page can measure. */
 function beginImportJob(kind,phase='picking'){
@@ -5901,7 +5913,7 @@ async function firstFlowPaint(job){
   while(performance.now()<deadline&&groups[idx]?.jpg&&!decisionPreviewReady(groups[idx])){await new Promise(r=>setTimeout(r,20));checkImportJob(job);}
 }
 function provisionalImportReport(job){
-  return {addedKeys:[...job.newKeys],updatedKeys:[],kept:0,duplicates:0,failed:[],unsupported:job.unsupported||[],received:job.received||0,
+  return {folderSummary:job.folderSummary||null,addedKeys:[...job.newKeys],updatedKeys:[],kept:0,duplicates:0,failed:[],unsupported:job.unsupported||[],received:job.received||0,
     append:job.append,pending:[],allKeys:[...job.newKeys],date:Date.now(),checkState:'checking'};
 }
 function freshLocalSelection(kind,files){
@@ -5979,7 +5991,7 @@ async function finishFlowPlan(job,plan){
   endFlip();hideNote();clearRange();scope=null;$('scopeChip').hidden=true;cmpOn=false;clearCmp();closeDone();hideBlockCard();releaseZip();
   const displayed=groups[idx],displayedFile=displayed?.jpg?.file;
   allGroups=plan.work.map(g=>{if(!g._original)return g;const original=g._original;delete g._original;Object.assign(original,g);return original;});
-  pendingImportCandidates=pending;lastImportReport=plan.report;lastImportReport.received=job.received;lastImportReport.unsupported=job.unsupported||[];lastImportReport.checkState='done';
+  pendingImportCandidates=pending;lastImportReport=plan.report;lastImportReport.received=job.received;lastImportReport.unsupported=job.unsupported||[];lastImportReport.checkState='done';lastImportReport.folderSummary=job.folderSummary||null;
   cardSig='local-v1|'+signature;
   const requestedFilter=activeTimeFilter||job.restoredFilter;
   if(!job.append&&!job.recheck)restoreSession();
@@ -6025,10 +6037,10 @@ async function openIncrementalPhotos(files,kind,requestedJob){
   try{
     updateImportProgress(job,'写真を受け取りました',files.length+'ファイル · 選別画面を準備しています');
     const built=await buildLocalGroups(files,kind,job);checkImportJob(job);
-    if(!built.list.length){$('openStatus').textContent='対応する写真がありません。写真を選び直してください。';return;}
+    if(!built.list.length){const message='対応する写真がありません。対象外 '+built.other.length+'件'+(job.folderSummary?'・隠しファイル '+job.folderSummary.hidden+'件':'')+'。別のフォルダか写真を選んでください。';$('openStatus').textContent=message;toast(message);return;}
     const first=await probeFlowFirst(built.list);checkImportJob(job);
     if(!first){
-      lastImportReport={addedKeys:[],updatedKeys:[],allKeys:[],kept:0,duplicates:0,received:files.length,unsupported:built.other,failed:built.list.map(group=>({name:group.stem,message:'画像ファイルの先頭を確認できませんでした',group})),checkState:'done'};
+      lastImportReport={folderSummary:job.folderSummary||null,addedKeys:[],updatedKeys:[],allKeys:[],kept:0,duplicates:0,received:files.length,unsupported:built.other,failed:built.list.map(group=>({name:group.stem,message:'画像ファイルの先頭を確認できませんでした',group})),checkState:'done'};
       finishImportJob(job);openImportReport();return;
     }
     const old=job.append?allGroups.slice():[],used=new Set(old.map(g=>g.key));
@@ -6057,7 +6069,7 @@ async function openIncrementalPhotos(files,kind,requestedJob){
 }
 async function resumeFlowCheck(){
   if(currentImportJob||openingFiles||!allGroups.length)return;
-  const job=beginImportJob(sessionSource,'preparing');job.receivedAt=Date.now();job.received=allGroups.reduce((n,g)=>n+g.files.length,0);job.recheck=true;job.append=true;
+  const job=beginImportJob(sessionSource,'preparing');job.receivedAt=Date.now();job.received=allGroups.reduce((n,g)=>n+g.files.length,0);job.recheck=true;job.append=true;job.folderSummary=lastImportReport?.folderSummary||null;
   job.oldKeys=new Set(allGroups.map(g=>g.key));job.oldFiles=new Map(allGroups.map(g=>[g.key,(g.jpg||g.files[0]).file]));job.oldTimes=new Map(allGroups.map(g=>[g.key,captureTimeOf(g)]));job.newKeys=new Set();job.unsupported=[];
   job.checkGroups=allGroups.slice();job.previousPending=pendingImportCandidates.slice();job.liveByFile=new Map(allGroups.flatMap(g=>(g.versions||[g]).map(v=>[fileOfVersion(v),g])));job.revisionBaseline=reviewRevision;
   job.rawSignature=activeRawImportSignature||cardSig;job.phase='checking';job.committed=true;prepRunning=true;importCheckPaused=false;lastImportReport=provisionalImportReport(job);$('importOverlay').hidden=true;syncImportUI();syncFlowUI();await runFlowCheck(job);
