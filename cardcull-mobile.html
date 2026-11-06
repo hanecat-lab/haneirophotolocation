@@ -7218,6 +7218,87 @@ const prToolsMenuBase=$('refineToolsBtn').onclick;$('refineToolsBtn').onclick=()
 for(const dialog of [heldReviewDialog,pairReviewDialog,prZoomDialog])dialog.addEventListener('keydown',e=>e.stopPropagation());
 for(const type of ['dragenter','dragover','drop'])window.addEventListener(type,e=>{if(!heldReviewDialog.open&&!pairReviewDialog.open&&!prZoomDialog.open)return;if(!Array.from(e.dataTransfer?.types||[]).includes('Files'))return;e.preventDefault();e.stopImmediatePropagation();if(type==='drop')toast('見直し・比較を閉じてから写真を追加してください');},true);
 
+
+/* End this document session after saving decisions; never delete source/destination files. */
+const cleanupNoticeKey='CardCull.cleanupNotice.v1';
+let cleanupEnding=false,cleanupSharing=false,cleanupSnapshot=null,cleanupLocalSaved=false,cleanupBackupIssued=false;
+const cleanupDialog=document.createElement('dialog');cleanupDialog.id='cleanupDialog';cleanupDialog.className='import-details-dialog';
+cleanupDialog.innerHTML=`<div class="import-dialog-heading"><h2>作業を終了して片付ける</h2><button id="cleanupClose" type="button">戻る</button></div><p id="cleanupSummary" class="source-note"></p><p>読み込んだ写真・プレビュー・比較・取り消し用データと、書き出し用の一時データを片付ける操作です。取り込み画面へ戻ります。再開するときは写真を選び直してください。</p><p id="cleanupSaveStatus" role="status" aria-live="polite"></p><button id="cleanupExport" class="primary" type="button">選別結果を共有・保存</button><p id="cleanupExportStatus" role="status"></p><label id="cleanupBackupRow" class="import-preference" hidden><input id="cleanupBackupConfirmed" type="checkbox" disabled> JSONを保存・共有できたことを確認しました</label><p class="source-note">ダウンロード中のファイルは、保存完了を確認してから終了してください。</p><button id="cleanupFinish" type="button" style="width:100%;min-height:48px;margin-top:12px">写真を片付けて終了</button><details><summary>片付けるデータについて</summary><p class="source-note">元のSDカード・写真ライブラリ・コピー先の画像は削除しません。ダウンロード済みのJSON・ZIPは削除しません。アプリ内で作成したZIPは、再ダウンロードするには作り直しが必要です。選別結果・設定・取り込み時間の目安も残します。iPhone・ブラウザ側の一時データの削除時期や、実際に空く容量はアプリから確認できません。</p></details>`;
+document.body.append(cleanupDialog);
+function cleanupBlocked(){return cleanupSharing||!!currentImportJob||openingFiles||prepRunning||copying||bgBusy||zipBuilding||newsBusy||newsPreviewRunning||rh.busy||handoffSending||pairReviewDialog.open||heldReviewDialog.open||prZoomDialog.open;}
+function cleanupVerifySave(){
+  try{
+    saveSoon();if(!allGroups.length&&!cardSig)return true;const pending=pendingSessionSave,signature=pending?.signature||cardSig,expected=pending?JSON.stringify(pending.session):null;flushSessionSave();
+    const text=localStorage.getItem(APP_KEY);if(!text)throw new Error('保存データがありません');const state=JSON.parse(text);
+    if(allGroups.length&&(!expected||!signature||JSON.stringify(state.sessions?.[signature])!==expected))throw new Error('最新の選別結果を確認できません');
+    // The normal save helper reports errors without throwing; verify writes explicitly too.
+    localStorage.setItem(APP_KEY,text);if(localStorage.getItem(APP_KEY)!==text)throw new Error('保存内容を確認できません');
+    return true;
+  }catch(e){return false;}
+}
+function cleanupPaint(){
+  $('cleanupSaveStatus').textContent=!allGroups.length?'現在読み込んでいる写真はありません。保存済みの選別結果と設定は残します。':cleanupLocalSaved?'選別結果はこのブラウザに保存できています。設定と一緒に残します。':'選別結果をブラウザに保存できていません。先にJSONを共有・保存し、保存できたことを確認してください。';
+  $('cleanupSaveStatus').style.color=cleanupLocalSaved?'':'#ffda85';$('cleanupBackupRow').hidden=cleanupLocalSaved;$('cleanupBackupConfirmed').disabled=!cleanupBackupIssued;
+  $('cleanupFinish').disabled=cleanupEnding||cleanupSharing||!cleanupLocalSaved&&!($('cleanupBackupConfirmed').checked&&cleanupBackupIssued);
+}
+function openCleanup(){
+  if(cleanupEnding||cleanupBlocked()){toast('取り込み・コピー・書き出しなどの処理が終わってから片付けてください');return;}
+  cleanupSnapshot=resultDocument();cleanupBackupIssued=false;$('cleanupBackupConfirmed').checked=false;$('cleanupExportStatus').textContent='';$('cleanupExport').disabled=!cleanupSnapshot.photos.length;
+  const stats=storageReadDataStats();$('cleanupSummary').textContent=stats.photos?'読み込み中：'+stats.photos+'枚 ／ 原本サイズ合計 '+storageSizeLabel(stats.loaded):'読み込んだ写真はありません。残っている表示・取り消し用データを片付けます。';
+  cleanupLocalSaved=cleanupVerifySave();cleanupPaint();if(!cleanupDialog.open)cleanupDialog.showModal();
+}
+$('cleanupBackupConfirmed').onchange=cleanupPaint;$('cleanupClose').onclick=()=>{if(!cleanupEnding&&!cleanupSharing)cleanupDialog.close();};cleanupDialog.addEventListener('cancel',e=>{if(cleanupEnding||cleanupSharing)e.preventDefault();});
+cleanupDialog.addEventListener('close',()=>{if(!cleanupDialog.open&&!cleanupEnding)cleanupSnapshot=null;});
+$('cleanupExport').onclick=async()=>{
+  if(cleanupEnding||cleanupSharing||!cleanupSnapshot?.photos.length)return;cleanupSharing=true;$('cleanupExport').disabled=true;$('cleanupFinish').disabled=true;$('cleanupClose').disabled=true;
+  const file=new File([JSON.stringify(cleanupSnapshot,null,2)],rawSelectionName(cleanupSnapshot),{type:'application/json'});
+  try{
+    let shared=false;if(navigator.canShare?.({files:[file]})){try{await navigator.share({files:[file],title:'CardCull 選別結果'});shared=true;}catch(e){if(e.name==='AbortError'){$('cleanupExportStatus').textContent='共有をキャンセルしました。';return;}}}
+    if(!shared)downloadBlob(file,file.name);cleanupBackupIssued=true;$('cleanupExportStatus').textContent=shared?'共有操作が終了しました。JSONを受け取れたことを確認してください。':'JSONの保存操作を行いました。ダウンロードの保存完了を確認してください。';
+  }catch(e){$('cleanupExportStatus').textContent='共有・保存できませんでした。もう一度お試しください。';}
+  finally{cleanupSharing=false;$('cleanupExport').disabled=false;$('cleanupClose').disabled=false;cleanupPaint();}
+};
+function cleanupReleaseSession(){
+  // Remove live File/Blob owners and DOM closures before reloading the document.
+  clearTimeout(saveTimer);pendingSessionSave=null;cardSig='';activeRawImportSignature=null;
+  hideNote();closeDone();hideBlockCard();endFlip();lastBlockG=null;scope=null;cmpOn=false;cmpIds=[];cdrag=null;zdrag=null;originalDrag=null;
+  allGroups=[];groups=[];blocks=[];idx=0;view='all';cardDir=null;destDir=null;destOK=false;dateDirs.clear();burstMembers.clear();burstSelections.clear();completedBursts.clear();blockShown.clear();screenKeys.clear();
+  photoRemovalUndo=null;photoRemovalSelection.clear();lastImportReport=null;pendingImportCandidates=[];importOnlyKeys=null;screenshotReviewKeys=null;txLateQueue=[];txConfirmNextDrop=false;storageLastCompletedJob=null;memoLastRecordedJob=null;
+  rh.controller?.abort();rh.data=null;rh.files=[];rh.rows=[];rh.source=null;rh.copied.clear();rh.failures=[];
+  hr.queue=[];hr.history=[];hr.origin=null;hr.pos=0;hr.started=false;hr.ready=false;
+  pr.selected.clear();pr.order=[];pr.pair=[];pr.history=[];pr.candidates.clear();pr.losers.clear();pr.skipped.clear();pr.ready.clear();pr.origin=null;pr.anchor=null;pr.fromHeld=false;
+  handoffSnapshot=null;cleanupSnapshot=null;++newsToken;newsAbort=true;newsItems=[];newsFiles=[];newsFailures=[];newsCrops.clear();newsConfig=null;newsRevokePreview();newsReleaseOutput();
+  clearImportReportImages();clearPhotoRemovalImages();releaseZip();prZoomRelease();resetPreviewSession();
+  for(const url of downloadURLs)URL.revokeObjectURL(url);downloadURLs.clear();clearExternalDrag();clearImportScreenLock();
+  for(const id of ['grid','cmp','burstFilmstrip','segDots','photoRemovalList','importReportBody','zipBatches','rhIssueList','rhZip','prGrid','prPair','prSelectedList','prCandidates','hrPhoto'])$(id)?.replaceChildren();
+  for(const im of document.querySelectorAll('img')){im.onload=null;im.onerror=null;im.removeAttribute('src');}
+  for(const input of document.querySelectorAll('input[type=file]'))input.value='';
+  sessionSource='files';sourceLabel='';setActiveTimeFilter(null);sourceBusy(false);syncSourceUI();syncImportUI();show('s-open');
+}
+function cleanupReload(){location.reload();}
+async function cleanupFinish(){
+  if(cleanupEnding||cleanupBlocked())return;
+  cleanupLocalSaved=cleanupVerifySave();if(!cleanupLocalSaved&&!($('cleanupBackupConfirmed').checked&&cleanupBackupIssued)){cleanupPaint();return;}
+  cleanupEnding=true;$('cleanupFinish').disabled=true;$('cleanupExport').disabled=true;$('cleanupClose').disabled=true;
+  try{
+    await stopBg(); // already idle by the guard; do not interrupt a copy or remove copied files.
+    const notice={at:Date.now(),saved:cleanupLocalSaved};try{sessionStorage.setItem(cleanupNoticeKey,JSON.stringify(notice));}catch(e){}
+    cleanupReleaseSession();
+    for(const dialog of document.querySelectorAll('dialog[open]'))dialog.close();
+    $('openStatus').textContent=cleanupLocalSaved?'今回の写真を片付けました。選別結果と設定は残しています。再開するには写真を選び直してください。':'今回の写真を片付けました。設定は保持し、選別結果は共有・保存したJSONから再開してください。';
+    // A fresh document also releases callbacks, weak caches and the old file-input listeners.
+    cleanupReload();
+  }catch(e){$('openStatus').textContent='作業を終了しました。このタブを閉じ、アプリを開き直してください。';}
+}
+$('cleanupFinish').onclick=cleanupFinish;
+const cleanupMoreBase=$('refineMoreBtn').onclick;$('refineMoreBtn').onclick=()=>{cleanupMoreBase();if(refineMore.dialog.open)refineAction(refineMore,'作業を終了して片付ける',openCleanup,cleanupBlocked());};
+const cleanupHomeButton=document.createElement('button');cleanupHomeButton.id='cleanupHomeButton';cleanupHomeButton.type='button';cleanupHomeButton.className='small';cleanupHomeButton.textContent='作業を終了して片付ける';cleanupHomeButton.onclick=openCleanup;$('showStorageInfoOpenBtn').after(cleanupHomeButton);
+function cleanupShowNotice(){
+  try{const text=sessionStorage.getItem(cleanupNoticeKey);if(!text)return;sessionStorage.removeItem(cleanupNoticeKey);const notice=JSON.parse(text);if(!notice||Date.now()-notice.at>3600000)return;$('openStatus').textContent=notice.saved?'今回の写真を片付けました。選別結果と設定は残しています。再開するには写真を選び直してください。':'今回の写真を片付けました。選別結果は共有・保存したJSONから再開してください。設定は残しています。';}catch(e){}
+}
+cleanupShowNotice();
+for(const type of ['dragenter','dragover','drop'])window.addEventListener(type,e=>{if(!cleanupDialog.open&&!cleanupEnding)return;if(!Array.from(e.dataTransfer?.types||[]).includes('Files'))return;e.preventDefault();e.stopImmediatePropagation();},true);
+
 </script>
 
 </body>
