@@ -43,17 +43,18 @@
 
 | ファイル | 出どころ（URL） | ライセンス | 取り込んだ日 | 使っているアプリ |
 |---|---|---|---|---|
-| （まだなし） | | | | |
+| `nyanisyarud-sfx/count.wav` | Pixabay「metronome」（freesound_community、ID 85688。ファイル名からの推定で、ページURLは未確認） | Pixabay Content License | 2026-11-07 | nyanisyarud（カウントダウン 3・2・1） |
 
 nyanisyarud の効果音は、次のファイル名で `nyanisyarud-sfx/` に置くと鳴る（置いていない音は和風の合成音で鳴る。`nyanisyarud.html?sfxtest=1` の試聴パネルで、合成音とファイルを鳴らし比べられる）。取り込んだら上の表に1行ずつ書く。
 
 | ファイル名 | 鳴る場面 | 音のイメージ | 長さの目安 |
 |---|---|---|---|
-| `count.mp3` | カウントダウン 3・2・1 | 拍子木「カッ」 | 0.25秒以内 |
-| `go.mp3` | GO | 太鼓「ドン」 | 0.7秒以内 |
-| `rocket-good.mp3` | ロケットスタート GOOD | 鈴「シャン」 | 0.5秒以内 |
-| `rocket-perfect.mp3` | ロケットスタート PERFECT | 鈴を2回（2回目は高く） | 0.6秒以内 |
-| `flying.mp3` | フライング | 低い「ポコッ」 | 0.4秒以内 |
+| `count.wav` | カウントダウン 3・2・1 | 拍子木「カッ」 | 0.25秒以内 |
+| `go.wav` | GO | 太鼓「ドン」 | 0.7秒以内 |
+| `rocket-good.wav` | ロケットスタート GOOD | 鈴「シャン」 | 0.5秒以内 |
+| `rocket-perfect.wav` | ロケットスタート PERFECT | 鈴を2回（2回目は高く） | 0.6秒以内 |
+| `flying.wav` | フライング | 低い「ポコッ」 | 0.4秒以内 |
 
 - 先頭の無音は削る（残すと拍より遅れて聞こえ、ロケットスタートの合わせ所がずれる）。
-- 形式は mp3・モノラル。音量は `nyanisyarud.html` の `SFX` の `volume` で合わせる。
+- 形式は WAV（16bit・モノラル・48kHz）。mp3 は先頭に約20msの無音が入り、ブラウザによって削られたり残ったりするため使わない。
+- 音量は `nyanisyarud.html` の `SFX` の `volume` で合わせる。
