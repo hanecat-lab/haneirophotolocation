@@ -44,6 +44,8 @@
 | ファイル | 出どころ（URL） | ライセンス | 取り込んだ日 | 使っているアプリ |
 |---|---|---|---|---|
 | `nyanisyarud-sfx/count.wav` | Pixabay「metronome」（freesound_community、ID 85688。ファイル名からの推定で、ページURLは未確認） | Pixabay Content License | 2026-11-07 | nyanisyarud（カウントダウン 3・2・1） |
+| `nyanisyarud-sfx/rocket-good.wav` | Pixabay「servant bell ring 2」（floraphonic、ID 211683。ファイル名からの推定で、ページURLは未確認） | Pixabay Content License | 2026-11-07 | nyanisyarud（ロケットスタート GOOD。PERFECT の1打目にも使用） |
+| `nyanisyarud-sfx/rocket-perfect.wav` | 上の servant bell と、Pixabay「bicycle bell」（soundreality、ID 155622。ファイル名からの推定で、ページURLは未確認）を0.09秒ずらして重ねたもの | Pixabay Content License | 2026-11-07 | nyanisyarud（ロケットスタート PERFECT） |
 
 nyanisyarud の効果音は、次のファイル名で `nyanisyarud-sfx/` に置くと鳴る（置いていない音は和風の合成音で鳴る。`nyanisyarud.html?sfxtest=1` の試聴パネルで、合成音とファイルを鳴らし比べられる）。取り込んだら上の表に1行ずつ書く。
 
