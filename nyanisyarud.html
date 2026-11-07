@@ -15905,31 +15905,86 @@ function prepareSound(){
   if(gutterAudio?.state==='suspended')gutterAudio.resume().catch(()=>{});
   loadSfx();
 }
-// 効果音ファイル(nyanisyarud-sfx/)：最初のタップで読み込み始める。読み込めていない音は、今までの合成音で鳴らす
-// volume は聞いて合わせる値(ファイルごとの音の大きさの違いをここでそろえる)
+// 効果音：nyanisyarud-sfx/ に音ファイルがあればそれを鳴らし、なければ和風の合成音で鳴らす
+// ファイルは最初のタップで読み込み始める。volume はファイルの音量をそろえる値(聞いて合わせる)
+// 合成音の数値(高さ Hz・長さ 秒・大きさ)は、?sfxtest=1 の試聴パネルで聞いて合わせる
 const SFX_DIRECTORY='./nyanisyarud-sfx/';
-const SFX={count:{file:'count.mp3',volume:.5},go:{file:'go.mp3',volume:.5},rocketGood:{file:'rocket-good.mp3',volume:.5},rocketPerfect:{file:'rocket-perfect.mp3',volume:.5},flying:{file:'flying.mp3',volume:.5}};
-const sfxBuffers={},sfxPlaying=new Set();
-let sfxLoading=false;
+const SFX={
+  count:{label:'3・2・1(拍子木)',file:'count.mp3',volume:.5,synth:()=>{sfxNoiseHit({type:'bandpass',freq:2500,q:8,peak:.5,decay:.05});sfxSweep({type:'triangle',from:1900,to:1700,sweep:.03,peak:.12,decay:.06});}},
+  go:{label:'GO(太鼓)',file:'go.mp3',volume:.5,synth:()=>{sfxSweep({type:'sine',from:140,to:55,sweep:.15,peak:.5,decay:.5});sfxSweep({type:'triangle',from:280,to:110,sweep:.15,peak:.15,decay:.35});sfxNoiseHit({type:'lowpass',freq:800,q:.7,peak:.15,decay:.06});}},
+  rocketGood:{label:'ロケット GOOD(鈴)',file:'rocket-good.mp3',volume:.5,synth:()=>{sfxBell({base:2200,peak:.12,decay:.45});}},
+  rocketPerfect:{label:'ロケット PERFECT(鈴2回)',file:'rocket-perfect.mp3',volume:.5,synth:()=>{sfxBell({base:2200,peak:.12,decay:.45});sfxBell({base:2900,peak:.12,decay:.5,at:.09});}},
+  flying:{label:'フライング(ポコッ)',file:'flying.mp3',volume:.5,synth:()=>{sfxSweep({type:'sine',from:420,to:200,sweep:.06,peak:.35,decay:.12});sfxNoiseHit({type:'bandpass',freq:1200,q:3,peak:.2,decay:.02});}},
+};
+const sfxBuffers={},sfxStatus={},sfxPlaying=new Set();
+let sfxLoading=false,sfxNoise=null,sfxPanelRefresh=null;
 function loadSfx(){
   if(sfxLoading||!gutterAudio)return;
   sfxLoading=true;const ctx=gutterAudio;
   for(const [name,{file}]of Object.entries(SFX)){
+    sfxStatus[name]='読込中';
     fetch(SFX_DIRECTORY+file).then(r=>{if(!r.ok)throw new Error(String(r.status));return r.arrayBuffer();})
       .then(data=>new Promise((resolve,reject)=>ctx.decodeAudioData(data,resolve,reject)))
-      .then(buffer=>{sfxBuffers[name]=buffer;}).catch(()=>{});
+      .then(buffer=>{sfxBuffers[name]=buffer;sfxStatus[name]='あり';},()=>{sfxStatus[name]='なし';})
+      .finally(()=>sfxPanelRefresh?.());
   }
 }
-function playSfx(name,fallback){
-  if(!soundEnabled||gutterAudio?.state!=='running')return;
-  const buffer=sfxBuffers[name];
-  if(!buffer){fallback();return;}
+function sfxEnvelope(gain,t,peak,decay){gain.gain.setValueAtTime(.0001,t);gain.gain.exponentialRampToValueAtTime(peak,t+.005);gain.gain.exponentialRampToValueAtTime(.0001,t+.005+decay);}
+// 高さを from→to へ sweep 秒で下げる音
+function sfxSweep({type,from,to,sweep,peak,decay,at=0}){
+  const ctx=gutterAudio,t=ctx.currentTime+at,osc=ctx.createOscillator(),gain=ctx.createGain();
+  osc.type=type;osc.frequency.setValueAtTime(from,t);osc.frequency.exponentialRampToValueAtTime(to,t+sweep);
+  sfxEnvelope(gain,t,peak,decay);osc.connect(gain);gain.connect(ctx.destination);
+  osc.start(t);osc.stop(t+decay+.03);sfxPlaying.add(osc);osc.onended=()=>{sfxPlaying.delete(osc);osc.disconnect();gain.disconnect();};
+}
+// 雑音をフィルターに通した、叩いた瞬間の音
+function sfxNoiseHit({type,freq,q,peak,decay,at=0}){
+  const ctx=gutterAudio,t=ctx.currentTime+at;
+  if(!sfxNoise){sfxNoise=ctx.createBuffer(1,ctx.sampleRate,ctx.sampleRate);const d=sfxNoise.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;}
+  const src=ctx.createBufferSource(),filter=ctx.createBiquadFilter(),gain=ctx.createGain();
+  src.buffer=sfxNoise;filter.type=type;filter.frequency.value=freq;filter.Q.value=q;
+  sfxEnvelope(gain,t,peak,decay);src.connect(filter);filter.connect(gain);gain.connect(ctx.destination);
+  src.start(t);src.stop(t+decay+.03);sfxPlaying.add(src);src.onended=()=>{sfxPlaying.delete(src);src.disconnect();filter.disconnect();gain.disconnect();};
+}
+// 鈴：倍音の比がずれた高い音を重ねる(高い倍音ほど早く消す)＋鳴り始めの「シャ」
+function sfxBell({base,peak,decay,at=0}){
+  for(const [ratio,weight]of [[1,1],[2.76,.5],[5.4,.25],[8.93,.12]])sfxSweep({type:'sine',from:base*ratio,to:base*ratio,sweep:.01,peak:peak*weight,decay:decay/Math.sqrt(ratio),at});
+  sfxNoiseHit({type:'highpass',freq:6000,q:.7,peak:.08,decay:.03,at});
+}
+function playSfxBuffer(name){
   const ctx=gutterAudio,src=ctx.createBufferSource(),gain=ctx.createGain();
-  src.buffer=buffer;gain.gain.value=SFX[name].volume;
+  src.buffer=sfxBuffers[name];gain.gain.value=SFX[name].volume;
   src.connect(gain);gain.connect(ctx.destination);src.start();sfxPlaying.add(src);
   src.onended=()=>{sfxPlaying.delete(src);src.disconnect();gain.disconnect();};
 }
-function stopSfx(){for(const src of sfxPlaying)try{src.stop();}catch(e){}}
+function playSfx(name){
+  if(!soundEnabled||gutterAudio?.state!=='running')return;
+  if(sfxBuffers[name])playSfxBuffer(name);else SFX[name].synth();
+}
+function stopSfx(){for(const node of sfxPlaying)try{node.stop();}catch(e){}}
+// 試聴パネル(?sfxtest=1)：音ごとに「合成」と「ファイル」を鳴らし比べる。音の設定がOFFでも鳴らす
+if(new URLSearchParams(location.search).get('sfxtest')==='1'){
+  const panel=document.createElement('div');
+  panel.style.cssText='box-sizing:border-box;position:fixed;right:8px;top:8px;z-index:99999;background:rgba(0,0,0,.85);color:#fff;font:13px/1.4 sans-serif;padding:10px;border-radius:8px;max-width:calc(100vw - 16px)';
+  const rows=Object.keys(SFX).map(name=>`<div style="display:flex;gap:6px;align-items:center;margin:4px 0"><span style="flex:1;min-width:9em">${SFX[name].label}</span><button data-sfx="${name}" data-kind="synth">合成</button><button data-sfx="${name}" data-kind="file">ファイル</button><span data-sfx-status="${name}" style="min-width:3.5em"></span></div>`).join('');
+  panel.innerHTML=`<b>効果音の試聴</b> <button data-sfx-close style="float:right">×</button><div data-sfx-sound style="margin:4px 0;opacity:.8"></div>${rows}`;
+  document.body.appendChild(panel);
+  sfxPanelRefresh=()=>{
+    panel.querySelector('[data-sfx-sound]').textContent=`音の設定：${soundEnabled?'ON':'OFF'}／AudioContext：${gutterAudio?.state??'未作成'}`;
+    for(const name of Object.keys(SFX))panel.querySelector(`[data-sfx-status="${name}"]`).textContent='ファイル'+(sfxStatus[name]??'未読込');
+  };
+  sfxPanelRefresh();
+  panel.addEventListener('click',e=>{
+    if(e.target.closest('[data-sfx-close]')){panel.remove();sfxPanelRefresh=null;return;}
+    const button=e.target.closest('[data-sfx]');if(!button)return;
+    prepareSound();
+    const name=button.dataset.sfx,kind=button.dataset.kind;
+    gutterAudio?.resume().then(()=>{
+      if(kind==='synth')SFX[name].synth();else if(sfxBuffers[name])playSfxBuffer(name);
+      sfxPanelRefresh?.();
+    });
+  });
+}
 // コースの準備(初めて走る時の重さを走り出す前に済ませる)：コースを作り直したら、
 // B：GLBの読み込みが終わるのを待つ(まだ始まっていない読み込みもあるので、idle ms 何も読み込んでいない状態が続いたら終わりとみなす。最長 maxWait ms)。
 // A：陰影の計算の準備(シェーダー)を並行してまとめて済ませ、絵(テクスチャ)をGPUへ送っておく。
@@ -16046,8 +16101,8 @@ function countdownBeat(beat){
   const number=document.getElementById('countdownNumber');number.textContent=beat<COUNTDOWN.count?String(COUNTDOWN.count-beat):'GO!';
   number.dataset.go=String(beat>=COUNTDOWN.count);
   if(appAnimationsEnabled)number.animate([{transform:'translate(-50%,-50%) scale(1.35)',opacity:.4},{transform:'translate(-50%,-50%) scale(1)',opacity:1}],{duration:180,easing:'ease-out'});
-  if(beat<COUNTDOWN.count){playSfx('count',()=>playTone(880,.12));if(navigator.vibrate)navigator.vibrate(15);}
-  else{playSfx('go',()=>playTone(1320,.45));if(navigator.vibrate)navigator.vibrate(40);}
+  if(beat<COUNTDOWN.count){playSfx('count');if(navigator.vibrate)navigator.vibrate(15);}
+  else{playSfx('go');if(navigator.vibrate)navigator.vibrate(40);}
 }
 function stepCountdown(dt){
   // 最初に押した時刻で判定する(GOより0.15秒以上早いとフライング)
@@ -16070,14 +16125,14 @@ function finishCountdown(){
 function rocketStart(grade){
   countdown.awaitAfter=false;
   const ind=document.getElementById('indicator');
-  if(grade==='FLYING'){if(ind){ind.textContent='フライング';ind.classList.add('on');setTimeout(()=>ind.classList.remove('on'),800);}playSfx('flying',()=>{playTone(330,.12,{type:'triangle'});playTone(220,.2,{type:'triangle',at:.1});});return;}
+  if(grade==='FLYING'){if(ind){ind.textContent='フライング';ind.classList.add('on');setTimeout(()=>ind.classList.remove('on'),800);}playSfx('flying');return;}
   // にゃんこランド(大すべり台)は、スタートの速さ(SLIDE.startKmh)にロケットスタートの速さをそのまま足す
   speed=TRACKS[currentKey]?.slide&&!isPracticeActive()?SLIDE.startKmh/3.6+ROCKET.speed[grade]:Math.max(speed,ROCKET.speed[grade]);
   if(grade==='PERFECT')countdown.boost=ROCKET.boostTime;
   if(appAnimationsEnabled){countdown.fovKick=Math.max(countdown.fovKick,grade==='PERFECT'?10:6);if(grade==='PERFECT')countdown.shake=.4;}
   if(ind){ind.textContent='ロケットスタート！ '+grade;ind.classList.add('on');setTimeout(()=>ind.classList.remove('on'),1000);}
   if(appAnimationsEnabled)Object.assign(rocketStreak,{active:true,time:.40,tier:grade==='PERFECT'?1:0,starts:rocketStreak.starts+1});
-  playSfx(grade==='PERFECT'?'rocketPerfect':'rocketGood',()=>{playTone(988,.10,{volume:.07});playTone(1319,.10,{volume:.07,at:.07});if(grade==='PERFECT')playTone(1760,.18,{volume:.07,at:.14});});
+  playSfx(grade==='PERFECT'?'rocketPerfect':'rocketGood');
   if(navigator.vibrate)navigator.vibrate(grade==='PERFECT'?[20,30,40]:[20,30,20]);
 }
 // GOの直後0.15秒以内に押したときもロケットスタート
