@@ -41,13 +41,14 @@
 
 ## 取り込んだ素材の記録
 
-| ファイル | 出どころ（URL） | ライセンス | 取り込んだ日 | 使っているアプリ |
+| ファイル | 出どころ | ライセンス | 取り込んだ日 | 使っているアプリ |
 |---|---|---|---|---|
-| `nyanisyarud-sfx/count.wav` | Pixabay「metronome」（freesound_community、ID 85688。ファイル名からの推定で、ページURLは未確認） | Pixabay Content License | 2026-11-07 | nyanisyarud（カウントダウン 3・2・1） |
-| `nyanisyarud-sfx/rocket-good.wav` | Pixabay「servant bell ring 2」（floraphonic、ID 211683。ファイル名からの推定で、ページURLは未確認） | Pixabay Content License | 2026-11-07 | nyanisyarud（ロケットスタート GOOD。PERFECT の1打目にも使用） |
-| `nyanisyarud-sfx/rocket-perfect.wav` | 上の servant bell と、Pixabay「bicycle bell」（soundreality、ID 155622。ファイル名からの推定で、ページURLは未確認）を0.09秒ずらして重ねたもの | Pixabay Content License | 2026-11-07 | nyanisyarud（ロケットスタート PERFECT） |
-| `nyanisyarud-sfx/go.wav` | Pixabay「sword」（freesound_community、ID 35999。ファイル名からの推定で、ページURLは未確認） | Pixabay Content License | 2026-11-07 | nyanisyarud（GO） |
-| `nyanisyarud-sfx/flying.wav` | Pixabay「bonk」（freesound_community、ID 99378。ファイル名からの推定で、ページURLは未確認） | Pixabay Content License | 2026-11-07 | nyanisyarud（フライング） |
+| `nyanisyarud-sfx/count.wav` | Pixabay「metronome」（freesound_community、ID 85688） | Pixabay Content License | 2026-11-07 | nyanisyarud（カウントダウン 3・2・1） |
+| `nyanisyarud-sfx/rocket-good.wav` | Pixabay「servant bell ring 2」（floraphonic、ID 211683） | Pixabay Content License | 2026-11-07 | nyanisyarud（ロケットスタート GOOD。PERFECT の1打目にも使用） |
+| `nyanisyarud-sfx/rocket-perfect.wav` | 上の servant bell と、Pixabay「bicycle bell」（soundreality、ID 155622）を0.09秒ずらして重ね、0.12秒後に下の猫の鳴き声を重ねたもの | Pixabay Content License | 2026-11-07 | nyanisyarud（ロケットスタート PERFECT） |
+| `nyanisyarud-sfx/go.wav` | Pixabay「sword」（freesound_community、ID 35999） | Pixabay Content License | 2026-11-07 | nyanisyarud（GO） |
+| `nyanisyarud-sfx/flying.wav` | Pixabay「bonk」（freesound_community、ID 99378） | Pixabay Content License | 2026-11-07 | nyanisyarud（フライング） |
+| （`rocket-perfect.wav` に合成） | Pixabay「cat meow」（dragon-studio、ID 401729） | Pixabay Content License | 2026-11-08 | nyanisyarud（ロケットスタート PERFECT の「にゃっ」） |
 
 nyanisyarud の効果音は、次のファイル名で `nyanisyarud-sfx/` に置くと鳴る（置いていない音は和風の合成音で鳴る。`nyanisyarud.html?sfxtest=1` の試聴パネルで、合成音とファイルを鳴らし比べられる）。取り込んだら上の表に1行ずつ書く。
 
@@ -56,7 +57,7 @@ nyanisyarud の効果音は、次のファイル名で `nyanisyarud-sfx/` に置
 | `count.wav` | カウントダウン 3・2・1 | 拍子木「カッ」 | 0.25秒以内 |
 | `go.wav` | GO | 刀を抜く「シャキン」（合成音のときは太鼓「ドン」） | 0.7秒以内 |
 | `rocket-good.wav` | ロケットスタート GOOD | 鈴「シャン」 | 0.5秒以内 |
-| `rocket-perfect.wav` | ロケットスタート PERFECT | 鈴を2回（2回目は高く） | 0.6秒以内 |
+| `rocket-perfect.wav` | ロケットスタート PERFECT | 鈴を2回（2回目は高く）＋猫「にゃっ」 | 0.75秒以内 |
 | `flying.wav` | フライング | 低い「ポコッ」 | 0.4秒以内 |
 
 - 先頭の無音は削る（残すと拍より遅れて聞こえ、ロケットスタートの合わせ所がずれる）。
