@@ -111,6 +111,7 @@
   </label>
   <div class="seg" role="group" aria-label="クリックで合わせるもの">
     <button type="button" data-mode="white" class="on" aria-pressed="true">白をクリック</button>
+    <button type="button" data-mode="same" aria-pressed="false">同じものをクリック</button>
     <button type="button" data-mode="skin" aria-pressed="false">肌をクリック</button>
   </div>
   <button type="button" id="autoBtn">自動で基準に寄せる</button>
@@ -167,6 +168,7 @@
     </div>
     <div id="status" role="status"></div>
     <div class="note">
+      Shift＋クリックで点を足すと、複数の点の平均で合わせます。<br>
       キー：← → で写真を切り替え、B を押している間は補正前。<br>
       書き出しは元の画素数のJPEGです。EXIF（撮影情報）は付きません。白く飛んだ部分の色は戻せません。
     </div>
@@ -280,7 +282,16 @@ function scaledData(img, max) {
 
 // ===== 状態 =====
 const photos = [];
-let selId = null, refId = null, mode = 'white', refSkin = null, beforeHeld = false, busy = false, nextId = 1;
+let selId = null, refId = null, mode = 'white', beforeHeld = false, busy = false, nextId = 1;
+// 基準写真で記録した目標の色（元画像のリニア値の合計と点の数）。「同じもの」と「肌」で別々に持つ。
+let refAcc = { same: null, skin: null };
+const MODE_NAME = { white: '白', same: '同じもの', skin: '肌' };
+// 色の合計に1点を足す（Shift＋クリック）か、1点だけにする。
+function accAdd(acc, rgb, add) {
+  if (!add || !acc) return { sum: rgb.slice(), n: 1 };
+  return { sum: acc.sum.map((v, i) => v + rgb[i]), n: acc.n + 1 };
+}
+const accAvg = acc => acc.sum.map(v => v / acc.n);
 const previewCache = new Map();   // id → 表示用 ImageData（直近4枚）
 const byId = id => photos.find(p => p.id === id);
 const cur = () => byId(selId);
@@ -299,7 +310,7 @@ async function addFiles(list) {
       const img = await loadImage(f);
       const thumb = scaledData(img, THUMB_MAX);
       const p = { id: nextId++, file: f, name: f.name, w: img.naturalWidth, h: img.naturalHeight,
-        thumb, est: estimateIlluminant(thumb), T: 0, M: 0, pick: null };
+        thumb, est: estimateIlluminant(thumb), T: 0, M: 0, picks: [], acc: null };
       photos.push(p);
       addThumbEl(p);
       if (refId == null) { refId = p.id; drawRefView(); }
@@ -345,7 +356,9 @@ function drawRefView() {
   if (!ref || !ref.cv) { $('refInfo').textContent = 'まだありません'; return; }
   rv.width = ref.cv.width; rv.height = ref.cv.height;
   rv.getContext('2d').drawImage(ref.cv, 0, 0);
-  $('refInfo').textContent = ref.name + (mode === 'skin' ? (refSkin ? '（肌：記録済み）' : '（肌：未記録）') : '');
+  const a = refAcc[mode];
+  $('refInfo').textContent = ref.name + (mode === 'white' ? ''
+    : `（${MODE_NAME[mode]}：${a ? `記録済み・${a.n}点` : '未記録'}）`);
 }
 
 // ===== 表示 =====
@@ -378,12 +391,15 @@ function drawView() {
   applyLuts(src.data, viewBuf.data, beforeHeld ? IDENTITY : makeLuts(gainsOf(p.T, p.M)));
   const x = cv.getContext('2d');
   x.putImageData(viewBuf, 0, 0);
-  if (p.pick && !beforeHeld) {
-    const px = p.pick.x * src.width, py = p.pick.y * src.height;
+  if (!beforeHeld) {
     const r = Math.max(6, Math.max(src.width, src.height) * 0.004 * 1.8);
     x.lineWidth = Math.max(2, src.width / 600);
-    x.strokeStyle = 'rgba(0,0,0,.8)'; x.beginPath(); x.arc(px, py, r + x.lineWidth, 0, Math.PI * 2); x.stroke();
-    x.strokeStyle = p.pick.mode === 'skin' ? '#ffa8a8' : '#ffffff'; x.beginPath(); x.arc(px, py, r, 0, Math.PI * 2); x.stroke();
+    for (const pk of p.picks) {
+      const px = pk.x * src.width, py = pk.y * src.height;
+      x.strokeStyle = 'rgba(0,0,0,.8)'; x.beginPath(); x.arc(px, py, r + x.lineWidth, 0, Math.PI * 2); x.stroke();
+      x.strokeStyle = { white: '#ffffff', same: '#74c0fc', skin: '#ffa8a8' }[pk.mode];
+      x.beginPath(); x.arc(px, py, r, 0, Math.PI * 2); x.stroke();
+    }
   }
   $('stageMsg').textContent = beforeHeld ? '補正前' : '';
 }
@@ -396,9 +412,11 @@ function queueView() {
 
 function refreshPanel() {
   const p = cur(), has = photos.length > 0;
-  $('help').innerHTML = mode === 'white'
-    ? '<b>白をクリック</b>：白・グレーのもの（紙、カード、白いシャツ）をクリックすると、そこが無彩色になるよう補正します。写真ごとに1回ずつクリックしてください。'
-    : '<b>肌をクリック</b>：まず基準写真（★）で肌をクリックして目標の色を記録し、ほかの写真で同じような肌（頬や額）をクリックすると、基準の肌の色に合わせます。';
+  $('help').innerHTML = {
+    white: '<b>白をクリック</b>：白・グレーのもの（紙、カード、白いシャツ）をクリックすると、そこが無彩色になるよう補正します。写真ごとに1回ずつクリックしてください。',
+    same: '<b>同じものをクリック</b>：まず基準写真（★）で、ほかの写真にも写っている物（壁、カウンター、カップなど）をクリックして色を記録します。ほかの写真で同じ物をクリックすると、基準と同じ色に合わせます。人以外の物を選ぶと、人の違いに左右されません。',
+    skin: '<b>肌をクリック</b>：まず基準写真（★）で肌をクリックして目標の色を記録し、ほかの写真で同じような肌（頬や額）をクリックすると、基準の肌の色に合わせます。人物が違うと、肌の色の差まで照明のせいとして合わせてしまいます。'
+  }[mode];
   $('curInfo').textContent = p ? `${p.name}\n${p.w}×${p.h}${p.id === refId ? '（基準）' : ''}` : '—';
   $('curInfo').style.whiteSpace = 'pre-line';
   $('temp').value = p ? Math.round(p.T / T_MAX * 100) : 0;
@@ -416,10 +434,12 @@ function refreshPanel() {
 function setBusy(b) { busy = b; refreshPanel(); }
 
 // T, M を設定する。上限で止めたら true。
-function setTM(p, T, M, pick) {
+// picks を渡すと印も置き換える（null で印と点の記録を消す）。
+function setTM(p, T, M, picks) {
   const T2 = Math.max(-T_MAX, Math.min(T_MAX, T)), M2 = Math.max(-M_MAX, Math.min(M_MAX, M));
   p.T = T2; p.M = M2;
-  if (pick !== undefined) p.pick = pick;
+  if (picks === null) { p.picks = []; p.acc = null; }
+  else if (picks !== undefined) p.picks = picks;
   updateThumb(p); refreshStrip();
   if (p.id === selId) { refreshPanel(); queueView(); }
   return T2 !== T || M2 !== M;
@@ -439,7 +459,7 @@ document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click'
     x.classList.toggle('on', x === b); x.setAttribute('aria-pressed', String(x === b));
   });
   refreshPanel();
-  status(mode === 'skin' && !refSkin ? '基準写真（★）で肌をクリックしてください。' : '');
+  status(mode !== 'white' && !refAcc[mode] ? `基準写真（★）で${MODE_NAME[mode]}をクリックしてください。` : '');
 }));
 
 $('view').addEventListener('click', e => {
@@ -452,32 +472,37 @@ $('view').addEventListener('click', e => {
   if (!smp) { status('白く飛んでいて色が読めません。少し暗い部分をクリックしてください。'); return; }
   if (Math.max(...smp.rgb) < 0.003) { status('暗すぎて色が読めません。もう少し明るい部分をクリックしてください。'); return; }
   const pick = { x: x / src.width, y: y / src.height, mode };
+  const add = e.shiftKey;
   const clipNote = smp.clipRate > 0.3 ? '（白飛びが多い場所です。ずれる場合は少し暗い部分で）' : '';
-  if (mode === 'white') {
-    const [T, M] = solveTM(smp.rgb, null);
-    const capped = setTM(p, T, M, pick);
-    status('クリックした所が無彩色になるよう補正しました。' + (capped ? '補正の上限で止めました。' : '') + clipNote);
-    return;
-  }
-  // 肌モード
-  if (p.id === refId) {
-    refSkin = smp.rgb; p.pick = pick;
+  const nm = MODE_NAME[mode];
+  // 「同じもの」「肌」の基準写真では、目標の色を記録するだけで補正はしない。
+  if (mode !== 'white' && p.id === refId) {
+    refAcc[mode] = accAdd(refAcc[mode], smp.rgb, add);
+    p.picks = add && p.picks.every(k => k.mode === mode) ? [...p.picks, pick] : [pick];
     drawView(); refreshPanel();
-    status('基準の肌を記録しました。ほかの写真で同じような肌をクリックしてください。' + clipNote);
+    status(`基準の${nm}を記録しました（${refAcc[mode].n}点）。ほかの写真で${mode === 'skin' ? '同じような肌' : '同じ物'}をクリックしてください。` + clipNote);
     return;
   }
-  if (!refSkin) { status('先に基準写真（★）で肌をクリックしてください。'); return; }
-  const ref = byId(refId), g = gainsOf(ref.T, ref.M);
-  const [T, M] = solveTM(smp.rgb, refSkin.map((v, i) => v * g[i]));
-  const capped = setTM(p, T, M, pick);
-  status('基準の肌の色に合わせました。' + (capped ? '補正の上限で止めました。' : '') + clipNote);
+  if (mode !== 'white' && !refAcc[mode]) { status(`先に基準写真（★）で${nm}をクリックしてください。`); return; }
+  const cont = add && p.acc && p.acc.mode === mode;
+  const acc = accAdd(cont ? p.acc : null, smp.rgb, cont);
+  let target = null;   // null は無彩色（白モード）
+  if (mode !== 'white') {
+    const ref = byId(refId), g = gainsOf(ref.T, ref.M);
+    target = accAvg(refAcc[mode]).map((v, i) => v * g[i]);
+  }
+  const [T, M] = solveTM(accAvg(acc), target);
+  const capped = setTM(p, T, M, cont ? [...p.picks, pick] : [pick]);
+  p.acc = { ...acc, mode };
+  const what = mode === 'white' ? 'クリックした所が無彩色になるよう補正しました' : `基準の${nm}の色に合わせました`;
+  status(`${what}（${acc.n}点の平均）。` + (capped ? '補正の上限で止めました。' : '') + clipNote);
 });
 
 $('setRef').addEventListener('click', () => {
   const p = cur(); if (!p) return;
-  refId = p.id; refSkin = null;
+  refId = p.id; refAcc = { same: null, skin: null };
   refreshStrip(); refreshPanel();
-  status(mode === 'skin' ? '基準を変えました。この写真で肌をクリックして記録してください。' : '基準を変えました。');
+  status(mode !== 'white' ? `基準を変えました。この写真で${MODE_NAME[mode]}をクリックして記録してください。` : '基準を変えました。');
 });
 
 $('autoBtn').addEventListener('click', () => {
