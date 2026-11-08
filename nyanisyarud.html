@@ -15915,6 +15915,7 @@ const SFX={
   rocketGood:{label:'ロケット GOOD(鈴)',file:'rocket-good.wav',volume:.5,synth:()=>{sfxBell({base:2200,peak:.12,decay:.45});}},
   rocketPerfect:{label:'ロケット PERFECT(鈴2回)',file:'rocket-perfect.wav',volume:.5,synth:()=>{sfxBell({base:2200,peak:.12,decay:.45});sfxBell({base:2900,peak:.12,decay:.5,at:.09});}},
   flying:{label:'フライング(ポコッ)',file:'flying.wav',volume:.5,synth:()=>{sfxSweep({type:'sine',from:420,to:200,sweep:.06,peak:.35,decay:.12});sfxNoiseHit({type:'bandpass',freq:1200,q:3,peak:.2,decay:.02});}},
+  waterfall:{label:'滝(ループ)',file:'waterfall.wav',volume:.3},
 };
 const sfxBuffers={},sfxStatus={},sfxPlaying=new Set();
 let sfxLoading=false,sfxNoise=null,sfxPanelRefresh=null;
@@ -15961,16 +15962,44 @@ function playSfx(name){
   if(!soundEnabled||gutterAudio?.state!=='running')return;
   if(sfxBuffers[name])playSfxBuffer(name);else SFX[name].synth();
 }
-function stopSfx(){for(const node of sfxPlaying)try{node.stop();}catch(e){}}
+function stopSfx(){for(const node of sfxPlaying)try{node.stop();}catch(e){}updateWaterfallSound(false);}
+// 滝の音：滝の入口の100m手前から、滝つぼの100m先までループで鳴らす(入る・出る時は0.5秒で大きく・小さく)
+// 三段滝は3つの滝ごと、天空すべり峠は1つの滝。龍の背渡りの空の滝は、コース上の位置から滝までの水平の距離で測る
+const WATERFALL_SOUND={range:100,fade:.5};
+let waterfallSound=null,waterfallWanted=false;
+function inWaterfallZone(d){
+  const def=TRACKS[currentKey],range=WATERFALL_SOUND.range;
+  if(def?.tripleFalls)return (skyRun?.tripleStages??[]).some(st=>d>=st.fallIn-range&&d<=st.pool+range);
+  if(def?.skySlide){const m=skyRun?.marks;return Boolean(m)&&d>=m.fallIn-range&&d<=m.pool+range;}
+  if(def?.dragon){const fall=dragonRun?.reversal?.waterfall;if(!fall)return false;const p=getTrackAtDist(d).p;return Math.hypot(fall.position.x-p.x,fall.position.z-p.z)<=range;}
+  return false;
+}
+function updateWaterfallSound(on){
+  const ctx=gutterAudio,w=waterfallSound;
+  on=Boolean(on&&soundEnabled&&ctx?.state==='running'&&sfxBuffers.waterfall);
+  if(on===Boolean(w?.on))return;
+  if(on){
+    let ws=w;
+    if(!ws){const src=ctx.createBufferSource(),gain=ctx.createGain();src.buffer=sfxBuffers.waterfall;src.loop=true;gain.gain.value=0;src.connect(gain);gain.connect(ctx.destination);src.start();ws=waterfallSound={src,gain,on:false,stopTimer:0};}
+    clearTimeout(ws.stopTimer);
+    const g=ws.gain.gain,now=ctx.currentTime;g.cancelScheduledValues(now);g.setValueAtTime(g.value,now);g.linearRampToValueAtTime(SFX.waterfall.volume,now+WATERFALL_SOUND.fade);ws.on=true;
+  }else{
+    const g=w.gain.gain,now=w.src.context.currentTime;g.cancelScheduledValues(now);g.setValueAtTime(g.value,now);g.linearRampToValueAtTime(0,now+WATERFALL_SOUND.fade);w.on=false;
+    w.stopTimer=setTimeout(()=>{if(waterfallSound!==w||w.on)return;try{w.src.stop();}catch(e){}w.src.disconnect();w.gain.disconnect();waterfallSound=null;},WATERFALL_SOUND.fade*1000+100);
+  }
+  sfxPanelRefresh?.();
+}
+// 画面が裏に回ると毎フレームの処理が止まるので、ここで止める
+document.addEventListener('visibilitychange',()=>{if(document.hidden)updateWaterfallSound(false);});
 // 試聴パネル(?sfxtest=1)：音ごとに「合成」と「ファイル」を鳴らし比べる。音の設定がOFFでも鳴らす
 if(new URLSearchParams(location.search).get('sfxtest')==='1'){
   const panel=document.createElement('div');
   panel.style.cssText='box-sizing:border-box;position:fixed;right:8px;top:8px;z-index:99999;background:rgba(0,0,0,.85);color:#fff;font:13px/1.4 sans-serif;padding:10px;border-radius:8px;max-width:calc(100vw - 16px)';
-  const rows=Object.keys(SFX).map(name=>`<div style="display:flex;gap:6px;align-items:center;margin:4px 0"><span style="flex:1;min-width:9em">${SFX[name].label}</span><button data-sfx="${name}" data-kind="synth">合成</button><button data-sfx="${name}" data-kind="file">ファイル</button><span data-sfx-status="${name}" style="min-width:3.5em"></span></div>`).join('');
+  const rows=Object.keys(SFX).map(name=>`<div style="display:flex;gap:6px;align-items:center;margin:4px 0"><span style="flex:1;min-width:9em">${SFX[name].label}</span>${SFX[name].synth?`<button data-sfx="${name}" data-kind="synth">合成</button>`:''}<button data-sfx="${name}" data-kind="file">ファイル</button><span data-sfx-status="${name}" style="min-width:3.5em"></span></div>`).join('');
   panel.innerHTML=`<b>効果音の試聴</b> <button data-sfx-close style="float:right">×</button><div data-sfx-sound style="margin:4px 0;opacity:.8"></div>${rows}`;
   document.body.appendChild(panel);
   sfxPanelRefresh=()=>{
-    panel.querySelector('[data-sfx-sound]').textContent=`音の設定：${soundEnabled?'ON':'OFF'}／AudioContext：${gutterAudio?.state??'未作成'}`;
+    panel.querySelector('[data-sfx-sound]').textContent=`音の設定：${soundEnabled?'ON':'OFF'}／AudioContext：${gutterAudio?.state??'未作成'}／滝の音：${waterfallSound?.on?'鳴っている':'止まっている'}`;
     for(const name of Object.keys(SFX))panel.querySelector(`[data-sfx-status="${name}"]`).textContent='ファイル'+(sfxStatus[name]??'未読込');
   };
   sfxPanelRefresh();
@@ -17214,6 +17243,7 @@ function updateDebugPanel(){
 const COURSE_GRAVITY=9.81;
 function tick(dt){
   if(gameState==='practiceResult')return;
+  waterfallWanted=gameState==='racing'&&inWaterfallZone(s);
   const realDt=dt;updateDragonWorld(realDt);clearSkyImpactOffset();updateSkyLandingSpray(realDt);updateSkyWaterStream(realDt);dt*=skyCrestTimeScale(realDt);
   updateLinkPracticeInput();
   updateBranchRoute();
@@ -20611,6 +20641,7 @@ document.getElementById('btnGhostSplitToggle').addEventListener('click',()=>{
 // === End personal-best ghost ===
 
 function advanceGameFrame(realDelta){
+  updateWaterfallSound(waterfallWanted);waterfallWanted=false;
   if(document.hidden||!document.getElementById('launchTitle').hidden)return;
   if(stepPause(realDelta))return;
   if(gameState==='racing'&&(document.getElementById('app').dataset.raceMenu==='on'||document.getElementById('rankingModal').classList.contains('on')||document.getElementById('courseDropdownMenu').style.display!=='none'))return;
