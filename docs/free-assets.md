@@ -54,7 +54,7 @@
 | `nyanisyarud-sfx/suberi-bounce.wav` | Pixabay「jump sound」（bestuploadsever67aryan、ID 531048） | Pixabay Content License | 2026-11-08 | nyanisyarud（すべり猫のはねかえり） |
 | `nyanisyarud-sfx/big-jump.wav` | Pixabay「8-bit arcade video game start sound effect gun reload and jump」（freesound_community、ID 81124） | Pixabay Content License | 2026-11-08 | nyanisyarud（大ジャンプ） |
 | `nyanisyarud-sfx/perfect-sparkle.wav` | Pixabay「magic twinkle」（universfield、ID 244951） | Pixabay Content License | 2026-11-09 | nyanisyarud（肉球ドリフトが PERFECT になった瞬間、1回） |
-| `nyanisyarud-sfx/drift-loop.wav` | Pixabay（olenchic、ID 110063） | Pixabay Content License | 2026-11-09 | nyanisyarud（肉球ドリフト中のループ） |
+| `nyanisyarud-sfx/drift-loop.wav` | Pixabay「sliding sound」（freesound_community、ID 103631）。以前は olenchic（ID 110063）だった | Pixabay Content License | 2026-11-09 | nyanisyarud（肉球ドリフト中のループ） |
 | `nyanisyarud-sfx/link-whoosh.wav` | Pixabay「whoosh tonal light」（soundreality、ID 243114） | Pixabay Content License | 2026-11-09 | （使っていない。連携は link-sparkle.wav に変更） |
 | `nyanisyarud-sfx/link-sparkle.wav` | Pixabay「sparkle」（koiroylers、ID 355937） | Pixabay Content License | 2026-11-09 | nyanisyarud（連携が決まった時） |
 | `nyanisyarud-sfx/combo-ten.wav` | Pixabay「magic spell 03」（universfield、ID 242245） | Pixabay Content License | 2026-11-09 | nyanisyarud（肉球コンボ10） |
