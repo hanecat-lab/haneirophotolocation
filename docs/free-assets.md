@@ -53,6 +53,7 @@
 | `nyanisyarud-sfx/hop.wav` | Pixabay「retro arcade player jump」（vadim_makes_sound、ID 622945） | Pixabay Content License | 2026-11-08 | nyanisyarud（猫が跳ねる） |
 | `nyanisyarud-sfx/suberi-bounce.wav` | Pixabay「jump sound」（bestuploadsever67aryan、ID 531048） | Pixabay Content License | 2026-11-08 | nyanisyarud（すべり猫のはねかえり） |
 | `nyanisyarud-sfx/big-jump.wav` | Pixabay「8-bit arcade video game start sound effect gun reload and jump」（freesound_community、ID 81124） | Pixabay Content License | 2026-11-08 | nyanisyarud（大ジャンプ） |
+| `nyanisyarud-sfx/perfect-sparkle.wav` | Pixabay「magic twinkle」（universfield、ID 244951） | Pixabay Content License | 2026-11-09 | nyanisyarud（肉球ドリフトが PERFECT になった瞬間、1回） |
 | `nyanisyarud-sfx/fall-splash.wav` | Pixabay「jumping into swimming pool」（flutie8211、ID 438546） | Pixabay Content License | 2026-11-08 | nyanisyarud（滝つぼに落ちた時） |
 
 nyanisyarud の効果音は、次のファイル名で `nyanisyarud-sfx/` に置くと鳴る（置いていない音は和風の合成音で鳴る。`nyanisyarud.html?sfxtest=1` の試聴パネルで、合成音とファイルを鳴らし比べられる）。取り込んだら上の表に1行ずつ書く。
