@@ -55,7 +55,8 @@
 | `nyanisyarud-sfx/big-jump.wav` | Pixabay「8-bit arcade video game start sound effect gun reload and jump」（freesound_community、ID 81124） | Pixabay Content License | 2026-11-08 | nyanisyarud（大ジャンプ） |
 | `nyanisyarud-sfx/perfect-sparkle.wav` | Pixabay「magic twinkle」（universfield、ID 244951） | Pixabay Content License | 2026-11-09 | nyanisyarud（肉球ドリフトが PERFECT になった瞬間、1回） |
 | `nyanisyarud-sfx/drift-loop.wav` | Pixabay（olenchic、ID 110063） | Pixabay Content License | 2026-11-09 | nyanisyarud（肉球ドリフト中のループ） |
-| `nyanisyarud-sfx/link-whoosh.wav` | Pixabay「whoosh tonal light」（soundreality、ID 243114） | Pixabay Content License | 2026-11-09 | nyanisyarud（連携が決まった時） |
+| `nyanisyarud-sfx/link-whoosh.wav` | Pixabay「whoosh tonal light」（soundreality、ID 243114） | Pixabay Content License | 2026-11-09 | （使っていない。連携は link-sparkle.wav に変更） |
+| `nyanisyarud-sfx/link-sparkle.wav` | Pixabay「sparkle」（koiroylers、ID 355937） | Pixabay Content License | 2026-11-09 | nyanisyarud（連携が決まった時） |
 | `nyanisyarud-sfx/combo-ten.wav` | Pixabay「magic spell 03」（universfield、ID 242245） | Pixabay Content License | 2026-11-09 | nyanisyarud（肉球コンボ10） |
 | `nyanisyarud-sfx/riser.wav` | Pixabay「whoosh tension sweep」（soundreality、ID 247165） | Pixabay Content License | 2026-11-09 | nyanisyarud（天空大瀑布の落ち口・龍の最後の打ち上げの手前） |
 | `nyanisyarud-sfx/fall-splash.wav` | Pixabay「jumping into swimming pool」（flutie8211、ID 438546） | Pixabay Content License | 2026-11-08 | nyanisyarud（滝つぼに落ちた時） |
