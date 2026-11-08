@@ -52,6 +52,8 @@
 | `nyanisyarud-sfx/waterfall.wav` | Pixabay（nineteen95studio、ID 226230） | Pixabay Content License | 2026-11-08 | nyanisyarud（滝の音。三段滝・天空すべり峠・龍の背渡り） |
 | `nyanisyarud-sfx/hop.wav` | Pixabay「retro arcade player jump」（vadim_makes_sound、ID 622945） | Pixabay Content License | 2026-11-08 | nyanisyarud（猫が跳ねる） |
 | `nyanisyarud-sfx/suberi-bounce.wav` | Pixabay「jump sound」（bestuploadsever67aryan、ID 531048） | Pixabay Content License | 2026-11-08 | nyanisyarud（すべり猫のはねかえり） |
+| `nyanisyarud-sfx/big-jump.wav` | Pixabay「8-bit arcade video game start sound effect gun reload and jump」（freesound_community、ID 81124） | Pixabay Content License | 2026-11-08 | nyanisyarud（大ジャンプ） |
+| `nyanisyarud-sfx/fall-splash.wav` | Pixabay「jumping into swimming pool」（flutie8211、ID 438546） | Pixabay Content License | 2026-11-08 | nyanisyarud（滝つぼに落ちた時） |
 
 nyanisyarud の効果音は、次のファイル名で `nyanisyarud-sfx/` に置くと鳴る（置いていない音は和風の合成音で鳴る。`nyanisyarud.html?sfxtest=1` の試聴パネルで、合成音とファイルを鳴らし比べられる）。取り込んだら上の表に1行ずつ書く。
 
@@ -63,8 +65,10 @@ nyanisyarud の効果音は、次のファイル名で `nyanisyarud-sfx/` に置
 | `rocket-perfect.wav` | ロケットスタート PERFECT | 鈴を2回（2回目は高く）＋猫「にゃっ」 | 0.75秒以内 |
 | `flying.wav` | フライング | 低い「ポコッ」 | 0.4秒以内 |
 | `waterfall.wav` | 滝の入口の100m手前〜滝つぼの100m先（ループ。100mの範囲で、近づくほど大きく・離れるほど小さく） | 滝の「ザー」 | 継ぎ目なくつながる長さ（今は10秒）。32kHz でよい |
-| `hop.wav` | 猫が跳ねる（竹の束・陥没・コブ・遺跡・中央分離帯・波の頂上・龍の壁・空の縁など） | 短く上がる「ピョン」 | 0.3秒以内 |
+| `hop.wav` | 猫が跳ねる（竹の束・陥没・コブ・遺跡・中央分離帯・波の頂上・龍の壁・空の縁・飛び石・龍の背渡りの小さな跳びなど） | 短く上がる「ピョン」 | 0.3秒以内 |
 | `suberi-bounce.wav` | すべり猫が壁やバンパーで跳ね返った時 | 低めに上がる「ボヨン」 | 0.45秒以内 |
+| `big-jump.wav` | 大ジャンプ（橋のジャンプ・空のジャンプ台・近道のジャンプ・龍の受け皿の間と最後の打ち上げ・飛び石を全部つないだ最後） | 上がり続ける「ピュイーン」 | 0.85秒以内 |
+| `fall-splash.wav` | 滝つぼに落ちた時（三段滝は滝ごと・天空すべり峠） | 水に飛び込む「ザブン」 | 1.4秒以内 |
 
 - 先頭の無音は削る（残すと拍より遅れて聞こえ、ロケットスタートの合わせ所がずれる）。
 - 形式は WAV（16bit・モノラル・48kHz）。mp3 は先頭に約20msの無音が入り、ブラウザによって削られたり残ったりするため使わない。
