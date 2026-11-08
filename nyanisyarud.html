@@ -15962,35 +15962,40 @@ function playSfx(name){
   if(!soundEnabled||gutterAudio?.state!=='running')return;
   if(sfxBuffers[name])playSfxBuffer(name);else SFX[name].synth();
 }
-function stopSfx(){for(const node of sfxPlaying)try{node.stop();}catch(e){}updateWaterfallSound(false);}
-// 滝の音：滝の入口の100m手前から、滝つぼの100m先までループで鳴らす(入る・出る時は0.5秒で大きく・小さく)
-// 三段滝は3つの滝ごと、天空すべり峠は1つの滝。龍の背渡りの空の滝は、コース上の位置から滝までの水平の距離で測る
-const WATERFALL_SOUND={range:100,fade:.5};
-let waterfallSound=null,waterfallWanted=false;
-function inWaterfallZone(d){
+function stopSfx(){for(const node of sfxPlaying)try{node.stop();}catch(e){}updateWaterfallSound(0);}
+// 滝の音：滝から100mの範囲で、近づくほど大きく、離れるほど小さくする(ループ)
+// 三段滝(3つの滝ごと)・天空すべり峠は、滝の入口の100m手前で0→滝の入口で最大、滝つぼで最大→100m先で0。滝の入口から滝つぼまでは最大
+// 龍の背渡りの空の滝は、コース上の位置から滝までの水平の距離で、100mで0→滝の真下で最大
+// 音量は 近さ(0〜1)の2乗 × SFX.waterfall.volume(耳には2乗の方が自然に大きくなって聞こえる)。smooth はフレームごとの変化をなめらかにする秒数
+const WATERFALL_SOUND={range:100,smooth:.15};
+let waterfallSound=null,waterfallWanted=0;
+function waterfallLevel(d){
   const def=TRACKS[currentKey],range=WATERFALL_SOUND.range;
-  if(def?.tripleFalls)return (skyRun?.tripleStages??[]).some(st=>d>=st.fallIn-range&&d<=st.pool+range);
-  if(def?.skySlide){const m=skyRun?.marks;return Boolean(m)&&d>=m.fallIn-range&&d<=m.pool+range;}
-  if(def?.dragon){const fall=dragonRun?.reversal?.waterfall;if(!fall)return false;const p=getTrackAtDist(d).p;return Math.hypot(fall.position.x-p.x,fall.position.z-p.z)<=range;}
-  return false;
+  const span=(from,to)=>d<from-range||d>to+range?0:d<from?1-(from-d)/range:d>to?1-(d-to)/range:1;
+  if(def?.tripleFalls)return Math.max(0,...(skyRun?.tripleStages??[]).map(st=>span(st.fallIn,st.pool)));
+  if(def?.skySlide){const m=skyRun?.marks;return m?span(m.fallIn,m.pool):0;}
+  if(def?.dragon){const fall=dragonRun?.reversal?.waterfall;if(!fall)return 0;const p=getTrackAtDist(d).p;return Math.max(0,1-Math.hypot(fall.position.x-p.x,fall.position.z-p.z)/range);}
+  return 0;
 }
-function updateWaterfallSound(on){
+function updateWaterfallSound(level){
   const ctx=gutterAudio,w=waterfallSound;
-  on=Boolean(on&&soundEnabled&&ctx?.state==='running'&&sfxBuffers.waterfall);
-  if(on===Boolean(w?.on))return;
-  if(on){
-    let ws=w;
-    if(!ws){const src=ctx.createBufferSource(),gain=ctx.createGain();src.buffer=sfxBuffers.waterfall;src.loop=true;gain.gain.value=0;src.connect(gain);gain.connect(ctx.destination);src.start();ws=waterfallSound={src,gain,on:false,stopTimer:0};}
-    clearTimeout(ws.stopTimer);
-    const g=ws.gain.gain,now=ctx.currentTime;g.cancelScheduledValues(now);g.setValueAtTime(g.value,now);g.linearRampToValueAtTime(SFX.waterfall.volume,now+WATERFALL_SOUND.fade);ws.on=true;
-  }else{
-    const g=w.gain.gain,now=w.src.context.currentTime;g.cancelScheduledValues(now);g.setValueAtTime(g.value,now);g.linearRampToValueAtTime(0,now+WATERFALL_SOUND.fade);w.on=false;
-    w.stopTimer=setTimeout(()=>{if(waterfallSound!==w||w.on)return;try{w.src.stop();}catch(e){}w.src.disconnect();w.gain.disconnect();waterfallSound=null;},WATERFALL_SOUND.fade*1000+100);
+  const on=level>0&&soundEnabled&&ctx?.state==='running'&&Boolean(sfxBuffers.waterfall);
+  if(!on){
+    if(!w?.on)return;
+    w.gain.gain.setTargetAtTime(0,w.src.context.currentTime,WATERFALL_SOUND.smooth);w.on=false;w.target=0;
+    w.stopTimer=setTimeout(()=>{if(waterfallSound!==w||w.on)return;try{w.src.stop();}catch(e){}w.src.disconnect();w.gain.disconnect();waterfallSound=null;},WATERFALL_SOUND.smooth*6000);
+    sfxPanelRefresh?.();return;
   }
+  let ws=w;
+  if(!ws){const src=ctx.createBufferSource(),gain=ctx.createGain();src.buffer=sfxBuffers.waterfall;src.loop=true;gain.gain.value=0;src.connect(gain);gain.connect(ctx.destination);src.start();ws=waterfallSound={src,gain,on:false,target:0,stopTimer:0};}
+  if(!ws.on){clearTimeout(ws.stopTimer);ws.on=true;}
+  const target=SFX.waterfall.volume*level*level;
+  if(Math.abs(target-ws.target)<.002)return;
+  ws.target=target;ws.gain.gain.setTargetAtTime(target,ctx.currentTime,WATERFALL_SOUND.smooth);
   sfxPanelRefresh?.();
 }
 // 画面が裏に回ると毎フレームの処理が止まるので、ここで止める
-document.addEventListener('visibilitychange',()=>{if(document.hidden)updateWaterfallSound(false);});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)updateWaterfallSound(0);});
 // 試聴パネル(?sfxtest=1)：音ごとに「合成」と「ファイル」を鳴らし比べる。音の設定がOFFでも鳴らす
 if(new URLSearchParams(location.search).get('sfxtest')==='1'){
   const panel=document.createElement('div');
@@ -15999,7 +16004,7 @@ if(new URLSearchParams(location.search).get('sfxtest')==='1'){
   panel.innerHTML=`<b>効果音の試聴</b> <button data-sfx-close style="float:right">×</button><div data-sfx-sound style="margin:4px 0;opacity:.8"></div>${rows}`;
   document.body.appendChild(panel);
   sfxPanelRefresh=()=>{
-    panel.querySelector('[data-sfx-sound]').textContent=`音の設定：${soundEnabled?'ON':'OFF'}／AudioContext：${gutterAudio?.state??'未作成'}／滝の音：${waterfallSound?.on?'鳴っている':'止まっている'}`;
+    panel.querySelector('[data-sfx-sound]').textContent=`音の設定：${soundEnabled?'ON':'OFF'}／AudioContext：${gutterAudio?.state??'未作成'}／滝の音：${waterfallSound?.on?`鳴っている(${Math.round(waterfallSound.target/SFX.waterfall.volume*100)}%)`:'止まっている'}`;
     for(const name of Object.keys(SFX))panel.querySelector(`[data-sfx-status="${name}"]`).textContent='ファイル'+(sfxStatus[name]??'未読込');
   };
   sfxPanelRefresh();
@@ -17243,7 +17248,7 @@ function updateDebugPanel(){
 const COURSE_GRAVITY=9.81;
 function tick(dt){
   if(gameState==='practiceResult')return;
-  waterfallWanted=gameState==='racing'&&inWaterfallZone(s);
+  waterfallWanted=gameState==='racing'?waterfallLevel(s):0;
   const realDt=dt;updateDragonWorld(realDt);clearSkyImpactOffset();updateSkyLandingSpray(realDt);updateSkyWaterStream(realDt);dt*=skyCrestTimeScale(realDt);
   updateLinkPracticeInput();
   updateBranchRoute();
@@ -20641,7 +20646,7 @@ document.getElementById('btnGhostSplitToggle').addEventListener('click',()=>{
 // === End personal-best ghost ===
 
 function advanceGameFrame(realDelta){
-  updateWaterfallSound(waterfallWanted);waterfallWanted=false;
+  updateWaterfallSound(waterfallWanted);waterfallWanted=0;
   if(document.hidden||!document.getElementById('launchTitle').hidden)return;
   if(stepPause(realDelta))return;
   if(gameState==='racing'&&(document.getElementById('app').dataset.raceMenu==='on'||document.getElementById('rankingModal').classList.contains('on')||document.getElementById('courseDropdownMenu').style.display!=='none'))return;
