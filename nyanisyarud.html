@@ -4862,6 +4862,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
   }
   window.addEventListener('click',event=>{
     if(overlay.hidden)return;
+    if(event.target.closest?.('[data-sfx-panel]'))return;// 試聴パネル(?sfxtest=1)のクリックはタイトルを閉じずにそのまま通す
     event.preventDefault();event.stopImmediatePropagation();
     if(event.target.closest?.('#btnTitleReplay'))replay();else dismiss();
   },true);
@@ -16218,6 +16219,7 @@ function updateWindSound(level,pitch=0){
 const DRIFT_LOOP={volume:.13,fileGain:.65,attack:.06,decay:.5,sustain:.5,lowpass:{BAD:1300,OK:1700,GOOD:2100,PERFECT:2600},fileLowpass:{BAD:2500,OK:3500,GOOD:5000,PERFECT:8000},
   q:.7,baseHz:420,perKmh:4,minHz:380,maxHz:1500,rateBase:.85,rateDiv:400,rateMax:1.2,smooth:.25,fade:.2};
 let driftLoop=null,driftLoopPreviewUntil=0;
+const driftLoopStarts=[];// 試聴パネルの観測用：ドリフトの音が鳴り始めた時刻(直近50回)
 function stopDriftLoopNow(){const w=driftLoop;if(!w)return;clearTimeout(w.stopTimer);try{w.src.stop();}catch(e){}for(const n of [w.src,w.band,w.low,w.env])n.disconnect();driftLoop=null;}
 function updateDriftLoop(level,quality='OK',kmh=80,force=false,useSynth=false){
   const ctx=gutterAudio,w=driftLoop,L=DRIFT_LOOP,on=level>0&&(soundEnabled||force)&&ctx?.state==='running';
@@ -16239,6 +16241,7 @@ function updateDriftLoop(level,quality='OK',kmh=80,force=false,useSynth=false){
   }
   const peak=L.volume*level*(ws.file?L.fileGain:1);
   if(!ws.on){
+    driftLoopStarts.push(performance.now());if(driftLoopStarts.length>50)driftLoopStarts.shift();
     clearTimeout(ws.stopTimer);ws.on=true;ws.startT=now;ws.level=level;
     const g=ws.env.gain;g.cancelScheduledValues(now);g.setValueAtTime(g.value,now);g.linearRampToValueAtTime(peak,now+L.attack);g.setTargetAtTime(peak*L.sustain,now+L.attack,L.decay/3);
   }else if(now>ws.startT+L.attack+L.decay*.6&&Math.abs(level-ws.level)>.03){ws.env.gain.setTargetAtTime(peak*L.sustain,now,L.smooth);ws.level=level;}
@@ -16257,18 +16260,23 @@ function previewDriftLoop(kind='file'){
 document.addEventListener('visibilitychange',()=>{if(document.hidden){updateWaterfallSound(0);updateWindSound(0);updateDriftLoop(0);}});
 // 試聴パネル(?sfxtest=1)：音ごとに「合成」と「ファイル」を鳴らし比べる。音の設定がOFFでも鳴らす
 if(new URLSearchParams(location.search).get('sfxtest')==='1'){
-  const panel=document.createElement('div');
-  panel.style.cssText='box-sizing:border-box;position:fixed;right:8px;top:8px;z-index:99999;background:rgba(0,0,0,.85);color:#fff;font:13px/1.4 sans-serif;padding:10px;border-radius:8px;max-width:calc(100vw - 16px)';
+  const panel=document.createElement('div');panel.dataset.sfxPanel='';
+  panel.style.cssText='box-sizing:border-box;position:fixed;right:8px;top:8px;z-index:99999;background:rgba(0,0,0,.85);color:#fff;font:13px/1.4 sans-serif;padding:10px;border-radius:8px;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;font-size:12px';
   const rows=Object.keys(SFX).map(name=>`<div style="display:flex;gap:6px;align-items:center;margin:4px 0"><span style="flex:1;min-width:9em">${SFX[name].label}</span>${SFX[name].synth?`<button data-sfx="${name}" data-kind="synth">合成</button>`:''}${SFX[name].file?`<button data-sfx="${name}" data-kind="file">ファイル</button>`:''}<span data-sfx-status="${name}" style="min-width:3.5em"></span></div>`).join('');
-  panel.innerHTML=`<b>効果音の試聴</b> <button data-sfx-close style="float:right">×</button><div data-sfx-sound style="margin:4px 0;opacity:.8"></div>${rows}<div style="display:flex;gap:6px;align-items:center;margin:4px 0"><span style="flex:1;min-width:9em">ドリフト中の音(3秒)</span><button data-drift-preview="synth">合成</button><button data-drift-preview="file">ファイル</button></div>`;
+  panel.innerHTML=`<b>効果音の試聴</b> <button data-sfx-close style="float:right">×</button><button data-sfx-fold style="float:right;margin-right:6px">たたむ</button><div data-sfx-sound style="margin:4px 0;opacity:.8"></div><div data-drift-diag style="margin:4px 0;color:#ffe9a8"></div><div data-sfx-rows>${rows}<div style="display:flex;gap:6px;align-items:center;margin:4px 0"><span style="flex:1;min-width:9em">ドリフト中の音(3秒)</span><button data-drift-preview="synth">合成</button><button data-drift-preview="file">ファイル</button></div></div>`;
   document.body.appendChild(panel);
   sfxPanelRefresh=()=>{
     panel.querySelector('[data-sfx-sound]').textContent=`音の設定：${soundEnabled?'ON':'OFF'}／AudioContext：${gutterAudio?.state??'未作成'}／滝の音：${waterfallSound?.on?`鳴っている(${Math.round(waterfallSound.target/SFX.waterfall.volume*100)}%・速さ${waterfallSound.rate})`:'止まっている'}／雲：${Math.round(skyCloudDiveValue*100)}%／虹と水煙：${skyRun?.grandFx?.shown?'表示中':'なし'}`;
     for(const name of Object.keys(SFX))panel.querySelector(`[data-sfx-status="${name}"]`).textContent='ファイル'+(sfxStatus[name]??'未読込');
   };
   sfxPanelRefresh();
+  // ドリフトの音の観測：鳴っているか・ファイルか合成か・直近5秒で鳴り始めた回数・今のドリフトの状態(0.25秒ごと)
+  const driftDiag=panel.querySelector('[data-drift-diag]'),diagTimer=setInterval(()=>{const now=performance.now(),recent=driftLoopStarts.filter(t=>now-t<5000).length;
+    const state=isBrakingDrift?'ブレーキドリフト':isSliding?(slideExitActive?'肉球(抜け中)':'肉球'):'なし';
+    driftDiag.textContent=`ドリフト音：${driftLoop?.on?'鳴っている':'止まっている'}(${driftLoop?(driftLoop.file?'ファイル':'合成'):'-'})／鳴り始め 直近5秒 ${recent}回・合計 ${driftLoopStarts.length}回／状態：${state}${meatLinkContext?'・連携中':''}`;},250);
   panel.addEventListener('click',e=>{
-    if(e.target.closest('[data-sfx-close]')){panel.remove();sfxPanelRefresh=null;return;}
+    if(e.target.closest('[data-sfx-close]')){clearInterval(diagTimer);panel.remove();sfxPanelRefresh=null;return;}
+    const fold=e.target.closest('[data-sfx-fold]');if(fold){const rowsEl=panel.querySelector('[data-sfx-rows]'),hide=!rowsEl.hidden;rowsEl.hidden=hide;fold.textContent=hide?'ひらく':'たたむ';return;}
     const dp=e.target.closest('[data-drift-preview]');if(dp){prepareSound();gutterAudio?.resume().then(()=>previewDriftLoop(dp.dataset.driftPreview));return;}
     const button=e.target.closest('[data-sfx]');if(!button)return;
     prepareSound();
