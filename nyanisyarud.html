@@ -12781,7 +12781,8 @@ let rankingViewScope='classic', raceRecordScope='classic';
 const RECORD_SCOPES=['classic','nyanV2','suberi'];
 function recordScopeForMode(){ return catModel==='suberi'?'suberi':driveMode==='nyanSapo'?'nyanV2':'classic'; }
 // ドリフトの仕様を変えた(肉球PERFECTの出口ブースト・おかわり肉球)ので、ガチとにゃんサポの記録を新しく数える。すべり猫・旧コースの記録はそのまま
-const DRIFT_RECORD_ERA=':drift2';
+// drift3：加速ボーナスを受け取れるのを頂点までにし、ドリフト中に曲がった割合で強さを変えたので、もう一度新しく数える
+const DRIFT_RECORD_ERA=':drift3';
 function trackRecordKey(trackKey,scope){
   const oldCourse=scope==='oldHarunaClassic'||scope==='oldHarunaNyan';
   const record=COURSES[trackKey]?.record,key=trackKey==='haruna'&&!oldCourse?'haruna:map15to1v3':record==='version'?trackKey+':'+TRACKS[trackKey].courseRecordVersion:record?trackKey+':'+record:trackKey;
@@ -15799,14 +15800,49 @@ function findDriveCorner(position=s){
 }
 function resetCornerDrive(preserveMeat=false){if(!preserveMeat)resetExitBonusVisual();cornerDrive=null;slideDriveCorner=null;dismissLinkFeedback(preserveMeat);}
 function cancelCornerDrive(){resetExitBonusVisual();if(cornerDrive){cornerDrive.blocked=true;cornerDrive.level=0;cornerDrive.blend=0;}dismissLinkFeedback();}
+// 加速ボーナスを受け取れるのは、入口の45m手前から頂点まで(コーナーの途中・頂点の後からのドリフトでは受け取れない)。溝走りの成功は今まで通り出口まで
+function cornerDriveAwardEnd(corner,method){return method==='gutter'?corner.end:getCornerDriveProfile(corner).apex;}
+// 加速ボーナスの強さ：ドリフト(肉球・ブレーキドリフト)を始めた位置で決める。
+// cover = 1 − (始めた時点で、頂点までに曲がる量のうち、もう曲がった割合)。コーナーの手前・入口で始めれば1、頂点の直前で始めれば0に近い
+// (ブレーキの走法のように手前で始めて離すドリフトも満額。同じコーナーで何度かドリフトしたら、いちばん早く始めたもの)
+// cover が none 以下で minScale 倍、full 以上で満額(間はなめらかに)。weak 未満の弱いボーナスは羽を出さず、風の加速だけ見せる。溝走りの成功は位置を見ない
+const DRIFT_COVER={enabled:true,none:.3,full:.8,minScale:.35,weak:.5};
+const driftCover={curve:null,corner:null,startTurn:null,lastS:0};
+function cornerTurnAt(c,profile,d){
+  const samples=profile.samples,pos=THREE.MathUtils.clamp((d-c.start)/(c.end-c.start)*(samples.length-1),0,samples.length-1);
+  const i=Math.floor(pos),j=Math.min(i+1,samples.length-1);return THREE.MathUtils.lerp(samples[i].turn,samples[j].turn,pos-i);
+}
+function driftCoverOf(c){
+  if(!c||driftCover.curve!==curve||driftCover.corner!==c)return 0;
+  if(driftCover.startTurn===null)return 0;
+  const p=getCornerDriveProfile(c),apexTurn=cornerTurnAt(c,p,p.apex);
+  return apexTurn<.05?1:THREE.MathUtils.clamp(1-driftCover.startTurn/apexTurn,0,1);
+}
+function driftCoverScale(receipt){
+  if(!DRIFT_COVER.enabled||!receipt||receipt.gutter)return 1;
+  return THREE.MathUtils.lerp(DRIFT_COVER.minScale,1,THREE.MathUtils.smoothstep(receipt.cover??0,DRIFT_COVER.none,DRIFT_COVER.full));
+}
+function isWeakCornerBonus(receipt){return Boolean(DRIFT_COVER.enabled&&receipt&&!receipt.gutter&&(receipt.cover??0)<DRIFT_COVER.weak);}
+// 毎コマ：このコーナーの範囲(入口の45m手前〜頂点)で、最初にドリフトしていたコマの「もう曲がった量」を覚える
+// (範囲の手前から続いているドリフトは、範囲に入ったコマで覚える。コーナーが替わる・後ろへ戻る(リスタート)と忘れる)
+function updateDriftCover(){
+  const c=findDriveCorner();
+  if(!c){driftCover.corner=null;return;}
+  if(driftCover.curve!==curve||driftCover.corner!==c||s<driftCover.lastS-5)Object.assign(driftCover,{curve,corner:c,startTurn:null});
+  driftCover.lastS=s;
+  const p=getCornerDriveProfile(c);
+  if((isSliding||isBrakingDrift)&&driftCover.startTurn===null&&s<=p.apex)driftCover.startTurn=s<=c.start?0:cornerTurnAt(c,p,s);
+  if(cornerDrive&&cornerDrive.curve===curve&&cornerDrive.corner===c)cornerDrive.cover=Math.max(cornerDrive.cover??0,driftCoverOf(c));
+}
 function awardCornerDrive(quality,link=0,corner=findDriveCorner(),method='brake'){
-  if(assistDiag){const why=shortcutOwnsInput()?'抜け道中':assistBonusBlocked(corner)?'補助取消のコーナー':!corner?'コーナー外':!['GOOD','GREAT','PERFECT'].includes(quality)?'判定'+quality:s<corner.start-45||s>corner.end?'位置が範囲外':cornerDrive?.curve===curve&&cornerDrive.corner===corner&&cornerDrive.blocked?'判定が取消済':'';assistDiag.award(method+' '+quality+(why?' → 作らず：'+why:' → 作った'));}
+  if(assistDiag){const why=shortcutOwnsInput()?'抜け道中':assistBonusBlocked(corner)?'補助取消のコーナー':!corner?'コーナー外':!['GOOD','GREAT','PERFECT'].includes(quality)?'判定'+quality:s<corner.start-45?'位置が範囲外':s>cornerDriveAwardEnd(corner,method)?'頂点より後':cornerDrive?.curve===curve&&cornerDrive.corner===corner&&cornerDrive.blocked?'判定が取消済':'';assistDiag.award(method+' '+quality+(why?' → 作らず：'+why:' → 作った'));}
   if(shortcutOwnsInput()||assistBonusBlocked(corner))return;
   if(!corner||!['GOOD','GREAT','PERFECT'].includes(quality))return;
-  if(s<corner.start-45||s>corner.end)return;
+  if(s<corner.start-45||s>cornerDriveAwardEnd(corner,method))return;
   if(!cornerDrive||cornerDrive.curve!==curve||cornerDrive.corner!==corner){
-    cornerDrive={curve,corner,level:0,link:0,blend:0,target:null,onsetSpeed:null,blocked:false,method,effectScale:1,linkQuality:null,linkBrakeType:null};
+    cornerDrive={curve,corner,level:0,link:0,blend:0,target:null,onsetSpeed:null,blocked:false,method,effectScale:1,linkQuality:null,linkBrakeType:null,cover:0};
   }
+  cornerDrive.cover=Math.max(cornerDrive.cover??0,driftCoverOf(corner));
   if(cornerDrive.blocked)return;
   cornerDrive.level=Math.max(cornerDrive.level,quality==='PERFECT'?1:.6);
   if(link>cornerDrive.link||(link>0&&link===cornerDrive.link&&quality==='PERFECT'&&cornerDrive.linkQuality!=='PERFECT')){
@@ -15882,7 +15918,7 @@ function stepCornerDrive(dt,isBraking,envBase,factor,weight,gradient,assistFloor
   const blend=receipt.blend;
   if(blend<.001)return null;
   const grade=receipt.level;
-  const effectScale=receipt.effectScale??1;
+  const effectScale=(receipt.effectScale??1)*driftCoverScale(receipt);
   const bonus=1+((receipt.link===2?1.32:receipt.link===1?1.16:1)-1)*effectScale;
   const cornerTarget=Math.max(15,36*factor*(1+.20*grade)*weight*gradient,assistFloor,rotationTarget);
   const normalTarget=envBase*weight*gradient;
@@ -16940,10 +16976,11 @@ function exitWingBlockReason(receipt,running=false){
     running&&(input.brake||input.brakePressed)?'ブレーキ中':shortcutOwnsFeedback()?'抜け道の表示中':!pawTrailGrounded()?'足が地面にない':running&&exitBonusVisual.curve!==curve?'道が切り替わった':'';
 }
 function startExitBonusVisual(receipt){
-  if(assistDiag&&receipt&&exitBonusVisual.receipt!==receipt)assistDiag.wing(exitWingBlockReason(receipt)||'出た');
+  if(assistDiag&&receipt&&exitBonusVisual.receipt!==receipt)assistDiag.wing(exitWingBlockReason(receipt)||(isWeakCornerBonus(receipt)?'弱いボーナス(風だけ)':'出た'));
   if(!appAnimationsEnabled||!receipt||exitBonusVisual.receipt===receipt||gameState!=='racing'||receipt.blocked||assistBonusBlocked(receipt.corner)||wallHitCooldown>0||shortcutOwnsFeedback()||!pawTrailGrounded())return;
-  Object.assign(exitBonusVisual,{receipt,curve,time:0,duration:1.30,tier:receipt.link||0,active:true,airStarted:false,starts:exitBonusVisual.starts+1});
-  playSfx('wingTwinkle');
+  const weak=isWeakCornerBonus(receipt);
+  Object.assign(exitBonusVisual,{receipt,curve,time:0,duration:1.30,tier:receipt.link||0,active:true,airStarted:false,starts:exitBonusVisual.starts+1,weak});
+  if(!weak)playSfx('wingTwinkle');
 }
 function updateExitBonusVisual(dt){
   const state=exitBonusVisual;if(!state.active)return;
@@ -16958,7 +16995,8 @@ function updateExitBonusVisual(dt){
   const opacity=THREE.MathUtils.smoothstep(time,0,.08)*(1-exitWingFade.value);
   const meter=document.getElementById('speedoBottom'),ring=THREE.MathUtils.smoothstep(time,.39,.45)*(1-THREE.MathUtils.smoothstep(time,.66,.88));
   meter.style.setProperty('--exit-boost-alpha',String(ring*.9));meter.style.setProperty('--exit-boost-turn',(-35+180*THREE.MathUtils.clamp((time-.40)/.45,0,1))+'deg');
-  exitBonusWind.visible=true;
+  // 弱いボーナス(ドリフトで曲がった割合が小さい)は羽を出さず、肩から流れる風と速度計の輪だけ
+  exitBonusWind.visible=!state.weak;
   for(const wing of exitWings){
     const {side,face,edge,seams}=wing.userData;
     wing.rotation.set(.12+.16*stroke-.05*settle,side*(1.12*(1-open)+.08*open+.22*stream),side*(.68*(1-open)+.22*open-.82*stroke+.20*settle),'YXZ');
@@ -17120,14 +17158,15 @@ function updateCup(){
 // ・水の量：鉢は丸いので、見た目の水の面積が水の量に比例する高さに水面を置く
 // ・横G(表示用)：速さ² × 道の曲がり ÷ 曲がれる限界の横の力(cornerGripSpeed と同じ 20×傾き×雨)。0=なし、1=限界ちょうど。
 //   符号は水が寄る向き(曲がりの外側。画面の左が −)。ドリフトの判定は今の lateralG のまま(表示用とは別)
-// ・水面は外側へ傾き(G=1で tilt 度)、バネ(1秒に hz 回・減衰 damp)で揺り返す。魚は水より遅れて外へ流され(fishHz・fishDamp)、流れに逆らって泳ぐ
+// ・水面は外側へ傾き(G=1で tilt 度・最大 tiltMax 度)、バネ(1秒に hz 回・減衰 damp)で揺り返す。魚は水より遅れて外へ流され(fishHz・fishDamp)、流れに逆らって泳ぐ
 //   限界(limit)に近いと鉢の縁が赤く光る
+// ・水が flopBelow %未満になると、魚は浅い水でぴちぴち跳ねる(水が少ないほど間隔が短く高く跳ねる。間隔 flopSlow→flopFast 秒)
 // ・水が0%になったら魚は鉢から跳び出して画面の外へ逃げ、空の鉢が傾いて(emptyTilt 度)底のしずくが外へ流れる。水が戻る(リスタート)と魚も戻る
 // ・アニメーションOFF(アプリの設定)の時は、揺り返し・尾びれ・ゆらゆら・逃げる跳ね方を止め、傾きと位置だけで見せる
 // ・時間(秒)で計算するので、1秒のコマ数(60・120)が違っても同じ揺れ方になる
-const FISH_BOWL={tilt:18,hz:2.5,damp:.25,fishHz:1.1,fishDamp:.55,fishYHz:1.5,fishYDamp:.6,limit:.85,emptyTilt:12,gSmooth:.06,escapeTextDelay:.6,escapeText:'金魚が逃げた…'};
+const FISH_BOWL={tilt:30,tiltMax:36,hz:2.5,damp:.25,fishHz:1.1,fishDamp:.55,fishYHz:1.5,fishYDamp:.6,limit:.85,emptyTilt:16,flopBelow:15,flopSlow:1.4,flopFast:.6,gSmooth:.06,escapeTextDelay:.6,escapeText:'金魚が逃げた…'};
 let fishBowlTargetG=0;
-const fishBowl={g:0,theta:0,thetaV:0,fx:0,fxV:0,fy:null,fyV:0,face:1,faceS:1,tail:0,time:0,jolt:0,drops:[],state:'swim',escape:null,frameMs:16.7,frameMax:0,geom:null};
+const fishBowl={g:0,theta:0,thetaV:0,fx:0,fxV:0,fy:null,fyV:0,face:1,faceS:1,tail:0,flopT:0,time:0,jolt:0,drops:[],state:'swim',escape:null,frameMs:16.7,frameMax:0,geom:null};
 // 単位円で、高さ t(上が+1)より下の面積の割合
 function bowlAreaBelow(t){t=Math.max(-1,Math.min(1,t));return (t*Math.sqrt(1-t*t)+Math.asin(t)+Math.PI/2)/Math.PI;}
 function bowlSurfaceT(frac){let lo=-1,hi=1;for(let i=0;i<24;i++){const m=(lo+hi)/2;if(bowlAreaBelow(m)<frac)lo=m;else hi=m;}return (lo+hi)/2;}
@@ -17154,10 +17193,11 @@ function updateFishBowl(dt){
   B.g+=(target-B.g)*(dt>0?1-Math.exp(-dt/FISH_BOWL.gSmooth):0);
   const G=B.geom&&B.geom.W===W&&B.geom.H===H?B.geom:(B.geom=bowlGeom(W,H));
   const g=THREE.MathUtils.clamp(B.g,-1.3,1.3);
-  if(B.state!=='swim'&&waterLevel>0){B.escape?.el.remove();B.escape=null;Object.assign(B,{state:'swim',fx:0,fxV:0,fy:null,fyV:0,theta:0,thetaV:0});}
-  if(B.state==='swim'&&waterLevel<=0&&gameState==='racing')startFishEscape(canvas,G,g);
+  // 水の量は小数で減るので、表示が0%(1%未満)になった時に逃げ、1%以上に戻った(リスタート)時に戻す
+  if(B.state!=='swim'&&waterLevel>=1){B.escape?.el.remove();B.escape=null;Object.assign(B,{state:'swim',fx:0,fxV:0,fy:null,fyV:0,theta:0,thetaV:0});}
+  if(B.state==='swim'&&waterLevel<1&&gameState==='racing')startFishEscape(canvas,G,g);
   const empty=B.state!=='swim';
-  const thetaT=(empty?FISH_BOWL.emptyTilt:FISH_BOWL.tilt)*Math.PI/180*g;
+  const thetaT=THREE.MathUtils.clamp((empty?FISH_BOWL.emptyTilt:FISH_BOWL.tilt)*g,-FISH_BOWL.tiltMax,FISH_BOWL.tiltMax)*Math.PI/180;
   if(motion){[B.theta,B.thetaV]=bowlSpring(B.theta,B.thetaV,thetaT,FISH_BOWL.hz,FISH_BOWL.damp,dt);}else{B.theta=thetaT;B.thetaV=0;}
   const frac=THREE.MathUtils.clamp(waterLevel/100,0,1)*bowlAreaBelow(G.tOpen-.08);
   const y0=G.cy-bowlSurfaceT(frac)*G.ry,slope=-Math.tan(B.theta);
@@ -17170,6 +17210,10 @@ function updateFishBowl(dt){
     const ys=y0+slope*B.fx,yb=G.cy+G.ry*Math.sqrt(Math.max(0,1-(B.fx/G.rx)**2));
     const ty=Math.min(Math.max(ys+(yb-ys)*.45,ys+L*.16),yb-L*.24);
     if(B.fy==null)B.fy=ty;
+    if(motion&&waterLevel<FISH_BOWL.flopBelow){
+      B.flopT-=dt;
+      if(B.flopT<=0){const k=1-waterLevel/FISH_BOWL.flopBelow;B.flopT=THREE.MathUtils.lerp(FISH_BOWL.flopSlow,FISH_BOWL.flopFast,k)*(.8+Math.random()*.4);B.fyV-=60+50*k;B.fxV+=(Math.random()-.5)*50;}
+    }else B.flopT=.3;
     if(motion){[B.fy,B.fyV]=bowlSpring(B.fy,B.fyV,ty,FISH_BOWL.fishYHz,FISH_BOWL.fishYDamp,dt);}else{B.fy=ty;B.fyV=0;}
     B.fy=Math.min(B.fy,yb-L*.24);
     B.face=g>.12?-1:g<-.12?1:B.fxV>1?1:B.fxV<-1?-1:B.face;
@@ -17181,8 +17225,8 @@ function updateFishBowl(dt){
   B.drops=B.drops.filter(d=>d.life>0&&d.y<H+2);
   drawFishBowl(canvas,G,g,y0,slope,empty,motion);
 }
-function drawGoldfish(c,x,y,L,s,tail){
-  c.save();c.translate(x,y);c.scale(s,1);
+function drawGoldfish(c,x,y,L,s,tail,rot=0){
+  c.save();c.translate(x,y);c.scale(s,1);c.rotate(rot);
   const fin='rgba(255,138,72,.88)',flap=Math.sin(tail)*.35;
   c.save();c.translate(-L*.32,0);c.rotate(flap);
   c.beginPath();c.moveTo(0,0);c.quadraticCurveTo(-L*.28,-L*.36,-L*.48,-L*.27);c.quadraticCurveTo(-L*.34,0,-L*.48,L*.27);c.quadraticCurveTo(-L*.28,L*.36,0,0);c.fillStyle=fin;c.fill();
@@ -17221,7 +17265,7 @@ function drawFishBowl(canvas,G,g,y0,slope,empty,motion){
     for(const [off,sz] of [[-.22,1.7],[0,2.1],[.2,1.5]]){const a=Math.PI/2-THREE.MathUtils.clamp(g,-1,1)*.55+off;c.beginPath();c.ellipse(cx+rx*.9*Math.cos(a),cy+ry*.9*Math.sin(a),sz,sz*.7,0,0,2*Math.PI);c.fillStyle=night?'rgba(110,160,235,.9)':'rgba(60,160,230,.9)';c.fill();}
   }
   c.restore();
-  if(!empty)drawGoldfish(c,cx+B.fx,B.fy,G.L,B.faceS,B.tail);
+  if(!empty)drawGoldfish(c,cx+B.fx,B.fy,G.L,B.faceS,B.tail,motion?THREE.MathUtils.clamp(B.fyV*.008,-.7,.7):0);
   // ガラスの縁・口・光
   const a0=-Math.asin(tOpen),a1=Math.PI+Math.asin(tOpen);
   c.beginPath();c.ellipse(cx,cy,rx,ry,0,a0,a1,false);c.strokeStyle=night?'rgba(205,218,255,.85)':'rgba(255,255,255,.95)';c.lineWidth=1.4;c.stroke();
@@ -17264,7 +17308,7 @@ function updateFishEscape(dt){
   c.save();c.translate(e.w/2,e.h/2);c.rotate(Math.atan2(vy,90)*e.dir*.6);drawGoldfish(c,0,0,e.L,e.dir,e.tail);c.restore();
 }
 function showFishEscapeText(){
-  if(waterLevel>0)return;
+  if(waterLevel>=1)return;
   const cup=document.getElementById('cupWrap');if(!cup)return;
   const el=document.createElement('div');el.className='cupLoss escape';el.textContent=FISH_BOWL.escapeText;cup.appendChild(el);setTimeout(()=>el.remove(),2600);
 }
@@ -18638,6 +18682,7 @@ function tick(dt){
   if(assistedTakeoffLane&&!isBraking)tSpd=Math.max(tSpd,IROHA_ENTRY.goodMaxSpeed/3.6);
   if(isBraking)tSpd=0;
   if(!globalIsAssist&&isBraking){exitBoostPower=0;exitBoostTimer=0;meatLinkContext=null;resetExitBonusVisual();}
+  updateDriftCover();
   const cornerLaunch=stepCornerDrive(dt,isBraking,envBase,factor_curv,f_weight,f_grad,globalIsAssist?gripGoal:0,rotationTarget);
   if(cornerLaunch){
     tSpd=cornerLaunch.target;
