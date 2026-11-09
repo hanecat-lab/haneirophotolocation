@@ -1013,6 +1013,54 @@ body.readonly-source #topbar.glass.compact > .topbar-row{flex-shrink:0 !importan
   left: 0 !important; right: 0 !important;
 }
 body:has(#s-cull.cc-photo-focus) #ccPhotoFocusExit { display: inline-flex; align-items: center; justify-content: center; }
+
+/* Full-screen culling: retain the full image, float translucent decisions above it. */
+#ccFocusDecisionBar {
+  display: none; position: fixed; z-index: 91;
+  left: 50%; transform: translateX(-50%);
+  bottom: calc(9px + env(safe-area-inset-bottom, 0px));
+  width: min(480px, calc(100% - 24px));
+  padding: 9px; border-radius: 20px;
+  background: rgba(11, 19, 31, .49);
+  border: 1px solid rgba(217, 231, 243, .23);
+  -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, .18);
+  box-sizing: border-box;
+}
+body:has(#s-cull.cc-photo-focus) #ccFocusDecisionBar { display: block; }
+body:has(#s-cull.cc-photo-focus) #note { display: none !important; }
+#ccFocusPosition {
+  font-size: 12px; font-weight: 500; line-height: 18px;
+  text-align: center; color: rgba(245, 250, 255, .86);
+  font-variant-numeric: tabular-nums; letter-spacing: .02em;
+  padding: 0 4px 7px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+#ccFocusActions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+#ccFocusActions button {
+  min-width: 0; min-height: 47px; padding: 8px 4px;
+  border-radius: 13px; border: 1px solid rgba(255, 255, 255, .22);
+  background: rgba(25, 34, 50, .38);
+  color: #f0f6fc; font-size: 16px; font-weight: 700;
+  line-height: 1.3; text-shadow: 0 1px 2px rgba(0,0,0,.4);
+  -webkit-tap-highlight-color: transparent;
+}
+#ccFocusDrop { color: #ffa5af !important; }
+#ccFocusHold { color: #ffe19b !important; }
+#ccFocusKeep { color: #a9edff !important; }
+#ccFocusActions button[aria-pressed=true] {
+  border-color: currentColor; background: rgba(111, 139, 161, .22);
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+#ccFocusActions button:disabled { opacity: .48; box-shadow: none; }
+#ccFocusActions button:focus-visible { outline: 2px solid #a9edff; outline-offset: 2px; }
+#s-cull.cc-photo-focus #stage,
+#s-cull.cc-photo-focus #photo { touch-action: pan-y; -webkit-user-select: none; user-select: none; }
+@media (max-height: 460px) {
+  #ccFocusDecisionBar { width: min(440px, calc(100% - 24px)); padding: 5px 8px; }
+  #ccFocusPosition { padding-bottom: 2px; }
+  #ccFocusActions button { min-height: 38px; padding: 5px 4px; }
+}
 </style>
 </head>
 <body>
@@ -7715,6 +7763,96 @@ for(const type of ['dragenter','dragover','drop'])window.addEventListener(type,e
   window.matchMedia?.('(display-mode: standalone)').addEventListener?.('change',setSafeArea);
 
   let focusMode = false;
+  let previousGridMode = null;
+  let nativeFocus = false;
+  const focusBar = document.createElement('div');
+  focusBar.id = 'ccFocusDecisionBar';
+  focusBar.setAttribute('role','group');
+  focusBar.setAttribute('aria-label','全画面の写真選別');
+  focusBar.innerHTML = '<div id="ccFocusPosition" aria-live="off"></div>' +
+    '<div id="ccFocusActions">' +
+    '<button id="ccFocusDrop" type="button" aria-pressed="false">外す</button>' +
+    '<button id="ccFocusHold" type="button" aria-pressed="false">保留</button>' +
+    '<button id="ccFocusKeep" type="button" aria-pressed="false">残す</button>' +
+    '</div>';
+  document.body.append(focusBar);
+  const focusButtons = {
+    drop:document.getElementById('ccFocusDrop'),
+    hold:document.getElementById('ccFocusHold'),
+    keep:document.getElementById('ccFocusKeep')
+  };
+  for(const [action,el] of Object.entries(focusButtons)){
+    el.addEventListener('click',()=>{
+      if(!focusMode || !screen.classList.contains('on') || currentImportJob) return;
+      // Use the exact same saving, undo history and advance rules as normal culling.
+      touchDecide(action);
+      updateFocusDecisions();
+    });
+  }
+  function updateFocusDecisions(){
+    const g = groups[idx];
+    const ready = !!g && decisionPreviewReady(g) && !currentImportJob;
+    const state = g ? decision(g) : 'unreviewed';
+    document.getElementById('ccFocusPosition').textContent =
+      g ? $('counter').textContent+'  ·  '+({keep:'残す',hold:'保留',drop:'外す',unreviewed:'未確認'}[state]||'未確認')
+        : '写真がありません';
+    for(const [action,el] of Object.entries(focusButtons)){
+      el.disabled = !ready;
+      el.setAttribute('aria-pressed',String(state===action));
+    }
+  }
+  // A photo may finish decoding after render(); update readiness at that time too.
+  const priorFocusRender=render;
+  render=function(...args){const result=priorFocusRender(...args);updateFocusDecisions();return result;};
+  const priorFocusReady=syncPreviewDecisions;
+  syncPreviewDecisions=function(...args){const result=priorFocusReady(...args);updateFocusDecisions();return result;};
+
+  // Horizontal swipe only in the image, never on the floating action buttons.
+  const stage=document.getElementById('stage');
+  let startTouch=null;
+  stage.addEventListener('touchstart',e=>{
+    if(!focusMode || e.touches.length!==1 || document.querySelector('dialog[open]')){startTouch=null;return;}
+    const t=e.touches[0];
+    startTouch={id:t.identifier,x:t.clientX,y:t.clientY,horizontal:false};
+  },{passive:true});
+  stage.addEventListener('touchmove',e=>{
+    if(!focusMode || !startTouch || e.touches.length!==1){startTouch=null;return;}
+    const t=e.touches[0];if(t.identifier!==startTouch.id)return;
+    const dx=t.clientX-startTouch.x,dy=t.clientY-startTouch.y;
+    if(Math.abs(dx)>14 && Math.abs(dx)>Math.abs(dy)*1.25){
+      startTouch.horizontal=true;
+      if(e.cancelable)e.preventDefault();
+    }
+  },{passive:false});
+  stage.addEventListener('touchend',e=>{
+    const gesture=startTouch;startTouch=null;
+    if(!focusMode || !gesture || document.querySelector('dialog[open]'))return;
+    const t=Array.from(e.changedTouches).find(x=>x.identifier===gesture.id);
+    if(!t)return;
+    const dx=t.clientX-gesture.x,dy=t.clientY-gesture.y;
+    if(Math.abs(dx)<52 || Math.abs(dx)<Math.abs(dy)*1.3)return;
+    if(e.cancelable)e.preventDefault();
+    if(zoomed)setZoom(false);
+    step(dx<0?1:-1);
+  },{passive:false});
+  stage.addEventListener('touchcancel',()=>{startTouch=null;},{passive:true});
+  // Dragging with a mouse also navigates, without turning a click into a swipe.
+  let mouseStart=null;
+  stage.addEventListener('pointerdown',e=>{
+    if(!focusMode || e.pointerType!=='mouse' || e.button!==0)return;
+    mouseStart={x:e.clientX,y:e.clientY};
+  });
+  stage.addEventListener('pointerup',e=>{
+    if(!focusMode || !mouseStart || e.pointerType!=='mouse')return;
+    const dx=e.clientX-mouseStart.x,dy=e.clientY-mouseStart.y;mouseStart=null;
+    if(Math.abs(dx)>=52 && Math.abs(dx)>Math.abs(dy)*1.3)step(dx<0?1:-1);
+  });
+  stage.addEventListener('pointercancel',()=>{mouseStart=null;});
+  // A tap should not activate the normal zoom handler and block the next swipe.
+  document.getElementById('photo').addEventListener('click',e=>{
+    if(focusMode){e.preventDefault();e.stopImmediatePropagation();}
+  },true);
+
   function paintFocusButton(){
     const active = focusMode || !!document.fullscreenElement;
     button.setAttribute('aria-pressed', String(active));
@@ -7726,7 +7864,17 @@ for(const type of ['dragenter','dragover','drop'])window.addEventListener(type,e
     if(focusMode){screen.style.setProperty('--photo-top','0px');screen.style.setProperty('--photo-bottom','0px');}
     else schedulePhotoLayout();
   }
-  function stopFocus(){focusMode=false;paintFocusButton();}
+  function stopFocus(){
+    focusMode=false;
+    if(document.fullscreenElement) void document.exitFullscreen().catch(()=>{});
+    nativeFocus=false;
+    hideNote();
+    paintFocusButton();
+    if(previousGridMode!==null){
+      const restore=previousGridMode; previousGridMode=null;
+      if(screen.classList.contains('on') && gridN!==restore)setGrid(restore);
+    }
+  }
   exit.onclick=stopFocus;
   // The original handler aborts when requestFullscreen is missing (iPhone).
   // Keep native fullscreen where available, otherwise show the photo without app chrome.
@@ -7737,18 +7885,36 @@ for(const type of ['dragenter','dragover','drop'])window.addEventListener(type,e
       try{await document.exitFullscreen();}catch(e){}
       paintFocusButton();return;
     }
+    let nativeEntered=false;
     if(!isIOS && document.documentElement.requestFullscreen && document.fullscreenEnabled !== false){
-      try{await document.documentElement.requestFullscreen({navigationUI:'hide'});paintFocusButton();return;}
+      try{await document.documentElement.requestFullscreen({navigationUI:'hide'});nativeEntered=true;}
       catch(e){/* In-page focus is available even if native fullscreen is blocked. */}
     }
-    focusMode=true;paintFocusButton();
+    nativeFocus=nativeEntered;
+    previousGridMode=gridN>1?gridN:null;
+    if(zoomed)setZoom(false);
+    if(gridN!==1)setGrid(1);
+    focusMode=true;hideNote();paintFocusButton();updateFocusDecisions();
   };
   button.onclick=()=>void toggleFullscreen();
   syncFullscreenButton=paintFocusButton;
-  document.addEventListener('fullscreenchange',paintFocusButton);
+  document.addEventListener('fullscreenchange',()=>{
+    if(nativeFocus && !document.fullscreenElement && focusMode)stopFocus();
+    else paintFocusButton();
+  });
   document.addEventListener('keydown',e=>{
-    if(!focusMode)return;
-    if(e.key==='Escape'){e.preventDefault();e.stopImmediatePropagation();stopFocus();}
+    if(!focusMode || !screen.classList.contains('on'))return;
+    if(e.key==='Escape'){
+      e.preventDefault();e.stopImmediatePropagation();stopFocus();return;
+    }
+    if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key) &&
+       !e.altKey && !e.metaKey && !e.ctrlKey &&
+       !document.querySelector('dialog[open]') &&
+       !e.target?.closest?.('input,textarea,select,[contenteditable=true]')){
+      e.preventDefault();e.stopImmediatePropagation();
+      if(zoomed)setZoom(false);
+      step(e.key==='ArrowRight'||e.key==='ArrowDown'?1:-1);
+    }
   },true);
   new MutationObserver(()=>{
     if(!screen.classList.contains('on') && focusMode)stopFocus();
