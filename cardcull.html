@@ -982,6 +982,37 @@ body.readonly-source #topbar.glass.compact > .topbar-row{flex-shrink:0 !importan
 .refine-tool-section h3{margin:0;color:var(--accent);font-size:.82rem}
 .refine-tool-section button{border-radius:14px;padding:8px 12px}
 .refine-action-description{display:block;margin-top:3px;color:var(--text2);font-size:.73rem;line-height:1.4}
+
+/* 2026-11-09: iPhone Home Screen safe-area and actual photo-focus mode.
+   Preserve all normal controls; never draw a tappable control under the status bar. */
+:root { --cc-app-top-inset: 0px; }
+#s-cull #topbar.glass.compact {
+  position: absolute !important;
+  top: calc(6px + var(--cc-app-top-inset)) !important;
+}
+/* The operating system's native photo/file picker is outside the web viewport. */
+#importOverlay { padding-top: calc(20px + var(--cc-app-top-inset));
+  padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px)); }
+#importOverlay .import-progress-card { max-height: calc(100dvh - 40px - var(--cc-app-top-inset) - env(safe-area-inset-bottom, 0px)); }
+#ccImportLive { color: #b7e9f3; font-variant-numeric: tabular-nums; margin: 6px 0; }
+#ccImportStall { margin: 6px 0; color: #efd49d; font-size: .77rem; line-height: 1.6; }
+#ccPhotoFocusExit {
+  display: none; position: fixed; z-index: 90; right: 12px;
+  top: calc(9px + var(--cc-app-top-inset));
+  min-height: 43px; padding: 8px 15px; border-radius: 999px;
+  background: rgba(19,30,41,.89); border: 1px solid rgba(92,225,255,.65);
+  color: #eef9fc; font-size: .82rem;
+}
+#s-cull.cc-photo-focus #topbar,
+#s-cull.cc-photo-focus #bar,
+#s-cull.cc-photo-focus #burstFilmstrip,
+#s-cull.cc-photo-focus #reviewOverlay { display: none !important; }
+#s-cull.cc-photo-focus #stage {
+  top: calc(3px + var(--cc-app-top-inset)) !important;
+  bottom: calc(3px + env(safe-area-inset-bottom, 0px)) !important;
+  left: 0 !important; right: 0 !important;
+}
+body:has(#s-cull.cc-photo-focus) #ccPhotoFocusExit { display: inline-flex; align-items: center; justify-content: center; }
 </style>
 </head>
 <body>
@@ -7642,6 +7673,123 @@ for(const id of ['rawHandoffEntry','filesBtn','folderBtn'])$(id).disabled=false;
 document.documentElement.classList.add('cardcull-ready');
 for(const type of ['dragenter','dragover','drop'])window.addEventListener(type,e=>{if(!cleanupDialog.open&&!cleanupEnding)return;if(!Array.from(e.dataTransfer?.types||[]).includes('Files'))return;e.preventDefault();e.stopImmediatePropagation();},true);
 
+
+/* 2026-11-09: Home Screen display and observable import phases. */
+(function ccFixHomeScreenAndPhotoFocus(){
+  'use strict';
+  const screen = document.getElementById('s-cull');
+  const button = document.getElementById('fullscreenBtn');
+  const exit = document.createElement('button');
+  exit.id = 'ccPhotoFocusExit'; exit.type = 'button';
+  exit.textContent = '✕ 全画面を終了';
+  exit.setAttribute('aria-label','写真の全画面表示を終了');
+  document.body.append(exit);
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const insetProbe = document.createElement('div');
+  insetProbe.style.cssText = 'position:fixed;visibility:hidden;pointer-events:none;padding-top:env(safe-area-inset-top,0px)';
+  document.body.append(insetProbe);
+  function isStandalone(){return navigator.standalone === true ||
+    !!window.matchMedia?.('(display-mode: standalone)').matches ||
+    !!window.matchMedia?.('(display-mode: fullscreen)').matches;}
+  function setSafeArea(){
+    const nativeTop = parseFloat(getComputedStyle(insetProbe).paddingTop) || 0;
+    let top = nativeTop;
+    if(isIOS && isStandalone() && nativeTop < 30){
+      // iOS 26+ may report a zero safe-area inset. If its visual viewport
+      // already excludes the status bar, don't reserve a second status bar.
+      const sh = Math.max(window.screen?.width||0, window.screen?.height||0);
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      const alreadyBelowBar = sh > 0 && sh - vh >= 36;
+      top = alreadyBelowBar ? 0 : 58;
+    }
+    const old = document.documentElement.style.getPropertyValue('--cc-app-top-inset');
+    const next = Math.round(Math.max(0,top)) + 'px';
+    if(old !== next){document.documentElement.style.setProperty('--cc-app-top-inset',next);schedulePhotoLayout();}
+  }
+  setSafeArea();
+  window.addEventListener('resize',setSafeArea,{passive:true});
+  window.addEventListener('orientationchange',setSafeArea,{passive:true});
+  window.addEventListener('pageshow',setSafeArea);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)setSafeArea();});
+  window.matchMedia?.('(display-mode: standalone)').addEventListener?.('change',setSafeArea);
+
+  let focusMode = false;
+  function paintFocusButton(){
+    const active = focusMode || !!document.fullscreenElement;
+    button.setAttribute('aria-pressed', String(active));
+    button.querySelector('span').textContent = active ? '全画面を終了' : '⛶ 全画面';
+    button.title = isIOS ? '写真を画面いっぱいに表示（iPhoneではOSの時刻表示は残ります）'
+      : active ? '全画面を終了' : '写真を全画面で表示';
+    exit.hidden = !focusMode;
+    screen.classList.toggle('cc-photo-focus',focusMode);
+    if(focusMode){screen.style.setProperty('--photo-top','0px');screen.style.setProperty('--photo-bottom','0px');}
+    else schedulePhotoLayout();
+  }
+  function stopFocus(){focusMode=false;paintFocusButton();}
+  exit.onclick=stopFocus;
+  // The original handler aborts when requestFullscreen is missing (iPhone).
+  // Keep native fullscreen where available, otherwise show the photo without app chrome.
+  toggleFullscreen=async function(){
+    if(!screen.classList.contains('on') || currentImportJob)return;
+    if(focusMode){stopFocus();return;}
+    if(document.fullscreenElement){
+      try{await document.exitFullscreen();}catch(e){}
+      paintFocusButton();return;
+    }
+    if(!isIOS && document.documentElement.requestFullscreen && document.fullscreenEnabled !== false){
+      try{await document.documentElement.requestFullscreen({navigationUI:'hide'});paintFocusButton();return;}
+      catch(e){/* In-page focus is available even if native fullscreen is blocked. */}
+    }
+    focusMode=true;paintFocusButton();
+  };
+  button.onclick=()=>void toggleFullscreen();
+  syncFullscreenButton=paintFocusButton;
+  document.addEventListener('fullscreenchange',paintFocusButton);
+  document.addEventListener('keydown',e=>{
+    if(!focusMode)return;
+    if(e.key==='Escape'){e.preventDefault();e.stopImmediatePropagation();stopFocus();}
+  },true);
+  new MutationObserver(()=>{
+    if(!screen.classList.contains('on') && focusMode)stopFocus();
+  }).observe(screen,{attributes:true,attributeFilter:['class']});
+  paintFocusButton();
+
+  const live=document.createElement('p');live.id='ccImportLive';live.setAttribute('aria-live','off');
+  const stall=document.createElement('p');stall.id='ccImportStall';stall.setAttribute('role','status');stall.setAttribute('aria-live','polite');
+  $('importElapsed').after(live,stall);
+  let trackedJob=null, trackedKey='', changeAt=0, lastStallMessage='';
+  const previousPaint=txPaint;
+  txPaint=function(job=currentImportJob){
+    previousPaint(job);
+    if(!job?.atomic || job!==currentImportJob){live.hidden=true;stall.hidden=true;return;}
+    const now=Date.now();
+    if(job!==trackedJob){trackedJob=job;trackedKey='';changeAt=now;lastStallMessage='';}
+    const key=[job.phase,job.done,job.total,job.received,job.receivedItems,job.builtGroupCount,job.title,job.detail].join('|');
+    if(key!==trackedKey){trackedKey=key;changeAt=now;}
+    const totalSeconds=Math.max(0,Math.floor((now-(job.waitStarted||job.started||now))/1000));
+    const before=Math.max(0,Math.floor(((job.receivedAt||now)-(job.waitStarted||now))/1000));
+    const after=job.receivedAt?Math.max(0,Math.floor(((job.completedAt||now)-job.receivedAt)/1000)):0;
+    const waiting=['picking','dragging','waiting'].includes(job.phase);
+    const complete=job.phase==='complete';
+    const count=Number.isFinite(job.received)?' ・受信 '+job.received+'件':'';
+    live.hidden=false;
+    live.textContent='開始から '+totalSeconds+'秒 ・ '+(waiting?'端末からの受信待ち':complete?'受信待ち '+before+'秒 ／ アプリ内処理 '+after+'秒':'アプリ内処理 '+after+'秒')+count;
+    let message='';
+    if(waiting){
+      message='写真を選ぶ画面はiPhone側が処理します。アプリにファイルが届くまで受信率・残り時間は取得できません。';
+    }else if(!complete&&job.phase!=='review-failures'&&now-changeAt>=8000){
+      message='8秒以上、進捗の更新がありません。端末が画像を準備している可能性があります。経過時間は上で更新しています。';
+    }
+    stall.hidden=!message;
+    // A screen reader should not be interrupted each second by a running clock.
+    if(message!==lastStallMessage){
+      stall.textContent=message;
+      lastStallMessage=message;
+    }
+  };
+  live.hidden=true;stall.hidden=true;
+})();
 </script>
 
 </body>
