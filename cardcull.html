@@ -10,6 +10,8 @@
 <link rel="icon" type="image/png" href="favicon01.png">
 <title>CardCull — カード・端末の写真選別</title>
 <style>
+#ccSaveRecovery{font-size:.72rem;color:#ffd99b;line-height:1.6;margin:5px 0;padding:5px 8px;border:1px solid rgba(255,217,155,.22);border-radius:8px;}
+#ccSaveRecovery button{font-size:.72rem;min-height:33px;margin:4px 5px 2px 0;}
   :root {
     --bg: #07090d;
     --bg2: #10151c;
@@ -1191,6 +1193,7 @@ body:has(#s-cull.cc-photo-focus.cc-focus-zoomed) .cc-focus-zoom-nav { display: i
   <p id="ccEventEmpty" class="source-note">保存済みイベントを確認中…</p>
   <p id="ccHomeStatus" role="status" aria-live="polite"></p>
   <p id="ccStoragePersistence"></p>
+  <p id="ccHomeRecovery" class="source-note" hidden></p>
   <button id="ccNewEvent" type="button" hidden>新しいイベントを作成</button>
 </div>
     <div class="photo-date-guide">
@@ -5833,7 +5836,7 @@ class LightPreviewStore{
   disableWorker(){this.workerPending?.();this.worker?.terminate();this.worker=null;if(this.workerURL)URL.revokeObjectURL(this.workerURL);this.workerURL=null;this.workerDisabled=true;}
   drop(key){const entry=this.entries.get(key);if(entry){URL.revokeObjectURL(entry.url);this.entries.delete(key);}}
   trim(protect=null){
-    const phone=isPhonePreview(),budget=(phone?40:80)*1024*1024,thumbMax=phone?24:40;
+    const phone=isPhonePreview(),budget=(phone?28:64)*1024*1024,thumbMax=phone?16:30;
     const cost=()=>[...this.entries.values()].reduce((n,e)=>n+e.cost,0);
     const count=tier=>[...this.entries.values()].filter(e=>e.tier===tier).length;
     const normalMax=Math.max(3,[...this.pins].filter(k=>this.entries.get(k)?.tier==='normal').length);
@@ -8279,12 +8282,28 @@ for(const type of ['dragenter','dragover','drop'])window.addEventListener(type,e
    Original JPEG bytes remain in IndexedDB; never remove files in Photos or on an SD card. */
 (function ccEventLibrary(){
 'use strict';
-const DB='CardCullEventLibraryV1',VERSION=1;
+const DB='CardCullEventLibraryV1',VERSION=1; // Non-destructive: retain existing event data
 let dbPromise=null, activeId=null, activeName='', bands=[], bandId='', saving=0, persisted=new Map();
 let queue=Promise.resolve(), metaTimer=0, metaChain=Promise.resolve(), restoreBusy=false, metaGeneration=0;
 let lastError='', savedCount=0, lastSaved=0, nextStamp=0;
-const emptyText='保存中の写真はアプリを終了しないでください。';
+let photoJobs=0, metadataWanted=0, metadataSaved=0, recoverExpectedCount=0;
+let recoverMissingDecisions={}, recoverMissingSeen=new Set();
+const SAVE_BATCH=30;
+const SAVE_STATUS_ID='ccSaveRecovery';
 const $id=id=>document.getElementById(id);
+const restoreNotice=document.createElement('div');
+restoreNotice.id=SAVE_STATUS_ID;restoreNotice.hidden=true;restoreNotice.className='cc-save-recovery';
+restoreNotice.innerHTML='<span id="ccSaveRecoveryText"></span> <button type="button" id="ccSaveRetry">保存を再試行</button><button type="button" id="ccSaveReadd" hidden>不足分を追加する</button>';
+$id('ccSavedStatus').after(restoreNotice);
+$id('ccSaveRetry').onclick=()=>{
+ if(!activeId||photoJobs||saving||restoreBusy)return;
+ lastError='';schedulePhotoSave();queueMeta(true);
+};
+$id('ccSaveReadd').onclick=()=>{
+ if(!activeId||currentImportJob||saving||photoJobs||restoreBusy)return;
+ $id('addPhotosBtn')?.click();
+};
+const emptyText='保存中の写真はアプリを終了しないでください。';
 const formatDate=ms=>fmtDate(ms||Date.now());
 const idle=()=>new Promise(resolve=>setTimeout(resolve,0));
 function openDB(){
@@ -8321,13 +8340,36 @@ const put=(store,obj)=>reqResult(store,'readwrite',s=>s.put(obj));
 const get=(store,key)=>reqResult(store,'readonly',s=>s.get(key));
 const drop=(store,key)=>reqResult(store,'readwrite',s=>s.delete(key));
 const all=(store)=>reqResult(store,'readonly',s=>s.getAll());
-async function photoRows(id){const db=await openDB();return new Promise((resolve,reject)=>{
- const result=[];const tx=db.transaction('photos','readonly');
- const index=tx.objectStore('photos').index('eventId');
- const req=index.openCursor(IDBKeyRange.only(id));
- req.onsuccess=()=>{const cursor=req.result;if(!cursor)return;result.push(cursor.value);cursor.continue();};
- tx.oncomplete=()=>resolve(result);tx.onerror=()=>reject(tx.error||new Error('読み込みに失敗しました'));
- });}
+// Read only a short JPEG batch at a time. Never hold an extra array of all 1,000 JPEGs.
+async function readPhotoBatch(id,afterKey=null,limit=SAVE_BATCH){
+ const db=await openDB();return new Promise((resolve,reject)=>{
+  const prefix=id+'|',rows=[];let last=null,more=false;
+  const tx=db.transaction('photos','readonly');
+  const lower=afterKey||prefix;
+  const range=IDBKeyRange.bound(lower,prefix+'\uffff',!!afterKey,false);
+  const req=tx.objectStore('photos').openCursor(range);
+  req.onsuccess=()=>{const cursor=req.result;if(!cursor)return;
+   if(rows.length>=limit){more=true;return;}
+   if(cursor.value.eventId===id){rows.push(cursor.value);last=cursor.primaryKey;}
+   cursor.continue();
+  };
+  tx.oncomplete=()=>resolve({rows,last,more});
+  tx.onerror=()=>reject(tx.error||new Error('写真の分割読み込みに失敗しました'));
+  tx.onabort=()=>reject(tx.error||new Error('写真の読み込みが中断されました'));
+ });
+}
+async function countPhotos(id){
+ return reqResult('photos','readonly',s=>s.index('eventId').count(IDBKeyRange.only(id)));
+}
+// Delete photos and event metadata in one atomic transaction (no half-deleted event).
+async function deleteEventAtomic(id){const db=await openDB();return new Promise((resolve,reject)=>{
+ const tx=db.transaction(['photos','events'],'readwrite');
+ const cursor=tx.objectStore('photos').index('eventId').openCursor(IDBKeyRange.only(id));
+ cursor.onsuccess=()=>{const c=cursor.result;if(c){c.delete();c.continue();}};
+ tx.objectStore('events').delete(id);
+ tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error||new Error('イベントを削除できません'));
+ tx.onabort=()=>reject(tx.error||new Error('イベントの削除が中断されました'));
+});}
 function photoId(e,key){return e+'|'+key;}
 function savedSignature(g){const f=g.jpg||g.files?.find(x=>JPG_EXT.has(x.ext));return f?JSON.stringify([f.name,f.file.size,f.file.lastModified||0]):'';}
 function photoRecord(g,id){
@@ -8350,18 +8392,39 @@ function rowToGroup(r){
 }
 function makeId(){return 'evt-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,9);}
 function sessionSnapshot(){return {currentKey:groups[idx]?.key||'',mode:pickMode,
- decisions:Object.fromEntries(allGroups.filter(g=>decision(g)!=='unreviewed').map(g=>[g.key,decision(g)])),
- seen:allGroups.filter(g=>g.seen).map(g=>g.key),view,timeFilter:activeTimeFilter?{...activeTimeFilter}:null,
+ decisions:{...recoverMissingDecisions,...Object.fromEntries(allGroups.filter(g=>decision(g)!=='unreviewed').map(g=>[g.key,decision(g)]))},
+ seen:[...new Set([...recoverMissingSeen,...allGroups.filter(g=>g.seen).map(g=>g.key)])],view,timeFilter:activeTimeFilter?{...activeTimeFilter}:null,
  focusBand:bandId||'',workMs,viewedN};}
 function eventRecord(id=activeId){if(!id)return null;
  return {id,name:activeName||'イベント',updatedAt:Date.now(),createdAt:createdAt||Date.now(),
-  signature:cardSig,photoCount:allGroups.length, bands:bands.map(b=>({...b})), session:sessionSnapshot()};}
+  signature:cardSig,photoCount:Math.max(allGroups.filter(g=>g.jpg).length,recoverExpectedCount),storedPhotoCount:savedCount,
+  saveIncomplete:!!(photoJobs||saving||lastError||savedCount<Math.max(allGroups.filter(g=>g.jpg).length,recoverExpectedCount)),
+  bands:bands.map(b=>({...b})), session:sessionSnapshot()};}
 let createdAt=0;
-function status(message='',bad=false){
- const el=$id('ccSavedStatus');el.textContent=message||(!activeId?'':saving?'JPEG保存中…':lastError?'保存エラー：'+lastError:'端末内に保存済み');
- el.dataset.error=String(bad||!!lastError);$id('ccHomeStatus').textContent=el.textContent;
+function expectedPhotos(){return Math.max(recoverExpectedCount,allGroups.filter(g=>g.jpg).length);}
+function paintRecovery(){
+ const incomplete=!!activeId&&(!!lastError||(!photoJobs&&!saving&&savedCount<expectedPhotos()));
+ restoreNotice.hidden=!incomplete;
+ if(!incomplete)return;
+ $id('ccSaveRecoveryText').textContent=lastError?'保存失敗：'+lastError+'。JPEG保存とJSONバックアップを確認してください。':
+  '保存途中：JPEG '+savedCount+' / '+expectedPhotos()+'枚。保存済みJPEGで選別を続けられます。';
+ $id('ccSaveRetry').hidden=!lastError||photoJobs>0;
+ $id('ccSaveReadd').hidden=!activeId||savedCount>=expectedPhotos();
 }
-function noteError(e){lastError=(e?.message||String(e));status('保存失敗：'+lastError+'。JSONも書き出してください。',true);console.error('[CardCull storage]',e);}
+function status(message='',bad=false){
+ const el=$id('ccSavedStatus');
+ const expected=expectedPhotos(),metaDirty=metadataSaved<metadataWanted;
+ const detail=!activeId?'':lastError?'保存エラー：'+lastError:
+   photoJobs||saving?'JPEG '+savedCount+' / '+expected+'枚を保存中（選別操作は可能）':
+   savedCount<expected?'JPEG '+savedCount+' / '+expected+'枚保存済み・不足分は再追加できます':
+   metaDirty?'JPEG '+savedCount+'枚保存済み・選別結果を保存中':
+   'JPEG '+savedCount+'枚・選別結果ともに保存完了';
+ el.textContent=message||detail;
+ el.dataset.error=String(bad||!!lastError);
+ $id('ccHomeStatus').textContent=el.textContent;
+ paintRecovery();
+}
+function noteError(e){lastError=(e?.message||String(e));status('保存失敗：'+lastError+'。重要な選別結果はJSONも書き出してください。',true);console.error('[CardCull storage]',e);}
 function updateButtons(){const active=!!activeId;
  $id('ccBandBar').hidden=!active||!allGroups.length;
  $id('ccEventName').textContent=active?(activeName||'イベント'):'イベント未選択';
@@ -8375,16 +8438,21 @@ function updateButtons(){const active=!!activeId;
 function queueMeta(force=false){
  if(!activeId||restoreBusy)return;
  clearTimeout(metaTimer);
- const id=activeId;
- const gen=++metaGeneration;
+ const id=activeId,gen=++metaGeneration,revision=++metadataWanted;
  const submit=()=>{
   if(!activeId||activeId!==id||restoreBusy)return;
   const rec=eventRecord(id);
-  metaChain=metaChain.catch(()=>{}).then(()=>put('events',rec)).then(()=>{lastSaved=Date.now(); if(!saving&&gen===metaGeneration)status('JPEG '+savedCount+'枚・選別結果を端末内に保存済み');}).catch(noteError);
+  metaChain=metaChain.catch(()=>{}).then(()=>put('events',rec)).then(()=>{
+   metadataSaved=Math.max(metadataSaved,revision);lastSaved=Date.now();
+   if(gen===metaGeneration)status();
+  }).catch(noteError);
+  status();
  };
- if(force)submit();else metaTimer=setTimeout(submit,100);
+ if(force)submit();else {metaTimer=setTimeout(submit,65);status();}
 }
-async function flushMeta(){clearTimeout(metaTimer);queueMeta(true);await metaChain;}
+async function flushMeta(){clearTimeout(metaTimer);queueMeta(true);await metaChain;
+ if(lastError)throw new Error('選別結果を保存できません：'+lastError);
+}
 function refreshBandFilter(key=groups[idx]?.key){
  const old=key;applyFilter(old);
  if(groups.length){if(!match(groups[idx]))view='all';render();}else render();
@@ -8417,38 +8485,46 @@ const baseSaveSoon=saveSoon;
 saveSoon=function(){baseSaveSoon();queueMeta();};
 window.addEventListener('pagehide',()=>{queueMeta(true);});
 document.addEventListener('visibilitychange',()=>{if(document.hidden)queueMeta(true);});
-function updateSaveProgress(done,total){
- if(!activeId)return;
- if(saving){status('JPEG保存中 '+done+' / '+total+'枚（選別操作は可能）');}
- else if(!lastError){status('JPEG保存完了 '+savedCount+'枚・選別結果も保存');}
-}
+function updateSaveProgress(){status();}
 async function saveAllPhotos(id,photos){
- const jpeg=photos.filter(g=>g.jpg);const required=[];
+ if(id!==activeId)return;
+ const jpeg=photos.filter(g=>g.jpg),required=[];
  for(const g of jpeg){const k=photoId(id,g.key),signature=savedSignature(g);
    if(persisted.get(k)!==signature)required.push(g);
  }
- if(!required.length){if(id===activeId)updateSaveProgress(jpeg.length,jpeg.length);return;}
- if(id===activeId){saving++;status('JPEG保存中 0 / '+required.length+'枚（選別操作は可能）');}
+ if(!required.length){updateSaveProgress();return;}
+ saving++;status();
  let done=0;
  try{
-   for(const g of required){
-     const record=photoRecord(g,id);if(!record)continue;
-     await put('photos',record);persisted.set(record.id,record.signature);done++;if(id===activeId){savedCount=persisted.size;updateSaveProgress(done,required.length);}
-     // Yield repeatedly so swipes, buttons and preview painting take priority.
-     if(done%3===0)await new Promise(resolve=>requestAnimationFrame(()=>resolve()));
-   }
-   if(id===activeId){lastError='';status('JPEG保存完了 '+savedCount+'枚');}
- }catch(e){if(id===activeId)noteError(e);throw e;}
- finally{if(id===activeId){saving=Math.max(0,saving-1);updateSaveProgress(done,required.length);}}
+  for(const g of required){
+   if(id!==activeId)throw new Error('保存中にイベントが切り替わりました');
+   const record=photoRecord(g,id);if(!record)continue;
+   await put('photos',record); // Resolve ONLY after IndexedDB transaction's oncomplete.
+   persisted.set(record.id,record.signature);done++;savedCount=persisted.size;
+   if(done%3===0){status();await idle();}
+  }
+  // A JPEG retry does not clear a separate metadata-write failure prematurely.
+ }catch(e){noteError(e);throw e;}
+ finally{saving=Math.max(0,saving-1);status();}
 }
 function schedulePhotoSave(id=activeId){
  if(!id)return;
- const snapshot=allGroups.slice();
- queue=queue.catch(()=>{}).then(()=>saveAllPhotos(id,snapshot)).catch(e=>{console.error('[CardCull JPEG persistence]',e);});
+ const snapshot=allGroups.slice();photoJobs++;status();
+ queue=queue.catch(()=>{}).then(()=>saveAllPhotos(id,snapshot)).then(async()=>{
+  // Commit updated JPEG count and selection AFTER the last JPEG transaction.
+  if(id===activeId){await flushMeta();await listEvents();}
+ }).catch(e=>{
+  if(id===activeId)noteError(e);
+  console.error('[CardCull JPEG persistence]',e);
+ }).finally(()=>{
+  photoJobs=Math.max(0,photoJobs-1);
+  if(id===activeId){queueMeta(true);status();}
+ });
 }
 function scheduleIndexRefresh(){void listEvents().catch(noteError);}
 const baseTxCommit=txCommit;
 txCommit=async function(job,plan,built,files,signature){
+ const previousEventHadPhotos=!!activeId&&allGroups.length>0;
  // Culling can continue while staged data is analyzed: preserve up-to-the-moment decisions.
  if(job.append){for(const saved of plan.work){
    const live=allGroups.find(g=>g.key===saved.key);
@@ -8458,8 +8534,24 @@ txCommit=async function(job,plan,built,files,signature){
  }}
  await baseTxCommit(job,plan,built,files,signature);
  if(!job.committed)return;
- if(!job.append||!activeId){activeId=makeId();createdAt=Date.now();activeName='イベント '+formatDate(allGroups[0]?.exif?.ms||allGroups[0]?.time);bands=[];bandId='';persisted=new Map();savedCount=0;}
- await flushMeta();
+ if(!job.append&&(!activeId||previousEventHadPhotos)){
+   // A fresh import must never overwrite an archived event, even if the user returned to Home.
+   activeId=makeId();createdAt=Date.now();activeName='イベント '+formatDate(allGroups[0]?.exif?.ms||allGroups[0]?.time);
+   bands=[];bandId='';persisted=new Map();savedCount=0;recoverExpectedCount=0;
+   recoverMissingDecisions={};recoverMissingSeen=new Set();metadataWanted=metadataSaved=0;
+   if(previousEventHadPhotos)toast('前のイベントは保存したまま、新しいイベントを作成しました');
+ }
+ // Re-imported JPEGs inherit the original decisions if their identity matches.
+ for(const g of allGroups){
+  if(Object.hasOwn(recoverMissingDecisions,g.key)){
+    if(decision(g)==='unreviewed')setDecision(g,recoverMissingDecisions[g.key]);
+    delete recoverMissingDecisions[g.key];
+  }
+  if(recoverMissingSeen.has(g.key)){g.seen=true;recoverMissingSeen.delete(g.key);}
+ }
+ if(recoverExpectedCount&&allGroups.filter(g=>g.jpg).length>=recoverExpectedCount)recoverExpectedCount=0;
+ // Write intent + selection metadata before starting long sequential JPEG saves.
+ try{await flushMeta();}catch(e){noteError(e);}
  schedulePhotoSave(activeId);scheduleIndexRefresh();updateButtons();
 };
 // During an append, show progress without trapping all touches or keyboard input.
@@ -8495,14 +8587,16 @@ removeLoadedPhotos=function(keys){const count=baseRemove(keys);if(count&&activeI
   // Undo still works while the app is open. On return, removed records are deleted from the saved event.
   const id=activeId;
   const removed=new Set(keys);
-  queue=queue.catch(()=>{}).then(async()=>{
-    // Give the user a short interval to undo a mistaken removal.
-    await new Promise(resolve=>setTimeout(resolve,6500));
+  setTimeout(()=>{
     if(id!==activeId)return;
-    for(const key of removed)if(!allGroups.some(g=>g.key===key)){
-      await drop('photos',photoId(id,key));persisted.delete(photoId(id,key));
-    }
-  }).catch(noteError);
+    queue=queue.catch(()=>{}).then(async()=>{
+      if(id!==activeId)return;
+      for(const key of removed)if(!allGroups.some(g=>g.key===key)){
+        await drop('photos',photoId(id,key));persisted.delete(photoId(id,key));savedCount=persisted.size;
+      }
+      if(id===activeId){recoverExpectedCount=Math.min(recoverExpectedCount,allGroups.length);await flushMeta();status();}
+    }).catch(noteError);
+  },6500);
   queueMeta();
  }return count;};
 const baseUndoRemove=undoPhotoRemoval;
@@ -8515,8 +8609,13 @@ const baseRefreshAfterChoice=refreshAfterImportChoice;
 refreshAfterImportChoice=function(key){baseRefreshAfterChoice(key);queueMeta();};
 async function listEvents(){
  const rows=(await all('events')).sort((a,b)=>b.updatedAt-a.updatedAt);
- const select=$id('ccEventPicker');const current=select.value;
- select.replaceChildren();for(const e of rows)select.add(new Option(e.name+'・'+(e.photoCount||0)+'枚',e.id));
+ const select=$id('ccEventPicker'),current=select.value;
+ select.replaceChildren();
+ for(const e of rows){
+  const actual=await countPhotos(e.id),expected=e.photoCount||actual;
+  const incomplete=actual<expected;
+  select.add(new Option(e.name+'・'+(incomplete?actual+'/'+expected+'枚（保存途中）':actual+'枚'),e.id));
+ }
  if(rows.some(e=>e.id===current))select.value=current;
  else if(rows.length)select.value=rows[0].id;
  $id('ccResumeEvent').disabled=!rows.length;
@@ -8524,6 +8623,8 @@ async function listEvents(){
  $id('ccSavedEvents').hidden=!rows.length;
  $id('ccEventEmpty').hidden=!!rows.length;
  if(!rows.length)$id('ccEventEmpty').textContent='保存済みイベントはありません。写真を取り込むと選別を始められます。';
+ $id('ccHomeRecovery').hidden=!rows.some((e,i)=>select.options[i]?.textContent.includes('保存途中'));
+ if(!$id('ccHomeRecovery').hidden)$id('ccHomeRecovery').textContent='保存途中のイベントがあります。開けば保存済みの写真を選別でき、同じJPEGを再追加して不足分を補えます。';
  $id('ccNewEvent').hidden=!rows.length;
  updateButtons();
 }
@@ -8536,28 +8637,47 @@ function fromEventMetadata(meta){
  setActiveTimeFilter(meta.session?.timeFilter||null);
 }
 async function restoreEvent(id){
- if(restoreBusy||currentImportJob||saving||copying){toast('保存処理が完了してからイベントを切り替えてください');return;}
+ if(restoreBusy||currentImportJob||saving||photoJobs||copying){toast('保存処理が完了してからイベントを切り替えてください');return;}
+ // Flush the previous event before entering restoreBusy (which inhibits new metadata writes).
+ if(activeId){try{await flushMeta();await queue;}catch(e){noteError(e);toast('前のイベントの保存に失敗しました。再開前に確認してください');return;}}
  restoreBusy=true;status('イベントを復元しています…');
  $id('ccResumeEvent').disabled=true;
  try{
-   await flushMeta();await queue;
+   await queue;
    const meta=await get('events',id);if(!meta)throw new Error('イベントが見つかりません');
-   const rows=await photoRows(id);
-   if(!rows.length)throw new Error('保存されたJPEGがありません。取り込みが完了していなかった可能性があります');
+   const physical=await countPhotos(id);
+   // No all-JPEG intermediate array: read bounded chunks then release each batch.
    cleanupReleaseSession();
    activeId=id;activeName=meta.name;createdAt=meta.createdAt||Date.now();bands=Array.isArray(meta.bands)?meta.bands:[];
-   bandId=meta.session?.focusBand||'';lastError='';persisted=new Map(rows.map(r=>[r.id,r.signature]));savedCount=rows.length;
-   const restored=[];
-   for(let i=0;i<rows.length;i++){restored.push(rowToGroup(rows[i]));if(i%30===0)await idle();}
+   bandId=meta.session?.focusBand||'';lastError='';persisted=new Map();savedCount=0;
+   recoverExpectedCount=Math.max(meta.photoCount||0,physical);
+   metadataWanted=0;metadataSaved=0;
+   const restored=[];let lastKey=null;
+   while(true){
+     const batch=await readPhotoBatch(id,lastKey,SAVE_BATCH);
+     for(const r of batch.rows){persisted.set(r.id,r.signature);restored.push(rowToGroup(r));}
+     savedCount=restored.length;
+     status('イベントを復元しています… JPEG '+savedCount+' / '+physical+'枚');
+     lastKey=batch.last;
+     if(!batch.more||!batch.rows.length)break;
+     await idle(); // Release the main thread after each small batch.
+   }
    allGroups=restored.sort((a,b)=>a.time-b.time||a.key.localeCompare(b.key));
    sessionSource='files';sourceLabel='保存済み：'+meta.name;cardSig=meta.signature||'event|'+id;
    activeRawImportSignature=cardSig;pendingImportCandidates=[];importOnlyKeys=null;
    showAlready=true;prepRunning=false;openingFiles=false;gridN=1;scope=null;zoomed=false;
-   fromEventMetadata(meta);assignBursts(allGroups);applyFilter(meta.session?.currentKey||allGroups[0].key);initBurstDone();
-   syncSourceUI();syncImportUI();show('s-cull');render();updateButtons();
-   if(meta.photoCount>rows.length)toast('写真の保存が途中で終了しました。保存済み'+rows.length+'枚のみ復元しました');
-   else toast(rows.length+'枚と選別結果を復元しました');
-   status('JPEG '+rows.length+'枚を端末内から復元');
+   const available=new Set(restored.map(g=>g.key));
+   recoverMissingDecisions=Object.fromEntries(Object.entries(meta.session?.decisions||{}).filter(([key])=>!available.has(key)));
+   recoverMissingSeen=new Set((meta.session?.seen||[]).filter(key=>!available.has(key)));
+   fromEventMetadata(meta);assignBursts(allGroups);applyFilter(meta.session?.currentKey||allGroups[0]?.key||null);initBurstDone();
+   syncSourceUI();syncImportUI();updateButtons();
+   if(restored.length){show('s-cull');render();}
+   else show('s-open');
+   if(recoverExpectedCount>savedCount){
+     const missing=recoverExpectedCount-savedCount;
+     toast('保存途中のイベントです。'+savedCount+'枚を復元、残り'+missing+'枚は再追加できます');
+     status('JPEG '+savedCount+' / '+recoverExpectedCount+'枚保存済み。元の写真を再追加してください');
+   }else {recoverExpectedCount=0;toast(savedCount+'枚と選別結果を復元しました');status();}
  }catch(e){noteError(e);toast('復元できません：'+e.message);}
  finally{restoreBusy=false;$id('ccResumeEvent').disabled=false;updateButtons();}
 }
@@ -8612,7 +8732,7 @@ $id('ccResumeEvent').onclick=()=>{
 const newEventDialog=$id('ccNewEventDialog'), newEventDeleteDialog=$id('ccNewEventDeleteDialog');
 let pendingNewEvent=null, startingNewEvent=false;
 async function resetForNewEvent(deletePrevious=false){
- if(startingNewEvent||currentImportJob||saving||restoreBusy||copying){toast('取り込み・保存処理が完了してから切り替えてください');return;}
+ if(startingNewEvent||currentImportJob||saving||photoJobs||restoreBusy||copying){toast('取り込み・保存処理が完了してから切り替えてください');return;}
  startingNewEvent=true;
  $id('ccNewEventKeep').disabled=true;
  $id('ccNewEventDeleteConfirm').disabled=true;
@@ -8621,7 +8741,7 @@ async function resetForNewEvent(deletePrevious=false){
    if(deletePrevious&&pendingNewEvent?.id)await deleteEvent(pendingNewEvent.id);
    // Clear only the working session: the other archived events remain intact.
    cleanupReleaseSession();
-   activeId=null;activeName='';bands=[];bandId='';persisted=new Map();savedCount=0;lastError='';
+   activeId=null;activeName='';bands=[];bandId='';persisted=new Map();savedCount=0;lastError='';recoverExpectedCount=0;recoverMissingDecisions={};recoverMissingSeen=new Set();metadataWanted=metadataSaved=0;
    pendingNewEvent=null;
    if(newEventDialog.open)newEventDialog.close();
    if(newEventDeleteDialog.open)newEventDeleteDialog.close();
@@ -8631,7 +8751,7 @@ async function resetForNewEvent(deletePrevious=false){
  finally{startingNewEvent=false;$id('ccNewEventKeep').disabled=false;$id('ccNewEventDeleteConfirm').disabled=false;}
 }
 $id('ccNewEvent').onclick=async()=>{
- if(currentImportJob||saving||restoreBusy||copying||startingNewEvent){toast('保存・取り込みが完了してから切り替えてください');return;}
+ if(currentImportJob||saving||photoJobs||restoreBusy||copying||startingNewEvent){toast('保存・取り込みが完了してから切り替えてください');return;}
  const id=$id('ccEventPicker').value||activeId;
  if(!id){toast('保存済みイベントはありません。写真を取り込んでください。');return;}
  try{
@@ -8653,11 +8773,7 @@ $id('ccNewEventDeleteConfirm').onclick=()=>void resetForNewEvent(true);
 newEventDialog.addEventListener('close',()=>{if(!newEventDeleteDialog.open&&!startingNewEvent)pendingNewEvent=null;});
 newEventDeleteDialog.addEventListener('close',()=>{if(!newEventDialog.open&&!startingNewEvent)pendingNewEvent=null;});
 // Cleanup removes the saved in-app JPEGs, never the original camera or Photos data.
-async function deleteEvent(id){
- const rows=await photoRows(id);
- for(let i=0;i<rows.length;i++){await drop('photos',rows[i].id);if(i%8===0)await idle();}
- await drop('events',id);
-}
+async function deleteEvent(id){await deleteEventAtomic(id);}
 const prevCleanupFinish=cleanupFinish;
 cleanupFinish=async function(){
  // "片付ける" is temporary session cleanup, not deletion of an archived event.
@@ -8680,11 +8796,11 @@ $id('cleanupFinish').onclick=cleanupFinish;
 // Browser storage counts in existing "容量" dialog may include the events library.
 const countAnchor=$id('storageSettingsValue');if(countAnchor){const info=document.createElement('dd');info.id='ccStorageInfo';info.className='source-note';info.textContent='JPEGの端末内保存容量は、このサイト全体の使用容量に含まれます。';countAnchor.after(info);}
 $id('ccEventDelete').onclick=async()=>{
- if(!activeId||currentImportJob||saving||restoreBusy)return;
+ if(!activeId||currentImportJob||saving||photoJobs||restoreBusy)return;
  if(!confirm('このイベントのアプリ内JPEGと選別記録を削除しますか？ iPhoneの元写真は削除されません。必要なら先にJSONを書き出してください。'))return;
  const id=activeId;
  try{await flushMeta();await queue;await deleteEvent(id);
-  activeId=null;activeName='';bands=[];bandId='';persisted=new Map();savedCount=0;
+  activeId=null;activeName='';bands=[];bandId='';persisted=new Map();savedCount=0;recoverExpectedCount=0;recoverMissingDecisions={};recoverMissingSeen=new Set();metadataWanted=metadataSaved=0;
   cleanupReleaseSession();scheduleIndexRefresh();toast('端末内のイベント保存を削除しました');
  }catch(e){noteError(e);}
 };
