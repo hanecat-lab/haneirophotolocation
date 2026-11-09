@@ -7269,7 +7269,7 @@ function updateSkyExpansion(from,to,dt,realDt=dt){
   const strength=THREE.MathUtils.smoothstep(to,m.riverFlow,m.riverFlow+40),bend=roadBendAt(to),flow=(-Math.sign(bend)*Math.min(.65,Math.abs(bend)*110)+.12*Math.sin(to/32))*strength;
   const edge=flow*lateral>0?1-THREE.MathUtils.smoothstep(Math.abs(lateral),skyHalfWidth(to)-1.5,skyHalfWidth(to)-.5):1;skyApplyDrift(flow*edge*dt);if(!input.brake&&!input.brakePressed)speed=Math.min(tripleSpeedLimit(),speed+suberiDriveAccel(18)*dt*strength);
   if(!r.waveUsed&&from<m.waveCrest&&to>=m.waveCrest){r.waveUsed=true;startRoadHop({max:.65,shake:.06,big:false});}
-  for(const rock of r.riverRocks){if(r.riverHits.has(rock.id)||from>rock.d+2||to<rock.d-2)continue;const k=to>from?THREE.MathUtils.clamp((rock.d-from)/(to-from),0,1):1,lat=THREE.MathUtils.lerp(r.lastLateral??lateral,lateral,k);if(Math.abs(lat-rock.lat)<rock.radius+.35){r.riverHits.add(rock.id);speed*=.9;skyApplyDrift((lat>=rock.lat?1:-1)*.65);const p=getTrackAtDist(rock.d).p.clone();p.y+=ROAD_Y;spawnSplash(p);showDriveNotice('岩をかすめた','水の流れを読んで立て直そう');}}
+  for(const rock of r.riverRocks){if(r.riverHits.has(rock.id)||from>rock.d+2||to<rock.d-2)continue;const k=to>from?THREE.MathUtils.clamp((rock.d-from)/(to-from),0,1):1,lat=THREE.MathUtils.lerp(r.lastLateral??lateral,lateral,k);if(Math.abs(lat-rock.lat)<rock.radius+.35){r.riverHits.add(rock.id);speed*=.9;skyApplyDrift((lat>=rock.lat?1:-1)*.65);const p=getTrackAtDist(rock.d).p.clone();p.y+=ROAD_Y;spawnSplash(p);playSfx('hazardHit');showDriveNotice('岩をかすめた','水の流れを読んで立て直そう');}}
  }
  if(r.tripleStages){updateTripleRiverToys(from,to,dt);updateTripleCushions(from,to,dt);updateTripleRingBonus(dt);const cap=triplePoolSpeedCap(to);if(Number.isFinite(cap)&&tripleRingBoostKmh()<=.01&&speed>cap)speed=THREE.MathUtils.damp(speed,cap,1.5,dt);}
  updateSkyWaterFlow(dt);
@@ -7427,7 +7427,7 @@ function windcutWallHit(side,dt,oldLateral,walls){
     resetSuberiCombo();
     const tr=getTrackAtDist(s),hit=tr.p.clone().addScaledVector(tr.n,side>0?walls.right:walls.left);hit.y+=ROAD_Y+.35;
     spawnHit(hit,0xffba39);triggerWallFlash();
-    showDriveNotice('減速壁 −14%',Math.round(before*3.6)+' → '+Math.round(speed*3.6)+'km/h');
+    playSfx('wallHit');showDriveNotice('減速壁 −14%',Math.round(before*3.6)+' → '+Math.round(speed*3.6)+'km/h');
     if(navigator.vibrate)navigator.vibrate([25]);
   }else if(simulationElapsed-contact.hitAt>.15){
     speed=Math.min(speed,WINDCUT.rubKmh/3.6);contact.until=simulationElapsed+.3;
@@ -7470,7 +7470,7 @@ function updateWindcutGates(from,to,fromLat,toLat,dt){
    if(!state.hit){
     state.hit=true;speed*=WINDCUT_GATE.keep;stopWallDrive();hazardSlipUntil=Math.max(hazardSlipUntil,simulationElapsed+WINDCUT.stall);
     const tr=getTrackAtDist(g.d),pos=tr.p.clone().addScaledVector(tr.n,lat);pos.y+=ROAD_Y+1.1;
-    spawnHit(pos,0xffba39);triggerWallFlash();showDriveNotice('ゲート接触 −14%',g.label+' · 青い通過口を狙おう');
+    spawnHit(pos,0xffba39);triggerWallFlash();playSfx('hazardHit');showDriveNotice('ゲート接触 −14%',g.label+' · 青い通過口を狙おう');
    }else if(state.dwell>.15)speed=Math.min(speed,WINDCUT_GATE.rubKmh/3.6);
   }
   if(to>g.d+WINDCUT_GATE.depth/2){state.passed=true;if(!state.hit&&appAnimationsEnabled){const tr=getTrackAtDist(g.d),pos=tr.p.clone().addScaledVector(tr.n,g.centre);pos.y+=ROAD_Y+.3;spawnHit(pos,0xa9f4ff);}}
@@ -10250,11 +10250,30 @@ function clearTrack(){
   trees=[];treeSpots=[];clearTreeInstances();
 }
 let raceProgressSections=[];
+// 「通過 ◯/◯」の区切り
+// A：曲がり方のガイドと同じコーナーで区切る(コーナー範囲があるコースはそれ、ないコースはガイドのコーナー)。コースを等分するのは、どちらもない時だけ
+// B：コーナーとして数えない、名前の付いた見せ場(ジャンプ・橋・滝・龍の頭など)も区切りに足し、位置の順に並べる
+// 近すぎる区切り(minGap m 未満)はまとめる。ねころん坂(点の番号で区切る)はそのまま
+const PROGRESS_SECTIONS={minGap:30};
+function progressHighlights(def){
+  const out=[],add=(label,end)=>{if(Number.isFinite(end)&&end>0&&end<totalLength)out.push({label,end});},r=skyRun;
+  if(def.tripleFalls&&r?.tripleStages){
+    r.tripleStages.forEach(st=>add(st.name,st.pool));
+    if(r.stones?.length)add('肉球とび石',r.stones.at(-1).d);
+    if(r.vortices?.length)add(r.vortices.length+'連渦流',r.vortices.at(-1).d);
+  }else if(def.skySlide&&r?.marks){
+    const m=r.marks;add('ゲート区間',m.gatesOut);
+    if(r.bridges?.length)add('雲海橋',r.bridges.at(-1).to);
+    (r.jumps||[]).forEach((j,i)=>add('ジャンプ'+(i+1),j.land));
+    add('急流と波',m.waveOut);add('見えない滝落ち',m.pool);
+  }
+  if(def.dragon&&dragonRun?.marks)add('龍の頭',dragonRun.marks.head);
+  if(def.slide&&slideRun?.launchAt)add('ピンボール坂のジャンプ',slideRun.launchAt);
+  return out;
+}
 function buildRaceProgressSections(def){
-  if(def.tripleFalls&&skyRun?.tripleStages)return skyRun.tripleStages.map(stage=>({label:stage.name,end:stage.pool}));
-  if(def.cornerRanges) return def.cornerRanges.map(c=>({label:c.label,end:c.end}));
-  const labels=def.corners.map((label,index)=>({label,index})).filter(c=>!/^START|^GOAL|^直線/.test(c.label));
-  if(def.progressCornerEndIndices){
+  const labels=def.corners?.map((label,index)=>({label,index})).filter(c=>!/^START|^GOAL|^直線/.test(c.label))||[];
+  if(!def.cornerRanges&&def.progressCornerEndIndices){
     const lengths=curve.getLengths();
     return labels.map((c,i)=>{
       const pos=def.progressCornerEndIndices[i]/(def.points.length-1)*(lengths.length-1);
@@ -10262,7 +10281,12 @@ function buildRaceProgressSections(def){
       return {label:c.label,end:THREE.MathUtils.lerp(lengths[lo],lengths[hi],pos-lo)};
     });
   }
-  return labels.map(c=>({label:c.label,end:(c.index+1)/def.corners.length*totalLength}));
+  const guide=DRIVING_GUIDE_DATA.tracks[currentKey]?.corners;
+  const base=def.cornerRanges?def.cornerRanges.map(c=>({label:c.label,end:c.end}))
+    :guide?.length?guide.map((c,i)=>({label:(i+1)+'番',end:c.end}))
+    :labels.map(c=>({label:c.label,end:(c.index+1)/def.corners.length*totalLength}));
+  const all=[...base,...progressHighlights(def)].sort((a,b)=>a.end-b.end);
+  return all.filter((c,i)=>i===0||c.end-all[i-1].end>=PROGRESS_SECTIONS.minGap);
 }
 function updateRaceProgress(distance,finished=false){
   const total=raceProgressSections.length;
@@ -11621,7 +11645,7 @@ function updateTunnelRocks(){
     lateral=rockLat+side*Math.sqrt(Math.max(0,reach*reach-along*along));
     if(!o.armed)continue;o.armed=false;
     const hp=new THREE.Vector3(o.x,o.y+.6,o.z);stopWallDrive();wallHitCooldown=.65;speed=Math.max(speed*.32,Math.min(speed*.75,20,activeGripLimit*.9));lastWallHitTime=performance.now()/1000;
-    spawnHit(hp,0xffaa44);waterLevel=Math.max(0,waterLevel-18);updateCup();spawnSplash(hp);triggerCupHit();showDriveNotice('岩にぶつかった','減速 · 水 −18%');if(navigator.vibrate)navigator.vibrate([60,40,60]);
+    spawnHit(hp,0xffaa44);waterLevel=Math.max(0,waterLevel-18);updateCup();spawnSplash(hp);triggerCupHit();playSfx('hazardHit');showDriveNotice('岩にぶつかった','減速 · 水 −18%');if(navigator.vibrate)navigator.vibrate([60,40,60]);
   }
 }
 // 百年後のトンネルの水：天井からしずくが落ちる所(約55mおき・岩の前後8mは避ける)の床に水たまり、天井に水のしみ。
@@ -15353,6 +15377,7 @@ const HAZARD={foam:{rate:[.88,.8,.7],min:7,cut:true,slip:0},hole:{rate:[.85],min
 let hazardSlipUntil=-1;
 // 減速して、落とした速さ(km/h)を返す
 function hitHazard(kind,stack=1){
+  if(kind!=='puddle')playSfx(kind==='barrel'||kind==='bundle'||kind==='fallen'?'hazardWood':'hazardHit');
   const h=HAZARD[kind],before=speed,rate=h.rate[Math.min(stack,h.rate.length)-1];
   speed-=Math.min(speed*.5,Math.max(speed*(1-rate),h.min/3.6));
   if(h.cut)stopWallDrive();
@@ -15492,7 +15517,7 @@ function updatePortBoxes(dt){
     const hp=new THREE.Vector3(o.home.x,o.home.y+.5,o.home.z);
     if(light){const lost=hitHazard('foam',o.stack);spawnHit(hp,0xffffff);showDriveNotice('発泡スチロールに当たった',`減速 −${lost}km/h`);if(navigator.vibrate)navigator.vibrate([15]);}
     else{stopWallDrive();wallHitCooldown=.65;speed=Math.max(speed*.32,Math.min(speed*.75,20,activeGripLimit*.9));lastWallHitTime=performance.now()/1000;
-      spawnHit(hp,0xffaa44);waterLevel=Math.max(0,waterLevel-18);updateCup();spawnSplash(hp);triggerCupHit();showDriveNotice('木箱にぶつかった','減速 · 水 −18%');if(navigator.vibrate)navigator.vibrate([60,40,60]);}
+      spawnHit(hp,0xffaa44);waterLevel=Math.max(0,waterLevel-18);updateCup();spawnSplash(hp);triggerCupHit();playSfx('hazardWood');showDriveNotice('木箱にぶつかった','減速 · 水 −18%');if(navigator.vibrate)navigator.vibrate([60,40,60]);}
   }
 }
 let lastWallContact=-Infinity,lastWallWaterLoss=18;
@@ -16095,6 +16120,10 @@ const SFX={
   link2:{label:'連携 PERFECT×PERFECT',file:'link-sparkle.wav',volume:.5,synth:()=>{[[784,0],[988,.07],[1319,.14],[1760,.21]].forEach(([f,at],i)=>sfxSweep({type:'sine',from:f,to:f,sweep:.01,peak:.09,decay:i===3?.28:.1,at}));}},
   comboFive:{label:'コンボ5',file:'rocket-good.wav',volume:.3,synth:()=>{sfxBell({base:2200,peak:.1,decay:.4});}},
   comboTen:{label:'コンボ10',file:'combo-ten.wav',volume:.4,synth:()=>{sfxBell({base:2200,peak:.1,decay:.4});sfxBell({base:2900,peak:.1,decay:.45,at:.09});}},
+  wallHit:{label:'壁にぶつかった(ゴツン＋チャプン)',file:null,volume:1,synth:()=>{sfxSweep({type:'sine',from:170,to:55,sweep:.09,peak:.38,decay:.2});sfxNoiseHit({type:'lowpass',freq:700,q:.7,peak:.22,decay:.06});sfxNoiseHit({type:'bandpass',freq:1100,q:1.4,peak:.14,decay:.16,at:.05});sfxSweep({type:'sine',from:520,to:900,sweep:.05,peak:.06,decay:.07,at:.07});}},
+  wallScrape:{label:'壁をこすった(ザッ)',file:null,volume:1,synth:()=>{sfxNoiseHit({type:'bandpass',freq:2300,q:.8,peak:.16,decay:.13});sfxNoiseHit({type:'bandpass',freq:1200,q:1,peak:.08,decay:.1,at:.03});}},
+  hazardHit:{label:'障害物に当たった(ドン)',file:null,volume:1,synth:()=>{sfxSweep({type:'sine',from:130,to:48,sweep:.1,peak:.36,decay:.24});sfxNoiseHit({type:'lowpass',freq:900,q:.7,peak:.2,decay:.05});}},
+  hazardWood:{label:'木の物に当たった(バキッ)',file:null,volume:1,synth:()=>{sfxNoiseHit({type:'bandpass',freq:1800,q:2.2,peak:.32,decay:.05});sfxSweep({type:'triangle',from:320,to:150,sweep:.04,peak:.14,decay:.09});sfxNoiseHit({type:'highpass',freq:3200,q:.7,peak:.14,decay:.03,at:.035});}},
   perfectSparkle:{label:'PERFECTのきらめき(1回)',file:'perfect-sparkle.wav',volume:.3,synth:()=>{sfxBell({base:3200,peak:.06,decay:.3});}},
   riser:{label:'盛り上がり(大瀑布・龍の打ち上げの手前)',file:'riser.wav',volume:.35},
   driftLoop:{label:'ドリフト中の音(ファイル・1回)',file:'drift-loop.wav',volume:.3},
@@ -18838,7 +18867,7 @@ function tick(dt){
     assistDiag?.hit(side,scrape,speedBeforeWall);
     lateral=THREE.MathUtils.clamp(lateral,walls.left+.35,walls.right-.35);bank=-side*(scrape?.2:.9);
     resetSteeredLine();
-    triggerWallFlash();loseBridgeBoost();
+    triggerWallFlash();loseBridgeBoost();playSfx(scrape?'wallScrape':'wallHit');
     const tr=getTrackAtDist(s),hp=tr.p.clone().add(tr.n.clone().multiplyScalar(lateral));
     spawnHit(hp,side<0?0xff4444:0x44ff44);
     waterLevel=Math.max(0,waterLevel-lastWallWaterLoss);updateCup();spawnSplash(hp);triggerCupHit();
@@ -18860,7 +18889,7 @@ function tick(dt){
     speed*=Math.exp(-.65*dt);
     waterLevel=Math.max(0,waterLevel-6*dt);updateCup();
     if(wallContactEpisode.rubTime>=.25&&!wallContactEpisode.notified){
-      wallContactEpisode.notified=true;stopWallDrive();
+      wallContactEpisode.notified=true;stopWallDrive();playSfx('wallScrape');
       showDriveNotice('壁こすり','減速中 · 壁から離れよう');
     }
   }
