@@ -12781,7 +12781,8 @@ let rankingViewScope='classic', raceRecordScope='classic';
 const RECORD_SCOPES=['classic','nyanV2','suberi'];
 function recordScopeForMode(){ return catModel==='suberi'?'suberi':driveMode==='nyanSapo'?'nyanV2':'classic'; }
 // ドリフトの仕様を変えた(肉球PERFECTの出口ブースト・おかわり肉球)ので、ガチとにゃんサポの記録を新しく数える。すべり猫・旧コースの記録はそのまま
-const DRIFT_RECORD_ERA=':drift2';
+// drift3：加速ボーナスを受け取れるのを頂点までにし、ドリフト中に曲がった割合で強さを変えたので、もう一度新しく数える
+const DRIFT_RECORD_ERA=':drift3';
 function trackRecordKey(trackKey,scope){
   const oldCourse=scope==='oldHarunaClassic'||scope==='oldHarunaNyan';
   const record=COURSES[trackKey]?.record,key=trackKey==='haruna'&&!oldCourse?'haruna:map15to1v3':record==='version'?trackKey+':'+TRACKS[trackKey].courseRecordVersion:record?trackKey+':'+record:trackKey;
@@ -15799,14 +15800,47 @@ function findDriveCorner(position=s){
 }
 function resetCornerDrive(preserveMeat=false){if(!preserveMeat)resetExitBonusVisual();cornerDrive=null;slideDriveCorner=null;dismissLinkFeedback(preserveMeat);}
 function cancelCornerDrive(){resetExitBonusVisual();if(cornerDrive){cornerDrive.blocked=true;cornerDrive.level=0;cornerDrive.blend=0;}dismissLinkFeedback();}
+// 加速ボーナスを受け取れるのは、入口の45m手前から頂点まで(コーナーの途中・頂点の後からのドリフトでは受け取れない)。溝走りの成功は今まで通り出口まで
+function cornerDriveAwardEnd(corner,method){return method==='gutter'?corner.end:getCornerDriveProfile(corner).apex;}
+// 加速ボーナスの強さ：頂点までに曲がる量のうち、ドリフト中(肉球・ブレーキドリフト)に曲がった割合(cover)で決める
+// cover が none 以下で minScale 倍、full 以上で満額(間はなめらかに)。weak 未満の弱いボーナスは羽を出さず、風の加速だけ見せる。溝走りの成功は割合を見ない
+// enabled:false の間は割合を見ず満額(ブレーキの走法が手前で離すと割合0になる問題の決定待ち)
+const DRIFT_COVER={enabled:false,none:.15,full:.6,minScale:.35,weak:.4};
+const driftCover={curve:null,corner:null,turn:0,last:null,lastS:0};
+function cornerTurnAt(c,profile,d){
+  const samples=profile.samples,pos=THREE.MathUtils.clamp((d-c.start)/(c.end-c.start)*(samples.length-1),0,samples.length-1);
+  const i=Math.floor(pos),j=Math.min(i+1,samples.length-1);return THREE.MathUtils.lerp(samples[i].turn,samples[j].turn,pos-i);
+}
+function driftCoverOf(c){
+  if(!c||driftCover.curve!==curve||driftCover.corner!==c)return 0;
+  const p=getCornerDriveProfile(c),apexTurn=cornerTurnAt(c,p,p.apex);
+  return apexTurn<.05?1:THREE.MathUtils.clamp(driftCover.turn/apexTurn,0,1);
+}
+function driftCoverScale(receipt){
+  if(!DRIFT_COVER.enabled||!receipt||receipt.gutter)return 1;
+  return THREE.MathUtils.lerp(DRIFT_COVER.minScale,1,THREE.MathUtils.smoothstep(receipt.cover??0,DRIFT_COVER.none,DRIFT_COVER.full));
+}
+function isWeakCornerBonus(receipt){return Boolean(DRIFT_COVER.enabled&&receipt&&!receipt.gutter&&(receipt.cover??0)<DRIFT_COVER.weak);}
+// 毎コマ：ドリフト中に、コーナーの入口から頂点までの間で曲がった量を足す(コーナーが替わる・後ろへ戻る(リスタート)と0から)
+function updateDriftCover(){
+  const c=findDriveCorner();
+  if(!c){driftCover.corner=null;return;}
+  if(driftCover.curve!==curve||driftCover.corner!==c||s<driftCover.lastS-5)Object.assign(driftCover,{curve,corner:c,turn:0,last:null});
+  driftCover.lastS=s;
+  const p=getCornerDriveProfile(c),now=s<=c.start?0:cornerTurnAt(c,p,Math.min(s,p.apex));
+  if((isSliding||isBrakingDrift)&&driftCover.last!==null)driftCover.turn+=Math.max(0,now-driftCover.last);
+  driftCover.last=now;
+  if(cornerDrive&&cornerDrive.curve===curve&&cornerDrive.corner===c)cornerDrive.cover=Math.max(cornerDrive.cover??0,driftCoverOf(c));
+}
 function awardCornerDrive(quality,link=0,corner=findDriveCorner(),method='brake'){
-  if(assistDiag){const why=shortcutOwnsInput()?'抜け道中':assistBonusBlocked(corner)?'補助取消のコーナー':!corner?'コーナー外':!['GOOD','GREAT','PERFECT'].includes(quality)?'判定'+quality:s<corner.start-45||s>corner.end?'位置が範囲外':cornerDrive?.curve===curve&&cornerDrive.corner===corner&&cornerDrive.blocked?'判定が取消済':'';assistDiag.award(method+' '+quality+(why?' → 作らず：'+why:' → 作った'));}
+  if(assistDiag){const why=shortcutOwnsInput()?'抜け道中':assistBonusBlocked(corner)?'補助取消のコーナー':!corner?'コーナー外':!['GOOD','GREAT','PERFECT'].includes(quality)?'判定'+quality:s<corner.start-45?'位置が範囲外':s>cornerDriveAwardEnd(corner,method)?'頂点より後':cornerDrive?.curve===curve&&cornerDrive.corner===corner&&cornerDrive.blocked?'判定が取消済':'';assistDiag.award(method+' '+quality+(why?' → 作らず：'+why:' → 作った'));}
   if(shortcutOwnsInput()||assistBonusBlocked(corner))return;
   if(!corner||!['GOOD','GREAT','PERFECT'].includes(quality))return;
-  if(s<corner.start-45||s>corner.end)return;
+  if(s<corner.start-45||s>cornerDriveAwardEnd(corner,method))return;
   if(!cornerDrive||cornerDrive.curve!==curve||cornerDrive.corner!==corner){
-    cornerDrive={curve,corner,level:0,link:0,blend:0,target:null,onsetSpeed:null,blocked:false,method,effectScale:1,linkQuality:null,linkBrakeType:null};
+    cornerDrive={curve,corner,level:0,link:0,blend:0,target:null,onsetSpeed:null,blocked:false,method,effectScale:1,linkQuality:null,linkBrakeType:null,cover:0};
   }
+  cornerDrive.cover=Math.max(cornerDrive.cover??0,driftCoverOf(corner));
   if(cornerDrive.blocked)return;
   cornerDrive.level=Math.max(cornerDrive.level,quality==='PERFECT'?1:.6);
   if(link>cornerDrive.link||(link>0&&link===cornerDrive.link&&quality==='PERFECT'&&cornerDrive.linkQuality!=='PERFECT')){
@@ -15882,7 +15916,7 @@ function stepCornerDrive(dt,isBraking,envBase,factor,weight,gradient,assistFloor
   const blend=receipt.blend;
   if(blend<.001)return null;
   const grade=receipt.level;
-  const effectScale=receipt.effectScale??1;
+  const effectScale=(receipt.effectScale??1)*driftCoverScale(receipt);
   const bonus=1+((receipt.link===2?1.32:receipt.link===1?1.16:1)-1)*effectScale;
   const cornerTarget=Math.max(15,36*factor*(1+.20*grade)*weight*gradient,assistFloor,rotationTarget);
   const normalTarget=envBase*weight*gradient;
@@ -16940,10 +16974,11 @@ function exitWingBlockReason(receipt,running=false){
     running&&(input.brake||input.brakePressed)?'ブレーキ中':shortcutOwnsFeedback()?'抜け道の表示中':!pawTrailGrounded()?'足が地面にない':running&&exitBonusVisual.curve!==curve?'道が切り替わった':'';
 }
 function startExitBonusVisual(receipt){
-  if(assistDiag&&receipt&&exitBonusVisual.receipt!==receipt)assistDiag.wing(exitWingBlockReason(receipt)||'出た');
+  if(assistDiag&&receipt&&exitBonusVisual.receipt!==receipt)assistDiag.wing(exitWingBlockReason(receipt)||(isWeakCornerBonus(receipt)?'弱いボーナス(風だけ)':'出た'));
   if(!appAnimationsEnabled||!receipt||exitBonusVisual.receipt===receipt||gameState!=='racing'||receipt.blocked||assistBonusBlocked(receipt.corner)||wallHitCooldown>0||shortcutOwnsFeedback()||!pawTrailGrounded())return;
-  Object.assign(exitBonusVisual,{receipt,curve,time:0,duration:1.30,tier:receipt.link||0,active:true,airStarted:false,starts:exitBonusVisual.starts+1});
-  playSfx('wingTwinkle');
+  const weak=isWeakCornerBonus(receipt);
+  Object.assign(exitBonusVisual,{receipt,curve,time:0,duration:1.30,tier:receipt.link||0,active:true,airStarted:false,starts:exitBonusVisual.starts+1,weak});
+  if(!weak)playSfx('wingTwinkle');
 }
 function updateExitBonusVisual(dt){
   const state=exitBonusVisual;if(!state.active)return;
@@ -16958,7 +16993,8 @@ function updateExitBonusVisual(dt){
   const opacity=THREE.MathUtils.smoothstep(time,0,.08)*(1-exitWingFade.value);
   const meter=document.getElementById('speedoBottom'),ring=THREE.MathUtils.smoothstep(time,.39,.45)*(1-THREE.MathUtils.smoothstep(time,.66,.88));
   meter.style.setProperty('--exit-boost-alpha',String(ring*.9));meter.style.setProperty('--exit-boost-turn',(-35+180*THREE.MathUtils.clamp((time-.40)/.45,0,1))+'deg');
-  exitBonusWind.visible=true;
+  // 弱いボーナス(ドリフトで曲がった割合が小さい)は羽を出さず、肩から流れる風と速度計の輪だけ
+  exitBonusWind.visible=!state.weak;
   for(const wing of exitWings){
     const {side,face,edge,seams}=wing.userData;
     wing.rotation.set(.12+.16*stroke-.05*settle,side*(1.12*(1-open)+.08*open+.22*stream),side*(.68*(1-open)+.22*open-.82*stroke+.20*settle),'YXZ');
@@ -18644,6 +18680,7 @@ function tick(dt){
   if(assistedTakeoffLane&&!isBraking)tSpd=Math.max(tSpd,IROHA_ENTRY.goodMaxSpeed/3.6);
   if(isBraking)tSpd=0;
   if(!globalIsAssist&&isBraking){exitBoostPower=0;exitBoostTimer=0;meatLinkContext=null;resetExitBonusVisual();}
+  updateDriftCover();
   const cornerLaunch=stepCornerDrive(dt,isBraking,envBase,factor_curv,f_weight,f_grad,globalIsAssist?gripGoal:0,rotationTarget);
   if(cornerLaunch){
     tSpd=cornerLaunch.target;
