@@ -15370,7 +15370,7 @@ const suberiBounce={v:0,t:-1,side:0,just:true,stallFrom:-1};
     body.append(sub,box);
   }
   const add=()=>document.body.appendChild(el);if(document.body)add();else document.addEventListener('DOMContentLoaded',add);})();
-const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,tapWindow:.05,fullSteerAfter:.39,cornerKmhGain:100,gripTurn:.8,pawTurnResponse:16,wallRelease:.60};
+const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,tapWindow:.05,fullSteerAfter:.39,cornerKmhGain:100,gripTurn:.8,pawTurnResponse:16,slideGripResponse:2.7,wallRelease:.60};
 const redcat={rig:null,geometries:[],loading:null,bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,steerSign:0,steerHeld:0,wallSide:0,neutralTime:0,warningAt:0};
 function redcatActive(){return catModel==='redcat';}
 function redcatDrivingActive(){return redcatActive()&&!isPracticeActive();}
@@ -15403,13 +15403,13 @@ function redcatSpeed(v,dt,braking,sliding,slideTime,slip,brakeScale=1,driveScale
   const grip=1-.84*THREE.MathUtils.smoothstep(Math.abs(slip),.08,.50);
   return Math.min(REDCAT.maxKmh/3.6,v+acceleration*grip*driveScale*dt);
 }
-function redcatMove(dt){
-  const travel=Math.max(0,speed)*dt;
+function redcatMove(dt,v=speed,heading=redcat.velocityHeading){
+  const travel=Math.max(0,v)*dt;
   const curvature=roadBendAt(s);
   const metric=THREE.MathUtils.clamp(1-curvature*lateral,.4,1.7);
   const road=getTrackAtDist(s);
   const startHeading=Math.atan2(road.t.z,road.t.x);
-  const heading=redcat.velocityHeading??startHeading;
+  heading??=startHeading;
   const estimate=Math.max(0,Math.cos(pathAngle(startHeading,heading)))*travel/metric;
   const mid=getTrackAtDist(s+estimate*.5);
   const relative=pathAngle(Math.atan2(mid.t.z,mid.t.x),heading);
@@ -15460,6 +15460,27 @@ function redcatStraighten(dt,axis){
     redcat.velocityHeading-=Math.sign(correction)*Math.min(Math.abs(travelYaw),Math.abs(correction)*.78);
   }
 }
+function redcatPawApexEase(v,direction){
+  if(!direction||redcat.slideTime<=.03)return 0;
+  const bend=roadBendAt(s);
+  if(direction*bend<=0||Math.abs(bend)<=.006)return 0;
+  const edge=direction>0?'right':'left';
+  const clearance=direction*(roadWallsAt(s)[edge]-lateral);
+  const horizon=.15;
+  if(clearance>v*horizon+1.25)return 0;
+  const slip=pathAngle(redcat.velocityHeading,redcat.bodyHeading);
+  // Use the average travel heading as the tires gradually follow the chassis.
+  const follow=REDCAT.slideGripResponse*horizon;
+  const meanHeading=redcat.velocityHeading+slip*(1-(1-Math.exp(-follow))/follow);
+  const move=redcatMove(horizon,v,meanHeading);
+  const nextEdge=roadWallsAt(Math.min(totalLength,s+move.distance))[edge];
+  const futureClearance=direction*(nextEdge-move.lateral)-.12;
+  const closing=THREE.MathUtils.smoothstep(clearance-.12-futureClearance,.025,.25);
+  const near=1-THREE.MathUtils.smoothstep(futureClearance,.35,1.25);
+  const established=THREE.MathUtils.smoothstep(redcat.slideTime,.03,.12);
+  const bendWeight=THREE.MathUtils.smoothstep(Math.abs(bend),.006,.025);
+  return .85*near*closing*established*bendWeight;
+}
 function redcatEaseInsideTurn(turn,axis,v){
   if(!turn)return turn;
   const bend=roadBendAt(s);
@@ -15483,7 +15504,10 @@ function stepRedcatSteering(dt,digital,braking,held,free,analog=0){
   const v=Math.max(speed,0),sliding=free&&held&&!braking&&v>=12&&(digital!==0||Math.abs(analog)>.08||redcat.sliding);
   redcat.sliding=sliding;redcat.slideTime=sliding?redcat.slideTime+dt:0;
   if(!free){redcat.pawTurn=0;redcat.neutralTime=0;resetRedcatSteerInput();return;}
-  redcat.pawTurn=THREE.MathUtils.damp(redcat.pawTurn,sliding?1:0,REDCAT.pawTurnResponse,dt);
+  const digitalDirection=Math.sign(digital),analogDirection=Math.sign(analog);
+  const pawDirection=digitalDirection*analogDirection<0?0:digitalDirection||analogDirection;
+  const pawTarget=sliding?1-redcatPawApexEase(v,pawDirection):0;
+  redcat.pawTurn=THREE.MathUtils.damp(redcat.pawTurn,pawTarget,REDCAT.pawTurnResponse,dt);
   const surface=kitsuneGripScale();
   const baseline=THREE.MathUtils.lerp(redcatTurnLimit(v,surface,false,false),redcatTurnLimit(v,surface,true,false),redcat.pawTurn);
   const full=THREE.MathUtils.lerp(redcatTurnLimit(v,surface,false,true),redcatTurnLimit(v,surface,true,true),redcat.pawTurn);
@@ -15499,7 +15523,7 @@ function stepRedcatSteering(dt,digital,braking,held,free,analog=0){
     redcatStraighten(dt,axis);
   }else redcat.neutralTime=0;
   const slip=pathAngle(redcat.velocityHeading,redcat.bodyHeading);
-  redcat.velocityHeading+=slip*(1-Math.exp(-dt*(sliding?2.7:16)));
+  redcat.velocityHeading+=slip*(1-Math.exp(-dt*(sliding?REDCAT.slideGripResponse:16)));
   const yawGap=pathAngle(redcat.velocityHeading,redcat.bodyHeading);
   redcat.velocityHeading=redcat.bodyHeading-THREE.MathUtils.clamp(yawGap,-.72,.72);
   redcatKeepWallClearance(dt,turn,previousVelocity);
