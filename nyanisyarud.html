@@ -15364,7 +15364,7 @@ const suberiBounce={v:0,t:-1,side:0,just:true,stallFrom:-1};
     body.append(sub,box);
   }
   const add=()=>document.body.appendChild(el);if(document.body)add();else document.addEventListener('DOMContentLoaded',add);})();
-const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.14,fullSteerAfter:.30,cornerKmhGain:100};
+const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,fullSteerAfter:.50,cornerKmhGain:100};
 const redcat={rig:null,geometries:[],loading:null,bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,steerSign:0,steerHeld:0,warningAt:0};
 function redcatActive(){return catModel==='redcat';}
 function redcatDrivingActive(){return redcatActive()&&!isPracticeActive();}
@@ -15375,15 +15375,17 @@ function resetRedcatDrive(){
   Object.assign(redcat,{bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,warningAt:0});
   document.getElementById('redcatBrakeCue').hidden=true;
 }
-function redcatSteeringInput(dt,digital,analog){
+function redcatDigitalTurn(dt,digital,baseline,full){
   const direction=Math.sign(digital);
   if(direction!==redcat.steerSign||!direction){
     redcat.steerSign=direction;redcat.steerHeld=0;
   }
-  const progress=THREE.MathUtils.smoothstep(redcat.steerHeld+dt*.5,0,REDCAT.fullSteerAfter);
-  const amount=REDCAT.tapSteer+(1-REDCAT.tapSteer)*progress;
-  if(direction)redcat.steerHeld=Math.min(REDCAT.fullSteerAfter,redcat.steerHeld+dt);
-  return THREE.MathUtils.clamp(analog+direction*amount,-1,1);
+  if(!direction)return 0;
+  const x=Math.min(1,(redcat.steerHeld+dt*.5)/REDCAT.fullSteerAfter);
+  redcat.steerHeld=Math.min(REDCAT.fullSteerAfter,redcat.steerHeld+dt);
+  // Interpolate the actual yaw rate so the button ramp and high-grip gain cannot compound.
+  const progress=x*x*x*(10+x*(-15+6*x));
+  return direction*THREE.MathUtils.lerp(baseline*REDCAT.tapSteer,full,progress);
 }
 function redcatSpeed(v,dt,braking,sliding,slideTime,slip,brakeScale=1,driveScale=1){
   if(braking)return Math.max(0,v-REDCAT.brake*brakeScale*dt);
@@ -15397,36 +15399,38 @@ function redcatForward(v,dt,heading,roadHeading,curvature,offset){
   const midHeading=roadHeading+curvature*v*dt/(2*metric);
   return Math.max(0,Math.cos(pathAngle(midHeading,heading)))*v*dt/metric;
 }
-function redcatTurnRate(v,surface,sliding,steerStrength){
+function redcatTurnLimit(v,surface,sliding,fullSteer){
   const lateralAccel=sliding?49:40,baseCap=sliding?2.6:2.25;
+  const baseline=lateralAccel*surface/Math.max(v,5);
+  if(!fullSteer)return Math.min(baseCap,baseline);
   const kmh=Math.max(190,v*3.6),gain=(kmh/(kmh-REDCAT.cornerKmhGain))**2;
-  // Short taps keep the old steering gain. A committed turn gets more lateral authority.
-  const commitment=THREE.MathUtils.smoothstep(steerStrength,.34,1);
   const cap=baseCap+2.1*Math.min(1,v/(190/3.6));
-  const baseline=Math.min(baseCap,lateralAccel*surface/Math.max(v,5));
-  const full=Math.min(cap,lateralAccel*surface*gain/Math.max(v,5));
-  return THREE.MathUtils.lerp(baseline,full,commitment);
+  return Math.min(cap,baseline*gain);
 }
 function redcatCornerSpeed(bend,surface){
   let low=0,high=REDCAT.maxKmh/3.6;
   for(let i=0;i<12;i++){
     const v=(low+high)/2;
-    if(redcatTurnRate(v,surface,false,1)>=bend*v)low=v;
+    if(redcatTurnLimit(v,surface,false,true)>=bend*v)low=v;
     else high=v;
   }
   return low;
 }
-function stepRedcatSteering(dt,steer,braking,held,free){
+function stepRedcatSteering(dt,digital,braking,held,free,analog=0){
   const road=getTrackAtDist(s),axis=Math.atan2(road.t.z,road.t.x);
   if(redcat.curve!==curve||redcat.bodyHeading===null||!free){
     redcat.bodyHeading=redcat.velocityHeading=axis;redcat.curve=curve;
   }
-  const v=Math.max(speed,0),sliding=free&&held&&!braking&&v>=12&&(Math.abs(steer)>.08||redcat.sliding);
+  const v=Math.max(speed,0),sliding=free&&held&&!braking&&v>=12&&(digital!==0||Math.abs(analog)>.08||redcat.sliding);
   redcat.sliding=sliding;redcat.slideTime=sliding?redcat.slideTime+dt:0;
-  if(!free)return;
-  const turn=redcatTurnRate(v,kitsuneGripScale(),sliding,Math.abs(steer));
+  if(!free){resetRedcatSteerInput();return;}
+  const surface=kitsuneGripScale();
+  const baseline=redcatTurnLimit(v,surface,sliding,false),full=redcatTurnLimit(v,surface,sliding,true);
+  const digitalTurn=redcatDigitalTurn(dt,digital,baseline,full);
+  const analogTurn=analog*THREE.MathUtils.lerp(baseline,full,THREE.MathUtils.smoothstep(Math.abs(analog),.34,1));
+  const turn=THREE.MathUtils.clamp(digitalTurn+analogTurn,-full,full);
   const previous=redcat.bodyHeading;
-  redcat.bodyHeading+=steer*turn*(braking?.74:1)*dt*Math.min(1,v/3);
+  redcat.bodyHeading+=turn*(braking?.74:1)*dt*Math.min(1,v/3);
   // Grip follows the chassis, including right after a slide. Drift keeps the incoming momentum.
   if(!sliding)redcat.velocityHeading+=pathAngle(previous,redcat.bodyHeading)*.78;
   const slip=pathAngle(redcat.velocityHeading,redcat.bodyHeading);
@@ -15436,7 +15440,7 @@ function stepRedcatSteering(dt,steer,braking,held,free){
   const k=roadBendAt(s),ds=redcatForward(v,dt,redcat.velocityHeading,axis,k,lateral);
   const ahead=getTrackAtDist(s+ds*.5),relative=pathAngle(Math.atan2(ahead.t.z,ahead.t.x),redcat.velocityHeading);
   lateral+=Math.sin(relative)*v*dt;
-  bank=THREE.MathUtils.damp(bank,steer*(sliding?-.22:-.11),9,dt);
+  bank=THREE.MathUtils.damp(bank,turn/Math.max(full,.001)*(sliding?-.22:-.11),9,dt);
 }
 function redcatTravel(dt){
   const road=getTrackAtDist(s),axis=Math.atan2(road.t.z,road.t.x);
@@ -15450,7 +15454,7 @@ function redcatBrakeCueDistance(){
   if(speed<12)return null;
   const brake=REDCAT.brake*Math.max(.1,kitsuneBrakeScale());
   const surface=kitsuneGripScale(),reaction=speed*.95;
-  const warningSpeed=speed*.94,clearBend=redcatTurnRate(warningSpeed,surface,false,1)/warningSpeed;
+  const warningSpeed=speed*.94,clearBend=redcatTurnLimit(warningSpeed,surface,false,true)/warningSpeed;
   const scan=Math.min(950,totalLength-s,speed*speed/(2*brake)+reaction+12);
   let distance=null,brakeAt=Infinity;
   for(let d=6;d<=scan;d+=12){
@@ -18879,8 +18883,7 @@ function tick(dt,renderDt=dt){
   const cushionHop=suberiActive()&&roadHop.t>=0&&roadHop.hop?.cushion;
   if(skyPoyoRebounding()){outwardVelocity=0;const impulse=suberiActive()?suberiBounce.v:skyRun.impulse;if(!cushionHop&&eff*impulse<0)lineRate*=.15;}
   if(redcatDriving){
-    const steer=redcatSteeringInput(dt,keyboardSteer()+steerBtnInput,joyActive?joyVec.x:0);
-    stepRedcatSteering(dt,steer,isBraking,input.drift||input.driftPressed,redcatFree);
+    stepRedcatSteering(dt,keyboardSteer()+steerBtnInput,isBraking,input.drift||input.driftPressed,redcatFree,joyActive?joyVec.x:0);
   }else if(lineMode){
     lateral=stepSteeredLine(eff,lineRate,lineLimit,dt,tLat-lineHoldTLat,sharpLateral,outwardVelocity);
   } else {
