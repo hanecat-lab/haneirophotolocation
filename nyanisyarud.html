@@ -15370,8 +15370,8 @@ const suberiBounce={v:0,t:-1,side:0,just:true,stallFrom:-1};
     body.append(sub,box);
   }
   const add=()=>document.body.appendChild(el);if(document.body)add();else document.addEventListener('DOMContentLoaded',add);})();
-const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,tapWindow:.05,fullSteerAfter:.39,cornerKmhGain:100,gripTurn:.8,pawTurnResponse:16,slideGripResponse:2.7,wallRelease:.60,pawCueDuration:.20};
-const redcat={rig:null,geometries:[],loading:null,bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,steerSign:0,steerHeld:0,wallSide:0,neutralTime:0,warningAt:0,pawCueUsed:false,pawCueAt:-Infinity};
+const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,tapWindow:.05,fullSteerAfter:.39,cornerKmhGain:100,gripTurn:.8,pawTurnResponse:16,slideGripResponse:2.7,wallRelease:.60,pawCueDuration:.50};
+const redcat={rig:null,geometries:[],loading:null,bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,steerSign:0,steerHeld:0,wallSide:0,neutralTime:0,warningAt:0,pawCueUsed:false,pawCueAt:-Infinity,pawCueCheckAt:0};
 function redcatActive(){return catModel==='redcat';}
 function redcatDrivingActive(){return redcatActive()&&!isPracticeActive();}
 function specialCatScope(model){return model==='redcat'||model==='suberi'?model:null;}
@@ -15380,8 +15380,12 @@ function resetRedcatDrive(){
   resetRedcatSteerInput();
   Object.assign(redcatHover,{lastSpeed:null,phase:0,pitch:0,lean:0,surge:0});
   if(redcatHover.wake)redcatHover.wake.visible=false;
-  Object.assign(redcat,{bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,wallSide:0,neutralTime:0,warningAt:0,pawCueUsed:false,pawCueAt:-Infinity});
+  Object.assign(redcat,{bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,wallSide:0,neutralTime:0,warningAt:0,pawCueUsed:false,pawCueAt:-Infinity,pawCueCheckAt:0});
   document.getElementById('redcatBrakeCue').hidden=true;
+}
+function redcatSteerProgress(held){
+  const x=THREE.MathUtils.clamp((held-REDCAT.tapWindow)/(REDCAT.fullSteerAfter-REDCAT.tapWindow),0,1);
+  return x*x*x*(10+x*(-15+6*x));
 }
 function redcatDigitalTurn(dt,digital,baseline,full){
   const direction=Math.sign(digital);
@@ -15390,10 +15394,9 @@ function redcatDigitalTurn(dt,digital,baseline,full){
   }
   if(!direction)return 0;
   const held=redcat.steerHeld+dt*.5;
-  const x=THREE.MathUtils.clamp((held-REDCAT.tapWindow)/(REDCAT.fullSteerAfter-REDCAT.tapWindow),0,1);
   redcat.steerHeld=Math.min(REDCAT.fullSteerAfter,redcat.steerHeld+dt);
   // Interpolate the actual yaw rate so the button ramp and high-grip gain cannot compound.
-  const progress=x*x*x*(10+x*(-15+6*x));
+  const progress=redcatSteerProgress(held);
   return direction*THREE.MathUtils.lerp(baseline*REDCAT.tapSteer,full,progress);
 }
 function redcatSpeed(v,dt,braking,sliding,slideTime,slip,brakeScale=1,driveScale=1){
@@ -15403,20 +15406,20 @@ function redcatSpeed(v,dt,braking,sliding,slideTime,slip,brakeScale=1,driveScale
   const grip=1-.84*THREE.MathUtils.smoothstep(Math.abs(slip),.08,.50);
   return Math.min(REDCAT.maxKmh/3.6,v+acceleration*grip*driveScale*dt);
 }
-function redcatMove(dt,v=speed,heading=redcat.velocityHeading){
+function redcatMove(dt,v=speed,heading=redcat.velocityHeading,distance=s,offset=lateral){
   const travel=Math.max(0,v)*dt;
-  const curvature=roadBendAt(s);
-  const metric=THREE.MathUtils.clamp(1-curvature*lateral,.4,1.7);
-  const road=getTrackAtDist(s);
+  const curvature=roadBendAt(distance);
+  const metric=THREE.MathUtils.clamp(1-curvature*offset,.4,1.7);
+  const road=getTrackAtDist(distance);
   const startHeading=Math.atan2(road.t.z,road.t.x);
   heading??=startHeading;
   const estimate=Math.max(0,Math.cos(pathAngle(startHeading,heading)))*travel/metric;
-  const mid=getTrackAtDist(s+estimate*.5);
+  const mid=getTrackAtDist(distance+estimate*.5);
   const relative=pathAngle(Math.atan2(mid.t.z,mid.t.x),heading);
   // One midpoint, speed and time step for both components and the wall check.
   return {
     distance:Math.max(0,Math.cos(relative))*travel/metric,
-    lateral:lateral+Math.sin(relative)*travel
+    lateral:offset+Math.sin(relative)*travel
   };
 }
 function redcatTurnLimit(v,surface,sliding,fullSteer){
@@ -15481,12 +15484,62 @@ function redcatPawApexEase(v,direction){
   const bendWeight=THREE.MathUtils.smoothstep(Math.abs(bend),.006,.025);
   return .85*near*closing*established*bendWeight;
 }
-function updateRedcatPawCue(held,risk){
+// Compare holding the paw with releasing it and unwinding the steering.
+function redcatTracePawCue(v,inside,digital,analog,surface,releaseStep){
+  const dt=.05;
+  let distance=s,offset=lateral,body=redcat.bodyHeading,heading=redcat.velocityHeading;
+  let closest=Infinity,inner=Infinity;
+  const analogMix=THREE.MathUtils.smoothstep(Math.abs(analog),.34,1);
+  const edge=inside>0?'right':'left';
+  const held=Math.sign(digital)===redcat.steerSign?redcat.steerHeld:0;
+  const pawAtRelease=1-(1-redcat.pawTurn)*Math.exp(-releaseStep*dt*REDCAT.pawTurnResponse);
+  for(let i=0;i<9;i++){
+    const t=i*dt,released=i>=releaseStep;
+    const blend=released?pawAtRelease*Math.exp(-(i-releaseStep)*dt*REDCAT.pawTurnResponse)
+      :1-(1-redcat.pawTurn)*Math.exp(-t*REDCAT.pawTurnResponse);
+    const baseline=THREE.MathUtils.lerp(redcatTurnLimit(v,surface,false,false),redcatTurnLimit(v,surface,true,false),blend);
+    const full=THREE.MathUtils.lerp(redcatTurnLimit(v,surface,false,true),redcatTurnLimit(v,surface,true,true),blend);
+    const progress=redcatSteerProgress(held+t+dt*.5);
+    const keyTurn=Math.sign(digital)*THREE.MathUtils.lerp(baseline*REDCAT.tapSteer,full,progress);
+    const stickTurn=analog*THREE.MathUtils.lerp(baseline,full,analogMix);
+    // The release candidate includes the player progressively unwinding steering toward the exit.
+    const unwind=released?1-THREE.MathUtils.smoothstep((i-releaseStep)*dt,0,.10):1;
+    const yawStep=THREE.MathUtils.clamp(keyTurn+stickTurn,-full,full)*unwind*dt;
+    body+=yawStep;
+    if(released)heading+=yawStep*.78;
+    heading+=pathAngle(heading,body)*(1-Math.exp(-dt*(released?16:REDCAT.slideGripResponse)));
+    heading=body-THREE.MathUtils.clamp(pathAngle(heading,body),-.72,.72);
+    v=redcatSpeed(v,dt,false,!released,redcat.slideTime+t,pathAngle(heading,body));
+    const move=redcatMove(dt,v,heading,distance,offset);
+    distance+=move.distance;offset=move.lateral;
+    const walls=roadWallsAt(distance);
+    closest=Math.min(closest,walls.right-offset,offset-walls.left);
+    inner=Math.min(inner,inside*(walls[edge]-offset));
+  }
+  const tangent=getTrackAtDist(distance).t;
+  return {closest:closest-.12,inner:inner-.12,yaw:Math.abs(pathAngle(Math.atan2(tangent.z,tangent.x),heading))};
+}
+function redcatCanCuePawRelease(v,inside,digital,analog){
+  if(!inside||redcat.slideTime<.055||inside*roadBendAt(s)<=.006)return false;
+  const surface=kitsuneGripScale();
+  const keep=redcatTracePawCue(v,inside,digital,analog,surface,Infinity);
+  if(keep.inner>.70)return false;
+  // Prefer a usable release 100–200 ms ahead. An immediate release is useful only if it still clears.
+  for(const step of [2,3,4,1,0]){
+    const release=redcatTracePawCue(v,inside,digital,analog,surface,step);
+    if(release.closest>=.20&&release.inner>=keep.inner+.10&&release.yaw<=.32)return true;
+  }
+  return false;
+}
+function updateRedcatPawCue(held,v,inside,digital,analog){
   if(!held){
-    redcat.pawCueUsed=false;redcat.pawCueAt=-Infinity;
-  }else if(!redcat.sliding){
-    redcat.pawCueAt=-Infinity;
-  }else if(!redcat.pawCueUsed&&risk>=.14){
+    redcat.pawCueUsed=false;redcat.pawCueAt=-Infinity;redcat.pawCueCheckAt=0;
+    return;
+  }
+  if(!redcat.sliding){redcat.pawCueAt=-Infinity;redcat.pawCueCheckAt=0;return;}
+  if(redcat.pawCueUsed||simulationElapsed<redcat.pawCueCheckAt)return;
+  redcat.pawCueCheckAt=simulationElapsed+.05;
+  if(redcatCanCuePawRelease(v,inside,digital,analog)){
     redcat.pawCueUsed=true;redcat.pawCueAt=simulationElapsed;
   }
 }
@@ -15516,7 +15569,7 @@ function stepRedcatSteering(dt,digital,braking,held,free,analog=0){
   const digitalDirection=Math.sign(digital),analogDirection=Math.sign(analog);
   const pawDirection=digitalDirection*analogDirection<0?0:digitalDirection||analogDirection;
   const apexRisk=sliding?redcatPawApexEase(v,pawDirection):0;
-  updateRedcatPawCue(held,apexRisk);
+  updateRedcatPawCue(held,v,pawDirection,digital,analog);
   const pawTarget=sliding?1-apexRisk:0;
   redcat.pawTurn=THREE.MathUtils.damp(redcat.pawTurn,pawTarget,REDCAT.pawTurnResponse,dt);
   const surface=kitsuneGripScale();
@@ -22526,7 +22579,7 @@ function syncRedcatPawCue(active){
   const duration=REDCAT.pawCueDuration;
   const quiet=pawMotionQuery.matches;
   const level=active&&appAnimationsEnabled&&age>=0&&age<duration
-    ?(1-THREE.MathUtils.smoothstep(age,.035,duration))*(quiet?.42:1)*THREE.MathUtils.smoothstep(age,0,.022)
+    ?(1-THREE.MathUtils.smoothstep(age,.28,duration))*(quiet?.42:1)*THREE.MathUtils.smoothstep(age,0,.022)
     :0;
   if(level===cue.level)return;
   cue.level=level;
