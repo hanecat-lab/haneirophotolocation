@@ -15364,7 +15364,7 @@ const suberiBounce={v:0,t:-1,side:0,just:true,stallFrom:-1};
     body.append(sub,box);
   }
   const add=()=>document.body.appendChild(el);if(document.body)add();else document.addEventListener('DOMContentLoaded',add);})();
-const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.38,fullSteerAfter:.15};
+const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.14,fullSteerAfter:.30,cornerKmhGain:100};
 const redcat={rig:null,geometries:[],loading:null,bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,steerSign:0,steerHeld:0,warningAt:0};
 function redcatActive(){return catModel==='redcat';}
 function redcatDrivingActive(){return redcatActive()&&!isPracticeActive();}
@@ -15397,6 +15397,25 @@ function redcatForward(v,dt,heading,roadHeading,curvature,offset){
   const midHeading=roadHeading+curvature*v*dt/(2*metric);
   return Math.max(0,Math.cos(pathAngle(midHeading,heading)))*v*dt/metric;
 }
+function redcatTurnRate(v,surface,sliding,steerStrength){
+  const lateralAccel=sliding?49:40,baseCap=sliding?2.6:2.25;
+  const kmh=Math.max(190,v*3.6),gain=(kmh/(kmh-REDCAT.cornerKmhGain))**2;
+  // Short taps keep the old steering gain. A committed turn gets more lateral authority.
+  const commitment=THREE.MathUtils.smoothstep(steerStrength,.34,1);
+  const cap=baseCap+2.1*Math.min(1,v/(190/3.6));
+  const baseline=Math.min(baseCap,lateralAccel*surface/Math.max(v,5));
+  const full=Math.min(cap,lateralAccel*surface*gain/Math.max(v,5));
+  return THREE.MathUtils.lerp(baseline,full,commitment);
+}
+function redcatCornerSpeed(bend,surface){
+  let low=0,high=REDCAT.maxKmh/3.6;
+  for(let i=0;i<12;i++){
+    const v=(low+high)/2;
+    if(redcatTurnRate(v,surface,false,1)>=bend*v)low=v;
+    else high=v;
+  }
+  return low;
+}
 function stepRedcatSteering(dt,steer,braking,held,free){
   const road=getTrackAtDist(s),axis=Math.atan2(road.t.z,road.t.x);
   if(redcat.curve!==curve||redcat.bodyHeading===null||!free){
@@ -15405,7 +15424,7 @@ function stepRedcatSteering(dt,steer,braking,held,free){
   const v=Math.max(speed,0),sliding=free&&held&&!braking&&v>=12&&(Math.abs(steer)>.08||redcat.sliding);
   redcat.sliding=sliding;redcat.slideTime=sliding?redcat.slideTime+dt:0;
   if(!free)return;
-  const surface=kitsuneGripScale(),turn=Math.min(sliding?2.6:2.25,(sliding?49:40)*surface/Math.max(v,5));
+  const turn=redcatTurnRate(v,kitsuneGripScale(),sliding,Math.abs(steer));
   const previous=redcat.bodyHeading;
   redcat.bodyHeading+=steer*turn*(braking?.74:1)*dt*Math.min(1,v/3);
   // Grip follows the chassis, including right after a slide. Drift keeps the incoming momentum.
@@ -15430,13 +15449,14 @@ function redcatAfterWall(){
 function redcatBrakeCueDistance(){
   if(speed<12)return null;
   const brake=REDCAT.brake*Math.max(.1,kitsuneBrakeScale());
-  const grip=40*kitsuneGripScale(),reaction=speed*.95;
+  const surface=kitsuneGripScale(),reaction=speed*.95;
+  const warningSpeed=speed*.94,clearBend=redcatTurnRate(warningSpeed,surface,false,1)/warningSpeed;
   const scan=Math.min(950,totalLength-s,speed*speed/(2*brake)+reaction+12);
   let distance=null,brakeAt=Infinity;
   for(let d=6;d<=scan;d+=12){
     const bend=Math.abs(roadBendAt(s+d));
-    const targetSquared=grip/Math.max(bend,1e-6);
-    if(targetSquared>=speed*speed*.94**2)continue;
+    if(bend<=clearBend)continue;
+    const targetSquared=redcatCornerSpeed(bend,surface)**2;
     const remaining=d-(speed*speed-targetSquared)/(2*brake);
     if(remaining<=reaction&&remaining<brakeAt){distance=d;brakeAt=remaining;}
   }
@@ -19891,7 +19911,10 @@ function tick(dt,renderDt=dt){
   const rpmHidden=document.getElementById('rpmValHidden'); if(rpmHidden && rpmHidden!==rpmEl) rpmHidden.textContent=`${Math.floor(rpm)} RPM`;
   // spdValはdrawSpeedo内で針角度から逆算して設定済み（専門家監修: 完全同期） - 上書きしない
   const wfEl=document.getElementById('waterFill'); if(wfEl){ if(isBrakingDrift) wfEl.style.width=brakeDriftPower*100+'%'; else if(isSliding) wfEl.style.width=slidePower*100+'%'; else wfEl.style.width=Math.min(speed/50*30, 30)+'%'; }
-  if(redcatDriving&&renderDt>0)updateRedcatCue(isBraking);
+  if(redcatDriving){
+    driftLoopWanted=redcat.sliding?.35+.38*THREE.MathUtils.smoothstep(Math.abs(pathAngle(redcat.velocityHeading,redcat.bodyHeading)),.04,.55):0;
+    if(renderDt>0)updateRedcatCue(isBraking);
+  }
   const slEl=document.getElementById('slideLabel'); if(slEl){
     if(isBrakingDrift) slEl.textContent=`BRAKE DRIFT ${Math.floor(brakeDriftPower*100)}%`;
     else if(isBrakingActive) slEl.textContent=`BRAKING ${Math.floor(brakeTime*50)}%`;
