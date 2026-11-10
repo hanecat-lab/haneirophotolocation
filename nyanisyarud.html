@@ -8985,6 +8985,11 @@ function updateCatFootShadows(){
   }
 }
 function updateGroundedShadows(){
+  if(shownCatModel()==='redcat'){
+    fitContactShadow(groundShadow,catRoot.position.x,catRoot.position.z,s,catRoot.rotation.y,.50,.88,catGroundPose.valid?.40:.23);
+    footShadows.forEach(mesh=>{mesh.material.opacity=0;});
+    return;
+  }
   fitContactShadow(groundShadow,catRoot.position.x,catRoot.position.z,s,catRoot.rotation.y,.76*THREE.MathUtils.clamp(catRoot.scale.x,.85,1.4),1.02*THREE.MathUtils.clamp(catRoot.scale.z,.85,1.25),.23);
   updateCatFootShadows();
 }
@@ -15373,6 +15378,8 @@ function specialCatScope(model){return model==='redcat'||model==='suberi'?model:
 function resetRedcatSteerInput(){redcat.steerSign=0;redcat.steerHeld=0;}
 function resetRedcatDrive(){
   resetRedcatSteerInput();
+  Object.assign(redcatHover,{lastSpeed:null,phase:0,pitch:0,lean:0,surge:0});
+  if(redcatHover.wake)redcatHover.wake.visible=false;
   Object.assign(redcat,{bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,wallSide:0,neutralTime:0,warningAt:0});
   document.getElementById('redcatBrakeCue').hidden=true;
 }
@@ -20600,7 +20607,7 @@ function buildGhostModel(player,shown){
   const cardboard=shown==='cardboard'?cardboardCat.parts:null,robo=shown==='robo'?roboCat.parts:null,copyOf=n=>copy[source.indexOf(n)];
   const glbParts=cardboard||robo,allowed=shown==='redcat'?new Set(redcat.geometries):shown==='maneki'?new Set(manekiCat.geometries):shown==='nekomata'?new Set(nekomataCat.geometries):shown==='yukionna'?new Set(yukionnaCat.geometries):shown==='akaoni'?new Set(akaoniCat.geometries):shown==='takeneko'?new Set(takenekoCat.geometries):shown==='kimono'?new Set(kimonoCat.geometries):shown==='suberi'?new Set(suberiCat.geometries):glbParts?new Set(Object.values(glbParts).map(part=>part.holder.children[0].geometry)):new Set([shared.body,shared.head,shared.ear,shared.leg,shared.paw,shared.tail]);
   player.shape=shown;
-  if(shown==='redcat'){const rig=copyOf(redcat.rig);rig.visible=true;rig.position.y=0;rig.rotation.set(0,0,0);}
+  if(shown==='redcat'){const rig=copyOf(redcat.rig);rig.visible=true;rig.position.y=REDCAT_HOVER_Y;rig.rotation.set(0,0,0);}
   // ロボ猫のゴーストはタイヤの回転などは付けず、形だけをチャトラの動きに乗せる
   if(robo){const rig=copyOf(roboCat.rig);rig.visible=true;rig.position.set(0,ROBO_CAT.groundY,0);rig.rotation.set(0,0,0);for(const part of Object.values(robo)){const holder=copyOf(part.holder);holder.position.set(...part.base);holder.rotation.set(0,0,0);holder.scale.set(1,1,1);}}
   // まねき猫のゴーストも弾み・鈴は付けず、形だけをチャトラの動きに乗せる
@@ -22437,18 +22444,82 @@ function syncSuberiCat(dt=0){
     const a=t<cut?t/cut:Math.max(0,1-(t-cut)/(T-cut)),b=t>cut?Math.sin(Math.PI*Math.min(1,(t-cut)/(T-cut))):0;
     suberiCat.rig.scale.set(1-SUBERI.squashX*a*q,1+SUBERI.squashX*.5*a*q,1+SUBERI.stretch*b*q);if(t>=T){suberiCat.squashT=-1;suberiCat.rig.scale.set(1,1,1);}}
 }
+// The shared ground pose raises catRoot by .20 m and the hips mount adds .14 m.
+const REDCAT_HOVER_Y=.065-.20-.14;
+const redcatHover={wake:null,lastSpeed:null,phase:0,pitch:0,lean:0,surge:0,halfWidth:0,halfLength:0,surface:{}};
 function loadRedcat(){
   return redcat.loading??=import('three/addons/loaders/GLTFLoader.js').then(({GLTFLoader})=>new GLTFLoader().setPath(GLB_DIRECTORY).loadAsync(REDCAT.url)).then(({scene:model})=>{
     const rig=new THREE.Group();rig.name='redcatRig';rig.visible=false;model.scale.setScalar(1.55);
+    const bounds=new THREE.Box3().setFromObject(model);
+    model.position.y-=bounds.min.y;
+    redcatHover.halfWidth=Math.max(Math.abs(bounds.min.x),Math.abs(bounds.max.x));
+    redcatHover.halfLength=Math.max(Math.abs(bounds.min.z),Math.abs(bounds.max.z));
+    rig.position.y=REDCAT_HOVER_Y;
     model.traverse(node=>{if(node.isMesh)redcat.geometries.push(node.geometry);});
     rig.add(model);chai.hips.add(rig);redcat.rig=rig;
   }).catch(error=>{redcat.loading=null;throw error;});
 }
+function updateRedcatWake(dt,active,slip){
+  const fx=redcatHover,speedWind=THREE.MathUtils.smoothstep(speed*3.6,105,450);
+  const heat=Math.max(fx.surge,slip);
+  const strength=Math.max(speedWind*.63,heat);
+  if(!active||strength<.025){if(fx.wake)fx.wake.visible=false;return;}
+  if(!fx.wake){
+    const g=new THREE.BufferGeometry();
+    for(const name of ['position','color'])g.setAttribute(name,new THREE.BufferAttribute(new Float32Array(12*2*3),3).setUsage(THREE.DynamicDrawUsage));
+    fx.wake=new THREE.LineSegments(g,new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity:.75,depthWrite:false,blending:THREE.AdditiveBlending}));
+    fx.wake.name='redcatHoverWake';fx.wake.frustumCulled=false;scene.add(fx.wake);
+  }
+  const heading=redcat.velocityHeading??Math.PI/2-catRoot.rotation.y;
+  const forwardX=Math.cos(heading),forwardZ=Math.sin(heading);
+  const x=catRoot.position.x,z=catRoot.position.z,road=sampleRoadAt(x,z,s,fx.surface);
+  if(!(Math.abs(road.ny)>=.15)){fx.wake.visible=false;return;}
+  const slope=-(road.nx*forwardX+road.nz*forwardZ)/road.ny;
+  const up=Math.sign(road.ny);
+  const {position,color}=fx.wake.geometry.attributes;
+  fx.phase=(fx.phase+dt*(2.8+speed*.055))%1;
+  for(let i=0;i<12;i++){
+    const phase=(fx.phase+i*.61803399)%1,side=i%2===0?-1:1;
+    const offset=side*(.23+phase*.38+(i%3)*.085),back=.43+phase*(.95+speedWind*1.3);
+    const px=x-forwardX*back-forwardZ*offset,pz=z-forwardZ*back+forwardX*offset;
+    const length=.15+phase*(.33+speedWind*.8+slip*.35);
+    const py=road.y-(road.nx*(px-x)+road.nz*(pz-z))/road.ny+up*(.07+phase*.07);
+    position.setXYZ(i*2,px,py,pz);
+    position.setXYZ(i*2+1,px-forwardX*length,py-slope*length,pz-forwardZ*length);
+    const glow=strength*Math.sin(phase*Math.PI)*(.68+(i%3)*.11);
+    const warm=THREE.MathUtils.clamp(heat,0,1);
+    color.setXYZ(i*2,glow*(.45+warm*.55),glow*(.76-warm*.36),glow*(1-warm*.81));
+    color.setXYZ(i*2+1,0,0,0);
+  }
+  position.needsUpdate=true;color.needsUpdate=true;fx.wake.visible=true;
+}
 function syncRedcatPose(dt){
-  if(!redcat.rig?.visible)return;
-  const braking=gameState==='racing'&&(input.brake||input.brakePressed);
-  redcat.rig.rotation.x=THREE.MathUtils.damp(redcat.rig.rotation.x,braking?.12:0,11,dt);
-  redcat.rig.position.y=THREE.MathUtils.damp(redcat.rig.position.y,braking?-.055:0,11,dt);
+  const fx=redcatHover;
+  if(!redcat.rig?.visible){if(fx.wake)fx.wake.visible=false;fx.lastSpeed=null;return;}
+  if(dt<=0)return;
+  const racing=gameState==='racing',grounded=catGroundPose.valid&&pawTrailGrounded();
+  const animate=appAnimationsEnabled&&!pawMotionQuery.matches;
+  const moving=racing&&grounded&&speed>2.5;
+  const braking=moving&&(input.brake||input.brakePressed);
+  const acceleration=moving&&fx.lastSpeed!==null?(speed-fx.lastSpeed)/dt:0;
+  fx.lastSpeed=moving?speed:null;
+  const surge=animate&&!braking?THREE.MathUtils.smoothstep(acceleration,5,23)*.75:0;
+  fx.surge=THREE.MathUtils.damp(fx.surge,surge,10,dt);
+  const slip=moving&&redcat.sliding?THREE.MathUtils.smoothstep(Math.abs(pathAngle(redcat.velocityHeading,redcat.bodyHeading)),.06,.5)*.72:0;
+  const leanLimit=redcat.sliding?.14:.095;
+  const pitch=braking?.105:animate?-fx.surge*.095:0;
+  fx.pitch=THREE.MathUtils.damp(fx.pitch,pitch,12,dt);
+  fx.lean=THREE.MathUtils.damp(fx.lean,moving&&animate?THREE.MathUtils.clamp(bank*.82,-leanLimit,leanLimit):0,13,dt);
+  const rig=redcat.rig;
+  rig.rotation.x=fx.pitch;
+  rig.rotation.z=grounded?fx.lean-chai.hips.rotation.z:0;
+  const pitchDepth=Math.abs(Math.sin(fx.pitch+chai.hips.rotation.x))*fx.halfLength;
+  const rollDepth=Math.abs(Math.sin(fx.lean))*fx.halfWidth;
+  const compression=braking?.026:0;
+  const clearanceLift=Math.max(0,pitchDepth+rollDepth+compression-.043);
+  const height=grounded?REDCAT_HOVER_Y+(brakePoseBase.hipsY-chai.hips.position.y)+clearanceLift-compression:-.12;
+  rig.position.y=THREE.MathUtils.damp(rig.position.y,height,18,dt);
+  updateRedcatWake(dt,moving&&animate,slip);
 }
 function shownCatModel(){return redcatActive()&&redcat.rig?'redcat':catModel==='cardboard'&&cardboardCat.rig?'cardboard':catModel==='robo'&&roboCat.rig?'robo':catModel==='maneki'&&manekiCat.rig?'maneki':catModel==='nekomata'&&nekomataCat.rig?'nekomata':catModel==='yukionna'&&yukionnaCat.rig?'yukionna':catModel==='akaoni'&&akaoniCat.rig?'akaoni':catModel==='takeneko'&&takenekoCat.rig?'takeneko':catModel==='kimono'&&kimonoCat.rig?'kimono':catModel==='suberi'&&suberiCat.rig?'suberi':'chatora';}
 function applyCatModel(){
