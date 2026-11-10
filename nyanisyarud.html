@@ -15365,14 +15365,14 @@ const suberiBounce={v:0,t:-1,side:0,just:true,stallFrom:-1};
   }
   const add=()=>document.body.appendChild(el);if(document.body)add();else document.addEventListener('DOMContentLoaded',add);})();
 const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,tapWindow:.05,fullSteerAfter:.39,cornerKmhGain:100,gripTurn:.8,pawTurnResponse:16,wallRelease:.60};
-const redcat={rig:null,geometries:[],loading:null,bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,steerSign:0,steerHeld:0,wallSide:0,warningAt:0};
+const redcat={rig:null,geometries:[],loading:null,bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,steerSign:0,steerHeld:0,wallSide:0,neutralTime:0,warningAt:0};
 function redcatActive(){return catModel==='redcat';}
 function redcatDrivingActive(){return redcatActive()&&!isPracticeActive();}
 function specialCatScope(model){return model==='redcat'||model==='suberi'?model:null;}
 function resetRedcatSteerInput(){redcat.steerSign=0;redcat.steerHeld=0;}
 function resetRedcatDrive(){
   resetRedcatSteerInput();
-  Object.assign(redcat,{bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,wallSide:0,warningAt:0});
+  Object.assign(redcat,{bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,wallSide:0,neutralTime:0,warningAt:0});
   document.getElementById('redcatBrakeCue').hidden=true;
 }
 function redcatDigitalTurn(dt,digital,baseline,full){
@@ -15428,6 +15428,26 @@ function redcatCornerSpeed(bend,surface){
   }
   return low;
 }
+function redcatStraighten(dt,axis){
+  const yaw=pathAngle(axis,redcat.bodyHeading);
+  const near=getTrackAtDist(s+2),far=getTrackAtDist(s+6);
+  const nearYaw=Math.atan2(near.t.z,near.t.x),farYaw=Math.atan2(far.t.z,far.t.x);
+  const bend=Math.max(Math.abs(pathAngle(axis,nearYaw))/2,Math.abs(pathAngle(nearYaw,farYaw))/4);
+  const exitBlend=1-THREE.MathUtils.smoothstep(bend,.0035,.011);
+  if(exitBlend===0)return;
+  const walls=roadWallsAt(s);
+  const clearance=Math.min(lateral-walls.left,walls.right-lateral);
+  // Give fine taps room to take effect. Recover larger exit angles immediately.
+  if(redcat.neutralTime<.08&&Math.abs(yaw)<.045&&clearance>1.2)return;
+  const nearWall=1-THREE.MathUtils.smoothstep(clearance,.35,1.8);
+  const response=(12+16*nearWall)*exitBlend;
+  const correction=yaw*(1-Math.exp(-dt*response));
+  redcat.bodyHeading-=correction;
+  const travelYaw=pathAngle(axis,redcat.velocityHeading);
+  if(travelYaw*correction>0){
+    redcat.velocityHeading-=Math.sign(correction)*Math.min(Math.abs(travelYaw),Math.abs(correction)*.78);
+  }
+}
 function stepRedcatSteering(dt,digital,braking,held,free,analog=0){
   const road=getTrackAtDist(s),axis=Math.atan2(road.t.z,road.t.x);
   if(redcat.curve!==curve||redcat.bodyHeading===null||!free){
@@ -15435,7 +15455,7 @@ function stepRedcatSteering(dt,digital,braking,held,free,analog=0){
   }
   const v=Math.max(speed,0),sliding=free&&held&&!braking&&v>=12&&(digital!==0||Math.abs(analog)>.08||redcat.sliding);
   redcat.sliding=sliding;redcat.slideTime=sliding?redcat.slideTime+dt:0;
-  if(!free){redcat.pawTurn=0;resetRedcatSteerInput();return;}
+  if(!free){redcat.pawTurn=0;redcat.neutralTime=0;resetRedcatSteerInput();return;}
   redcat.pawTurn=THREE.MathUtils.damp(redcat.pawTurn,sliding?1:0,REDCAT.pawTurnResponse,dt);
   const surface=kitsuneGripScale();
   const baseline=THREE.MathUtils.lerp(redcatTurnLimit(v,surface,false,false),redcatTurnLimit(v,surface,true,false),redcat.pawTurn);
@@ -15443,15 +15463,19 @@ function stepRedcatSteering(dt,digital,braking,held,free,analog=0){
   const digitalTurn=redcatDigitalTurn(dt,digital,baseline,full);
   const analogTurn=analog*THREE.MathUtils.lerp(baseline,full,THREE.MathUtils.smoothstep(Math.abs(analog),.34,1));
   const turn=THREE.MathUtils.clamp(digitalTurn+analogTurn,-full,full);
-  const previous=redcat.bodyHeading;
+  const previous=redcat.bodyHeading,previousVelocity=redcat.velocityHeading;
   redcat.bodyHeading+=turn*(braking?.74:1)*dt*Math.min(1,v/3);
   // Grip follows the chassis, including right after a slide. Drift keeps the incoming momentum.
   if(!sliding)redcat.velocityHeading+=pathAngle(previous,redcat.bodyHeading)*.78;
+  if(digital===0&&analog===0&&!held&&v>1){
+    redcat.neutralTime+=dt;
+    redcatStraighten(dt,axis);
+  }else redcat.neutralTime=0;
   const slip=pathAngle(redcat.velocityHeading,redcat.bodyHeading);
   redcat.velocityHeading+=slip*(1-Math.exp(-dt*(sliding?2.7:16)));
   const yawGap=pathAngle(redcat.velocityHeading,redcat.bodyHeading);
   redcat.velocityHeading=redcat.bodyHeading-THREE.MathUtils.clamp(yawGap,-.72,.72);
-  redcatKeepWallClearance();
+  redcatKeepWallClearance(dt,turn,previousVelocity);
   bank=THREE.MathUtils.damp(bank,turn/Math.max(full,.001)*(sliding?-.22:-.11),9,dt);
 }
 function redcatWallTangent(distance,side){
@@ -15463,25 +15487,33 @@ function redcatWallTangent(distance,side){
   const z=b.p.z+b.n.z*endOffset-a.p.z-a.n.z*startOffset;
   return x*x+z*z>1e-8?Math.atan2(z,x):Math.atan2(b.t.z,b.t.x);
 }
-function redcatClipWallMotion(distance,side){
-  const wallHeading=redcatWallTangent(distance,side);
+function redcatClipWallMotion(wallHeading,side){
   const relative=pathAngle(wallHeading,redcat.velocityHeading);
   if(side*Math.sin(relative)<=0)return 1;
   const along=Math.cos(relative);
   redcat.velocityHeading=wallHeading+(along<0?Math.PI:0);
   return Math.abs(along);
 }
-function redcatKeepWallClearance(){
+function redcatKeepWallClearance(dt,turn,previousVelocity){
   const side=redcat.wallSide;
   if(!side)return;
   const walls=roadWallsAt(s),clearance=side>0?walls.right-lateral:lateral-walls.left;
   if(clearance>=REDCAT.wallRelease){redcat.wallSide=0;return;}
   // Grip must not restore velocity into a wall we are still alongside.
-  redcatClipWallMotion(s,side);
+  const wallHeading=redcatWallTangent(s,side);
+  redcatClipWallMotion(wallHeading,side);
+  if(turn*side>=0)return;
+  // Away input reaches the travel direction even while the chassis still faces the rail.
+  const current=pathAngle(wallHeading,redcat.velocityHeading);
+  const previous=pathAngle(wallHeading,previousVelocity);
+  if(Math.cos(current)<=0||Math.cos(previous)<=0)return;
+  const inward=Math.max(0,-side*current,-side*previous);
+  const target=Math.min(.12,Math.abs(turn)*.24);
+  redcat.velocityHeading=wallHeading-side*THREE.MathUtils.damp(inward,Math.max(inward,target),18,dt);
 }
 function redcatAfterWall(distance,side){
   redcat.wallSide=side;
-  speed*=redcatClipWallMotion(distance,side);
+  speed*=redcatClipWallMotion(redcatWallTangent(distance,side),side);
   redcat.sliding=false;redcat.slideTime=0;
 }
 function redcatBrakeCueDistance(){
