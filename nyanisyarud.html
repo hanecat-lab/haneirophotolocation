@@ -15370,8 +15370,8 @@ const suberiBounce={v:0,t:-1,side:0,just:true,stallFrom:-1};
     body.append(sub,box);
   }
   const add=()=>document.body.appendChild(el);if(document.body)add();else document.addEventListener('DOMContentLoaded',add);})();
-const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,tapWindow:.05,fullSteerAfter:.39,cornerKmhGain:100,gripTurn:.8,pawTurnResponse:16,pawReleaseResponse:24,slideGripResponse:2.7,wallRelease:.60,pawCueLead:.4,pawCueRefresh:.08};
-const redcat={rig:null,geometries:[],loading:null,bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,steerSign:0,steerHeld:0,wallSide:0,neutralTime:0,warningAt:0,releaseBlend:0,pawCueStage:0,pawCueLevel:0,pawCueVisualAt:0,pawCueCheckAt:0};
+const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,tapWindow:.05,fullSteerAfter:.46,cornerKmhGain:100,gripTurn:.8,pawTurnResponse:16,pawReleaseResponse:24,slideGripResponse:2.7,wallRelease:.60,pawCueLead:.4,pawCueRefresh:.08};
+const redcat={rig:null,geometries:[],loading:null,bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,steerSign:0,steerHeld:0,wallSide:0,neutralTime:0,warningAt:0,releaseBlend:0,pawCueStage:0,pawCueLevel:0,pawCueVisualAt:0,pawCueCheckAt:0,pawCueReason:'待機',steerInput:0,steerOutput:0,steerRate:0};
 function redcatActive(){return catModel==='redcat';}
 function redcatDrivingActive(){return redcatActive()&&!isPracticeActive();}
 function specialCatScope(model){return model==='redcat'||model==='suberi'?model:null;}
@@ -15380,7 +15380,7 @@ function resetRedcatDrive(){
   resetRedcatSteerInput();
   Object.assign(redcatHover,{lastSpeed:null,phase:0,pitch:0,lean:0,surge:0});
   if(redcatHover.wake)redcatHover.wake.visible=false;
-  Object.assign(redcat,{bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,wallSide:0,neutralTime:0,warningAt:0,releaseBlend:0,pawCueStage:0,pawCueLevel:0,pawCueVisualAt:0,pawCueCheckAt:0});
+  Object.assign(redcat,{bodyHeading:null,velocityHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,wallSide:0,neutralTime:0,warningAt:0,releaseBlend:0,pawCueStage:0,pawCueLevel:0,pawCueVisualAt:0,pawCueCheckAt:0,pawCueReason:'待機',steerInput:0,steerOutput:0,steerRate:0});
   document.getElementById('redcatBrakeCue').hidden=true;
 }
 function redcatSteerProgress(held){
@@ -15484,12 +15484,32 @@ function redcatPawApexEase(v,direction,pose=redcat,distance=s,offset=lateral){
   const bendWeight=THREE.MathUtils.smoothstep(Math.abs(bend),.006,.025);
   return .85*near*closing*established*bendWeight;
 }
+// Identify a real upcoming bend, not curvature left behind at a corner exit.
+function redcatCueCorner(v,distance=s){
+  const step=4,range=THREE.MathUtils.clamp(v*1.4,36,180);
+  let direction=0,start=0,end=0,angle=0,peak=0,gap=0;
+  for(let d=2;d<=range&&distance+d<totalLength;d+=step){
+    const bend=roadBendAt(distance+d),magnitude=Math.abs(bend);
+    if(!direction){
+      if(magnitude<.006)continue;
+      direction=Math.sign(bend);start=distance+d;
+    }
+    if(direction*bend<-.0035)break;
+    if(direction*bend>.0035){
+      end=distance+d;gap=0;angle+=magnitude*step;peak=Math.max(peak,magnitude);
+    }else if((gap+=step)>=8)break;
+  }
+  if(!direction||angle<.16||start-distance>Math.max(6,v*.18))return null;
+  return {direction,start,end,apex:(start+end)*.5,angle,peak};
+}
 // Forecast the same manual steering/release response used by the live drive.
-// No predicted position or turn is ever applied to the player.
+// A close outer entry may open its clearance progressively; actual rail crossings never qualify.
 function redcatTracePawCue(v,inside,digital,analog,surface,releaseAfter,unwindDelay=0){
-  const dt=.05,pose={...redcat};
-  let distance=s,offset=lateral,closest=Infinity,inner=Infinity;
+  const dt=.05,pose={...redcat},initial=roadWallsAt(s);
+  let distance=s,offset=lateral,closest=Math.min(initial.right-offset,offset-initial.left),inner=Infinity,reserve=Infinity,firstHit=Infinity;
   const edge=inside>0?'right':'left';
+  const outerStart=inside>0?offset-initial.left:initial.right-offset;
+  if(closest<.12)return {closest:closest-.12,inner:-Infinity,reserve:-Infinity,firstHit:0,yaw:Infinity};
   for(let i=0;i<20;i++){
     const t=i*dt,released=t+1e-6>=releaseAfter;
     const unwound=t+1e-6>=releaseAfter+unwindDelay;
@@ -15499,33 +15519,44 @@ function redcatTracePawCue(v,inside,digital,analog,surface,releaseAfter,unwindDe
     v=redcatSpeed(v,dt,false,!released,pose.slideTime,pathAngle(pose.velocityHeading,pose.bodyHeading));
     const move=redcatMove(dt,v,pose.velocityHeading,distance,offset);
     distance+=move.distance;offset=move.lateral;
-    const walls=roadWallsAt(distance);
-    closest=Math.min(closest,walls.right-offset,offset-walls.left);
-    inner=Math.min(inner,inside*(walls[edge]-offset));
-    if(closest<.12)break;
+    const walls=roadWallsAt(distance),right=walls.right-offset,left=offset-walls.left;
+    const innerClear=inside>0?right:left,outerClear=inside>0?left:right;
+    const outerMargin=THREE.MathUtils.lerp(Math.max(.12,Math.min(.32,outerStart-.03)),.32,
+      THREE.MathUtils.smoothstep(t+dt,0,.25));
+    closest=Math.min(closest,right,left);inner=Math.min(inner,innerClear);
+    reserve=Math.min(reserve,innerClear-.32,outerClear-outerMargin);
+    if(Math.min(right,left)<.12){firstHit=t+dt;break;}
   }
   const tangent=getTrackAtDist(distance).t;
-  return {closest:closest-.12,inner:inner-.12,yaw:Math.abs(pathAngle(Math.atan2(tangent.z,tangent.x),pose.velocityHeading))};
+  return {closest:closest-.12,inner:inner-.12,reserve,firstHit,yaw:Math.abs(pathAngle(Math.atan2(tangent.z,tangent.x),pose.velocityHeading))};
 }
-function redcatPawReleaseWindow(v,inside,digital,analog){
-  if(!inside||redcat.slideTime<.035||inside*roadBendAt(s)<=.004||redcat.wallSide)return 0;
-  const surface=kitsuneGripScale();
+function redcatPawReleaseWindow(v,inputDirection,digital,analog){
+  redcat.pawCueReason='直線・待機';
+  const corner=redcatCueCorner(v);
+  if(!corner)return 0;
+  if(!inputDirection||inputDirection!==corner.direction||redcat.slideTime<.035){redcat.pawCueReason='旋回入力待ち';return 0;}
+  const inside=corner.direction,surface=kitsuneGripScale();
   const keep=redcatTracePawCue(v,inside,digital,analog,surface,Infinity);
+  // Timing is evaluated only within this bend. Straight-line unwinding is not a cue.
   for(let after=0;after<=REDCAT.pawCueLead+1e-6;after+=.10){
     const quick=redcatTracePawCue(v,inside,digital,analog,surface,after,0);
     const slow=redcatTracePawCue(v,inside,digital,analog,surface,after,.12);
-    // Both an immediate unwind and a slightly delayed one must leave room.
-    const clearance=Math.min(quick.closest,slow.closest),yaw=Math.max(quick.yaw,slow.yaw);
-    const useful=keep.closest<clearance+.10||yaw+.06<keep.yaw;
-    if(clearance>=.20&&useful)return after<.05?2:1;
+    if(Math.min(quick.reserve,slow.reserve)>=0){
+      redcat.pawCueReason=after<.05?'いま離せる':'離し時が近い';
+      return after<.05?2:1;
+    }
   }
+  // Preparation announces the approaching apex, not an already guaranteed release.
+  // It therefore does not inherit the full-release safety test that used to suppress entry cues.
+  const toApex=(corner.apex-s)/Math.max(v,1);
+  if(toApex<=.65&&keep.firstHit>.20){redcat.pawCueReason='頂点へ進入・準備';return 1;}
+  redcat.pawCueReason=keep.firstHit<=.20?'壁接近・修正が必要':'まだ旋回中';
   return 0;
 }
 function updateRedcatPawCue(held,v,inside,digital,analog){
-  if(!held||!redcat.sliding){redcat.pawCueStage=0;redcat.pawCueCheckAt=0;return;}
+  if(!held||!redcat.sliding){redcat.pawCueStage=0;redcat.pawCueReason='待機';redcat.pawCueCheckAt=0;return;}
   if(simulationElapsed<redcat.pawCueCheckAt)return;
   redcat.pawCueCheckAt=simulationElapsed+REDCAT.pawCueRefresh;
-  // Re-evaluate continuously, including a new corner while the paw stays down.
   redcat.pawCueStage=redcatPawReleaseWindow(v,inside,digital,analog);
 }
 function redcatEaseInsideTurn(turn,axis,v,distance=s,offset=lateral,heading=redcat.velocityHeading){
@@ -15553,11 +15584,24 @@ function redcatStepPose(dt,pose,distance,offset,v,digital,analog,sliding,braking
     sliding?REDCAT.pawTurnResponse:REDCAT.pawReleaseResponse,dt);
   const baseline=THREE.MathUtils.lerp(redcatTurnLimit(v,surface,false,false),redcatTurnLimit(v,surface,true,false),pose.pawTurn);
   const full=THREE.MathUtils.lerp(redcatTurnLimit(v,surface,false,true),redcatTurnLimit(v,surface,true,true),pose.pawTurn);
-  const keyTurn=redcatDigitalTurn(dt,digital,baseline,full,pose);
-  const stickTurn=analog*THREE.MathUtils.lerp(baseline,full,THREE.MathUtils.smoothstep(Math.abs(analog),.34,1));
-  const turn=redcatEaseInsideTurn(THREE.MathUtils.clamp(keyTurn+stickTurn,-full,full),axis,v,distance,offset,pose.velocityHeading);
+  const sustainScale=THREE.MathUtils.lerp(.80,1,THREE.MathUtils.smoothstep(v*3.6,160,300));
+  const sustainedFull=THREE.MathUtils.lerp(baseline*REDCAT.tapSteer,full,sustainScale);
+  const keyTurn=redcatDigitalTurn(dt,digital,baseline,sustainedFull,pose);
+  const stickTurn=analog*THREE.MathUtils.lerp(baseline,sustainedFull,THREE.MathUtils.smoothstep(Math.abs(analog),.34,1));
+  let turn=redcatEaseInsideTurn(THREE.MathUtils.clamp(keyTurn+stickTurn,-sustainedFull,sustainedFull),axis,v,distance,offset,pose.velocityHeading);
+  const slip=pathAngle(pose.velocityHeading,pose.bodyHeading);
+  // Reduce only additional rotation into an established slide. Countersteer remains available.
+  if(sliding&&turn*slip>0){
+    const established=THREE.MathUtils.smoothstep(pose.slideTime,.04,.16);
+    const lead=THREE.MathUtils.smoothstep(Math.abs(slip),.22,.48);
+    turn*=1-.70*lead*established;
+  }
+  const yawRate=turn*(braking?.74:1)*Math.min(1,v/3);
+  pose.steerInput=THREE.MathUtils.clamp(digital+analog,-1,1);
+  pose.steerOutput=THREE.MathUtils.clamp(yawRate/Math.max(full,.001),-1,1);
+  pose.steerRate=yawRate;
   const previous=pose.bodyHeading;
-  pose.bodyHeading+=turn*(braking?.74:1)*dt*Math.min(1,v/3);
+  pose.bodyHeading+=yawRate*dt;
   if(!sliding)pose.velocityHeading+=pathAngle(previous,pose.bodyHeading)*.78;
   if(digital===0&&analog===0&&!sliding&&neutralAllowed&&v>1){
     pose.neutralTime+=dt;redcatStraighten(dt,axis,pose,distance,offset,v);
@@ -15575,7 +15619,7 @@ function stepRedcatSteering(dt,digital,braking,held,free,analog=0){
   }
   const v=Math.max(speed,0),sliding=free&&held&&!braking&&v>=12&&(digital!==0||Math.abs(analog)>.08||redcat.sliding);
   redcat.sliding=sliding;redcat.slideTime=sliding?redcat.slideTime+dt:0;
-  if(!free){updateRedcatPawCue(held,0);redcat.pawTurn=0;redcat.neutralTime=0;resetRedcatSteerInput();return;}
+  if(!free){updateRedcatPawCue(held,0);redcat.steerInput=redcat.steerOutput=redcat.steerRate=0;redcat.pawTurn=0;redcat.neutralTime=0;resetRedcatSteerInput();return;}
   const previousVelocity=redcat.velocityHeading;
   const {turn,full}=redcatStepPose(dt,redcat,s,lateral,v,digital,analog,sliding,braking,kitsuneGripScale(),!held);
   redcatKeepWallClearance(dt,turn,previousVelocity);
@@ -15652,6 +15696,32 @@ function updateRedcatCue(braking){
     if(panel.textContent!==label)panel.textContent=label;
   }
 }
+// ?steerdiag: actual applied steering, raw input and chassis/travel angle for tuning.
+const redcatSteerDiag=(()=>{
+  if(!new URLSearchParams(location.search).has('steerdiag'))return null;
+  const el=document.createElement('div');el.id='redcatSteerDiag';
+  el.style.cssText='position:fixed;left:10px;top:calc(env(safe-area-inset-top,0px) + 78px);width:min(62vw,300px);box-sizing:border-box;z-index:9999;padding:7px 9px;border-radius:9px;color:#fff;background:rgba(12,18,24,.82);font:700 11px/1.5 monospace;pointer-events:none';
+  const title=document.createElement('div');title.textContent='操舵量（ハンドル相当）';el.append(title);
+  const rail=document.createElement('div');rail.style.cssText='height:12px;position:relative;margin:5px 0;background:#34424c;border-radius:4px;overflow:hidden';
+  const center=document.createElement('div');center.style.cssText='position:absolute;left:50%;top:0;width:1px;height:100%;background:#fff9;z-index:2';
+  const fill=document.createElement('div');fill.style.cssText='position:absolute;left:50%;top:2px;width:0;height:8px;background:#7ce7ff';
+  const marker=document.createElement('div');marker.style.cssText='position:absolute;left:50%;top:0;width:2px;height:12px;background:#ffce70;z-index:3';
+  rail.append(fill,center,marker);el.append(rail);
+  const values=document.createElement('div'),cue=document.createElement('div');el.append(values,cue);el.hidden=true;
+  document.body.append(el);
+  return {tick(){
+    el.hidden=!redcatDrivingActive();if(el.hidden)return;
+    const active=gameState==='racing',output=active?redcat.steerOutput:0,input=active?redcat.steerInput:0;
+    fill.style.left=(50+Math.min(0,output)*50)+'%';fill.style.width=(Math.abs(output)*50)+'%';
+    marker.style.left='calc('+(50+input*50)+'% - 1px)';
+    const gap=redcat.bodyHeading===null||redcat.velocityHeading===null?0:pathAngle(redcat.velocityHeading,redcat.bodyHeading)*180/Math.PI;
+    const label=output>.005?'右':output<-.005?'左':'中立';
+    title.textContent='操舵 '+label+' '+Math.round(Math.abs(output)*100)+'%　橙:入力／青:実効';
+    values.textContent='旋回 '+(active?redcat.steerRate*180/Math.PI:0).toFixed(0)+'°/秒　向き差 '+gap.toFixed(0)+'°';
+    cue.textContent='発光: '+(active?redcat.pawCueReason:'待機');
+    cue.style.color=active&&redcat.pawCueStage===2?'#fff0b8':active&&redcat.pawCueStage===1?'#b8edff':'#c6cdd3';
+  }};
+})();
 function suberiActive(){return catModel==='suberi';}
 // 今の跳ね返りの判定の幅の倍率(ぽよん壁なら広い)
 function suberiWin(){return suberiBounce.poyo?SLIDE.poyo.window:1;}
@@ -22621,6 +22691,7 @@ function updateRedcatWake(dt,active,slip){
   position.needsUpdate=true;color.needsUpdate=true;fx.wake.visible=true;
 }
 function syncRedcatPose(dt){
+  redcatSteerDiag?.tick();
   const fx=redcatHover;
   syncRedcatPawCue(Boolean(redcat.rig?.visible)&&gameState==='racing'&&redcat.sliding);
   if(!redcat.rig?.visible){if(fx.wake)fx.wake.visible=false;fx.lastSpeed=null;return;}
