@@ -7018,6 +7018,17 @@ const correctLightPixels=(pixels, light)=>{
 };
 
 // 逆再生・ブーメラン：書き出しと同じく、シークしてそのコマが出るまで待つ。
+// 書き出しの残り時間の文（「あと約◯分◯秒」）。分かるまでは空。
+const vlogRemainingLabel=sec=>{
+  if(!Number.isFinite(sec) || sec<0) return '';
+  const fine=Math.max(5,Math.ceil(sec/5)*5);
+  if(fine<60) return `あと約${fine}秒`;
+  const rounded=Math.max(60,Math.round(sec/10)*10);
+  return `あと約${Math.floor(rounded/60)}分${rounded%60?`${rounded%60}秒`:''}`;
+};
+// 書き出し前の予想容量（MB）。映像と音の量 × 長さ。実際の容量は素材で変わるので目安。
+const vlogEstimateExportMb=(profile,seconds)=>
+  (Number(profile?.videoBitrate||0)+Number(profile?.audioBitrate||128000))*Math.max(0,Number(seconds)||0)/8/1000000;
 const vlogSettleVideo=(video,time)=>new Promise(resolve=>{
   if(!video.seeking && Math.abs(video.currentTime-time)<0.0005 && video.readyState>=2){ resolve(); return; }
   let done=false;
@@ -12758,6 +12769,8 @@ function App(){
   const [exportStatus, setExportStatus] = useState('idle');
   const [exportProgress, setExportProgress] = useState(0);
   const [exportMessage, setExportMessage] = useState('');
+  const [exportEta, setExportEta] = useState('');
+  const lastExportScopeRef = useRef('all');
   const [exportFile, setExportFile] = useState(null);
   // 前回の書き出しが途中で落ちていれば、その記録（起動時に一度だけ読む）。
   const [lastExportCrash, setLastExportCrash] = useState(()=>{ try{ return JSON.parse(localStorage.getItem('vlogExportRun')||'null'); }catch{ return null; } });
@@ -16495,6 +16508,8 @@ function App(){
   };
   const startExport=async(scope='all')=>{
     if(exportJobRef.current) return;
+    lastExportScopeRef.current=scope;
+    setExportEta('');
     setExportChoiceOpen(false);
     setExportDiagnosticText('');
     setExportDiagnosticVisible(false);
@@ -17017,6 +17032,7 @@ function App(){
           try{ video.currentTime=time; }catch{ finish(); }
         });
         job.phase='recording';
+        const frameLoopStartedAt=performance.now();
         for(let index=0;index<frameCount;index++){
           if(job.cancelled) throw new Error(job.failure||'書き出しを中止しました。');
           const t=Math.min(total-0.001,index/exportFps);
@@ -17056,7 +17072,12 @@ function App(){
           videoEncoder.encode(frame,{keyFrame:index%(exportFps*2)===0});
           frame.close();
           while(videoEncoder.encodeQueueSize>4 && !job.cancelled) await new Promise(resolve=>setTimeout(resolve,4));
-          if(index%6===0) setExportProgress(Math.min(95,Math.round(index/frameCount*(mixed?90:95))));
+          if(index%6===0){
+            setExportProgress(Math.min(95,Math.round(index/frameCount*(mixed?90:95))));
+            // 残り時間: ここまでの1コマあたりの時間 × 残りのコマ数。最初の2秒は計算しない。
+            const elapsedMs=performance.now()-frameLoopStartedAt;
+            setExportEta(index>0 && elapsedMs>2000 ? vlogRemainingLabel(elapsedMs/index*(frameCount-index)/1000) : '残り時間を計算中');
+          }
         }
         await videoEncoder.flush();
         videoEncoder.close();
@@ -17572,7 +17593,7 @@ function App(){
           job.stats.maxDrawMs=Math.max(job.stats.maxDrawMs,drawMs);
           if(drawMs>1000/exportFps) job.stats.slowFrames++;
         }
-        if(now-lastProgress>500){ lastProgress=now; job.lastProgressAt=performance.now(); setExportProgress(Math.min(100,Math.round(t/total*100))); }
+        if(now-lastProgress>500){ lastProgress=now; job.lastProgressAt=performance.now(); setExportProgress(Math.min(100,Math.round(t/total*100))); setExportEta(vlogRemainingLabel(total-t)); }
         job.lastWorkMs=performance.now()-now;
         job.frame=requestAnimationFrame(render);
       };
@@ -23887,16 +23908,20 @@ const recomputeStarts=(arr)=>{
         React.createElement('div',{className:'grid grid-cols-1 gap-2 mb-2'},
           ['quality','compact','smaller','smallest'].map(mode=>{
             const profile=VLOG_EXPORT_PROFILES[mode];
+            // 予想容量: 選んだ範囲の長さ × 映像と音の量（目安）。
+            let estimateSeconds=0;
+            try{ const {items:estimateItems}=buildExportSelection(exportChoiceScope); estimateSeconds=estimateItems.length?Math.max(...estimateItems.map(c=>c.timelineStart+c.duration)):0; }catch{}
+            const estimateMb=vlogEstimateExportMb(profile,estimateSeconds);
             return React.createElement('button',{key:mode,type:'button',onClick:()=>setExportSizeMode(mode),
               'aria-pressed':exportSizeMode===mode,
               className:`min-h-11 rounded-xl border px-3 py-2 text-left flex items-center justify-between gap-2 ${exportSizeMode===mode?'border-violet-400 bg-violet-500/20':'border-white/20 bg-white/5'}`},
               React.createElement('span',{className:'text-xs font-bold'},`${exportSizeMode===mode?'●':'○'} ${profile.label}`),
-              React.createElement('span',{className:'text-[10px] text-white/55 shrink-0'},`約${(profile.videoBitrate/1000000).toFixed(1)}Mbps · ${profile.fps}fps · ${profile.short}p`));
+              React.createElement('span',{className:'text-[10px] text-white/55 shrink-0'},`${estimateMb>0?`約${estimateMb<10?estimateMb.toFixed(1):Math.round(estimateMb)}MB · `:''}${(profile.videoBitrate/1000000).toFixed(1)}Mbps · ${profile.fps}fps · ${profile.short}p`));
           })),
         React.createElement('div',{className:'text-[10px] text-white/55 mb-2'},
           (VLOG_EXPORT_PROFILES[exportSizeMode]?.fps===24)
-            ? '24fpsで描画と録画の負荷を抑えます。動きの多い場面は30fpsより滑らかさが下がる場合があります。容量は書き出し後の実測値で確認できます。'
-            : '容量は素材と端末の録画方式で変わります。書き出し後に実測値を表示します。'),
+            ? '24fpsで描画と録画の負荷を抑えます。動きの多い場面は30fpsより滑らかさが下がる場合があります。容量（約◯MB）は目安で、書き出し後の実測値で確認できます。'
+            : '容量（約◯MB）は目安です。素材と端末の録画方式で変わります。書き出し後に実測値を表示します。'),
         React.createElement('div',{className:'text-[10px] text-amber-100/85 mb-2'},
           '動画は実時間で作成するため、素材の長さ以上かかります。終了までこの画面を開いたままにしてください。'),
         React.createElement('button', {onClick:()=>startExport(exportChoiceScope), disabled:!clips.length || exportChoiceScope==='selected' && !clips.some(c=>selectedClipIds.includes(c.id)),
@@ -23956,7 +23981,7 @@ const recomputeStarts=(arr)=>{
               background:'rgba(41,58,52,.08)',color:'#293A34',border:'1px solid rgba(41,58,52,.2)'}}, '×')
         ),
         (exportStatus==='preparing'||exportStatus==='recording'||exportStatus==='verifying') && React.createElement(React.Fragment,null,
-          React.createElement('div', {className:'text-sm text-white/70 mb-3'}, exportStatus==='preparing'?'素材を準備しています':exportStatus==='verifying'?'完成した動画を確認しています':`書き出し中 ${exportProgress}%`),
+          React.createElement('div', {className:'text-sm text-white/70 mb-3'}, exportStatus==='preparing'?'素材を準備しています':exportStatus==='verifying'?'完成した動画を確認しています':`書き出し中 ${exportProgress}%${exportEta?`（${exportEta}）`:''}`),
           exportMessage && React.createElement('div',{className:'text-xs text-white/60 mb-2','aria-live':'polite'},exportMessage),
           React.createElement('div',{className:'text-sm font-bold text-amber-100 mb-3'},
             EXPORT_FRAME_ENGINE && typeof VideoEncoder==='function' && typeof VideoFrame==='function'
@@ -24009,6 +24034,8 @@ const recomputeStarts=(arr)=>{
               React.createElement('button',{type:'button',onClick:()=>{
                 navigator.clipboard?.writeText?.(exportDiagnosticText)?.catch?.(()=>{});
               },className:'mt-2 rounded-full bg-white/10 px-4 py-2 text-xs'},'診断をコピー'))),
+          clips.length>0 && React.createElement('button', {type:'button', onClick:()=>startExport(lastExportScopeRef.current),
+            className:'camera-key-primary w-full h-11 rounded-full bg-white text-black font-bold mb-2'}, '↻ もう一度書き出す'),
           React.createElement('button', {onClick:closeExport, className:'w-full h-10 rounded-full bg-white/10'}, '閉じる')
         )
       )
