@@ -15372,8 +15372,8 @@ const suberiBounce={v:0,t:-1,side:0,just:true,stallFrom:-1};
   const add=()=>document.body.appendChild(el);if(document.body)add();else document.addEventListener('DOMContentLoaded',add);})();
 // Dry-road full-paw curvature capacity, calibrated to the agreed speed bands.
 const REDCAT_TURN_BANDS=[[0,.100],[100,.100],[180,.090],[200,.080],[230,.075],[250,.065],[330,.035],[350,.029],[450,.016],[500,.012],[600,.0085]];
-const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,gripTapSteer:.8,tapWindow:.05,fullSteerAfter:.38,gripSteerAfter:.50,gripTurn:.22,pawTurnResponse:14,pawReleaseResponse:18,turnResponse:16,reverseResponse:30,reverseThreshold:.06,releaseResponse:45,pawCoastResponse:110,pawCoastDelay:.18,apexGapMin:.30,apexGapMax:.50,wallSkin:.12,bodyResponse:16,bodySlip:.34,wallRelease:.60,pawCueLead:.4,pawCueReaction:.20,pawCueRefresh:.08,diagTurnDegrees:360,analogNeutral:.025,exitLookTime:.35,exitLookMin:8,exitLookMax:30,exitMinDrive:.45,exitAssistRate:2.2,exitResponse:16,slideDrag:.8,slideDragAfter:1.1,slideDragRise:1.8,slideDragMax:4};
-function redcatDriveDefaults(){return {bodyHeading:null,velocityHeading:null,stepHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,turnRate:0,diveCoastTime:0,steerSign:0,steerHeld:0,wallSide:0,neutralTime:0,neutralFromTurn:false,recoveryBodyRate:0,recoveryTravelRate:0,recoveryReason:'待機',exitDrive:1,exitSettling:false,warningAt:0,releaseBlend:0,pawCueStage:0,pawCueLevel:0,pawCueVisualAt:0,pawCueCheckAt:0,pawCueReason:'待機',pawCueActionAfter:null,pawCueTargetGap:null,pawCorner:null,pawCornerCurve:null,pawCueTransition:'',pawCueTransitionAt:0,steerInput:0,steerOutput:0,steerRate:0};}
+const REDCAT={url:'redcat-robot.glb',maxKmh:600,brake:25,tapSteer:.07,gripTapSteer:.8,tapWindow:.05,fullSteerAfter:.38,gripSteerAfter:.50,gripTurn:.22,pawTurnResponse:14,pawReleaseResponse:18,pawHandoffResponse:6,pawHandoffDuration:.35,turnResponse:16,reverseResponse:30,reverseThreshold:.06,releaseResponse:45,pawCoastResponse:110,pawCoastDelay:.18,apexGapMin:.30,apexGapMax:.50,wallSkin:.12,bodyResponse:16,bodySlip:.34,wallRelease:.60,pawCueLead:.4,pawCueReaction:.20,pawCueRefresh:.08,diagTurnDegrees:360,analogNeutral:.025,exitLookTime:.35,exitLookMin:8,exitLookMax:30,exitMinDrive:.45,exitAssistRate:2.2,exitResponse:16,slideDrag:.8,slideDragAfter:1.1,slideDragRise:1.8,slideDragMax:4};
+function redcatDriveDefaults(){return {bodyHeading:null,velocityHeading:null,stepHeading:null,curve:null,sliding:false,slideTime:0,pawTurn:0,turnRate:0,diveCoastTime:0,poseSliding:false,pawExitAge:Infinity,slideDirection:0,steerSign:0,steerHeld:0,wallSide:0,neutralTime:0,neutralFromTurn:false,recoveryBodyRate:0,recoveryTravelRate:0,recoveryReason:'待機',exitDrive:1,exitSettling:false,warningAt:0,releaseBlend:0,pawCueStage:0,pawCueLevel:0,pawCueVisualAt:0,pawCueCheckAt:0,pawCueReason:'待機',pawCueActionAfter:null,pawCueTargetGap:null,pawCorner:null,pawCornerCurve:null,pawCueTransition:'',pawCueTransitionAt:0,steerInput:0,steerOutput:0,steerRate:0};}
 const redcat={rig:null,geometries:[],loading:null,...redcatDriveDefaults()};
 function redcatActive(){return catModel==='redcat';}
 function redcatDrivingActive(){return redcatActive()&&!isPracticeActive();}
@@ -15458,7 +15458,7 @@ function redcatRecoveryProfile(distance,v,pose){
 function redcatExitDrive(dt,pose,v,axis,neutral,sliding,braking,neutralAllowed){
   const angle=Math.abs(pathAngle(axis,pose.velocityHeading)),sideways=Math.sin(angle)*v;
   if(sliding||braking||!neutralAllowed){pose.exitSettling=false;pose.exitDrive=1;return;}
-  if(neutral&&(pose.neutralFromTurn||pose.releaseBlend>.03||angle>.055)&&angle>.025)pose.exitSettling=true;
+  if((neutral&&(pose.neutralFromTurn||pose.releaseBlend>.03||angle>.055)||pose.pawExitAge<REDCAT.pawHandoffDuration)&&angle>.025)pose.exitSettling=true;
   if(angle<.025&&sideways<1)pose.exitSettling=false;
   const aligned=(1-THREE.MathUtils.smoothstep(angle,.025,.16))
     *(1-THREE.MathUtils.smoothstep(sideways,1,6));
@@ -15644,17 +15644,28 @@ function redcatStepPose(dt,pose,distance,offset,v,digital,analog,sliding,braking
   const startHeading=pose.velocityHeading;
   const hasInput=digital!==0||analog!==0;
   pose.diveCoastTime=sliding&&!hasInput?pose.diveCoastTime+dt:0;
-  pose.pawTurn=THREE.MathUtils.damp(pose.pawTurn,sliding?1:0,sliding?REDCAT.pawTurnResponse:REDCAT.pawReleaseResponse,dt);
+  const direction=Math.sign(digital||analog);
+  if(sliding){pose.pawExitAge=Infinity;if(direction)pose.slideDirection=direction;}
+  else if(pose.poseSliding)pose.pawExitAge=0;
+  else if(Number.isFinite(pose.pawExitAge))pose.pawExitAge+=dt;
+  pose.poseSliding=sliding;
+  // Retain some of the player's existing turn while handing the paw back to normal steering.
+  // Opposite input and key release keep their normal cancellation response.
+  const handoff=!sliding&&hasInput&&direction===pose.slideDirection&&pose.pawExitAge<REDCAT.pawHandoffDuration;
+  const inwardAngle=direction*pathAngle(axis,pose.velocityHeading);
+  const handoffGain=handoff?1-THREE.MathUtils.smoothstep(inwardAngle,.015,.09):0;
+  const releaseResponse=THREE.MathUtils.lerp(REDCAT.pawReleaseResponse,REDCAT.pawHandoffResponse,handoffGain);
+  pose.pawTurn=THREE.MathUtils.damp(pose.pawTurn,sliding?1:0,sliding?REDCAT.pawTurnResponse:releaseResponse,dt);
   pose.releaseBlend=sliding?1:pose.releaseBlend*Math.exp(-dt/.16);
   const baseline=THREE.MathUtils.lerp(redcatTurnLimit(v,surface,false,false),redcatTurnLimit(v,surface,true,false),pose.pawTurn);
   const full=THREE.MathUtils.lerp(redcatTurnLimit(v,surface,false,true),redcatTurnLimit(v,surface,true,true),pose.pawTurn);
   const keyTurn=redcatDigitalTurn(dt,digital,baseline,full,pose);
   const stickTurn=analog*THREE.MathUtils.lerp(baseline,full,THREE.MathUtils.smoothstep(Math.abs(analog),.34,1));
   const requested=THREE.MathUtils.clamp(keyTurn+stickTurn,-full,full);
-  const inwardAngle=Math.sign(requested)*pathAngle(axis,pose.velocityHeading);
+  const requestedInwardAngle=Math.sign(requested)*pathAngle(axis,pose.velocityHeading);
   // A held paw turn eases as travel already points across the road. It only reduces requested yaw;
   // it never turns without input, aims at a racing line, or changes the lateral position.
-  const crossRoadGain=1-.65*THREE.MathUtils.smoothstep(inwardAngle,.12,.42)*pose.pawTurn;
+  const crossRoadGain=1-.65*THREE.MathUtils.smoothstep(requestedInwardAngle,.12,.42)*pose.pawTurn;
   const target=requested*crossRoadGain*(braking?.90:1)*Math.min(1,v/3);
   const integrated=v>.01?redcatIntegrateTurn(dt,pose.turnRate,target,full,hasInput,sliding&&!hasInput):{rate:0,delta:0};
   pose.turnRate=integrated.rate;
