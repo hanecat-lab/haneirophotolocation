@@ -12795,6 +12795,9 @@ function App(){
   const [defaultTransition, setDefaultTransition] = useState({type:'fade', duration:0.5});
   // 「👀 動きを見る」: オンの間はトランジションを押すと見本を1回再生する（選択は変えない）。保存しない。
   const [transitionPeekMode, setTransitionPeekMode] = useState(false);
+  // 「ばらばらに付ける」で使う種類（選び直せる）。
+  const [transitionMixOpen, setTransitionMixOpen] = useState(false);
+  const [transitionMixTypes, setTransitionMixTypes] = useState(['fade','white','slide-left','zoom','wipe']);
   const [fileDragActive, setFileDragActive] = useState(false);
   const fileDropRef = useRef({upload:null, blocked:false});
   const [transitionPeek, setTransitionPeek] = useState(null);
@@ -20583,7 +20586,92 @@ const recomputeStarts=(arr)=>{
   },[connectionEditor,connectionMarkPeek,connectionCompareOriginal,clips]);
 
   // 素材の行のつなぎボタン: 選んだ種類を付け、「↶ 戻す」で取り消せるようにする。
-  const applyRowTransition=(clipId,newType)=>{
+  // すべてのつなぎ目にトランジションを付ける。pickTrans(i) が i 番目のつなぎ目の種類と長さを返す。
+  const applyTransitionToAll=(pickTrans)=>{
+    const currentClips = clipsRef.current;
+    if(!currentClips || currentClips.length<2) return;
+    const newClips = currentClips.map((c,i)=>{
+      if(i<currentClips.length-1){
+        return {...c, _transitionToNext: pickTrans(i)};
+      } else {
+        const { _transitionToNext, ...rest } = c;
+        return rest;
+      }
+    });
+    // 重なりを考慮してtimelineStartを再計算（黒画面防止の最重要）
+    let cur=0;
+    const recomputed = newClips.map((c,i)=>{
+      const n={...c,timelineStart:cur};
+      const transDur = (c._transitionToNext && c._transitionToNext.type!=='none') ? (c._transitionToNext.duration||0.5) : 0;
+      if(i < newClips.length-1 && transDur>0){
+        cur+= Math.max(0.1, c.duration - transDur);
+      } else {
+        cur+=c.duration;
+      }
+      return n;
+    });
+    // テキストを素材にひっつけて見た目を保持
+    const newTexts = recomputeTextsForTransition(clipsRef.current, recomputed, textsRef.current);
+    // 再生位置を相対で保持
+    const currentClip = clipsRef.current.find(c=> timeRef.current >= c.timelineStart && timeRef.current < c.timelineStart + c.duration);
+    let newTime = timeRef.current;
+    if(currentClip){
+      const newCurrentClip = recomputed.find(c=> c.id === currentClip.id);
+      if(newCurrentClip){
+        const local = timeRef.current - currentClip.timelineStart;
+        newTime = newCurrentClip.timelineStart + local;
+      }
+    }
+    setClips(recomputed);
+    clipsRef.current = recomputed;
+    setTexts(newTexts);
+    textsRef.current = newTexts;
+    timeRef.current = newTime;
+    setCurrentTime(newTime);
+    const maxEnd = recomputed.length ? Math.max(...recomputed.map(x=>x.timelineStart+x.duration)) : 3;
+    setDuration(maxEnd);
+    durationRef.current=maxEnd;
+    // 黒画面防止: 0秒にリセットして安全に描画
+    timeRef.current = 0;
+    setCurrentTime(0);
+    setTimeout(()=> {
+      try{
+        const canvas = canvasRef.current;
+        if(canvas){
+          const cctx = canvas.getContext('2d');
+          if(cctx){ cctx.filter='none'; cctx.globalAlpha=1; }
+          canvas.style.filter='none';
+        }
+      }catch{}
+      syncCanvasSize(true);
+      drawFrameRef.current(0);
+    },10);
+    setTimeout(()=> {
+      try{
+        const canvas = canvasRef.current;
+        if(canvas){
+          const cctx = canvas.getContext('2d');
+          if(cctx){ cctx.filter='none'; cctx.globalAlpha=1; }
+        }
+      }catch{}
+      drawFrameRef.current(0);
+    },50);
+    setTimeout(()=> drawFrameRef.current(0),150);
+  };
+  // 選んだ種類を、同じ種類が続かないようにばらばらに付ける。
+  const applyMixedTransitions=()=>{
+    const types=transitionMixTypes.filter(Boolean);
+    if(!types.length) return;
+    const duration=Number(defaultTransitionRef.current.duration)||0.5;
+    let last=null;
+    applyTransitionToAll(()=>{
+      const pool=types.length>1 ? types.filter(t=>t!==last) : types;
+      const type=pool[Math.floor(Math.random()*pool.length)];
+      last=type;
+      return {type, duration:type==='page'?0.7:duration};
+    });
+  };
+  const applyRowTransition=(clipId,newType,newDuration)=>{
     const before=editSnapshot();
     const currentClips=clipsRef.current;
     const targetClip=currentClips.find(x=> x.id===clipId);
@@ -20591,15 +20679,15 @@ const recomputeStarts=(arr)=>{
     const currentTrans=targetClip._transitionToNext;
     const newClips = newType==='none'
       ? currentClips.map(x=> x.id===clipId ? (()=>{ const { _transitionToNext, ...rest } = x; return rest; })() : x)
-      : currentClips.map(x=> x.id===clipId ? {...x, _transitionToNext:{type:newType, duration:(currentTrans&&currentTrans.type!=='none'&&currentTrans.duration)||0.5}} : x);
+      : currentClips.map(x=> x.id===clipId ? {...x, _transitionToNext:{type:newType, duration:newDuration||(currentTrans&&currentTrans.type!=='none'&&currentTrans.duration)||0.5}} : x);
     const recomputed=recomputeStarts(newClips);
     setClips(recomputed);
     clipsRef.current=recomputed;
     const maxEnd=recomputed.length ? Math.max(...recomputed.map(x=>x.timelineStart+x.duration)) : 3;
     setDuration(maxEnd);
     durationRef.current=maxEnd;
-    recordEdit(before,{label:'つながりの種類'});
-    setRowTransPickerId(null);
+    recordEdit(before,{label:newDuration?'つながりの長さ':'つながりの種類'});
+    if(!newDuration) setRowTransPickerId(null);
     setTimeout(()=>{
       const clip=recomputed.find(x=> x.id===clipId);
       if(!clip) return;
@@ -25440,78 +25528,7 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
           ),
           React.createElement('div', {className:'flex gap-2'},
             React.createElement('button', {
-              onClick:()=>{
-                const currentClips = clipsRef.current;
-                const currentTrans = {...defaultTransitionRef.current};
-                if(!currentClips || currentClips.length<2) return;
-                const newClips = currentClips.map((c,i)=>{
-                  if(i<currentClips.length-1){
-                    return {...c, _transitionToNext: {...currentTrans}};
-                  } else {
-                    const { _transitionToNext, ...rest } = c;
-                    return rest;
-                  }
-                });
-                // 重なりを考慮してtimelineStartを再計算（黒画面防止の最重要）
-                let cur=0;
-                const recomputed = newClips.map((c,i)=>{
-                  const n={...c,timelineStart:cur};
-                  const transDur = (c._transitionToNext && c._transitionToNext.type!=='none') ? (c._transitionToNext.duration||0.5) : 0;
-                  if(i < newClips.length-1 && transDur>0){
-                    cur+= Math.max(0.1, c.duration - transDur);
-                  } else {
-                    cur+=c.duration;
-                  }
-                  return n;
-                });
-                // テキストを素材にひっつけて見た目を保持
-                const newTexts = recomputeTextsForTransition(clipsRef.current, recomputed, textsRef.current);
-                // 再生位置を相対で保持
-                const currentClip = clipsRef.current.find(c=> timeRef.current >= c.timelineStart && timeRef.current < c.timelineStart + c.duration);
-                let newTime = timeRef.current;
-                if(currentClip){
-                  const newCurrentClip = recomputed.find(c=> c.id === currentClip.id);
-                  if(newCurrentClip){
-                    const local = timeRef.current - currentClip.timelineStart;
-                    newTime = newCurrentClip.timelineStart + local;
-                  }
-                }
-                setClips(recomputed);
-                clipsRef.current = recomputed;
-                setTexts(newTexts);
-                textsRef.current = newTexts;
-                timeRef.current = newTime;
-                setCurrentTime(newTime);
-                const maxEnd = recomputed.length ? Math.max(...recomputed.map(x=>x.timelineStart+x.duration)) : 3;
-                setDuration(maxEnd);
-                durationRef.current=maxEnd;
-                // 黒画面防止: 0秒にリセットして安全に描画
-                timeRef.current = 0;
-                setCurrentTime(0);
-                setTimeout(()=> {
-                  try{
-                    const canvas = canvasRef.current;
-                    if(canvas){
-                      const cctx = canvas.getContext('2d');
-                      if(cctx){ cctx.filter='none'; cctx.globalAlpha=1; }
-                      canvas.style.filter='none';
-                    }
-                  }catch{}
-                  syncCanvasSize(true);
-                  drawFrameRef.current(0);
-                },10);
-                setTimeout(()=> {
-                  try{
-                    const canvas = canvasRef.current;
-                    if(canvas){
-                      const cctx = canvas.getContext('2d');
-                      if(cctx){ cctx.filter='none'; cctx.globalAlpha=1; }
-                    }
-                  }catch{}
-                  drawFrameRef.current(0);
-                },50);
-                setTimeout(()=> drawFrameRef.current(0),150);
-              },
+              onClick:()=>applyTransitionToAll(()=>({...defaultTransitionRef.current})),
               className:'flex-1 h-8 rounded-full bg-violet-600/30 border border-violet-500/50 text-[11px] text-violet-200 active:bg-violet-600/50 hover:bg-violet-600/40'
             }, '全てに適用'),
             React.createElement('button', {
@@ -25546,6 +25563,22 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
               },
               className:'flex-1 h-8 rounded-full bg-white/10 text-[11px] active:bg-white/20 hover:bg-white/15'
             }, '全てカット')
+          ),
+          React.createElement('button', {type:'button', 'aria-expanded':transitionMixOpen, onClick:()=>setTransitionMixOpen(v=>!v),
+            className:'w-full h-8 mt-2 rounded-full bg-white/10 text-[11px] active:bg-white/20 hover:bg-white/15'}, transitionMixOpen?'🎲 ばらばらに付ける（閉じる）':'🎲 ばらばらに付ける…'),
+          transitionMixOpen && React.createElement('div', {className:'mt-2 p-2 rounded-xl border border-white/10'},
+            React.createElement('div', {className:'text-[10px] text-white/60 mb-2'}, '使う種類を選んでください。同じ種類が続かないように、すべてのつなぎ目に付けます（長さは上の「長さ」）。'),
+            React.createElement('div', {className:'grid grid-cols-5 gap-1 mb-2'},
+              [['fade','フェード'],['white','ホワイト'],['slide-left','スライド'],['zoom','ズーム'],['black','ブラック'],
+               ['iris','丸く開く'],['wipe','ワイプ'],['slide-up','上へ'],['page','めくる'],['fold','折る']].map(([id,name])=>{
+                const on=transitionMixTypes.includes(id);
+                return React.createElement('button', {key:id, type:'button', 'aria-pressed':on,
+                  onClick:()=>setTransitionMixTypes(prev=>prev.includes(id)?prev.filter(x=>x!==id):[...prev,id]),
+                  className:`h-8 rounded-lg border text-[9px] font-bold ${on?'bg-violet-600 border-violet-500 text-white':'bg-[#111113] border-white/10 text-white/60'}`}, name);
+              })),
+            React.createElement('button', {type:'button', disabled:!transitionMixTypes.length || clips.length<2, onClick:applyMixedTransitions,
+              className:'w-full h-8 rounded-full bg-violet-600/30 border border-violet-500/50 text-[11px] text-violet-200 disabled:opacity-40'},
+              `選んだ${transitionMixTypes.length}種類をばらばらに付ける`)
           ),
           React.createElement('div', {className:'text-amber-200/90 mt-1'}, (()=>{ const d=Number(defaultTransition.duration)||0.5; return [
             React.createElement('span', {key:'main', 'data-transition-note':'main', style:{display:'block',fontSize:'13px'}}, `※${d.toFixed(1)}秒なら素材は${(d*3).toFixed(1)}秒以上がおすすめ`),
@@ -25773,13 +25806,30 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   }, '🗑')
                 )
               ),
+              rowTransPickerId===c.id && React.createElement('div',{className:'flex items-center justify-between gap-2 px-1 pb-1'},
+                React.createElement('span',{className:'text-[10px] text-violet-300',role:'status'}, transitionPeekMode?'押すと動きを再生します（選択は変わりません）':''),
+                React.createElement('button',{type:'button','aria-pressed':transitionPeekMode,onClick:()=>setTransitionPeekMode(v=>!v),
+                  className:`shrink-0 px-2 py-1 rounded-full border text-[10px] font-bold ${transitionPeekMode?'bg-violet-600 border-violet-500 text-white':'bg-[#111113] border-white/10 text-white/70'}`},
+                  transitionPeekMode?'👀 動きを見る：オン':'👀 動きを見る')),
               rowTransPickerId===c.id && React.createElement('div',{className:'grid grid-cols-4 gap-1 px-1 pb-2','aria-label':`${c.name}から次へのつなぎ`},
                 [['none','カット','✂️'],['fade','フェード','◐'],['white','ホワイト','◑'],['black','ブラック','●'],['slide-left','スライド','→'],['slide-right','左へ','←'],
                  ['zoom','ズーム','◎'],['iris','丸く開く','○'],['wipe','ワイプ','⇥'],['slide-up','上へ','↑'],['page','めくる','📄'],['fold','折る','📖']].map(([id,name,icon])=>
-                  React.createElement('button',{key:id,type:'button',onClick:()=>applyRowTransition(c.id,id),
+                  React.createElement('button',{key:id,type:'button',
+                    onClick:()=>{
+                      if(transitionPeekMode){ setTransitionPeek({type:id,name,duration:id==='page'?0.7:(c._transitionToNext?.duration||0.5)}); return; }
+                      applyRowTransition(c.id,id);
+                    },
                     'aria-pressed':(c._transitionToNext?.type||'none')===id,
                     className:`h-10 rounded-lg border text-[10px] flex flex-col items-center justify-center ${(c._transitionToNext?.type||'none')===id?'bg-violet-600 border-violet-500 text-white':'bg-[#111113] border-white/10'}`},
                     React.createElement('span',null,icon),name))),
+              rowTransPickerId===c.id && c._transitionToNext && c._transitionToNext.type!=='none' && React.createElement('div',{className:'flex items-center gap-1 px-1 pb-2','aria-label':'このつなぎ目の長さ'},
+                React.createElement('span',{className:'text-[10px] text-white/50 shrink-0 w-8'},'長さ'),
+                [0.3,0.5,0.8,1.0,1.5,2.0].map(sec=>{
+                  const on=Math.abs((c._transitionToNext.duration||0.5)-sec)<0.05;
+                  return React.createElement('button',{key:sec,type:'button','aria-pressed':on,
+                    onClick:()=>applyRowTransition(c.id,c._transitionToNext.type,sec),
+                    className:`flex-1 h-8 rounded-lg border text-[10px] ${on?'bg-violet-600 border-violet-500 text-white':'bg-[#111113] border-white/10'}`},`${sec.toFixed(1)}秒`);
+                })),
               isFocused && React.createElement('div',{className:'flex flex-col gap-1.5 px-1 pb-1'},
                 React.createElement('span',{className:'text-[10px] text-emerald-100 break-all'},
                   `${i+1}/${clips.length} · ${c.name} · ${c.timelineStart.toFixed(1)}秒`),
