@@ -16606,9 +16606,37 @@ function App(){
         }).catch(error=>{job.stats.wakeLock=`unavailable:${error?.name||'unknown'}`;});
       }catch(error){job.stats.wakeLock=`unavailable:${error?.name||'unknown'}`;}
     }else job.stats.wakeLock='unavailable';
+    // 1コマずつ書き出す方式は実時間に依存しないので、画面が隠れたら止めずに待ち、戻ったら続きから再開する。
+    // 実時間で録る方式（古い端末向け）は待てないので、今までどおり止める。
+    const exportUsesFrameEngine=EXPORT_FRAME_ENGINE && typeof VideoEncoder==='function' && typeof VideoFrame==='function';
     const onExportVisibility=()=>{
-      if(document.visibilityState!=='hidden' || job.cancelled ||
-         job.phase==='verifying' || exportJobRef.current!==job) return;
+      if(job.cancelled || exportJobRef.current!==job) return;
+      if(exportUsesFrameEngine){
+        if(document.visibilityState==='hidden'){
+          if(job.hiddenAt==null){
+            job.hiddenAt=performance.now();
+            job.stats.hiddenCount=(job.stats.hiddenCount||0)+1;
+            recordExportEvent('page-hidden-paused',null,{phase:job.phase,frames:job.stats.frames});
+          }
+        }else if(job.hiddenAt!=null){
+          const hiddenMs=Math.round(performance.now()-job.hiddenAt);
+          job.hiddenAt=null;
+          job.stats.hiddenMs=(job.stats.hiddenMs||0)+hiddenMs;
+          recordExportEvent('page-visible-resumed',null,{phase:job.phase,hiddenMs,frames:job.stats.frames,
+            encoder:job.videoEncoder?.state||null});
+          // 画面の自動消灯の防止は隠れると外れるので、取り直す。
+          if(navigator.wakeLock?.request && !job.wakeLock){
+            try{ navigator.wakeLock.request('screen').then(lock=>{
+              if(exportJobRef.current!==job || job.cancelled){ lock.release().catch(()=>{}); return; }
+              job.wakeLock=lock; job.stats.wakeLock='active';
+              lock.addEventListener('release',()=>{ if(job.wakeLock===lock) job.wakeLock=null; });
+            }).catch(()=>{}); }catch{}
+          }
+          job.resumeVisible?.();
+        }
+        return;
+      }
+      if(document.visibilityState!=='hidden' || job.phase==='verifying') return;
       job.failure='書き出し中にタブやアプリを切り替えたため、書き出しを止めました。この画面を開いたまま、もう一度書き出してください。';
       job.stats.visibilityInterrupted=true;
       recordExportEvent('page-hidden',null,{phase:job.phase});
@@ -17033,8 +17061,31 @@ function App(){
         });
         job.phase='recording';
         const frameLoopStartedAt=performance.now();
+        job.videoEncoder=videoEncoder;
+        let framePausedMs=0;
         for(let index=0;index<frameCount;index++){
           if(job.cancelled) throw new Error(job.failure||'書き出しを中止しました。');
+          // 画面が隠れている間は進めない（裏ではコマが出た合図が来ず、違うコマを描くおそれがある）。戻ったら続きから。
+          if(document.visibilityState==='hidden'){
+            const pausedAt=performance.now();
+            await new Promise(resolve=>{
+              const poll=setInterval(()=>{ if(job.cancelled || document.visibilityState!=='hidden') done(); },500);
+              const done=()=>{ clearInterval(poll); job.resumeVisible=null; resolve(); };
+              job.resumeVisible=done;
+            });
+            framePausedMs+=performance.now()-pausedAt;
+            if(job.cancelled) throw new Error(job.failure||'書き出しを中止しました。');
+            // 離れている間に端末がエンコーダや動画を回収していたら、続けられない。
+            const lostVideo=[...job.videos.values()].some(entry=>entry?.video?.error);
+            if(videoEncoder.state!=='configured' || lostVideo){
+              job.stats.visibilityInterrupted=true;
+              job.failure='画面を離れている間に端末が書き出しを止めました。この画面を開いたまま、もう一度書き出してください。';
+              recordExportEvent('resume-failed',null,{encoder:videoEncoder.state,lostVideo});
+              job.cancelled=true;
+              throw new Error(job.failure);
+            }
+            setExportMessage('画面を離れている間は一時停止していました。続きから再開しました。');
+          }
           const t=Math.min(total-0.001,index/exportFps);
           timeRef.current=t;
           // 先の素材を準備し、終わった素材は解放する（同時に持つデコーダを絞る）。
@@ -17075,7 +17126,7 @@ function App(){
           if(index%6===0){
             setExportProgress(Math.min(95,Math.round(index/frameCount*(mixed?90:95))));
             // 残り時間: ここまでの1コマあたりの時間 × 残りのコマ数。最初の2秒は計算しない。
-            const elapsedMs=performance.now()-frameLoopStartedAt;
+            const elapsedMs=performance.now()-frameLoopStartedAt-framePausedMs;
             setExportEta(index>0 && elapsedMs>2000 ? vlogRemainingLabel(elapsedMs/index*(frameCount-index)/1000) : '残り時間を計算中');
           }
         }
@@ -23989,7 +24040,9 @@ const recomputeStarts=(arr)=>{
               : '書き出し中はこの画面を開いたままにしてください。画面の自動消灯を防止します（端末が許可した場合）。'),
           React.createElement('div',{role:'note','data-paper-preserve':true,
             style:{fontSize:'13px',fontWeight:700,lineHeight:1.5,padding:'8px 12px',marginBottom:'12px',borderRadius:'12px',background:'#FBEFC9',color:'#6B4A00',border:'1px solid #D9B85C'}},
-            '⚠ 書き出しが終わるまで、タブやアプリを切り替えないでください（切り替えると止まります）'),
+            EXPORT_FRAME_ENGINE && typeof VideoEncoder==='function' && typeof VideoFrame==='function'
+              ? '⚠ タブやアプリを切り替えると一時停止します。この画面に戻ると続きから再開します'
+              : '⚠ 書き出しが終わるまで、タブやアプリを切り替えないでください（切り替えると止まります）'),
           React.createElement('progress', {value:exportProgress, max:100, className:'w-full h-2 mb-5', 'aria-label':'書き出しの進行状況'}),
           exportStatus!=='verifying' && React.createElement('button', {onClick:cancelExport, className:'w-full h-10 rounded-full bg-white/10'}, '中止')
         ),
