@@ -12542,6 +12542,7 @@ function App(){
   const [bgmBeats, setBgmBeats] = useState([]);
   const bgmClipsRef = useRef([]);
   const [showBpmGrid, setShowBpmGrid] = useState(false);
+  const [beatSnapNote, setBeatSnapNote] = useState('');
   const [draggingText, setDraggingText] = useState(null);
   const textBarDragRef = useRef(null);
   const suppressTextBarClickRef = useRef(0);
@@ -18954,6 +18955,52 @@ const recomputeStarts=(arr)=>{
     return n; 
   }); 
 };
+// 拍の並び: 拾った山（0.1秒刻みで粗い）から、BPM の間隔に一番よく乗るずれ（位相）を探す。
+const vlogBeatGrid=(peaks,bpm)=>{
+  const period=60/Number(bpm);
+  if(!Number.isFinite(period) || period<=0 || !peaks?.length) return null;
+  let best=0,bestHits=-1;
+  for(let phase=0;phase<period;phase+=0.01){
+    let hits=0;
+    for(const p of peaks){ const d=((p-phase)%period+period)%period; if(Math.min(d,period-d)<=0.05) hits++; }
+    if(hits>bestHits){ bestHits=hits; best=phase; }
+  }
+  // 当たった山とのずれの平均で、位相を真ん中に合わせ直す（同じ当たり数の幅の端を選ばないため）。
+  let sum=0,count=0;
+  for(const p of peaks){ let d=((p-best)%period+period)%period; if(d>period/2) d-=period; if(Math.abs(d)<=0.05){ sum+=d; count++; } }
+  if(count) best=((best+sum/count)%period+period)%period;
+  return {period,phase:best};
+};
+// 動画の素材を伸ばせる上限（タイムラインの秒）。写真は10秒まで（長さのスライダーと同じ）。
+const vlogClipMaxDuration=clip=>{
+  if(clip.type==='photo') return Math.max(10,clip.duration||0);
+  const rate=vlogClipSourceRate(clip), base=Number(clip.trimStart)||0;
+  let end=Number.isFinite(clip._sourceDuration)&&clip._sourceDuration>0 ? clip._sourceDuration : base+(clip.duration||0)*rate;
+  if(clip._good3SourceRange && Number.isFinite(clip._good3SourceRange.end)) end=Math.min(end,clip._good3SourceRange.end);
+  return Math.max(clip.duration||0,(end-base)/rate);
+};
+// 切れ目（次の素材の始まり）を、先頭から順に一番近い拍へ寄せる。beats はタイムラインの秒（昇順）。
+const vlogSnapCutsToBeats=(clips,beats)=>{
+  let arr=recomputeStarts(clips);
+  let snapped=0,skipped=0;
+  for(let i=0;i<arr.length-1;i++){
+    const clip=arr[i];
+    if(clip._splitScreen){ skipped++; continue; }
+    const cut=arr[i+1].timelineStart;
+    const near=beats.filter(b=>b>clip.timelineStart+0.5).sort((a,b)=>Math.abs(a-cut)-Math.abs(b-cut)).slice(0,4);
+    let done=false;
+    for(const beat of near){
+      if(Math.abs(beat-cut)<0.02){ done=true; break; }
+      const trans=clip._transitionToNext && clip._transitionToNext.type!=='none' ? (clip._transitionToNext.duration||0.5) : 0;
+      const dur=Math.round((beat-clip.timelineStart+trans)*1000)/1000;
+      if(dur<0.5 || dur>vlogClipMaxDuration(clip)+0.001) continue;
+      const trial=recomputeStarts(arr.map((c,k)=>k===i?{...c,duration:dur}:c));
+      if(Math.abs(trial[i+1].timelineStart-beat)<0.02){ arr=trial; done=true; break; }
+    }
+    if(done) snapped++; else skipped++;
+  }
+  return {clips:arr,snapped,skipped};
+};
 
   // 素材の元の動画（逆再生・ブーメランにした素材なら、その元）の URL と範囲。
   const motionInputOf=async(clip)=>{
@@ -23870,6 +23917,34 @@ const recomputeStarts=(arr)=>{
       window.removeEventListener('drop',onDrop);
     };
   },[]);
+  // BGM の拍に、素材の切れ目を寄せる。
+  const snapCutsToBeats=()=>{
+    const grid=vlogBeatGrid(bgmBeats,bgmBpm);
+    if(!grid || clipsRef.current.length<2){ setBeatSnapNote('拍を読み取れませんでした。'); return; }
+    const first=bgmClipsRef.current?.[0];
+    const start=first ? (Number(first.timelineStart)||0) : (bgmTimelineStartRef.current||0);
+    const offset=first ? (Number(first.offset)||0) : (bgmOffsetRef.current||0);
+    const end=first ? start+(Number(first.duration)||0) : start+(bgmTimelineDurationRef.current||0);
+    const beats=[];
+    const firstK=Math.ceil((offset-grid.phase)/grid.period);
+    for(let k=firstK;k<firstK+10000;k++){
+      const t=start+(grid.phase+k*grid.period-offset);
+      if(t>end+0.001) break;
+      if(t>=start-0.001) beats.push(t);
+    }
+    if(!beats.length){ setBeatSnapNote('BGM が鳴っている範囲に拍がありません。'); return; }
+    const before=editSnapshot();
+    const {clips:snappedClips,snapped,skipped}=vlogSnapCutsToBeats(clipsRef.current,beats);
+    const newTexts=recomputeTextsForTransition(clipsRef.current,snappedClips,textsRef.current);
+    clipsRef.current=snappedClips; setClips(snappedClips);
+    textsRef.current=newTexts; setTexts(newTexts);
+    const total=snappedClips.length ? Math.max(...snappedClips.map(c=>c.timelineStart+c.duration)) : 3;
+    durationRef.current=total; setDuration(total);
+    timeRef.current=Math.min(timeRef.current,Math.max(0,total-0.01)); setCurrentTime(timeRef.current);
+    recordEdit(before,{label:'拍にそろえる'});
+    setBeatSnapNote(`${snapped}か所を拍にそろえました${skipped?`（${skipped}か所は動画の長さが足りないなどで、そのまま）`:''}。`);
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
   const openProjectList=()=>{handleStop();setProjectBulkIds(null);refreshProjectList().catch(error=>setProjectError(error?.message||'作業一覧を開けません。'));setProjectGate(true);};
   return React.createElement('div', {className:'soft-editorial-ui camera-shell min-h-[100vh] bg-[#0a0a0b] text-white flex flex-col select-none', style:{fontFamily:'-apple-system,BlinkMacSystemFont,sans-serif'}},
     // 1段目「この作品」: 作品名（押すと作業一覧）と保存の状態（押すと今すぐ保存）、おまかせ・書き出し。
@@ -26674,9 +26749,14 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   bgmBpm && React.createElement('button', {
                     onClick:()=> setShowBpmGrid(v=>!v),
                     className:`text-[8px] px-1.5 py-0.5 rounded ${showBpmGrid ? 'bg-emerald-600 text-white' : 'bg-white/10 text-white/50'}`
-                  }, showBpmGrid ? 'ビートON' : 'ビート')
+                  }, showBpmGrid ? 'ビートON' : 'ビート'),
+                  bgmBpm && React.createElement('button', {type:'button', onClick:snapCutsToBeats, disabled:clips.length<2,
+                    title:'素材の切れ目を、近くの拍へ寄せます（「戻す」で元に戻せます）',
+                    className:'text-[8px] px-1.5 py-0.5 rounded bg-emerald-600/30 border border-emerald-500/50 text-emerald-100 disabled:opacity-40'
+                  }, '🥁 切れ目を拍にそろえる')
                 )
               ),
+              beatSnapNote && React.createElement('div', {className:'text-[10px] text-emerald-200 mb-1', role:'status'}, beatSnapNote),
               React.createElement('div', {
                 id:'bgm-waveform', className:'bgm-waveform relative h-[60px] bg-black/50 rounded-lg overflow-hidden border border-white/10 cursor-pointer',
                 ref:bgmWaveformCanvasRef,
