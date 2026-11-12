@@ -15428,6 +15428,7 @@ function resetRedcatSteerInput(){redcat.skimIntent=null;redcat.steerSign=0;redca
 function resetRedcatDrive(){
   Object.assign(redcatHover,{lastSpeed:null,phase:0,pitch:0,lean:0,surge:0,lightHeading:null});
   if(redcatHover.wake)redcatHover.wake.visible=false;
+  if(redcatHover.brakeTrail){redcatHover.brakeTrail.history=[];redcatHover.brakeTrail.group.visible=false;}
   Object.assign(redcat,redcatDriveDefaults());
   document.getElementById('redcatBrakeCue').hidden=true;
 }
@@ -23384,7 +23385,10 @@ function buildRedcatDriveLights(model=null){
     model.updateWorldMatrix(true,true);const parent=model.parent,matrix=parent?.matrixWorld??new THREE.Matrix4(),inverse=matrix.clone().invert(),meshes=[];
     model.traverse(o=>{if(o.isMesh&&!o.userData.redcatPawOutline)meshes.push(o);});
     const ray=new THREE.Raycaster(new THREE.Vector3(x,y,z).applyMatrix4(matrix),new THREE.Vector3(dx,dy,dz).transformDirection(matrix));
-    const hit=ray.intersectObjects(meshes,false)[0];return hit?hit.point.clone().applyMatrix4(inverse):new THREE.Vector3(x,y,z);
+    const hit=ray.intersectObjects(meshes,false)[0];
+    if(!hit)return new THREE.Vector3(x,y,z);
+    const point=hit.point.clone().applyMatrix4(inverse),normal=hit.face.normal.clone().transformDirection(hit.object.matrixWorld).transformDirection(inverse);
+    if(normal.dot(new THREE.Vector3(-dx,-dy,-dz))<0)normal.negate();point.mountNormal=normal;return point;
   };
   const group=new THREE.Group();group.name='redcatChestAndBrakeLights';
   const fronts=[],status=[];
@@ -23395,10 +23399,20 @@ function buildRedcatDriveLights(model=null){
     const point=surface(side*.22,.60,1.4,0,0,-1);shell.position.copy(point);shell.position.z+=.012;group.add(shell);
     const lamp=new THREE.Mesh(new THREE.CircleGeometry(.055,10),lens);lamp.position.copy(point);lamp.position.z+=.045;group.add(lamp);fronts.push(lamp);
   }
-  const material=new THREE.MeshBasicMaterial({color:0xc62c22,transparent:true,opacity:.4,toneMapped:false,depthWrite:false});material.userData.glow=true;
-  for(const side of [-1,1]){const points=Array.from({length:9},(_,i)=>{const p=surface(side*.15,1.6,-.25+i*.33/8,0,-1,0);p.y+=.014;return p;});const strip=new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points),16,.012,5,false),material);group.add(strip);status.push(strip);}
-  const points=Array.from({length:9},(_,i)=>{const p=surface(-.16+i*.32/8,.62,-1.2,0,0,1);p.z-=.014;return p;});
-  const rear=new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points),16,.018,5,false),material);group.add(rear);status.push(rear);
+  const material=new THREE.MeshBasicMaterial({color:0x561616,toneMapped:false});material.userData.glow=true;
+  const outline=new THREE.Shape();outline.moveTo(-.071,-.027);outline.lineTo(-.054,.032);outline.lineTo(.059,.027);outline.lineTo(.071,-.017);outline.lineTo(.053,-.032);outline.closePath();
+  const inner=new THREE.Shape();inner.moveTo(-.051,-.014);inner.lineTo(-.039,.017);inner.lineTo(.044,.014);inner.lineTo(.051,-.009);inner.lineTo(.038,-.018);inner.closePath();
+  const opening=new THREE.Path(inner.getPoints());outline.holes.push(opening);
+  const bezelGeometry=new THREE.ExtrudeGeometry(outline,{depth:.025,bevelEnabled:true,bevelSize:.004,bevelThickness:.003,bevelSegments:1,steps:1});bezelGeometry.translate(0,0,-.025);
+  const backGeometry=new THREE.ExtrudeGeometry(inner,{depth:.008,bevelEnabled:false});backGeometry.translate(0,0,-.024);
+  for(const side of [-1,1]){
+    const mount=new THREE.Group();mount.name=side<0?'redcatBrakeLampLeft':'redcatBrakeLampRight';
+    const point=surface(side*.18,.62,-1.2,0,0,1),normal=point.mountNormal??new THREE.Vector3(0,0,-1);
+    mount.position.copy(point).addScaledVector(normal,.012);mount.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1),normal);
+    const bezel=new THREE.Mesh(bezelGeometry,housing),back=new THREE.Mesh(backGeometry,housing);
+    const lamp=new THREE.Mesh(new THREE.ShapeGeometry(inner),material);lamp.position.z=-.003;
+    mount.add(back,bezel,lamp);group.add(mount);status.push(lamp);
+  }
   return {group,fronts,lens,status,material};
 }
 function syncRedcatDriveLights(){
@@ -23408,8 +23422,55 @@ function syncRedcatDriveLights(){
   const lit=nightMode&&catLightMode!=='off'&&!(gameState==='goal'&&goalPhoto.ready);
   lamps.lens.color.setHex(lit?0xffedcd:0x51463b);
   const warning=stage>0&&!braking;
-  lamps.material.color.setHex(braking?0xff3020:warning?0xff9c24:0xb72620);
-  lamps.material.opacity=braking?1:stage===2?.95:stage===1?(pawMotionQuery.matches||!appAnimationsEnabled?.72:.65+.20*(.5+.5*Math.sin(simulationElapsed*Math.PI*2*1.25))):nightMode?.55:.32;
+  lamps.material.color.setHex(braking?0xff3020:warning?0xff9c24:nightMode?0x561616:0x401311);
+  lamps.material.opacity=1;
+}
+// Two world-space afterimages follow the actual rear lenses; no particles or extra lights.
+function updateRedcatBrakeTrail(dt){
+  const fx=redcatHover,lamps=fx.driveLights,active=appAnimationsEnabled&&!pawMotionQuery.matches&&redcat.rig?.visible&&gameState==='racing'&&pawTrailGrounded();
+  let trail=fx.brakeTrail;
+  if(!active||!lamps){if(trail){trail.history=[];trail.group.visible=false;}return;}
+  const braking=Boolean(input.brake||input.brakePressed)&&speed>3;
+  if(!trail&&!braking)return;
+  if(!trail){
+    const group=new THREE.Group();group.name='redcatBrakeAfterimages';const meshes=[];
+    for(let i=0;i<2;i++){
+      const geometry=new THREE.BufferGeometry();for(const name of ['position','color'])geometry.setAttribute(name,new THREE.BufferAttribute(new Float32Array(32*6*3),3).setUsage(THREE.DynamicDrawUsage));geometry.setDrawRange(0,0);
+      const mesh=new THREE.Mesh(geometry,new THREE.MeshBasicMaterial({vertexColors:true,transparent:true,opacity:.8,blending:THREE.AdditiveBlending,depthWrite:false,side:THREE.DoubleSide,toneMapped:false}));mesh.frustumCulled=false;group.add(mesh);meshes.push(mesh);
+    }
+    scene.add(group);trail=fx.brakeTrail={group,meshes,history:[],curve};
+  }
+  if(trail.group.parent!==scene)scene.add(trail.group);
+  const now=simulationElapsed;
+  if(trail.curve!==curve||trail.history.some(p=>p.at>now)){trail.history=[];trail.curve=curve;}
+  trail.history=trail.history.filter(p=>now-p.at<=.22);
+  if(braking&&dt>0){
+    redcat.rig.updateWorldMatrix(true,true);const positions=lamps.status.map(lamp=>lamp.getWorldPosition(new THREE.Vector3()));
+    const previous=trail.history.at(-1);
+    if(previous&&previous.positions[0].distanceTo(positions[0])>Math.max(8,speed*dt*3))trail.history=[];
+    trail.history.push({at:now,positions});if(trail.history.length>33)trail.history.shift();
+  }
+  trail.group.visible=trail.history.length>1;
+  const tint=new THREE.Color(0xff3020),cameraPosition=camera.position;
+  for(let lamp=0;lamp<2;lamp++){
+    const mesh=trail.meshes[lamp],positions=mesh.geometry.attributes.position,colors=mesh.geometry.attributes.color;
+    const points=[];let length=0;
+    for(let i=trail.history.length-1;i>=0;i--){
+      const sample=trail.history[i],point=sample.positions[lamp].clone();
+      if(points.length){const previous=points.at(-1).point,d=previous.distanceTo(point);if(d<1e-5)continue;
+        if(length+d>4){point.copy(previous).lerp(sample.positions[lamp],(4-length)/d);length=4;points.push({point,fade:0});break;}length+=d;
+      }
+      points.push({point,fade:Math.max(0,1-(now-sample.at)/.22)*(1-length/4)});
+    }
+    let vertex=0;
+    for(let i=0;i<points.length-1&&i<32;i++){
+      const a=points[i],b=points[i+1],tangent=b.point.clone().sub(a.point),view=cameraPosition.clone().sub(a.point);
+      const right=new THREE.Vector3().crossVectors(tangent,view);if(right.lengthSq()<1e-10)right.set(1,0,0);right.normalize();
+      const wa=.018*(.3+.7*a.fade),wb=.018*(.3+.7*b.fade),al=a.point.clone().addScaledVector(right,wa),ar=a.point.clone().addScaledVector(right,-wa),bl=b.point.clone().addScaledVector(right,wb),br=b.point.clone().addScaledVector(right,-wb);
+      for(const [p,fade] of [[al,a.fade],[bl,b.fade],[ar,a.fade],[ar,a.fade],[bl,b.fade],[br,b.fade]]){positions.setXYZ(vertex,p.x,p.y,p.z);colors.setXYZ(vertex,tint.r*fade,tint.g*fade,tint.b*fade);vertex++;}
+    }
+    positions.needsUpdate=colors.needsUpdate=true;mesh.geometry.setDrawRange(0,vertex);
+  }
 }
 function redcatHeadlightPose(dt,lit){
   const lamps=redcatHover.driveLights;if(!redcat.rig?.visible||!lamps)return null;
@@ -23509,8 +23570,8 @@ function syncRedcatPose(dt){
   redcatSteerDiag?.tick();
   const fx=redcatHover;
   syncRedcatPawCue(false);syncRedcatDriveLights();
-  if(!redcat.rig?.visible){if(fx.wake)fx.wake.visible=false;fx.lastSpeed=null;fx.lightHeading=null;return;}
-  if(dt<=0)return;
+  if(!redcat.rig?.visible){if(fx.wake)fx.wake.visible=false;fx.lastSpeed=null;fx.lightHeading=null;updateRedcatBrakeTrail(dt);return;}
+  if(dt<=0){updateRedcatBrakeTrail(0);return;}
   const racing=gameState==='racing',grounded=catGroundPose.valid&&pawTrailGrounded();
   const animate=appAnimationsEnabled&&!pawMotionQuery.matches;
   const moving=racing&&grounded&&speed>2.5;
@@ -23533,7 +23594,7 @@ function syncRedcatPose(dt){
   const clearanceLift=Math.max(0,pitchDepth+rollDepth+compression-.043);
   const height=grounded?REDCAT_HOVER_Y+(brakePoseBase.hipsY-chai.hips.position.y)+clearanceLift-compression:-.12;
   rig.position.y=THREE.MathUtils.damp(rig.position.y,height,18,dt);
-  updateRedcatWake(dt,moving&&animate,slip);
+  updateRedcatWake(dt,moving&&animate,slip);updateRedcatBrakeTrail(dt);
 }
 function shownCatModel(){return redcatActive()&&redcat.rig?'redcat':catModel==='cardboard'&&cardboardCat.rig?'cardboard':catModel==='robo'&&roboCat.rig?'robo':catModel==='maneki'&&manekiCat.rig?'maneki':catModel==='nekomata'&&nekomataCat.rig?'nekomata':catModel==='yukionna'&&yukionnaCat.rig?'yukionna':catModel==='akaoni'&&akaoniCat.rig?'akaoni':catModel==='takeneko'&&takenekoCat.rig?'takeneko':catModel==='kimono'&&kimonoCat.rig?'kimono':catModel==='suberi'&&suberiCat.rig?'suberi':'chatora';}
 function applyCatModel(){
