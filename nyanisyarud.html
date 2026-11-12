@@ -15976,15 +15976,15 @@ function redcatContactAt(distance,offset,side,world=null){
     for(let i=Math.max(0,index-5);i<=Math.min(n-2,index+5);i++){
       const k=i*3,a=rail.points,bx=a[k+3]-a[k],bz=a[k+5]-a[k+2],len=Math.hypot(bx,bz);if(len<1e-6)continue;
       const raw=((x-a[k])*bx+(z-a[k+2])*bz)/(len*len);
-      // Open rail ends are not invisible infinite walls.
-      if(i===0&&raw<0||i===n-2&&raw>1)continue;
+      // A real rail tip is a finite obstacle: test the torso circle against the endpoint.
+      const endcap=i===0&&raw<0||i===n-2&&raw>1;
       const f=THREE.MathUtils.clamp(raw,0,1),wx=a[k]+bx*f,wz=a[k+2]+bz*f,wy=THREE.MathUtils.lerp(a[k+1],a[k+4],f);
-      const sq=(x-wx)**2+(z-wz)**2;if(sq>=bestSq)continue;
+      const sq=(x-wx)**2+(z-wz)**2;if(sq>bestSq+1e-10||Math.abs(sq-bestSq)<=1e-10&&(!best?.endcap||endcap))continue;
       let nx=side*bz/len,nz=-side*bx/len;
       const plane=(x-wx)*nx+(z-wz)*nz;
-      const signed=raw<0||raw>1?Math.sign(plane||1)*Math.sqrt(sq):plane;
-      if((raw<0||raw>1)&&sq>1e-12){const sign=plane>=0?1:-1;nx=sign*(x-wx)/Math.sqrt(sq);nz=sign*(z-wz)/Math.sqrt(sq);}
-      bestSq=sq;best={gap:signed-REDCAT_CONTACT_BODY.radius,point:{x:wx,y:wy,z:wz},normal:{x:nx,z:nz},tangent:Math.atan2(bz,bx),visual:true,
+      const signed=endcap?Math.sqrt(sq):raw<0||raw>1?Math.sign(plane||1)*Math.sqrt(sq):plane;
+      if((raw<0||raw>1)&&sq>1e-12){const sign=endcap||plane>=0?1:-1;nx=sign*(x-wx)/Math.sqrt(sq);nz=sign*(z-wz)/Math.sqrt(sq);}
+      bestSq=sq;best={gap:signed-REDCAT_CONTACT_BODY.radius,point:{x:wx,y:wy,z:wz},normal:{x:nx,z:nz},tangent:Math.atan2(bz,bx),visual:true,endcap,
         line:[{x:a[k],y:a[k+1],z:a[k+2]},{x:a[k+3],y:a[k+4],z:a[k+5]}],body:{x,y:tr.p.y+ROAD_Y,z},radius:REDCAT_CONTACT_BODY.radius};
     }
   }
@@ -15993,7 +15993,8 @@ function redcatContactAt(distance,offset,side,world=null){
   const walls=roadWallsAt(distance),center=walls[side>0?'right':'left']-side*REDCAT.wallSkin;
   const face=center+side*REDCAT_CONTACT_BODY.radius,nx=-side*tr.n.x,nz=-side*tr.n.z;
   const wx=tr.p.x+tr.n.x*face,wz=tr.p.z+tr.n.z*face;
-  return {gap:(x-wx)*nx+(z-wz)*nz-REDCAT_CONTACT_BODY.radius,point:{x:wx,y:tr.p.y+ROAD_Y,z:wz},normal:{x:nx,z:nz},tangent:Math.atan2(tr.t.z,tr.t.x),visual:false,
+  const opening=redcatRailProfiles().some(rail=>rail.path===curve&&rail.side===side);
+  return {gap:opening?Infinity:(x-wx)*nx+(z-wz)*nz-REDCAT_CONTACT_BODY.radius,point:{x:wx,y:tr.p.y+ROAD_Y,z:wz},normal:{x:nx,z:nz},tangent:Math.atan2(tr.t.z,tr.t.x),visual:false,
     line:[{x:wx-tr.t.x,y:tr.p.y+ROAD_Y,z:wz-tr.t.z},{x:wx+tr.t.x,y:tr.p.y+ROAD_Y,z:wz+tr.t.z}],body:{x,y:tr.p.y+ROAD_Y,z},radius:REDCAT_CONTACT_BODY.radius};
 }
 function redcatContactWalls(distance,offset){
@@ -16110,6 +16111,29 @@ function redcatResolveRailSegment(fromDistance,fromOffset,move,check){
     angle:Math.asin(Math.min(1,into)),entry:removed,last:1,snapshot:first,resolved:true};
   return {distance:Math.max(0,result.distance-fromDistance),lateral:result.lateral,side,sweep:resolved,normal:lastFace.normal,normalSpeed:Math.max(0,speed)*into,clipped,resolvedSkin:REDCAT.wallSkin+.002};
 }
+// Preserve an intentional inner turn across a band around this corner's apex.
+// This is a steering-state allowance, never a new turn command or an extended free-contact timer.
+function redcatApexSkimWeight(distance,v,side){
+  if(Math.sign(redcat.steerInput)!==side||redcat.turnRate*side<=0||redcat.grazeState?.blocked||(redcat.grazeState?.loss??0)>0)return 0;
+  const location=redcatGrazeLocation(distance,v,side),corner=location.corner;
+  if(!location.innerGraze||!corner)return 0;
+  const start=Math.max(corner.start,corner.apex-THREE.MathUtils.clamp(v*.20,6,18));
+  let end=Math.min(corner.end+3,corner.apex+THREE.MathUtils.clamp(v*.25,8,22));
+  for(const next of redcat.contactCorners??[])if(next.start>corner.start+1)end=Math.min(end,next.start);
+  if(distance<=start||distance>=end)return 0;
+  const fade=Math.min(4,(end-start)*.25);
+  return THREE.MathUtils.smoothstep(distance,start,start+fade)*(1-THREE.MathUtils.smoothstep(distance,end-fade,end));
+}
+function redcatSkimResponseNormal(distance,offset,side,normal,weight){
+  if(weight<=0)return normal;
+  const a=redcatContactAt(Math.max(0,distance-.45),offset,side),b=redcatContactAt(Math.min(totalLength,distance+.45),offset,side);
+  if(!a.visual||!b.visual||a.endcap||b.endcap)return normal;
+  const x=b.point.x-a.point.x,z=b.point.z-a.point.z,length=Math.hypot(x,z);if(length<1e-5)return normal;
+  const nx=side*z/length,nz=-side*x/length;
+  if(nx*normal.x+nz*normal.z<.9)return normal;
+  const bx=THREE.MathUtils.lerp(normal.x,nx,weight),bz=THREE.MathUtils.lerp(normal.z,nz,weight),len=Math.hypot(bx,bz);
+  return {x:bx/len,z:bz/len};
+}
 // Reintegrate a contact frame in short time/distance slices, retaining the player's planned yaw.
 // Each slice clips only the into-wall displacement; it never locks onto a wall or a racing line.
 function redcatResolveRailMove(fromDistance,fromOffset,move,check){
@@ -16117,7 +16141,7 @@ function redcatResolveRailMove(fromDistance,fromOffset,move,check){
   if(!initial?.touch?.visual)return null;
   const duration=move.duration??1/60,v=move.travelSpeed??Math.max(0,speed);
   const count=Math.max(1,Math.ceil(duration/Math.min(1/180,.20/Math.max(v,1)))),h=duration/count;
-  const delta=move.turnDelta??0,stepTurn=delta/count;
+  const delta=move.turnDelta??0,stepTurn=delta/count;let apexWeight=0;
   let heading=move.startHeading??move.heading??redcat.stepHeading??redcat.velocityHeading;
   let distance=fromDistance,offset=fromOffset,first=null,last=null,firstAt=0,lastAt=0,contactFraction=0,entry=0,angle=0,depth=0,clipped=false;
   for(let i=0;i<count;i++){
@@ -16127,12 +16151,15 @@ function redcatResolveRailMove(fromDistance,fromOffset,move,check){
     heading+=stepTurn;
     if(contact){
       if(!first){first=contact;firstAt=(i+contact.sweep.first)/count;}
+      const shallow=contact.sweep.angle<=REDCAT_GRAZE.angle&&contact.sweep.depth<=REDCAT_GRAZE.depth&&!contact.sweep.touch.endcap;
+      const weight=shallow?redcatApexSkimWeight(contact.sweep.touch.distance,v,contact.side):0;
+      apexWeight=Math.max(apexWeight,weight);
       last=contact;lastAt=(i+contact.sweep.last)/count;
       contactFraction+=(contact.sweep.last-contact.sweep.first)/count;
       entry+=contact.sweep.entry;angle=Math.max(angle,contact.sweep.angle);depth=Math.max(depth,contact.sweep.depth);
       distance+=contact.distance;offset=contact.lateral;clipped||=contact.clipped;
       if(contact.clipped){
-        const n=contact.normal,x=Math.cos(heading),z=Math.sin(heading),into=Math.min(0,x*n.x+z*n.z);
+        const n=redcatSkimResponseNormal(distance,offset,contact.side,contact.normal,weight),x=Math.cos(heading),z=Math.sin(heading),into=Math.min(0,x*n.x+z*n.z);
         const tx=x-n.x*into,tz=z-n.z*into;
         if(into<0&&Math.hypot(tx,tz)>1e-5)heading=Math.atan2(tz,tx);
       }
@@ -16141,14 +16168,16 @@ function redcatResolveRailMove(fromDistance,fromOffset,move,check){
   // A coarse chord may touch a curved rail while the actual steering arc clears it.
   if(!first)return {distance:distance-fromDistance,lateral:offset,clear:true,heading};
   const sweep={...first.sweep,first:firstAt,last:lastAt,contactFraction,entry,angle,depth};
-  return {...first,distance:Math.max(0,distance-fromDistance),lateral:offset,sweep,normal:last.normal,clipped,heading};
+  return {...first,distance:Math.max(0,distance-fromDistance),lateral:offset,sweep,normal:last.normal,clipped,heading,apexWeight};
 }
 function redcatApplyContactMotion(contact){
   if(!contact||contact.clear||!contact.clipped)return;
   // Keep the held wheel's yaw rate, input ramp, release state and corner mode intact.
   // Only the real travel/steering heading receives the nonpenetration correction.
   redcat.velocityHeading=contact.heading;
-  redcat.steerHeading=contact.heading;redcat.stepHeading=contact.heading;
+  const keep=contact.apexWeight??0;
+  redcat.steerHeading=contact.heading+pathAngle(contact.heading,redcat.steerHeading)*keep;
+  redcat.stepHeading=contact.heading;
 }
 function redcatWallGrazeStep(dt,fromDistance,fromOffset,toDistance,toOffset,side,controls,ordinaryContact=false){
   let state=redcat.grazeState;
@@ -20028,7 +20057,7 @@ function tick(dt,renderDt=dt){
   if(skyPoyoZone()&&Math.abs(lateral)>=skyHalfWidth(s)-.45){hitWall=true;side=lateral>0?1:-1;}
   if(hitWall&&(dragonWall(side)||skyRiverBank(side)||skyPoyoWall(side))){hitWall=false;}
   let redcatWallCheck=null,redcatRailMove=null;
-  if(redcatMoveStep&&!inGap&&!slideWallBouncy()&&!skyPoyoZone()){
+  if(redcatMoveStep&&(!inGap||!(irohaJumpReserved||irohaOnJumpCurve))&&!slideWallBouncy()&&!skyPoyoZone()){
     redcatWallCheck=redcatWallSweep(s,lateralBeforeTick,wallDistance,lateral);
     if(hitWall&&(side>0?redcatWallCheck.right:redcatWallCheck.left).visual)hitWall=false;
     if(redcatWallCheck.side&&(redcatWallCheck.side>0?redcatWallCheck.right:redcatWallCheck.left).visual){hitWall=true;side=redcatWallCheck.side;}
@@ -20044,8 +20073,8 @@ function tick(dt,renderDt=dt){
     }
   }
   updateWallSeparation(dt,wallDistance);
-  if(inGap&&currentKey==='irohaLocal'){wallContactEpisode=null;if(redcatMoveStep)redcat.grazeState=null;}
-  if(redcatMoveStep&&!inGap&&!slideWallBouncy()&&!skyPoyoZone()){
+  if(inGap&&currentKey==='irohaLocal'&&!redcatRailMove){wallContactEpisode=null;if(redcatMoveStep)redcat.grazeState=null;}
+  if(redcatMoveStep&&(!inGap||redcatRailMove)&&!slideWallBouncy()&&!skyPoyoZone()){
     const graze=redcatWallGrazeStep(dt,s,lateralBeforeTick,wallDistance,lateral,hitWall?side:0,
       {digital:keyboardSteer()+steerBtnInput,analog:joyActive?redcatAnalogSteer(joyVec.x):0,paw:input.drift||input.driftPressed,braking:isBraking,sweep:hitWall&&redcatWallCheck?(side>0?redcatWallCheck.right:redcatWallCheck.left):null},Boolean(wallContactEpisode));
     if(graze.allowed){
