@@ -15936,8 +15936,10 @@ function redcatClipWallMotion(wallHeading,side){
   redcat.velocityHeading=wallHeading+(along<0?Math.PI:0);
   return Math.abs(along);
 }
-// A shallow apex skim is a pass through a thin tolerance band, never a wall-follow force.
-const REDCAT_GRAZE={depth:.20,angle:12*Math.PI/180,time:.12,distance:4,softDepth:.32,softAngle:20*Math.PI/180,softTime:.18,softDistance:6,clearance:.55,rearmTime:.18,exitGap:.02};
+// Inner-corner skims are bounded actual contacts, never a wall-follow force.
+const REDCAT_GRAZE={depth:.35,angle:18*Math.PI/180,time:.18,distance:8,softDepth:.45,softAngle:25*Math.PI/180,softTime:.25,softDistance:12,clearance:.55,rearmTime:.18,exitGap:.02};
+// Outer walls and straights keep their existing contact limits.
+const REDCAT_EDGE_CONTACT={depth:.20,angle:12*Math.PI/180,time:.12,distance:4,softDepth:.32,softAngle:20*Math.PI/180,softTime:.18,softDistance:6};
 function redcatGrazeGap(distance,offset,side){
   const walls=roadWallsAt(distance);
   return side>0?walls.right-REDCAT.wallSkin-offset:offset-walls.left-REDCAT.wallSkin;
@@ -15950,9 +15952,12 @@ function redcatGrazeLocation(distance,v,side){
   if(corner.direction!==side)return {corner,zone:'アウト側'};
   const from=corner.apex-Math.min(8,(corner.end-corner.start)*.22);
   const to=Math.min(corner.end,corner.apex+Math.max(5,Math.min(12,v*.15)));
-  if(distance<from)return {corner,zone:'イン入口寄り'};
-  if(distance>to||side*roadBendAt(distance)<.004)return {corner,zone:'イン出口寄り'};
-  return {corner,zone:'イン頂点'};
+  const innerSide=distance>=corner.start&&distance<=corner.end+2;
+  const innerGraze=innerSide&&distance>=Math.max(corner.start,from-5)
+    &&distance<=Math.min(corner.end+2,to+4)&&side*roadBendAt(distance)>.002;
+  if(distance<from)return {corner,zone:'イン入口寄り',innerSide,innerGraze};
+  if(distance>to||side*roadBendAt(distance)<.004)return {corner,zone:'イン出口寄り',innerSide,innerGraze};
+  return {corner,zone:'イン頂点',innerSide,innerGraze};
 }
 function redcatGrazeCorner(distance,v,side){
   const location=redcatGrazeLocation(distance,v,side);
@@ -15981,24 +15986,6 @@ function redcatGrazeSweep(fromDistance,fromOffset,toDistance,toOffset,side){
   }
   return {first:first??1,last,depth,angle,travel};
 }
-function redcatGrazeWillLeave(distance,offset,v,side,timeLeft,distanceLeft,controls,limits=REDCAT_GRAZE){
-  if(redcatGrazeGap(distance,offset,side)>=REDCAT_GRAZE.exitGap)return true;
-  const pose={...redcat};let elapsed=0,travelled=0;
-  while(elapsed<timeLeft-1e-8&&travelled<distanceLeft-1e-8){
-    const dt=Math.min(1/480,.15/Math.max(v,1),timeLeft-elapsed,(distanceLeft-travelled)/Math.max(v,1));
-    const sliding=controls.paw&&!controls.braking&&v>=12&&(controls.digital!==0||Math.abs(controls.analog)>.08||pose.sliding);
-    pose.sliding=sliding;pose.slideTime=sliding?pose.slideTime+dt:0;
-    redcatStepPose(dt,pose,distance,offset,v,controls.digital,controls.analog,sliding,controls.braking,kitsuneGripScale(),!controls.paw);
-    v=redcatSpeed(v,dt,controls.braking,sliding,pose.slideTime,0,kitsuneBrakeScale(),pose.baseDriveScale,pose.exitDrive,pose.wallDriveScale,pose.steerRate);
-    const move=redcatMove(dt,v,pose.stepHeading,distance,offset);
-    distance+=move.distance;offset=move.lateral;elapsed+=dt;travelled+=v*dt;
-    const gap=redcatGrazeGap(distance,offset,side);
-    if(gap < -limits.depth-1e-6)return false;
-    if(gap<=0&&Math.abs(pathAngle(redcatWallTangent(distance,side),pose.stepHeading))>limits.angle+1e-6)return false;
-    if(gap>=REDCAT_GRAZE.exitGap)return true;
-  }
-  return false;
-}
 function redcatWallGrazeStep(dt,fromDistance,fromOffset,toDistance,toOffset,side,controls,ordinaryContact=false){
   let state=redcat.grazeState;
   if(state&&state.curve!==curve){redcat.grazeState=null;state=null;}
@@ -16007,7 +15994,6 @@ function redcatWallGrazeStep(dt,fromDistance,fromOffset,toDistance,toOffset,side
     if(state.clearTime>=REDCAT_GRAZE.rearmTime){redcat.grazeState=null;state=null;}
   }
   const previousTime=state?.time??0,previousTravel=state?.travel??0;
-  if(state){state.time+=dt;state.travel+=Math.max(speed,0)*dt;}
   if(!side)return {allowed:false,started:false};
   let metrics={depth:0,angle:0,time:previousTime,travel:previousTravel};
   const fail=reason=>{
@@ -16018,49 +16004,52 @@ function redcatWallGrazeStep(dt,fromDistance,fromOffset,toDistance,toOffset,side
   if(state?.blocked&&redcat.grazeDiag?.grade==='衝突')return {allowed:false,started:false,reason:redcat.grazeDiag.reason};
   if(ordinaryContact||state?.blocked||state&&state.side!==side)return fail('通常の壁接触');
   const sweep=redcatGrazeSweep(fromDistance,fromOffset,toDistance,toOffset,side);
-  const started=!state,first=started?sweep.first:0;
+  const started=!state,first=sweep.first;
   const contactTime=previousTime+dt*Math.max(0,sweep.last-first);
   const contactTravel=previousTravel+Math.max(speed,0)*dt*Math.max(0,sweep.last-first);
   metrics={depth:Math.max(state?.depth??0,sweep.depth),angle:Math.max(state?.angle??0,sweep.angle),time:contactTime,travel:contactTravel};
   const contactDistance=THREE.MathUtils.lerp(fromDistance,toDistance,sweep.first);
   const location=redcatGrazeLocation(contactDistance,speed,side);metrics.zone=location.zone;
-  const nextTime=previousTime+dt*(1-first),nextTravel=previousTravel+Math.max(speed,0)*dt*(1-first);
-  const reason=sweep.depth>REDCAT_GRAZE.depth?'深さ':sweep.angle>REDCAT_GRAZE.angle?'角度':
-    contactTime>REDCAT_GRAZE.time?'時間':contactTravel>REDCAT_GRAZE.distance?'距離':location.zone!=='イン頂点'?location.zone:'抜けない予測軌道';
-  const shallow=sweep.depth<=REDCAT_GRAZE.depth+1e-6&&sweep.angle<=REDCAT_GRAZE.angle+1e-6&&
-    contactTime<=REDCAT_GRAZE.time+1e-6&&contactTravel<=REDCAT_GRAZE.distance+1e-6;
-  const free=location.zone==='イン頂点'&&shallow&&redcatGrazeWillLeave(toDistance,toOffset,speed,side,REDCAT_GRAZE.time-nextTime,REDCAT_GRAZE.distance-nextTravel,controls);
+  // Keep one episode's limits stable across the apex/exit boundary. Proper separation rearms it.
+  const inner=state?.inner??Boolean(location.innerSide);
+  const freeWindow=state?.freeWindow??Boolean(location.innerGraze);
+  const limits=inner?REDCAT_GRAZE:REDCAT_EDGE_CONTACT;
+  const reason=metrics.depth>limits.depth?'深さ':metrics.angle>limits.angle?'角度':
+    contactTime>limits.time?'時間':contactTravel>limits.distance?'距離':location.zone;
+  const shallow=metrics.depth<=limits.depth+1e-6&&metrics.angle<=limits.angle+1e-6&&
+    contactTime<=limits.time+1e-6&&contactTravel<=limits.distance+1e-6;
+  // Give the player the actual bounded contact window, without predicting an unchanged held input.
+  const free=inner&&freeWindow&&shallow;
   let soft=false,severity=0;
   if(!free){
-    if(sweep.depth>REDCAT_GRAZE.softDepth+1e-6)return fail('深さ');
-    if(sweep.angle>REDCAT_GRAZE.softAngle+1e-6)return fail('角度');
-    if(contactTime>REDCAT_GRAZE.softTime+1e-6)return fail('時間');
-    if(contactTravel>REDCAT_GRAZE.softDistance+1e-6)return fail('距離');
-    // Brief shallow contact gets a paid correction window even if the current held input would not leave.
-    // Actual depth, angle and the shared episode clock still promote wall pressure to a normal impact.
+    if(metrics.depth>limits.softDepth+1e-6)return fail('深さ');
+    if(metrics.angle>limits.softAngle+1e-6)return fail('角度');
+    if(contactTime>limits.softTime+1e-6)return fail('時間');
+    if(contactTravel>limits.softDistance+1e-6)return fail('距離');
     soft=true;
-    severity=Math.max(THREE.MathUtils.smoothstep(sweep.depth,REDCAT_GRAZE.depth,REDCAT_GRAZE.softDepth),
-      THREE.MathUtils.smoothstep(sweep.angle,REDCAT_GRAZE.angle,REDCAT_GRAZE.softAngle),
-      THREE.MathUtils.smoothstep(contactTime,REDCAT_GRAZE.time,REDCAT_GRAZE.softTime),
-      THREE.MathUtils.smoothstep(contactTravel,REDCAT_GRAZE.distance,REDCAT_GRAZE.softDistance));
+    severity=Math.max(THREE.MathUtils.smoothstep(metrics.depth,limits.depth,limits.softDepth),
+      THREE.MathUtils.smoothstep(metrics.angle,limits.angle,limits.softAngle),
+      THREE.MathUtils.smoothstep(contactTime,limits.time,limits.softTime),
+      THREE.MathUtils.smoothstep(contactTravel,limits.distance,limits.softDistance));
   }
   // Charge only the incremental severity of one contact episode, never a percentage every frame.
-  const loss=Math.max(state?.loss??0,soft ? .02+.06*severity : 0),water=Math.max(state?.water??0,soft?2:0);
+  const loss=Math.max(state?.loss??0,soft?(inner ? .01+.04*severity : .02+.06*severity):0),water=Math.max(state?.water??0,soft?(inner?1:2):0);
   const speedScale=(1-loss)/(1-(state?.loss??0)),waterLoss=water-(state?.water??0);
   const grade=loss>0?'軽い接触':'かすめ',detail=loss>0?(soft?reason:state?.reason??reason):'成立';
-  redcat.grazeState={curve,side,time:nextTime,travel:nextTravel,clearTime:0,blocked:false,reason:detail,loss,water,depth:metrics.depth,angle:metrics.angle};
+  redcat.grazeState={curve,side,time:contactTime,travel:contactTravel,clearTime:0,blocked:false,inner,freeWindow,reason:detail,loss,water,depth:metrics.depth,angle:metrics.angle};
   redcat.grazeDiag={...metrics,grade,reason:detail,at:simulationElapsed};
   return {allowed:true,started,side,soft:loss>0,softStarted:loss>0&&!(state?.loss>0),speedScale,waterLoss};
 }
-function redcatGrazeFeedback(distance,offset){
+function redcatGrazeFeedback(distance,offset,side){
   playSfx('redcatGraze');
   if(!appAnimationsEnabled)return;
-  const road=getTrackAtDist(distance),p=road.p.clone().addScaledVector(road.n,offset);
-  for(let i=0;i<3;i++){
-    const m=new THREE.Mesh(new THREE.SphereGeometry(.035,4,3),new THREE.MeshBasicMaterial({color:0xffe9a0,transparent:true,opacity:.8,depthWrite:false}));
+  const road=getTrackAtDist(distance),edge=roadWallsAt(distance)[side>0?'right':'left'];
+  const p=road.p.clone().addScaledVector(road.n,edge);
+  for(let i=0;i<6;i++){
+    const m=new THREE.Mesh(new THREE.SphereGeometry(.045,4,3),new THREE.MeshBasicMaterial({color:0xffe9a0,transparent:true,opacity:.9,depthWrite:false}));
     m.position.copy(p);m.position.y+=.3+i*.04;
     m.userData.vel=new THREE.Vector3((Math.random()-.5)*1.5,.5+Math.random(),(Math.random()-.5)*1.5);
-    m.userData.life=.18;hitGroup.add(m);
+    m.userData.life=.24;hitGroup.add(m);
   }
 }
 function redcatAfterWall(distance,side){
@@ -16955,7 +16944,7 @@ const SFX={
   comboFive:{label:'コンボ5',file:'rocket-good.wav',volume:.3,synth:()=>{sfxBell({base:2200,peak:.1,decay:.4});}},
   comboTen:{label:'コンボ10',file:'combo-ten.wav',volume:.4,synth:()=>{sfxBell({base:2200,peak:.1,decay:.4});sfxBell({base:2900,peak:.1,decay:.45,at:.09});}},
   wallHit:{label:'壁にぶつかった(ゴツン＋チャプン)',file:null,volume:1,synth:()=>{sfxSweep({type:'sine',from:170,to:55,sweep:.09,peak:.38,decay:.2});sfxNoiseHit({type:'lowpass',freq:700,q:.7,peak:.22,decay:.06});sfxNoiseHit({type:'bandpass',freq:1100,q:1.4,peak:.14,decay:.16,at:.05});sfxSweep({type:'sine',from:520,to:900,sweep:.05,peak:.06,decay:.07,at:.07});}},
-  redcatGraze:{label:'REDCAT インかすめ',file:null,volume:1,synth:()=>sfxNoiseHit({type:'highpass',freq:3000,q:.8,peak:.045,decay:.055})},
+  redcatGraze:{label:'REDCAT インかすめ',file:null,volume:1,synth:()=>sfxNoiseHit({type:'highpass',freq:3000,q:.8,peak:.060,decay:.085})},
   wallScrape:{label:'壁をこすった(ザッ)',file:null,volume:1,synth:()=>{sfxNoiseHit({type:'bandpass',freq:2300,q:.8,peak:.16,decay:.13});sfxNoiseHit({type:'bandpass',freq:1200,q:1,peak:.08,decay:.1,at:.03});}},
   hazardHit:{label:'障害物に当たった(ドン)',file:null,volume:1,synth:()=>{sfxSweep({type:'sine',from:130,to:48,sweep:.1,peak:.36,decay:.24});sfxNoiseHit({type:'lowpass',freq:900,q:.7,peak:.2,decay:.05});}},
   hazardWood:{label:'木の物に当たった(バキッ)',file:null,volume:1,synth:()=>{sfxNoiseHit({type:'bandpass',freq:1800,q:2.2,peak:.32,decay:.05});sfxSweep({type:'triangle',from:320,to:150,sweep:.04,peak:.14,decay:.09});sfxNoiseHit({type:'highpass',freq:3200,q:.7,peak:.14,decay:.03,at:.035});}},
@@ -19835,8 +19824,8 @@ function tick(dt,renderDt=dt){
     if(graze.allowed){
       hitWall=false;speed*=graze.speedScale;
       if(graze.waterLoss>0){waterLevel=Math.max(0,waterLevel-graze.waterLoss);updateCup();}
-      if(graze.started)redcatGrazeFeedback(wallDistance,lateral);
-      if(graze.softStarted)showDriveNotice('軽い接触','小さな減速 · 水 −2%');
+      if(graze.started)redcatGrazeFeedback(wallDistance,lateral,graze.side);
+      if(graze.softStarted)showDriveNotice('軽い接触',`小さな減速 · 水 −${graze.waterLoss}%`);
     }
   }
   // A successful skim bypasses both velocity projection and the ordinary collision penalties.
