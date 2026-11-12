@@ -12958,7 +12958,7 @@ const DRIFT_RECORD_ERA=':drift5';
 function trackRecordKey(trackKey,scope,isNight=nightMode){
   const oldCourse=scope==='oldHarunaClassic'||scope==='oldHarunaNyan';
   const record=COURSES[trackKey]?.record,key=trackKey==='haruna'&&!oldCourse?'haruna:map15to1v3':record==='version'?trackKey+':'+TRACKS[trackKey].courseRecordVersion:record?trackKey+':'+record:trackKey;
-  return (scope==='nyanV2'||scope==='oldHarunaNyan'?key+':nyanBalance2':scope==='suberi'?key+':suberi:combo38':scope==='redcat'?key+':redcat:v7':key)+(scope==='classic'||scope==='nyanV2'?DRIFT_RECORD_ERA:'')+(isNight?':night':'');
+  return (scope==='nyanV2'||scope==='oldHarunaNyan'?key+':nyanBalance2':scope==='suberi'?key+':suberi:combo38':scope==='redcat'?key+':redcat:v8':key)+(scope==='classic'||scope==='nyanV2'?DRIFT_RECORD_ERA:'')+(isNight?':night':'');
 }
 function recordScopeLabel(scope,trackKey){return (trackKey==='haruna'?'はるにゃ山15→1 溝走り・':trackKey==='harunaUp'?'はるにゃ山1→15 立ち上がり溝・':trackKey==='irohaLocal'?'新レイアウト・':'')+(scope==='nyanV2'?'にゃんサポ':scope==='suberi'?'すべり猫':scope==='redcat'?'REDCAT（ロボ）':'ガチ峠')+(nightMode?'・夜':'');}
 function syncRankingScopes(trackKey){
@@ -13337,7 +13337,7 @@ let irohaLastScore=0, irohaLastRank='', irohaExitFactor=0.85, irohaEntrySpeed=0,
 let irohaHasPreBrake=false, irohaPreBrakeS=-9999, irohaPreSpeed=0;
 let irohaLineTotal=0, irohaLineMaintained=0, irohaLineLateralAvg=0, irohaLineLateralSamples=0, irohaLineAngleAvg=0;
 let irohaGapBrakeTime=0, irohaGapDriftTime=0, irohaGapLateral=0, irohaReleaseS=0, irohaHasPassedGateWithBrake=false;
-let irohaPrepTime=0, irohaLineRun=0, irohaPrevSample=null, irohaBrakeWasDown=false;
+let irohaPrepTime=0, irohaLineRun=0, irohaPrevSample=null, irohaBrakeWasDown=false, redcatRampPrevS=null;
 let irohaEntryAttempt=null, irohaEntryEngaged=false, irohaEntryClosed=false;
 let irohaFeedbackTimer=null, shortcutTakeoffSmokeShown=false;
 let irohaEntryLastMiss=null;
@@ -13352,7 +13352,7 @@ function resetIrohaHistory(){
   irohaSSLineRun=0;irohaApproachStartedAt=null;irohaApproachTouched=false;
   irohaLineLateralAvg=0; irohaLineLateralSamples=0; irohaLineAngleAvg=0;
   irohaGapBrakeTime=0; irohaGapDriftTime=0; irohaGapLateral=0; irohaReleaseS=0;
-  irohaHasPassedGateWithBrake=false; irohaPrevSample=null; irohaBrakeWasDown=false;
+  irohaHasPassedGateWithBrake=false; irohaPrevSample=null; irohaBrakeWasDown=false; redcatRampPrevS=null;
   irohaEntryAttempt=null; irohaEntryEngaged=false; irohaEntryClosed=false;
   irohaLastScore=0; irohaLastRank=''; irohaExitFactor=.85; irohaEntrySpeed=0;
   shortcutTakeoffSmokeShown=false; irohaEntryLastMiss=null;
@@ -13371,9 +13371,21 @@ const IROHA_GRADES=Object.freeze({
   S:Object.freeze({release:2.5,minSpeed:90,maxSpeed:112,minAngle:12,maxAngle:24,halfWidth:.7,stable:.35}),
   SS:Object.freeze({release:1.2,minSpeed:96,maxSpeed:106,minAngle:14,maxAngle:20,halfWidth:.3,stable:.5})
 });
-// REDCATは肉球なしだと横へ平行に寄る動き(横の速さ最大2.2m/秒)になり、切れ目側への向きは1〜3°しか付かない。向きの条件をREDCATに合わせる(普通の猫は6〜30°)
-const REDCAT_IROHA_ENTRY=Object.freeze({...IROHA_ENTRY,minSpeed:180,maxSpeed:260,goodMinSpeed:200,goodMaxSpeed:240,minAngle:1,maxAngle:12});
-const REDCAT_IROHA_GRADES=Object.freeze({S:Object.freeze({...IROHA_GRADES.S,minSpeed:200,maxSpeed:240,minAngle:1.5,maxAngle:5}),SS:Object.freeze({...IROHA_GRADES.SS,minSpeed:210,maxSpeed:230,minAngle:2,maxAngle:3.5})});
+const REDCAT_IROHA_ENTRY=Object.freeze({...IROHA_ENTRY,minSpeed:180,maxSpeed:260,goodMinSpeed:200,goodMaxSpeed:240});
+const REDCAT_IROHA_GRADES=Object.freeze({S:Object.freeze({...IROHA_GRADES.S,minSpeed:190,maxSpeed:250,halfWidth:.5}),SS:Object.freeze({...IROHA_GRADES.SS,minSpeed:210,maxSpeed:240,halfWidth:.25})});
+// REDCATのショートカットは「ジャンプ台」：分岐(branchS)の手前 length m・右の帯(横 lineMin〜lineMax m)に光る台を置き、分岐を通り過ぎる瞬間に台の上で minKmh〜maxKmh なら自動で跳ぶ(ブレーキを離す操作は要らない)。
+// ランクは台の中央からのずれ(half m)と速さ(min〜max km/h)。SS・S は REDCAT_IROHA_GRADES と同じ値。外れたら本線を素通り
+const REDCAT_IROHA_RAMP=Object.freeze({length:10,lineMin:1.4,lineMax:3.4,minKmh:150,maxKmh:280,SS:{half:.25,min:210,max:240},S:{half:.5,min:190,max:250},A:{half:.8}});
+function evaluateRedcatRamp(sample){
+  const R=REDCAT_IROHA_RAMP,kmh=sample.speed*3.6,mid=(R.lineMin+R.lineMax)/2,err=sample.lateral-mid,onLine=sample.lateral>=R.lineMin&&sample.lateral<=R.lineMax;
+  const speedOk=kmh>=R.minKmh&&kmh<=R.maxKmh,grade=g=>Math.abs(err)<=g.half&&(g.min==null||kmh>=g.min&&kmh<=g.max);
+  const reason=!onLine?'ジャンプ台から外れた。右の帯の中を通ろう':kmh>R.maxKmh?`速すぎた(${Math.round(kmh)}km/h・${R.maxKmh}以下で)`:kmh<R.minKmh?`遅すぎた(${Math.round(kmh)}km/h・${R.minKmh}以上で)`:'';
+  const rank=reason?'':grade(R.SS)?'SS':grade(R.S)?'S':grade(R.A)?'A':'B';
+  const ok=b=>({speed:b,position:b,angle:true,release:true,stability:b});
+  return {rank,reason,issue:!onLine?'line':!speedOk?'speed':'',advice:'',action:'',checks:{speed:speedOk,line:onLine,angle:true,release:true},
+    good:ok(rank==='A'||rank==='S'||rank==='SS'),strong:ok(rank==='S'||rank==='SS'),elite:{...ok(rank==='SS'),contact:true},onLine,kmh,angle:0,line:0,ssLine:0,
+    lateralError:err,offset:sample.s-branchS,factor:{B:.85,A:.92,S:.98,SS:1}[rank]||0,total:{B:50,A:70,S:85,SS:100}[rank]||0};
+}
 function irohaEntryConfig(){return redcatActive()?REDCAT_IROHA_ENTRY:IROHA_ENTRY;}
 function irohaGrades(){return redcatActive()?REDCAT_IROHA_GRADES:IROHA_GRADES;}
 function irohaEntryAngle(sample){
@@ -13525,12 +13537,15 @@ function checkIrohaBranch(s,dt=0,sample=null){
   if(!onLine)irohaLineRun=0;
   if(Math.abs(sample.lateral-(c.lineMin+c.lineMax)/2)>irohaGrades().S.halfWidth+1e-7)irohaSSLineRun=0;
   const released=irohaBrakeWasDown && !sample.braking;
-  if(shortcutPractice.active&&!irohaEntryClosed&&released&&sample.s>=branchS+c.pressStart){
-    shortcutPracticeReleaseRecord=Object.freeze({...evaluateIrohaEntry(sample),guideMode:irohaAssistMode});
+  // REDCATはジャンプ台：分岐を通り過ぎた瞬間に判定する(ブレーキを離す操作は使わない)
+  // 前のコマの位置は irohaPrevSample が同じコマのうちに書き換わることがあるので、台の判定用に別に持つ
+  const redcatRamp=redcatActive(),rampPrev=redcatRampPrevS??sample.s,rampCross=redcatRamp&&rampPrev<branchS&&sample.s>=branchS;redcatRampPrevS=sample.s;
+  if(shortcutPractice.active&&!irohaEntryClosed&&(redcatRamp?rampCross:released&&sample.s>=branchS+c.pressStart)){
+    shortcutPracticeReleaseRecord=Object.freeze({...(redcatRamp?evaluateRedcatRamp(sample):evaluateIrohaEntry(sample)),guideMode:irohaAssistMode});
   }
-  if(!irohaEntryClosed && released && Math.abs(sample.s-branchS)<=c.releaseWindow+1e-7){
+  if(!irohaEntryClosed && (redcatRamp?rampCross:released && Math.abs(sample.s-branchS)<=c.releaseWindow+1e-7)){
     // Early releases are adjustments; only a valid release commits the jump.
-    const attempt=evaluateIrohaEntry(sample);
+    const attempt=redcatRamp?evaluateRedcatRamp(sample):evaluateIrohaEntry(sample);
     if(attempt.rank){
       irohaReleaseS=sample.s; irohaEntryAttempt=attempt; irohaEntryClosed=true;
       irohaLastRank=irohaEntryAttempt.rank; irohaLastScore=irohaEntryAttempt.total;
@@ -13543,15 +13558,16 @@ function checkIrohaBranch(s,dt=0,sample=null){
       window._jumpTargetYaw=Math.atan2(rightDir.x,rightDir.z);
       window._jumpDir=rightDir;window._jumpTargetBank=.45;
       showIrohaEntryFeedback(irohaEntryAttempt);
-    } else irohaEntryLastMiss=attempt;
-  }else if(!irohaEntryClosed && released && sample.s>=branchS+c.pressStart && sample.s<branchS-c.releaseWindow){
+    } else {irohaEntryLastMiss=attempt;
+      if(redcatRamp){irohaEntryClosed=true;irohaEntryAttempt=attempt;showIrohaEntryFeedback(attempt);showDriveNotice('ジャンプ台 不成立',attempt.reason);}}
+  }else if(!redcatRamp && !irohaEntryClosed && released && sample.s>=branchS+c.pressStart && sample.s<branchS-c.releaseWindow){
     irohaEntryLastMiss=evaluateIrohaEntry(sample);
   }
   if(!irohaEntryClosed && sample.s>branchS+c.releaseWindow+1e-7){
     irohaEntryClosed=true;
     // Keep the last real release snapshot, not a later coasting pose.
-    if(released)irohaEntryLastMiss=evaluateIrohaEntry(sample);
-    irohaEntryAttempt=irohaEntryLastMiss?.checks?.release?irohaEntryLastMiss:
+    if(released&&!redcatRamp)irohaEntryLastMiss=evaluateIrohaEntry(sample);
+    irohaEntryAttempt=redcatRamp?{rank:'',issue:'ramp',reason:'ジャンプ台を通らなかった'}:irohaEntryLastMiss?.checks?.release?irohaEntryLastMiss:
       (sample.braking||released)?{rank:'',issue:'late',reason:'離すのが遅かった。次はミントの線で'}:
       (irohaEntryLastMiss||{rank:'',issue:'press',reason:'踏み切りでブレーキを押して離そう'});
     if(irohaEntryEngaged) showIrohaEntryFeedback(irohaEntryAttempt);
@@ -13771,7 +13787,7 @@ applyBrakeFeedbackUI();
 document.getElementById('btnBrakeFeedbackToggle').addEventListener('click',e=>{e.stopPropagation();toggleBrakeFeedback();});
 
 // 初期UI適用はDOMContentLoadedで
-let irohaAssistGroup = null;
+let irohaAssistGroup = null, redcatRampMesh = null;
 let assistBrakeLine = null;
 let assistIdealLine = null;
 let assistLandingCircle = null;
@@ -13932,6 +13948,7 @@ function setupIrohaAssist(){
     }
   }catch(e){}
   assistBrakeLine=assistIdealLine=assistLandingCircle=assistTrajectory=assistSSLine=null;
+  if(redcatRampMesh){scene.remove(redcatRampMesh);redcatRampMesh.geometry.dispose();redcatRampMesh.material.dispose();redcatRampMesh=null;}
   irohaAssistGroup = new THREE.Group();
   irohaAssistGroup.name='irohaAssistGroup';
   scene.add(irohaAssistGroup);
@@ -13952,6 +13969,17 @@ function setupIrohaAssist(){
   }catch(e){console.warn('ideal ribbon failed',e);}
 
   buildFullShortcutGuide();
+  // REDCATのジャンプ台(右の帯の上。補助表示の設定に関係なく、REDCATの時だけ見せる)
+  try{
+    const R=REDCAT_IROHA_RAMP,verts=[],from=branchS-R.length;
+    for(let ds=from;ds<branchS;ds+=1){const a=getTrackAtDist(ds),b=getTrackAtDist(Math.min(ds+1,branchS)),h=k=>.05+.35*(k-from)/R.length;
+      const c4=[a.p.clone().addScaledVector(a.n,R.lineMin),a.p.clone().addScaledVector(a.n,R.lineMax),b.p.clone().addScaledVector(b.n,R.lineMin),b.p.clone().addScaledVector(b.n,R.lineMax)];
+      c4[0].y+=ROAD_Y+h(ds);c4[1].y+=ROAD_Y+h(ds);c4[2].y+=ROAD_Y+h(ds+1);c4[3].y+=ROAD_Y+h(ds+1);
+      for(const i of [0,2,1,1,2,3])verts.push(c4[i].x,c4[i].y,c4[i].z);}
+    const geo=new THREE.BufferGeometry();geo.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));
+    redcatRampMesh=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({color:0xff6a3d,transparent:true,opacity:.7,side:THREE.DoubleSide,depthWrite:false,fog:false}));
+    redcatRampMesh.name='redcatJumpRamp';redcatRampMesh.material.userData.glow=true;redcatRampMesh.visible=redcatActive();scene.add(redcatRampMesh);
+  }catch(e){console.warn('redcat ramp failed',e);}
   irohaAssistGroup.visible = (irohaAssistMode!=='off');
   setAssistMode(irohaAssistMode);
 }
@@ -13974,6 +14002,11 @@ const IROHA_GUIDE_CUES=Object.freeze({
   missed:{stage:3,title:'今回は本線へ',sub:'ブレーキを離し、道路に沿って進もう',brake:'離す'}
 });
 function selectIrohaGuide(dt){
+  // REDCATはジャンプ台：右の帯へ → (速すぎれば)ブレーキで減速 → そのまま台へ。ブレーキを離す・▶を押す案内は出さない
+  if(redcatActive()){const R=REDCAT_IROHA_RAMP,kmh=speed*3.6,braking=Boolean(input.brake||input.brakePressed);
+    if(lateral<R.lineMin||lateral>R.lineMax){const right=lateral<R.lineMin;return {key:'line',stage:1,title:'右の光る帯へ',sub:(right?'▶':'◀')+'で帯の中のジャンプ台へ',right:right?'押す':undefined,left:right?undefined:'押す'};}
+    if(kmh>R.maxKmh)return {key:'high',stage:1,title:'ブレーキで減速',sub:R.maxKmh+'km/h以下でジャンプ台へ',brake:'押す'};
+    return {key:'keep',stage:2,title:'そのままジャンプ台へ',sub:'光る台の中央・'+R.SS.min+'〜'+R.SS.max+'km/hでSS'+(braking?'。ブレーキは離してよい':''),brake:braking?'離す':undefined};}
   const c=irohaEntryConfig(),offset=s-branchS,braking=Boolean(input.brake||input.brakePressed);
   const result=evaluateIrohaEntry({s,speed,lateral,relYaw}),state=irohaGuideState;
   if(result.onLine)state.seenLine=true;
@@ -14110,6 +14143,7 @@ function renderIrohaResult(result){
 }
 function updateIrohaAssist(dt){
   clearShortcutControlCues();
+  if(redcatRampMesh)redcatRampMesh.visible=currentKey==='irohaLocal'&&redcatActive()&&!irohaJumpDone;
   const racing=gameState==='racing'&&currentKey==='irohaLocal';
   const resultActive=racing&&!shortcutPractice.active&&irohaGuideResult?.landed&&performance.now()<irohaGuideResult.until;
   const approach=racing&&irohaAssistMode!=='off'&&!irohaEntryClosed&&!irohaOnJumpCurve&&landingPhase==='none'&&s>branchS-95&&s<=branchS+IROHA_ENTRY.releaseWindow;
@@ -14123,7 +14157,7 @@ function updateIrohaAssist(dt){
   if(flying&&irohaAssistMode==='full')syncFullShortcutTrajectory();
   if(resultActive){renderIrohaResult(irohaGuideResult);return;}
   if(!approach){clearShortcutTiming();document.getElementById('brakeAlertHUD').style.display='none';return;}
-  const result=evaluateIrohaEntry({s,speed,lateral,relYaw});
+  const result=redcatActive()?evaluateRedcatRamp({s,speed,lateral}):evaluateIrohaEntry({s,speed,lateral,relYaw});
   if(assistIdealLine){assistIdealLine.material.color.setHex(result.onLine?0x86f4be:0xffc865);assistIdealLine.material.opacity=result.onLine?.32:.23;}
   if(assistTrajectory)assistTrajectory.material.opacity=.75;
   if(assistLandingCircle)assistLandingCircle.visible=irohaAssistMode==='full';
