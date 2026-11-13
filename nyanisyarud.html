@@ -15139,6 +15139,41 @@ const assistDiag=(()=>{
     }
   };
 })();
+// ?redcatsapo：REDCATのにゃんサポの補助(自動ブレーキ・壁よけ・直線の横移動・Cセーフ)が実機でどれだけ働いているかを読む表示(左上・たためる)。
+// 自動ブレーキは1回ごとに「始めの速さ→終わりの速さ・目安の速さ」と、その後3秒の「一番遅い速さ・肉球・自分のブレーキ・壁(ぶつかり/−1%/かすめ)」を出す。結果は画面を撮って送ってもらう
+const redcatSapoDiag=(()=>{
+  if(!new URLSearchParams(location.search).has('redcatsapo'))return null;
+  const el=document.createElement('div');el.style.cssText='position:fixed;left:6px;top:120px;z-index:9999;padding:6px 8px;border-radius:8px;background:rgba(0,0,0,.72);color:#fff;font:700 11px/1.5 monospace;width:250px';document.body.appendChild(el);
+  const head=document.createElement('button');head.type='button';head.textContent='REDCATサポ診断 ▲';head.style.cssText='width:100%;font:inherit;color:#fff;background:#433;border:0;border-radius:6px;padding:3px';el.appendChild(head);
+  const live=document.createElement('pre'),log=document.createElement('pre');for(const p of [live,log]){p.style.cssText='margin:4px 0 0;white-space:pre-wrap;font:inherit';el.appendChild(p);}
+  head.addEventListener('click',()=>{live.hidden=log.hidden=!live.hidden;head.textContent='REDCATサポ診断 '+(live.hidden?'▼':'▲');});
+  const kmh=v=>Math.round(v*3.6),gap=g=>Number.isFinite(g)?g.toFixed(2):'-';
+  let lastT=0,clock=0,tot,lines,ep,wallLast;
+  const reset=()=>{tot={auto:0,autoTime:0,autoKmh:0,own:0,wall:0,wallMax:0,hard:0,soft:0,free:0};lines=[];ep=null;wallLast=-9;};
+  const render=()=>{log.textContent=`この走行の合計\n自動ブレーキ ${tot.auto}回 ${tot.autoTime.toFixed(1)}秒 −${Math.round(tot.autoKmh)}km/h\n自分のブレーキ ${tot.own.toFixed(1)}秒\n壁よけ ${tot.wall}回 最深${tot.wallMax.toFixed(2)}\n壁 ぶつかり${tot.hard} −1%${tot.soft} かすめ${tot.free}\nCセーフ ${cornerGrades.forgiven}\n自動ブレーキごと(直近4)\n${lines.slice(-4).join('\n')||'まだ'}`;};
+  const flush=()=>{if(!ep||ep.logged)return;ep.logged=true;lines.push(`${kmh(ep.v0)}→${kmh(ep.vEnd)} 目安${kmh(ep.target)}｜後3秒 最低${ep.min<Infinity?kmh(ep.min):'-'} 肉球${ep.paw?'○':'×'} 自分${ep.own.toFixed(1)}秒 壁${ep.hard}/${ep.soft}/${ep.free}`);render();};
+  // 最初は書き出さない(cornerGrades などはこの後で作られるため)
+  reset();log.textContent='まだ走っていない';
+  return {
+    tick(){
+      const t=simulationElapsed,step=t-lastT;if(step<0){reset();render();}lastT=t;
+      if(gameState==='racing'&&redcatDrivingActive()&&step>0&&step<.2){
+        const own=Boolean(input.brake||input.brakePressed);if(own)tot.own+=step;
+        if(redcat.sapoBraking){
+          if(!ep||t-ep.endT>.5){flush();tot.auto++;ep={v0:speed,target:redcat.sapoForecast?.target??0,vEnd:speed,endT:t,min:Infinity,paw:false,own:0,hard:0,soft:0,free:0,logged:false};render();}
+          ep.vEnd=speed;ep.endT=t;tot.autoTime+=step;tot.autoKmh+=Math.max(0,(redcat.sapoDecel||0)*step*3.6);
+        }else if(ep&&!ep.logged){ep.min=Math.min(ep.min,speed);if(redcat.sliding)ep.paw=true;if(own)ep.own+=step;if(t-ep.endT>3)flush();}
+        const depth=redcat.sapoWallDepth||0;if(depth>0){if(t-wallLast>.5){tot.wall++;render();}wallLast=t;tot.wallMax=Math.max(tot.wallMax,depth);}
+      }
+      if((clock-=1)>0)return;clock=8;
+      if(!redcatDrivingActive()){live.textContent='REDCATではない（REDCATを選ぶと出る）';return;}
+      const f=redcat.sapoForecast;
+      live.textContent=`${document.getElementById('raceModeStatus')?.textContent||''} サポ判定:${redcatSapoActive()}\n${kmh(speed)}km/h 先の目安 ${f?kmh(f.target)+'km/h '+Math.round(f.cornerAt-s)+'m先':'なし'}\n自動ブレーキ ${redcat.sapoBraking?'ON '+(redcat.sapoDecel||0).toFixed(1)+'m/s²':'—'}\n壁よけ ${(redcat.sapoWallDepth||0).toFixed(2)} すき間 左${gap(redcatGrazeGap(s,lateral,-1))} 右${gap(redcatGrazeGap(s,lateral,1))}\n肉球${redcat.sliding?'○':'×'} コーナーのハンドル${redcat.cornerSteering?'○':'×'}\n横移動 上限${(redcat.laneMax||0).toFixed(1)}m/s 押して${(redcat.laneHeld||0).toFixed(2)}秒`;
+    },
+    // 壁の3種類(hard：ぶつかり、soft：−1%、free：減速なしのかすめ)。始まった時だけ数える
+    contact(kind,started){if(!started||gameState!=='racing')return;tot[kind]++;if(ep&&!ep.logged)ep[kind]++;render();}
+  };
+})();
 // Read-only exit readiness. No braking, steering or lookahead into the next corner.
 const manualExitCache={key:null,value:0};
 function manualCornerExit(c=findDriveCorner()){
@@ -16065,9 +16100,11 @@ function redcatStepPose(dt,pose,distance,offset,v,digital,analog,sliding,braking
     target=sign*Math.min(Math.abs(target),cap);
   }
   // にゃんサポの壁よけ：肉球中・コーナーのハンドル中だけ。進む向きの側の壁まで wallZone 未満なら、道と平行へ戻す旋回を足す(肉球を押さずに膨らんだ時は助けない)
+  if(pose===redcat)redcat.sapoWallDepth=0;
   if(redcatSapoActive()&&(sliding||pose.cornerSteering||pose.cornerFreeRoll)){
     const toward=pathAngle(axis,pose.velocityHeading),side=Math.sign(toward);
     const depth=side?THREE.MathUtils.clamp(1-redcatGrazeGap(distance,offset,side)/REDCAT_SAPO.wallZone,0,1):0;
+    if(pose===redcat)redcat.sapoWallDepth=depth;
     if(depth>0){const cap=full*REDCAT_ROAD_FOLLOW.capScale;target=THREE.MathUtils.clamp(target-side*Math.min(Math.abs(toward)/Math.max(dt,1e-3),REDCAT_SAPO.wallTurn*depth),-cap,cap);}
   }
   const roadError=pathAngle(axis,pose.velocityHeading);
@@ -16091,7 +16128,8 @@ function redcatStepPose(dt,pose,distance,offset,v,digital,analog,sliding,braking
     pose.laneInput=THREE.MathUtils.damp(pose.laneInput,input,REDCAT.laneInputResponse,dt);
     // 押し続けた時間で横の速さの上限を laneSpeed→held まで上げる(軽く押せば細かく、押し続ければ速く横へ)
     const dir=Math.sign(input);pose.laneHeld=dir&&dir===pose.laneHeldDir?pose.laneHeld+dt:0;pose.laneHeldDir=dir;
-    let sideSpeed=pose.laneInput*Math.min(THREE.MathUtils.lerp(REDCAT.laneSpeed,REDCAT_LANE.held,THREE.MathUtils.smoothstep(pose.laneHeld,0,REDCAT_LANE.rampAfter)),v*.18);
+    const laneMax=Math.min(THREE.MathUtils.lerp(REDCAT.laneSpeed,REDCAT_LANE.held,THREE.MathUtils.smoothstep(pose.laneHeld,0,REDCAT_LANE.rampAfter)),v*.18);if(pose===redcat)redcat.laneMax=laneMax;
+    let sideSpeed=pose.laneInput*laneMax;
     // にゃんサポ：寄っていく側の壁まで wallSlow を切ったら横の速さを弱め、wallStop で止める(方向キーだけでは壁に当たらない)
     if(redcatSapoActive()&&sideSpeed){const gap=redcatGrazeGap(distance,offset,Math.sign(sideSpeed));sideSpeed*=THREE.MathUtils.clamp((gap-REDCAT_LANE.wallStop)/(REDCAT_LANE.wallSlow-REDCAT_LANE.wallStop),0,1);}
     const aim=axis+Math.asin(sideSpeed/Math.max(v,1));
@@ -19325,7 +19363,7 @@ function tick(dt,renderDt=dt){
     let kawaiiEl=document.getElementById('kawaiiScore');
     if(kawaiiEl) kawaiiEl.textContent='🐾'+Math.floor(window._kawaiiScore);
   }catch(e){}
-  simulationElapsed+=dt;if(!isPracticeActive())elapsed+=realDt;hazardLab?.tick();assistDiag?.tick();
+  simulationElapsed+=dt;if(!isPracticeActive())elapsed+=realDt;hazardLab?.tick();assistDiag?.tick();redcatSapoDiag?.tick();
   stepLapRun();
   // ゴール判定を区間に - 0.985以上で確定
   if(!isPracticeActive()&&s/totalLength>=(TRACKS[currentKey].finishRatio??0.985)){
@@ -20218,13 +20256,13 @@ function tick(dt,renderDt=dt){
     speed=redcatSpeed(speed,dt,isBraking,redcat.sliding,redcat.slideTime,slip,kitsuneBrakeScale(),driveScale,redcat.exitDrive,redcat.wallDriveScale,redcat.steerRate);
     // にゃんサポの自動ブレーキ：先のコーナーの目安の速さ(redcatCornerSpeed)に、最大ブレーキの brakeShare で間に合わなくなったら、間に合う強さで減速する。
     // ブレーキの入力は立てない(肉球のドリフトやコーナーのハンドルの状態を変えない)。先読みは forecastEvery 秒ごと
-    redcat.sapoBraking=false;
+    redcat.sapoBraking=false;redcat.sapoDecel=0;
     if(redcatSapoActive()&&!isBraking&&redcatFree&&!shortcutOwnsInput()){
       if(simulationElapsed>=redcat.sapoForecastNext||simulationElapsed<redcat.sapoForecastNext-REDCAT_SAPO.forecastEvery*2){redcat.sapoForecast=redcatBrakeForecast();redcat.sapoForecastNext=simulationElapsed+REDCAT_SAPO.forecastEvery;}
       const f=redcat.sapoForecast;
       if(f&&speed>f.target){
         const brake=REDCAT.brake*Math.max(.1,kitsuneBrakeScale()),room=Math.max(.5,f.cornerAt-s-REDCAT_SAPO.margin),need=(speed*speed-f.target*f.target)/(2*room);
-        if(need>=brake*REDCAT_SAPO.brakeShare){speed=Math.max(f.target,speed-Math.min(brake,need)*dt);redcat.sapoBraking=true;}
+        if(need>=brake*REDCAT_SAPO.brakeShare){redcat.sapoDecel=Math.min(brake,need);speed=Math.max(f.target,speed-redcat.sapoDecel*dt);redcat.sapoBraking=true;}
       }
     }
   }else if(gutterRun.active&&!isBraking){
@@ -20483,7 +20521,7 @@ function tick(dt,renderDt=dt){
       const waterBeforeContact=waterLevel;
       if(graze.waterLoss>0){spillWater(graze.waterLoss);updateCup();}
       redcatContactWaterFeedback(graze,waterBeforeContact-waterLevel);
-      redcatContactFeedback(wallDistance,lateral,graze.side,graze.soft?'soft':'free',{started:graze.started||graze.softStarted,snapshot:redcat.grazeDiag?.snapshot});
+      redcatContactFeedback(wallDistance,lateral,graze.side,graze.soft?'soft':'free',{started:graze.started||graze.softStarted,snapshot:redcat.grazeDiag?.snapshot});redcatSapoDiag?.contact(graze.soft?'soft':'free',graze.started||graze.softStarted);
       if(graze.started&&!graze.soft)showDriveNotice('かすめ成功','減速なし');
       if(graze.softStarted)showDriveNotice('軽い接触',`小さな減速 · 水 −${graze.waterLoss}%`);
     }
@@ -20555,6 +20593,7 @@ function tick(dt,renderDt=dt){
     resetSteeredLine();
     triggerWallFlash();loseBridgeBoost();
     const tr=getTrackAtDist(s),hp=tr.p.clone().add(tr.n.clone().multiplyScalar(lateral));
+    if(redcatMoveStep)redcatSapoDiag?.contact('hard',true);
     if(redcatMoveStep)redcatContactFeedback(wallDistance,lateral,side,'hard',{started:true,snapshot:redcatWallCheck?(side>0?redcatWallCheck.right:redcatWallCheck.left).snapshot:null});
     else{playSfx(scrape?'wallScrape':'wallHit');spawnHit(hp,side<0?0xff4444:0x44ff44);}
     const waterBeforeImpact=waterLevel;
