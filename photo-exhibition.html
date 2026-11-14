@@ -162,6 +162,32 @@ function detachEntrances(store, targets) {
   });
   return out;
 }
+const copyExhibitionData = (value) => JSON.parse(JSON.stringify(value));
+function exhibitionPlanOf(data) { return copyExhibitionData({ placements: data.placements || [], lights: data.lights || [] }); }
+function readExhibitionPlans(raw, roomIds) {
+  if (raw === undefined || raw === null) return {};
+  const bad = () => { throw new Error("A/B比較案のデータが不正です"); };
+  if (typeof raw !== "object" || Array.isArray(raw)) bad();
+  const out = {};
+  for (const [rid, rec] of Object.entries(raw)) {
+    if (!["__proto__", "constructor", "prototype"].includes(rid) && roomIds.includes(rid) && rec && ["A", "B"].includes(rec.active) && rec.slots) {
+      const slots = {};
+      for (const key of ["A", "B"]) {
+        const slot = rec.slots[key];
+        if (!slot || !Array.isArray(slot.placements) || !Array.isArray(slot.lights)) bad();
+        slots[key] = exhibitionPlanOf(slot);
+        slots[key].lights = slots[key].lights.map((light) => {
+          if (!light || typeof light !== "object") bad();
+          const normalized = { ...defaultLight(), ...light };
+          if (!["x", "z", "intensity", "kelvin", "angle", "tilt", "dir"].every((field) => Number.isFinite(normalized[field]))) bad();
+          return normalized;
+        });
+      }
+      out[rid] = { active: rec.active, slots };
+    } else bad();
+  }
+  return out;
+}
 function validateExhibitionFile(j) {
   const fail = () => { throw new Error("部屋や配置のデータが不正です。現在の展示は変更していません"); };
   const idOK = (id) => typeof id === "string" && id.length > 0 && !["__proto__", "constructor", "prototype"].includes(id);
@@ -199,6 +225,13 @@ function validateExhibitionFile(j) {
     }
   } else if (j.version === 1 && Array.isArray(j.placements)) check(j);
   else fail();
+  if (j.version === 2) {
+    const plans = readExhibitionPlans(j.exhibitionPlans, j.rooms.map((r) => r.id));
+    for (const [rid, rec] of Object.entries(plans)) for (const slot of Object.values(rec.slots)) check({ ...j.store[rid], ...slot });
+  } else if (j.comparison !== undefined) {
+    const plans = readExhibitionPlans({ single: j.comparison }, ["single"]);
+    for (const slot of Object.values(plans.single.slots)) check({ ...j, ...slot });
+  }
   const photoIds = new Set();
   if (j.photos !== undefined && !Array.isArray(j.photos)) fail();
   for (const ph of j.photos || []) {
@@ -901,6 +934,23 @@ function artFront(r, p, cols, blocks) {
   return { x: c.x, y: c.y, z: c.z, nx: n.x, nz: n.z, size };
 }
 const PHOTO_FOCUS_C = 0xf59e0b;
+const PLACEMENT_SLOT_KEYS = new Set(["id", "method", "wall", "col", "face", "pos", "center", "x", "z", "rot"]);
+function swappedPlacementPair(first, second, mode) {
+  if (mode === "photo") return [{ ...first, photo: second.photo }, { ...second, photo: first.photo }];
+  const moveArtwork = (slot, artwork) => {
+    const next = Object.fromEntries(Object.entries(slot).filter(([key]) => PLACEMENT_SLOT_KEYS.has(key)));
+    for (const [key, value] of Object.entries(artwork)) if (!PLACEMENT_SLOT_KEYS.has(key)) next[key] = value;
+    return next;
+  };
+  return [moveArtwork(first, second), moveArtwork(second, first)];
+}
+function swapPreviewPlacements(list, session, roomId, force = false) {
+  if (!session || session.room !== roomId || !session.second || session.showOriginal && !force) return list;
+  const first = list.find((p) => p.id === session.first), second = list.find((p) => p.id === session.second);
+  if (!first || !second || JSON.stringify(first) !== JSON.stringify(session.firstBefore) || JSON.stringify(second) !== JSON.stringify(session.secondBefore)) return list;
+  const pair = swappedPlacementPair(first, second, session.mode);
+  return list.map((p) => p.id === first.id ? pair[0] : p.id === second.id ? pair[1] : p);
+}
 function replacementNeedsCommit(rep) { return !!rep?.candidate && rep.candidate.id !== rep.photo; }
 function replacementAffects(rep, roomId, p) {
   return !!rep && (rep.scope === "all" ? p.photo === rep.photo : rep.room === roomId && p.id === rep.placement);
@@ -1186,6 +1236,70 @@ function App() {
   const [env, setEnv] = useState(defaultEnv);
   const [blocks, setBlocks] = useState([]);
   const [rooms, setRoomsRaw] = useState([{ id: "r1", name: "展示室1", floor: "1F" }]);
+  const [exhibitionPlans, setExhibitionPlansRaw] = useState({});
+  const exhibitionPlansRef = useRef({});
+  const comparisonHoldRef = useRef(null);
+  function setExhibitionPlans(value) { exhibitionPlansRef.current = value; setExhibitionPlansRaw(value); }
+  function planStoreWithCurrent() {
+    const valid = new Set(roomsRef.current.map((r) => r.id));
+    const out = Object.fromEntries(Object.entries(exhibitionPlansRef.current).filter(([id]) => valid.has(id)));
+    const rid = curRoomRef.current, rec = out[rid];
+    if (rec) out[rid] = { ...rec, slots: { ...rec.slots, [rec.active]: exhibitionPlanOf(dataRef.current) } };
+    return out;
+  }
+  function persistPlanChange(nextPlans, nextLayout, message) {
+    const rid = curRoomRef.current, d = dataRef.current;
+    const store = { ...projectStore(), [rid]: { ...roomDataOf(d), ...nextLayout } };
+    const before = snapStr();
+    try {
+      localStorage.setItem(APP_KEY, JSON.stringify({ version: 2, rooms: roomsRef.current, currentRoom: rid, env: d.env, store, exhibitionPlans: nextPlans }));
+    } catch { setSaveStatus("error"); setNotice("A/B案を保存できませんでした。現在の展示は変更していません。空き容量を確認してください"); return false; }
+    pushHistoryRaw(before);
+    finishRoomResize(); setResizeReview(null); closeBatchTargets(); stopArtMove(); endPlace(); clearSelection();
+    setExhibitionPlans(nextPlans);
+    if (nextLayout) {
+      dataRef.current = { ...dataRef.current, ...nextLayout };
+      setPlacements(nextLayout.placements); setLights(nextLayout.lights);
+      const wr = walkRef.current;
+      comparisonHoldRef.current = stateRef.current.mode === "view" ? { room: rid, x: wr.pos.x, z: wr.pos.z, floorY: wr.floorY } : null;
+    }
+    roomStore.current = store;
+    setSaveStatus("saved"); setReplacementSuccess(null); setNotice(message);
+    return true;
+  }
+  function startPlanComparison() {
+    if (photoBusyRef.current || !guardPendingAction(startPlanComparison)) return false;
+    const rid = curRoomRef.current;
+    if (exhibitionPlansRef.current[rid]) return true;
+    const slot = exhibitionPlanOf(dataRef.current);
+    const plans = { ...planStoreWithCurrent(), [rid]: { active: "A", slots: { A: slot, B: copyExhibitionData(slot) } } };
+    return persistPlanChange(plans, null, "現在の展示をA案・B案に保存しました。切り替えて編集すると、その案に自動保存します");
+  }
+  function switchExhibitionPlan(key) {
+    if (!["A", "B"].includes(key) || photoBusyRef.current || !guardPendingAction(() => switchExhibitionPlan(key))) return false;
+    const rid = curRoomRef.current, plans = planStoreWithCurrent(), rec = plans[rid];
+    if (!rec || rec.active === key) return false;
+    const slot = rec.slots[key], d = dataRef.current;
+    const invalid = slot.placements.filter((p) => p.col && !mountOf(d.columns, d.blocks, p.col));
+    if (invalid.length) { setNotice(`${key}案の${invalid.length}点は取り付け先の壁がありません。壁を戻すか、現在の案を${key}案にコピーしてください`); return false; }
+    const fitted = fitToRoom(d.room, { ...d, ...slot });
+    const nextLayout = exhibitionPlanOf(fitted);
+    plans[rid] = { active: key, slots: { ...rec.slots, [key]: nextLayout } };
+    const adjusted = JSON.stringify(nextLayout) !== JSON.stringify(slot);
+    return persistPlanChange(plans, nextLayout, `${key}案に切り替えました。同じ視点で比較できます${adjusted ? "（現在の部屋の寸法に合わせて位置を調整しました）" : ""}`);
+  }
+  function copyCurrentPlanTo(key) {
+    if (!["A", "B"].includes(key) || photoBusyRef.current || !guardPendingAction(() => copyCurrentPlanTo(key))) return false;
+    const rid = curRoomRef.current, plans = planStoreWithCurrent(), rec = plans[rid];
+    if (!rec || rec.active === key) return false;
+    if (!confirm(`現在の${rec.active}案の作品配置・額装・照明で${key}案を上書きします。${key}案の内容は置き換わります。コピーしますか？`)) return false;
+    plans[rid] = { ...rec, slots: { ...rec.slots, [key]: exhibitionPlanOf(dataRef.current) } };
+    return persistPlanChange(plans, null, `現在の${rec.active}案を${key}案にコピーしました。${key}案に切り替えて編集できます`);
+  }
+  function planComparisonPanel() {
+    const rec = exhibitionPlans[curRoomId];
+    return React.createElement("section", { "aria-label": "展示案A/B比較", className: "space-y-2 rounded-xl border border-[var(--line)] p-3" }, React.createElement("h3", { className: "font-bold text-sm" }, "展示案 A／B 比較"), React.createElement("p", { className: "small" }, "この部屋の作品配置・額装・照明を比較します。部屋の形・壁・入口・家具は共通です。"), rec ? React.createElement(React.Fragment, null, React.createElement("p", { className: "small" }, `編集中：${rec.active}案。変更はこの案に自動保存します。`), React.createElement("div", { className: "flex gap-2" }, ...["A", "B"].map((key) => React.createElement("button", { type: "button", key, "aria-pressed": rec.active === key, onClick: () => switchExhibitionPlan(key), disabled: !!photoTask, className: "chip text-sm flex-1 " + (rec.active === key ? "tab-active" : "") }, `${key}案（${key === rec.active ? placements.length : rec.slots[key].placements.length}点）`))), React.createElement("button", { type: "button", className: "chip text-xs", disabled: !!photoTask, onClick: () => copyCurrentPlanTo(rec.active === "A" ? "B" : "A") }, `現在の${rec.active}案を${rec.active === "A" ? "B" : "A"}案にコピー`)) : React.createElement("button", { type: "button", className: "chip text-sm font-bold w-full", disabled: !!photoTask, onClick: startPlanComparison }, "現在の展示からA案・B案を作る"));
+  }
   const [curRoomId, setCurRoomId] = useState("r1");
   const roomsRef = useRef([{ id: "r1", name: "展示室1", floor: "1F" }]);
   const curRoomRef = useRef("r1");
@@ -1287,6 +1401,7 @@ function App() {
     if (after) return after();
   }
   function guardPendingAction(after) {
+    if (!cancelArtworkSwap(false, after)) return false;
     if (!cancelArrange(false, after)) return false;
     if (!cancelReplacement(true, false, after)) return false;
     return true;
@@ -1295,6 +1410,81 @@ function App() {
   const [photoStorageProblem, setPhotoStorageProblemRaw] = useState(false);
   const photoStorageProblemRef = useRef(false);
   function setPhotoStorageProblem(value) { photoStorageProblemRef.current = value; setPhotoStorageProblemRaw(value); }
+  const [artworkSwap, setArtworkSwapRaw] = useState(null);
+  const artworkSwapRef = useRef(null);
+  const [artworkSwapExit, setArtworkSwapExit] = useState(false);
+  const artworkSwapExitActionRef = useRef(null);
+  function setArtworkSwap(value) {
+    artworkSwapRef.current = value; setArtworkSwapRaw(value);
+    if (!value) { setArtworkSwapExit(false); artworkSwapExitActionRef.current = null; }
+  }
+  function swapNeedsCommit() {
+    const session = artworkSwapRef.current;
+    if (!session?.second) return false;
+    return JSON.stringify(swapPreviewPlacements(dataRef.current.placements, session, curRoomRef.current, true)) !== JSON.stringify(dataRef.current.placements);
+  }
+  function cancelArtworkSwap(force = false, after = null) {
+    if (!artworkSwapRef.current) return true;
+    if (!force && photoBusyRef.current) { setNotice("写真の処理が終わるまでお待ちください"); return false; }
+    if (!force && swapNeedsCommit()) { artworkSwapExitActionRef.current = after; setArtworkSwapExit(true); return false; }
+    setArtworkSwap(null); return true;
+  }
+  function finishArtworkSwapExit(choice) {
+    if (choice === "stay") { setArtworkSwapExit(false); artworkSwapExitActionRef.current = null; return; }
+    const after = artworkSwapExitActionRef.current;
+    if (choice === "commit") { if (!commitArtworkSwap()) return; }
+    else if (choice === "discard") { cancelArtworkSwap(true); setNotice("入れ替えの仮表示を取り消しました"); }
+    else return;
+    if (after) return after();
+  }
+  function startArtworkSwap(id) {
+    if (stateRef.current.mode !== "edit" || photoBusyRef.current || !guardPendingAction(() => startArtworkSwap(id))) return;
+    const first = dataRef.current.placements.find((p) => p.id === id);
+    if (!first || dataRef.current.placements.length < 2) { setNotice("入れ替えるには、この部屋に作品を2点以上飾ってください"); return; }
+    finishRoomResize(); closeBatchTargets(); stopArtMove(); endPlace(); setReplacementSuccess(null);
+    selectObj("placement", id);
+    setArtworkSwap({ room: curRoomRef.current, first: id, firstBefore: copyExhibitionData(first), second: null, secondBefore: null, mode: "photo", showOriginal: false });
+    setTab("展示"); setPanelOpen(true); if (isPhone) setSheetSnap("half");
+    setNotice("入れ替える相手を、3Dの作品か下の一覧から選んでください");
+  }
+  function selectSwapTarget(id) {
+    const session = artworkSwapRef.current;
+    if (!session || session.room !== curRoomRef.current || photoBusyRef.current) return;
+    if (id === session.first) { setNotice("最初とは別の作品を選んでください"); return; }
+    const second = dataRef.current.placements.find((p) => p.id === id), first = dataRef.current.placements.find((p) => p.id === session.first);
+    if (!first || !second || JSON.stringify(first) !== JSON.stringify(session.firstBefore)) { setNotice("元の展示が変更されています。一度キャンセルして選び直してください"); return; }
+    setArtworkSwap({ ...session, second: id, secondBefore: copyExhibitionData(second), showOriginal: false });
+    setNotice("入れ替えを仮表示しています。赤い「この入れ替えで確定」を押してください");
+  }
+  function setArtworkSwapMode(mode) {
+    if (artworkSwapRef.current && ["photo", "artwork"].includes(mode)) setArtworkSwap({ ...artworkSwapRef.current, mode, showOriginal: false });
+  }
+  function commitArtworkSwap() {
+    const session = artworkSwapRef.current;
+    if (!session || photoBusyRef.current || !swapNeedsCommit()) return false;
+    const next = swapPreviewPlacements(dataRef.current.placements, session, curRoomRef.current, true);
+    const warnings = roomLayoutWarnings(dataRef.current.room, { ...dataRef.current, placements: next });
+    if (warnings.length && !confirm(`入れ替え後の配置：${warnings.join("。")}。このまま確定しますか？`)) return false;
+    pushHistoryRaw(snapStr());
+    updatePlacements(next, false); setArtworkSwap(null);
+    const saved = saveAll();
+    setReplacementSuccess({ saved, text: saved ? "✓ 2作品の入れ替えを確定・保存しました" : "入れ替えは確定しましたが、配置は未保存です" });
+    setNotice(`2作品を${session.mode === "artwork" ? "大きさ・額ごと" : "写真だけ"}入れ替えました。「元に戻す」で戻せます`);
+    return true;
+  }
+  function swapConfirmButton(compact = false, onConfirm = commitArtworkSwap) {
+    const disabled = !swapNeedsCommit() || !!photoTask;
+    return React.createElement("button", { type: "button", "aria-label": "この入れ替えで確定", onClick: onConfirm, disabled, style: { width: compact ? undefined : "100%", minHeight: compact ? 44 : 52, borderRadius: 99, padding: "9px 12px", background: disabled ? "#d1cec5" : "#c63822", color: disabled ? "#716e65" : "#fff", fontSize: compact ? 13 : 16, fontWeight: 900 } }, "✓ この入れ替えで確定");
+  }
+  function artworkSwapPanel() {
+    const session = artworkSwap;
+    if (!session) return null;
+    const first = placements.find((p) => p.id === session.first), second = placements.find((p) => p.id === session.second);
+    const title = (p) => p ? `#${placements.findIndex((x) => x.id === p.id) + 1} ${photoOf(p.photo).title}` : "未選択";
+    const preview = swapPreviewPlacements(placements, session, curRoomId, true);
+    const warnings = session.second ? roomLayoutWarnings(room, { ...dataRef.current, placements: preview }) : [];
+    return React.createElement("div", { className: "space-y-3", "aria-label": "作品の入れ替え" }, React.createElement("div", { style: { position: "sticky", top: 0, zIndex: 2, background: "var(--surface)", paddingBottom: 8 } }, React.createElement("h3", { className: "font-bold text-sm" }, "2作品の入れ替え"), React.createElement("p", { className: "small" }, title(first), " ↔ ", title(second)), React.createElement("p", { style: { background: "#fff2cc", color: "#713509", borderRadius: 9, padding: "8px 10px", fontSize: 12, fontWeight: 800, margin: "7px 0" } }, session.second ? "仮表示中：まだ入れ替えは確定・保存されていません" : "次は、入れ替える相手を選んでください"), swapConfirmButton(), React.createElement("button", { type: "button", className: "chip text-xs mt-2", onClick: () => cancelArtworkSwap() }, "入れ替えをキャンセル")), React.createElement("div", { className: "flex gap-2" }, ...[["photo", "写真だけ"], ["artwork", "作品ごと（大きさ・額も）"]].map(([mode, label]) => React.createElement("button", { key: mode, type: "button", "aria-pressed": session.mode === mode, onClick: () => setArtworkSwapMode(mode), className: "chip text-xs flex-1 " + (session.mode === mode ? "tab-active" : "") }, label))), React.createElement("p", { className: "small" }, session.mode === "photo" ? "各場所の大きさ・額・縦横向きを保ち、写真だけを交換します。" : "写真・大きさ・額・縦横向きをまとめて、相手の展示位置へ移します。壁掛け／イーゼルは各場所の設定を使います。"), session.second && React.createElement("button", { type: "button", className: "chip text-xs", onClick: () => setArtworkSwap({ ...session, showOriginal: !session.showOriginal }) }, session.showOriginal ? "入れ替え後を見る" : "元の配置を見る"), ...warnings.map((w) => React.createElement("p", { key: w, role: "alert", className: "small", style: { color: "#a33e19" } }, "⚠ ", w)), session.second && !swapNeedsCommit() && React.createElement("p", { role: "status", className: "small" }, "同じ内容のため見た目は変わりません。「作品ごと」を選ぶか、別の相手を選んでください。"), React.createElement("p", { className: "small" }, "相手は3D上の作品をタップしても選べます。"), ...placements.filter((p) => p.id !== session.first).map((p) => React.createElement("button", { type: "button", key: p.id, onClick: () => selectSwapTarget(p.id), "aria-pressed": session.second === p.id, className: "chip w-full text-left text-xs " + (session.second === p.id ? "tab-active" : ""), style: { minHeight: 46 } }, title(p), " ・ ", p.size, " ・ ", p.orient, " ・ ", p.frame)));
+  }
   const [photos, setPhotos] = useState([]);
   const [photoImportResult, setPhotoImportResult] = useState(null);
   const [photoVer, setPhotoVer] = useState(0);
@@ -1315,13 +1505,13 @@ function App() {
     return () => clearTimeout(timer);
   }, [replacementSuccess]);
   useEffect(() => {
-    if (!replacementNeedsCommit(replacement) && !arrangeNeedsCommit() && !["error", "dirty"].includes(saveStatus) && !photoStorageProblem) return;
+    if (!replacementNeedsCommit(replacement) && !swapNeedsCommit() && !arrangeNeedsCommit() && !["error", "dirty"].includes(saveStatus) && !photoStorageProblem) return;
     const beforeUnload = (e) => {
-      if (replacementNeedsCommit(replacementRef.current) || arrangeNeedsCommit() || ["error", "dirty"].includes(saveStatus) || photoStorageProblemRef.current) { e.preventDefault(); e.returnValue = ""; }
+      if (replacementNeedsCommit(replacementRef.current) || swapNeedsCommit() || arrangeNeedsCommit() || ["error", "dirty"].includes(saveStatus) || photoStorageProblemRef.current) { e.preventDefault(); e.returnValue = ""; }
     };
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
-  }, [replacement?.candidate?.id, replacement?.photo, arrange, saveStatus, photoStorageProblem]);
+  }, [replacement?.candidate?.id, replacement?.photo, arrange, artworkSwap, saveStatus, photoStorageProblem]);
   function setReplacement(value) {
     replacementRef.current = value;
     setReplacementRaw(value);
@@ -1360,6 +1550,7 @@ function App() {
     if (after) await after();
   }
   function closeObjectPanel() {
+    if (!cancelArtworkSwap(false, closeObjectPanel)) return;
     if (replacementRef.current && !cancelReplacement(true, false, closeObjectPanel)) return;
     setPanelOpen(false);
   }
@@ -1554,6 +1745,7 @@ function App() {
   }, [tab]);
   useEffect(() => {
     if (replacementRef.current) return;
+    if (artworkSwapRef.current) return;
     if (isPhone && selected && mode === "edit") setTab("選択中");
     else if (tab === "選択中") setTab(lastTabRef.current);
   }, [selected?.id, selected?.kind, isPhone, mode]);
@@ -1716,6 +1908,7 @@ function App() {
     if (persist) saveAll();
   }
   function loadProject(v) {
+    cancelArtworkSwap(true);
     finishRoomResize();
     setResizeReview(null);
     closeBatchTargets();
@@ -1726,6 +1919,9 @@ function App() {
     cancelReplacement(true, true);
     cancelArrange(true);
     endPlace();
+    comparisonHoldRef.current = null;
+    try { setExhibitionPlans(readExhibitionPlans(v?.exhibitionPlans, (v?.rooms || []).map((r) => r.id))); }
+    catch { setExhibitionPlans({}); setNotice("A/B比較案を読み込めませんでした。現在の部屋の配置を読み込みました"); }
     if (v && v.version === 2 && Array.isArray(v.rooms) && v.rooms.length && v.store) {
       const list = v.rooms.filter((r) => r && typeof r.id === "string" && !["__proto__", "constructor", "prototype"].includes(r.id)).map((r) => ({ id: r.id, name: String(r.name || "部屋"), floor: String(r.floor || "1F") }));
       if (!list.length) { setNotice("保存データに有効な部屋がありません"); return; }
@@ -1782,7 +1978,9 @@ function App() {
     if (next) dataRef.current = { ...dataRef.current, ...next };
     try {
       const store = { ...roomStore.current, [curRoomRef.current]: roomDataOf(dataRef.current) };
-      localStorage.setItem(APP_KEY, JSON.stringify({ version: 2, rooms: roomsRef.current, currentRoom: curRoomRef.current, env: dataRef.current.env, store }));
+      const plans = planStoreWithCurrent();
+      localStorage.setItem(APP_KEY, JSON.stringify({ version: 2, rooms: roomsRef.current, currentRoom: curRoomRef.current, env: dataRef.current.env, store, exhibitionPlans: plans }));
+      setExhibitionPlans(plans);
       setSaveStatus("saved");
       setNotice(photoStorageProblemRef.current ? "配置は保存しましたが、写真は未保存です。保存ボタンから再試行できます" : "配置と空間を保存しました（この端末のブラウザ内）");
       return true;
@@ -1798,7 +1996,7 @@ function App() {
   const [histLen, setHistLen] = useState(0);
   function snapStr() {
     const d = dataRef.current;
-    return JSON.stringify({ room: d.room, furniture: d.furniture, blocks: d.blocks, columns: d.columns, windows: d.windows, entrances: d.entrances, placements: d.placements, lights: d.lights, roomNorthAngle: Number.isFinite(d.room.northAngle) ? d.room.northAngle : null, roomEntrances: Object.fromEntries(Object.entries(projectStore()).map(([id, r]) => [id, r.entrances])) });
+    return JSON.stringify({ exhibitionPlans: planStoreWithCurrent(), room: d.room, furniture: d.furniture, blocks: d.blocks, columns: d.columns, windows: d.windows, entrances: d.entrances, placements: d.placements, lights: d.lights, roomNorthAngle: Number.isFinite(d.room.northAngle) ? d.room.northAngle : null, roomEntrances: Object.fromEntries(Object.entries(projectStore()).map(([id, r]) => [id, r.entrances])) });
   }
   function pushHistoryRaw(str) {
     histTime.current = 0;
@@ -1824,6 +2022,8 @@ function App() {
     finishRoomResize();
     setResizeReview(null);
     const v = JSON.parse(str);
+    if (v.exhibitionPlans) setExhibitionPlans(v.exhibitionPlans);
+    comparisonHoldRef.current = null;
     if (v.room) { dataRef.current = { ...dataRef.current, room: v.room }; setRoom(v.room); }
     if (v.resizeVisitor) { walkRef.current.pos.set(v.resizeVisitor.x, v.resizeVisitor.y, v.resizeVisitor.z); walkRef.current.floorY = v.resizeVisitor.floorY; }
     if (v.projectPlacements) {
@@ -2004,6 +2204,7 @@ function App() {
     if (save) saveAll();
   }
   function selectObj(kind, id) {
+    if (artworkSwapRef.current && (kind !== "placement" || id !== artworkSwapRef.current.first) && !cancelArtworkSwap(false, () => selectObj(kind, id))) return;
     if (replacementRef.current && (kind !== "placement" || id !== replacementRef.current.placement) && !cancelReplacement(true, false, () => selectObj(kind, id))) return;
     closeBatchTargets();
     if (kind !== "placement" || id !== artMoveRef.current) stopArtMove();
@@ -2030,6 +2231,7 @@ function App() {
     }
   }
   function clearSelection() {
+    if (!cancelArtworkSwap(false, clearSelection)) return;
     if (replacementRef.current && !cancelReplacement(true, false, clearSelection)) return;
     closeBatchTargets();
     stopArtMove();
@@ -2276,7 +2478,7 @@ function App() {
     let lastDiag = 0;
     const sceneSig = () => {
       const s = stateRef.current, wr = walkRef.current;
-      return [s.room, s.columns, s.windows, s.entrances, s.placements, s.selected, s.view, s.eyeHeight, s.mode, s.viewArt, s.personSel, s.alignH, s.alignMode, s.showLine, s.tab, s.rooms, s.lights, s.env, s.lookClean, s.blocks, s.furniture, s.modelVer, s.photoVer, s.replacement, s.batchFocus, s.artMoveId, s.arrange, s.placeMode?.kind, s.placeMode?.arg?.ceil, s.plan, dragInfoRef.current, ...s.view === "orbit" ? [wr.pos.x, wr.pos.z, wr.yaw] : [0, 0, 0]];
+      return [s.room, s.columns, s.windows, s.entrances, s.placements, s.selected, s.view, s.eyeHeight, s.mode, s.viewArt, s.personSel, s.alignH, s.alignMode, s.showLine, s.tab, s.rooms, s.lights, s.env, s.lookClean, s.blocks, s.furniture, s.modelVer, s.photoVer, s.replacement, s.artworkSwap, s.batchFocus, s.artMoveId, s.arrange, s.placeMode?.kind, s.placeMode?.arg?.ceil, s.plan, dragInfoRef.current, ...s.view === "orbit" ? [wr.pos.x, wr.pos.z, wr.yaw] : [0, 0, 0]];
     };
     const disposeGroup = () => {
       group.traverse((o) => {
@@ -2769,10 +2971,10 @@ function App() {
         }
         group.add(g);
       });
-      s.placements.forEach((p) => {
+      swapPreviewPlacements(s.placements, s.artworkSwap, s.roomId).forEach((p) => {
         const photo = photoForDisplay(p, s.replacement, s.roomId);
         const pw = frameW(p), ph = frameH(p);
-        const focus = s.selected?.kind === "placement" && s.selected.id === p.id || replacementAffects(s.replacement, s.roomId, p);
+        const focus = s.selected?.kind === "placement" && s.selected.id === p.id || replacementAffects(s.replacement, s.roomId, p) || s.artworkSwap?.room === s.roomId && [s.artworkSwap.first, s.artworkSwap.second].includes(p.id);
         const photoNumber = s.placements.findIndex((x) => x.id === p.id) + 1;
         const isSel = sel?.kind === "placement" && sel.id === p.id;
         const mat2 = new THREE.MeshStandardMaterial({ map: frameTexture(photo, p.size, p.orient, p.frame, p.mat, p.sq), roughness: 0.7, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0 });
@@ -3306,9 +3508,12 @@ function App() {
           mv.addScaledVector(r, j.x);
         }
         if (mv.length()) {
+          comparisonHoldRef.current = null;
           mv.normalize().multiplyScalar(speed);
           wr.pos.add(mv);
         }
+        if (mv.length()) comparisonHoldRef.current = null;
+        const heldComparison = comparisonHoldRef.current?.room === s.roomId ? comparisonHoldRef.current : null;
         const halfW = s.room.w / 2 - 0.3, halfD = s.room.d / 2 - 0.3;
         wr.pos.x = clamp(wr.pos.x, -halfW, halfW);
         wr.pos.z = clamp(wr.pos.z, -halfD, halfD);
@@ -3397,6 +3602,7 @@ function App() {
         });
         wr.pos.x = clamp(wr.pos.x, -halfW, halfW);
         wr.pos.z = clamp(wr.pos.z, -halfD, halfD);
+        if (heldComparison) { wr.pos.x = heldComparison.x; wr.pos.z = heldComparison.z; wr.floorY = heldComparison.floorY; }
         wr.pos.y = s.eyeHeight;
         camera.position.set(wr.pos.x, s.eyeHeight + (wr.floorY || 0), wr.pos.z);
         camera.rotation.order = "YXZ";
@@ -3865,6 +4071,11 @@ function App() {
       dragRef.current = { x: e.clientX, y: e.clientY, mode: view === "orbit" ? "orbit" : "look", startX: e.clientX, startY: e.clientY, moved: false, tapHit: h && h.obj && h.kind !== "person" ? { kind: h.kind, id: h.id } : null };
       return;
     }
+    if (artworkSwapRef.current) {
+      const h = pick(e);
+      dragRef.current = { x: e.clientX, y: e.clientY, mode: view === "orbit" ? "orbit" : "look", startX: e.clientX, startY: e.clientY, moved: false, tapSwap: h?.kind === "placement" ? h.id : null, t0: performance.now() };
+      return;
+    }
     if (replacementRef.current) {
       const h = pick(e);
       dragRef.current = { x: e.clientX, y: e.clientY, mode: view === "orbit" ? "orbit" : "look", startX: e.clientX, startY: e.clientY, moved: false, tapReplacement: h?.kind === "placement" ? h.id : null, t0: performance.now() };
@@ -4075,6 +4286,7 @@ function App() {
       return;
     }
     const d = dragRef.current;
+    if (d && !d.moved && d.tapSwap && e.type === "pointerup") selectSwapTarget(d.tapSwap);
     if (d && !d.moved && d.tapReplacement && e.type === "pointerup" && d.tapReplacement !== replacementRef.current?.placement) {
       const p = dataRef.current.placements.find((p) => p.id === d.tapReplacement);
       if (p) choosePhotoReplacement(p.photo, p.id);
@@ -4132,6 +4344,7 @@ function App() {
         return;
       }
       if (e.key === "Escape") {
+        if (artworkSwapRef.current) { cancelArtworkSwap(); return; }
         if (batchFocusRef.current) { closeBatchTargets(); return; }
         if (replacementRef.current) { cancelReplacement(); return; }
         if (placeRef.current) {
@@ -4261,9 +4474,13 @@ function App() {
       const store = projectStore();
       const used = Object.entries(store).map(([rid, d]) => ({ rid, count: d.placements.filter((p) => p.photo === id).length })).filter((r) => r.count);
       const count = used.reduce((n, r) => n + r.count, 0);
-      if (!confirm(count ? `写真「${ph.title}」をライブラリから削除し、${used.length}部屋の展示（合計${count}点）も削除します。「元に戻す」では復元できません。削除しますか？` : `写真「${ph.title}」をライブラリから削除します。「元に戻す」では復元できません。削除しますか？`)) return;
+      const savedPlans = planStoreWithCurrent();
+      const usedInPlans = Object.values(savedPlans).some((rec) => Object.values(rec.slots).some((slot) => slot.placements.some((p) => p.photo === id)));
+      if (!confirm((usedInPlans ? "保存したA/B案からもこの写真の展示を外します。" : "") + (count ? `写真「${ph.title}」をライブラリから削除し、${used.length}部屋の展示（合計${count}点）も削除します。「元に戻す」では復元できません。削除しますか？` : `写真「${ph.title}」をライブラリから削除します。「元に戻す」では復元できません。削除しますか？`))) return;
       // Commit the durable deletion first; a storage failure must not masquerade as success.
       await idbDel(id);
+      for (const rec of Object.values(savedPlans)) for (const slot of Object.values(rec.slots)) slot.placements = slot.placements.filter((p) => p.photo !== id);
+      setExhibitionPlans(savedPlans);
       const latest = projectStore();
       Object.values(latest).forEach((d) => { d.placements = d.placements.filter((p) => p.photo !== id); });
       roomStore.current = latest;
@@ -5107,7 +5324,7 @@ function App() {
   function exportLayout() {
     if (!guardPendingAction(exportLayout)) return;
     const d = dataRef.current;
-    const out = { app: "photo-exhibition", version: 1, exportedAt: (/* @__PURE__ */ new Date()).toISOString(), room: d.room, columns: d.columns, windows: d.windows, entrances: d.entrances, lights: d.lights, blocks: d.blocks, furniture: d.furniture, env: d.env, placements: d.placements, photos: photosRef.current.map((p) => ({ id: p.id, title: p.title, ratio: p.ratio })) };
+    const out = { app: "photo-exhibition", version: 1, exportedAt: (/* @__PURE__ */ new Date()).toISOString(), room: d.room, columns: d.columns, windows: d.windows, entrances: d.entrances, lights: d.lights, blocks: d.blocks, furniture: d.furniture, env: d.env, placements: d.placements, comparison: planStoreWithCurrent()[curRoomRef.current], photos: photosRef.current.map((p) => ({ id: p.id, title: p.title, ratio: p.ratio })) };
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([JSON.stringify(out, null, 1)], { type: "application/json" }));
     a.download = "photo-exhibition_" + (/* @__PURE__ */ new Date()).toISOString().slice(0, 10) + ".json";
@@ -5143,7 +5360,8 @@ function App() {
           staged.push(ph);
         }
         const available = new Set([...PHOTOS.map((p) => p.id), ...staged.map((p) => p.id)]);
-        for (const r of j.rooms) for (const p of j.store[r.id].placements || []) if (!available.has(p.photo)) throw new Error("展示作品に対応する写真情報が不足しています");
+        const planLayouts = Object.values(j.exhibitionPlans || {}).flatMap((rec) => Object.values(rec.slots));
+        for (const d of [...j.rooms.map((r) => j.store[r.id]), ...planLayouts]) for (const p of d.placements || []) if (!available.has(p.photo)) throw new Error("展示作品やA/B案に対応する写真情報が不足しています");
       } else {
         const have = new Set(photosRef.current.map((p) => p.id));
         for (const p of j.photos || []) if (!have.has(p.id) && !photoReg.has(p.id)) {
@@ -5158,7 +5376,7 @@ function App() {
         // Validate/decode everything before either saved data or visible state changes.
         const store = {};
         j.rooms.forEach((r) => { store[r.id] = roomDataOf(j.store[r.id]); });
-        const normalized = { version: 2, rooms: j.rooms, currentRoom: j.rooms.some((r) => r.id === j.currentRoom) ? j.currentRoom : j.rooms[0].id, env: j.env || defaultEnv(), store: cleanEntranceLinks(store) };
+        const normalized = { version: 2, rooms: j.rooms, currentRoom: j.rooms.some((r) => r.id === j.currentRoom) ? j.currentRoom : j.rooms[0].id, env: j.env || defaultEnv(), store: cleanEntranceLinks(store), exhibitionPlans: readExhibitionPlans(j.exhibitionPlans, j.rooms.map((r) => r.id)) };
         const previousPhotos = await idbAll();
         const previous = localStorage.getItem(APP_KEY);
         const serialized = JSON.stringify(normalized);
@@ -5187,7 +5405,10 @@ function App() {
         // One transaction prevents a partly imported photo list on quota failure.
         if (staged.length) await idbWritePhotos(staged.map(({ id, title, ratio, blob, t }) => ({ id, title, ratio, blob, t })));
         if (staged.length) commitPhotos([...photosRef.current, ...staged]);
-        if (isProj) loadProject(j); else addRoom(j, "読み込んだ部屋");
+        if (isProj) loadProject(j); else {
+          addRoom(j, "読み込んだ部屋");
+          if (j.comparison) setExhibitionPlans({ ...exhibitionPlansRef.current, [curRoomRef.current]: readExhibitionPlans({ single: j.comparison }, ["single"]).single });
+        }
         saveAll();
       }
       clearSelection();
@@ -5210,12 +5431,13 @@ function App() {
     if (!guardPendingAction(exportBackup)) return;
     if (!beginPhotoTask("写真込みバックアップを作っています…")) return;
     try {
-      const out = JSON.parse(JSON.stringify({ app: "photo-exhibition", version: 2, backup: "photos-v1", exportedAt: new Date().toISOString(), rooms: roomsRef.current, currentRoom: curRoomRef.current, env: dataRef.current.env, store: projectStore() }));
+      const out = JSON.parse(JSON.stringify({ app: "photo-exhibition", version: 2, backup: "photos-v1", exportedAt: new Date().toISOString(), rooms: roomsRef.current, currentRoom: curRoomRef.current, env: dataRef.current.env, store: projectStore(), exhibitionPlans: planStoreWithCurrent() }));
       const photos = [...photosRef.current];
       // Older layouts can contain orphaned references from a previous photo deletion.
       // Keep those as explicit missing records so our own backup always restores.
       const known = new Set([...PHOTOS.map((p) => p.id), ...photos.map((p) => p.id)]);
-      Object.values(out.store).forEach((d) => (d.placements || []).forEach((placed) => {
+      const planLayouts = Object.values(out.exhibitionPlans || {}).flatMap((rec) => Object.values(rec.slots));
+      [...Object.values(out.store), ...planLayouts].forEach((d) => (d.placements || []).forEach((placed) => {
         if (!known.has(placed.photo)) {
           const missing = photoOf(placed.photo);
           photos.push({ id: placed.photo, title: missing.title, ratio: missing.ratio, blob: null, missing: true, t: Date.now() });
@@ -5282,6 +5504,7 @@ function App() {
     setNotice(o.length ? `照明${lights.findIndex((x) => x.id === l.id) + 1}を一括に戻し、ほかの対象の灯と同じ値に揃えました` : `照明${lights.findIndex((x) => x.id === l.id) + 1}を一括の対象に戻しました`);
   }
   function goToArt(id) {
+    comparisonHoldRef.current = null;
     const s = stateRef.current;
     const p = s.placements.find((x) => x.id === id);
     if (!p) return;
@@ -5566,6 +5789,7 @@ function App() {
   }
   function switchRoom(id, spawn, quiet) {
     if (id === curRoomRef.current) return;
+    comparisonHoldRef.current = null;
     if (!guardPendingAction(() => switchRoom(id, spawn, quiet))) return;
     finishRoomResize();
     setResizeReview(null);
@@ -5791,7 +6015,7 @@ function App() {
   function exportProject() {
     if (!guardPendingAction(exportProject)) return;
     const store = { ...roomStore.current, [curRoomRef.current]: roomDataOf(dataRef.current) };
-    const out = { app: "photo-exhibition", version: 2, exportedAt: (/* @__PURE__ */ new Date()).toISOString(), rooms: roomsRef.current, currentRoom: curRoomRef.current, env: dataRef.current.env, store, photos: photosRef.current.map((p) => ({ id: p.id, title: p.title, ratio: p.ratio })) };
+    const out = { app: "photo-exhibition", version: 2, exportedAt: (/* @__PURE__ */ new Date()).toISOString(), rooms: roomsRef.current, currentRoom: curRoomRef.current, env: dataRef.current.env, store, exhibitionPlans: planStoreWithCurrent(), photos: photosRef.current.map((p) => ({ id: p.id, title: p.title, ratio: p.ratio })) };
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([JSON.stringify(out, null, 1)], { type: "application/json" }));
     a.download = "photo-exhibition-all_" + (/* @__PURE__ */ new Date()).toISOString().slice(0, 10) + ".json";
@@ -5845,6 +6069,7 @@ function App() {
   stateRef.current.camStyle = camStyle;
   stateRef.current.lookClean = lookClean || mode === "view";
   stateRef.current.replacement = replacement;
+  stateRef.current.artworkSwap = artworkSwap;
   stateRef.current.roomId = curRoomId;
   const showHints = false;
   const addTile = (key, label, svg, go) => /* @__PURE__ */ React.createElement("button", { key, type: "button", onClick: go, "aria-label": `${label}を追加`, className: "soft h-[62px] rounded-[14px] flex flex-col items-center justify-center gap-[3px] text-[11px] font-extrabold" }, /* @__PURE__ */ React.createElement("svg", { width: "26", height: "26", viewBox: "0 0 26 26", "aria-hidden": "true" }, svg), label);
@@ -5892,7 +6117,7 @@ function App() {
       freshUnexhibitedIds.length ? React.createElement(React.Fragment, null, React.createElement("p", null, `${freshUnexhibitedIds.length}枚は、まだどの部屋にも展示していません。`), React.createElement("button", { type: "button", disabled: !!photoTask, onClick: selectImportedPhotos, className: "chip text-xs font-bold mt-1" }, `今回の未展示${freshUnexhibitedIds.length}枚を選ぶ`)) : photoImportResult.addedIds.length > 0 ? React.createElement("p", null, `今回追加した写真：展示済み${importedExistingIds.filter((id) => photoUsage.get(id)?.total).length}枚${photoImportResult.addedIds.length > importedExistingIds.length ? `・削除済み${photoImportResult.addedIds.length - importedExistingIds.length}枚` : ""}。`) : null,
       photoImportResult.restoredIds.length > 0 && React.createElement("p", null, "復元した写真は、配置済みの展示にも反映しています。")),
     React.createElement("p", { className: "small" }, "次はライブラリで写真を選び、「選んだ写真を飾る」を押します。"));
-  const tabContent = replacement ? replacementPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, tab === "部屋" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: "space-y-1" }, addHead("押すと新しい部屋（フロア）を作って移ります"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-4 gap-1.5" }, addTile("room", "部屋", /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("path", { d: "M3 21V9l10-5 10 5v12z", fill: "none", stroke: "currentColor", strokeWidth: "1.8", strokeLinejoin: "round" }), /* @__PURE__ */ React.createElement("path", { d: "M3 21h20", stroke: "currentColor", strokeWidth: "1.8" }), /* @__PURE__ */ React.createElement("rect", { x: "10", y: "14", width: "6", height: "7", fill: "#d8d4ca", stroke: "currentColor", strokeWidth: "1.4" })), () => addRoom()), addTile("stair", "階段", /* @__PURE__ */ React.createElement("path", { d: "M3 22h5v-5h5v-5h5V7h5", fill: "none", stroke: "currentColor", strokeWidth: "1.8", strokeLinejoin: "round" }), () => addRoom(emptyStairData("straight"), "階段")))), /* @__PURE__ */ React.createElement("section", { className: "space-y-2 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold text-sm" }, "部屋（フロア）")), [...new Set(rooms.map((r) => r.floor))].sort().map((fl) => /* @__PURE__ */ React.createElement("div", { key: fl, className: "space-y-1" }, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold text-[var(--muted)]" }, fl), rooms.filter((r) => r.floor === fl).map((r) => {
+  const tabContent = artworkSwap ? artworkSwapPanel() : replacement ? replacementPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, tab === "部屋" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: "space-y-1" }, addHead("押すと新しい部屋（フロア）を作って移ります"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-4 gap-1.5" }, addTile("room", "部屋", /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("path", { d: "M3 21V9l10-5 10 5v12z", fill: "none", stroke: "currentColor", strokeWidth: "1.8", strokeLinejoin: "round" }), /* @__PURE__ */ React.createElement("path", { d: "M3 21h20", stroke: "currentColor", strokeWidth: "1.8" }), /* @__PURE__ */ React.createElement("rect", { x: "10", y: "14", width: "6", height: "7", fill: "#d8d4ca", stroke: "currentColor", strokeWidth: "1.4" })), () => addRoom()), addTile("stair", "階段", /* @__PURE__ */ React.createElement("path", { d: "M3 22h5v-5h5v-5h5V7h5", fill: "none", stroke: "currentColor", strokeWidth: "1.8", strokeLinejoin: "round" }), () => addRoom(emptyStairData("straight"), "階段")))), /* @__PURE__ */ React.createElement("section", { className: "space-y-2 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold text-sm" }, "部屋（フロア）")), [...new Set(rooms.map((r) => r.floor))].sort().map((fl) => /* @__PURE__ */ React.createElement("div", { key: fl, className: "space-y-1" }, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold text-[var(--muted)]" }, fl), rooms.filter((r) => r.floor === fl).map((r) => {
     const cur = r.id === curRoomId;
     const links = entrancesOf(r.id).filter((e) => e.link).map((e) => `入口（${wallName(e.wall)}壁）→ ${roomLabel(e.link.room)}`);
     return /* @__PURE__ */ React.createElement("div", { key: r.id, className: `border rounded-xl p-2 space-y-1 ${cur ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "text-left text-sm font-bold w-full", onClick: () => switchRoom(r.id) }, r.name, cur ? "（表示中）" : ""), links.length > 0 && /* @__PURE__ */ React.createElement("p", { className: "small" }, links.join(" ／ ")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "underline", onClick: () => renameRoom(r.id) }, "名前"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "underline", onClick: () => setRoomFloor(r.id) }, "階"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "underline", onClick: () => duplicateRoom(r.id) }, "複製"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "text-red-600 underline", onClick: () => deleteRoom(r.id) }, "部屋を削除")));
@@ -5989,7 +6214,7 @@ function App() {
     return /* @__PURE__ */ React.createElement("div", { key: p.id, className: `rounded-xl overflow-hidden border-2 bg-[var(--surface)] ${on ? "border-[var(--accent)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { type: "button", "aria-pressed": on, disabled: !!photoTask || p.missing, onClick: () => togglePhoto(p.id), title: "飾る写真として選びます。この操作だけでは展示しません", className: "relative block w-full text-left" }, p.thumb ? /* @__PURE__ */ React.createElement("img", { src: p.thumb, alt: p.title, className: "w-full object-cover", style: { aspectRatio: "4/3" } }) : /* @__PURE__ */ React.createElement("div", { style: { aspectRatio: "4/3", background: p.missing ? "#8a8a84" : `linear-gradient(135deg,hsl(${p.hue} 42% 72%),hsl(${(p.hue + 70) % 360} 35% 28%))` }, className: "flex items-end p-2 text-white text-xs font-bold" }, p.missing ? "未読込" : p.title), on && /* @__PURE__ */ React.createElement("span", { className: "absolute top-1.5 left-1.5 w-6 h-6 rounded-full bg-[var(--accent)] text-white text-xs font-black flex items-center justify-center" }, order + 1), React.createElement("span", { className: "absolute bottom-1.5 left-1.5 text-[10px] font-bold px-2 py-0.5 rounded-full", style: { background: usage.total ? "rgba(0,0,0,.75)" : "#fff2cc", color: usage.total ? "#fff" : "#713509" } }, p.missing ? "画像未読込" : usage.here ? `この部屋で展示 ×${usage.here}` : usage.total ? `ほかの部屋で展示 ×${usage.total}` : "未展示（ライブラリのみ）")), /* @__PURE__ */ React.createElement("div", { className: "p-2 text-xs" }, /* @__PURE__ */ React.createElement("div", { className: "font-bold truncate" }, p.title), /* @__PURE__ */ React.createElement("div", { className: "text-[var(--muted)]" }, "縦横比 ", p.ratio.toFixed(2)), p.uploaded && /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex gap-3" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "underline", disabled: !!photoTask, onClick: () => renamePhoto(p.id) }, "名前"), React.createElement("button", { type: "button", className: "underline", disabled: !!photoTask, onClick: () => choosePhotoReplacement(p.id) }, "差し替え"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "text-red-600 underline", disabled: !!photoTask, onClick: () => deletePhoto(p.id) }, "写真を削除"))));
   })))), tab === "展示" && (() => {
     const groupList = [...["北", "南", "東", "西"].map((wl) => ({ key: wl, label: `${wallName(wl)}壁`, items: placements.filter((p) => p.method === "壁掛け" && !p.col && p.wall === wl), g: { t: "wall", wall: wl } })), { key: "col", label: "柱・下がり天井", items: placements.filter((p) => p.method === "壁掛け" && !!p.col), g: null }, { key: "easel", label: "イーゼル", items: placements.filter((p) => p.method === "イーゼル"), g: { t: "easel" } }].filter((x) => x.items.length > 0);
-    return /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("section", { className: "space-y-2 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("h4", { className: "text-sm font-bold" }, "作品の高さをそろえる"), React.createElement("p", { className: "small" }, `対象：この部屋の壁掛け${placements.filter((p) => p.method === "壁掛け").length}点（外壁・柱・下がり天井）。イーゼルは対象外です。`), React.createElement("button", { type: "button", className: "chip text-xs font-bold", onClick: () => previewHeights(() => true, "壁・柱") }, "高さを変える対象を3Dで確認"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, [["center", "中心"], ["top", "上端"], ["bottom", "下端"]].map(([k, lb]) => /* @__PURE__ */ React.createElement("button", { key: k, type: "button", onClick: () => setAlignMode(k), className: `chip text-xs ${alignMode === k ? "tab-active" : ""}` }, lb, "でそろえる"))), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "基準の高さ（床から）"), /* @__PURE__ */ React.createElement("b", null, fmt(alignH), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "基準の高さ", className: "w-full", type: "range", min: "0.5", max: String(Math.max(1, room.h - 0.1)), step: "0.1", value: alignH, onChange: (e) => setAlignH(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-2 text-xs" }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: showLine, onChange: (e) => setShowLine(e.target.checked) }), "壁に基準線を表示"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => alignHeights(() => true, "壁・柱"), className: "w-full bg-[var(--accent)] text-white py-2 rounded-xl font-bold text-sm" }, "この部屋の壁掛け", placements.filter((p) => p.method === "壁掛け").length, "点の", alignLabel, " ", fmt(alignH), " m にそろえる"), /* @__PURE__ */ React.createElement("p", { className: "small" }, "一般的な展示では、作品の中心を 1.45 m 前後にそろえます。壁ごとにそろえるときは、下の各壁の「↕ 高さ」を押します。")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "展示中 ", /* @__PURE__ */ React.createElement("span", { className: "text-sm font-normal text-[var(--muted)]" }, placements.length, " 点")), /* @__PURE__ */ React.createElement("span", { className: "small" }, "タップで3Dに選択表示")), placements.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small py-3 text-center" }, "まだ飾っていません。「写真」タブで写真を選んで飾ってください。"), groupList.map((grp) => /* @__PURE__ */ React.createElement("section", { key: grp.key, className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("h4", { className: "text-sm font-bold" }, grp.label, "（", grp.items.length, "点）"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, grp.key !== "easel" && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => alignHeights(grp.key === "col" ? ((p) => !!p.col) : ((p) => !p.col && p.wall === grp.key), grp.label), className: "chip text-xs" }, "↕ 高さ（", grp.items.length, "点）"), grp.key !== "easel" && React.createElement("button", { type: "button", className: "chip text-xs", onClick: () => previewHeights(grp.key === "col" ? ((p) => !!p.col) : ((p) => !p.col && p.wall === grp.key), grp.label) }, "対象を確認"), /* @__PURE__ */ React.createElement("button", { type: "button", disabled: grp.items.length < 3 || !grp.g, onClick: () => grp.g && distributeGroup(grp.g), className: "chip text-xs disabled:opacity-40" }, "↔ 等間隔に並べる"))), grp.items.map((p) => {
+    return /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, planComparisonPanel(), /* @__PURE__ */ React.createElement("section", { className: "space-y-2 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("h4", { className: "text-sm font-bold" }, "作品の高さをそろえる"), React.createElement("p", { className: "small" }, `対象：この部屋の壁掛け${placements.filter((p) => p.method === "壁掛け").length}点（外壁・柱・下がり天井）。イーゼルは対象外です。`), React.createElement("button", { type: "button", className: "chip text-xs font-bold", onClick: () => previewHeights(() => true, "壁・柱") }, "高さを変える対象を3Dで確認"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, [["center", "中心"], ["top", "上端"], ["bottom", "下端"]].map(([k, lb]) => /* @__PURE__ */ React.createElement("button", { key: k, type: "button", onClick: () => setAlignMode(k), className: `chip text-xs ${alignMode === k ? "tab-active" : ""}` }, lb, "でそろえる"))), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "基準の高さ（床から）"), /* @__PURE__ */ React.createElement("b", null, fmt(alignH), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "基準の高さ", className: "w-full", type: "range", min: "0.5", max: String(Math.max(1, room.h - 0.1)), step: "0.1", value: alignH, onChange: (e) => setAlignH(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-2 text-xs" }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: showLine, onChange: (e) => setShowLine(e.target.checked) }), "壁に基準線を表示"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => alignHeights(() => true, "壁・柱"), className: "w-full bg-[var(--accent)] text-white py-2 rounded-xl font-bold text-sm" }, "この部屋の壁掛け", placements.filter((p) => p.method === "壁掛け").length, "点の", alignLabel, " ", fmt(alignH), " m にそろえる"), /* @__PURE__ */ React.createElement("p", { className: "small" }, "一般的な展示では、作品の中心を 1.45 m 前後にそろえます。壁ごとにそろえるときは、下の各壁の「↕ 高さ」を押します。")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "展示中 ", /* @__PURE__ */ React.createElement("span", { className: "text-sm font-normal text-[var(--muted)]" }, placements.length, " 点")), /* @__PURE__ */ React.createElement("span", { className: "small" }, "タップで3Dに選択表示")), placements.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small py-3 text-center" }, "まだ飾っていません。「写真」タブで写真を選んで飾ってください。"), groupList.map((grp) => /* @__PURE__ */ React.createElement("section", { key: grp.key, className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("h4", { className: "text-sm font-bold" }, grp.label, "（", grp.items.length, "点）"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, grp.key !== "easel" && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => alignHeights(grp.key === "col" ? ((p) => !!p.col) : ((p) => !p.col && p.wall === grp.key), grp.label), className: "chip text-xs" }, "↕ 高さ（", grp.items.length, "点）"), grp.key !== "easel" && React.createElement("button", { type: "button", className: "chip text-xs", onClick: () => previewHeights(grp.key === "col" ? ((p) => !!p.col) : ((p) => !p.col && p.wall === grp.key), grp.label) }, "対象を確認"), /* @__PURE__ */ React.createElement("button", { type: "button", disabled: grp.items.length < 3 || !grp.g, onClick: () => grp.g && distributeGroup(grp.g), className: "chip text-xs disabled:opacity-40" }, "↔ 等間隔に並べる"))), grp.items.map((p) => {
       const ph = photoOf(p.photo);
       const number = placements.findIndex((x) => x.id === p.id) + 1;
       return /* @__PURE__ */ React.createElement("article", { key: p.id, className: `border rounded-xl p-2 flex items-center gap-2 ${selectedPlacement === p.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}`  , style: selectedPlacement === p.id ? { borderColor: "#f59e0b" } : undefined }, React.createElement("span", { className: "shrink-0 text-xs font-bold rounded px-1", style: { background: selectedPlacement === p.id ? "#f59e0b" : "var(--surface2)", color: selectedPlacement === p.id ? "#171713" : "var(--ink)" } }, "#" + number), /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex flex-1 min-w-0 items-center gap-2 text-left", onClick: () => selectObj("placement", p.id) }, ph.thumb ? /* @__PURE__ */ React.createElement("img", { src: ph.thumb, alt: "", className: "w-12 h-10 rounded object-cover shrink-0" }) : /* @__PURE__ */ React.createElement("span", { className: "w-12 h-10 rounded shrink-0", style: { background: ph.missing ? "#8a8a84" : `linear-gradient(135deg,hsl(${ph.hue} 42% 72%),hsl(${(ph.hue + 70) % 360} 35% 28%))` } }), /* @__PURE__ */ React.createElement("span", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("span", { className: "block font-bold text-sm truncate" }, ph.title, ph.missing && ph.uploaded ? "（未読込）" : ""), /* @__PURE__ */ React.createElement("span", { className: "small block" }, p.size, " ・ ", p.orient, " ・ ", p.frame === "パネル" ? `パネル ${Math.round((p.thick ?? PANEL_T) * 1e3)}mm` : `額${p.frame}`, " ・ ", p.method === "壁掛け" ? p.col ? (columns.some((c) => c.id === p.col) ? `柱${columns.findIndex((c) => c.id === p.col) + 1}の${wallName(p.face || "南")}面` : `下がり天井${blocks.findIndex((b) => b.id === p.col) + 1}の前の面`) + ` ・ 中心 ${fmt(p.center)} m` : `壁端から ${fmt(p.pos + wallLen(room, p.wall) / 2)} m ・ 中心 ${fmt(p.center)} m` : `X ${fmt(p.x)} m, Z ${fmt(p.z)} m`))), React.createElement("button", { type: "button", className: "chip text-xs shrink-0", disabled: !!photoTask, onClick: () => choosePhotoReplacement(p.photo, p.id) }, "差し替え"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs text-red-600 shrink-0", onClick: () => deletePlacementById(p.id), title: "この部屋の展示を外します。写真はライブラリに残ります" }, "展示を外す"));
@@ -6003,7 +6228,7 @@ function App() {
     const disabled = !plan?.items.length;
     return React.createElement("button", { type: "button", "aria-label": "この並びで確定", onClick: onConfirm, disabled, style: { minHeight: compact ? 44 : 50, width: compact ? undefined : "100%", padding: "9px 14px", borderRadius: 99, background: disabled ? "#d1cec5" : "#c63822", color: disabled ? "#716e65" : "#fff", fontSize: compact ? 13 : 16, fontWeight: 900, boxShadow: disabled ? "none" : "0 3px 9px rgba(150,40,20,.25)", whiteSpace: "nowrap" } }, "✓ この並びで確定");
   }
-  const pendingPreview = replacementNeedsCommit(replacement) || arrangeNeedsCommit();
+  const pendingPreview = replacementNeedsCommit(replacement) || swapNeedsCommit() || arrangeNeedsCommit();
   const storageFailed = saveStatus === "error" || photoStorageProblem;
   const saveLabel = saveStatus === "error" ? "配置未保存・再試行" : photoStorageProblem ? "写真未保存・再試行" : photoTask ? "写真を処理中…" : pendingPreview ? "仮表示・未確定" : saveStatus === "dirty" ? "配置を編集中" : saveStatus === "saved" ? "✓ 端末に保存済み" : "まだ保存していません";
   const saveIndicator = React.createElement("span", { "aria-label": "保存状態", role: "status", title: "保存先はこの端末のブラウザ内です。持ち出す場合は写真込みバックアップを使います", style: { display: "block", fontSize: 10, lineHeight: "13px", fontWeight: 700, color: storageFailed ? "#b42d20" : pendingPreview ? "#9a5600" : "#286447", whiteSpace: "nowrap" } }, saveLabel);
@@ -6015,9 +6240,13 @@ function App() {
     const active = artMoveId === id;
     return React.createElement("button", { type: "button", "aria-label": active ? "作品の移動を終了" : "作品を動かす", "aria-pressed": active, onClick: () => toggleArtMove(id), style: { minHeight: 42, width: full ? "100%" : undefined, padding: "7px 12px", flexShrink: 0, borderRadius: 99, border: "1px solid " + (active ? "#b83120" : "#9aa49f"), background: active ? "#c63822" : "var(--surface)", color: active ? "#fff" : "var(--ink)", fontSize: 12, fontWeight: 900 } }, active ? "✓ 移動を終了" : "✥ 作品を動かす");
   }
-  const artInteractionOverlay = mode === "edit" && selected?.kind === "placement" && !replacement && !arrange && !placeMode && !batchFocus ? React.createElement("div", { "aria-label": "作品のドラッグ操作", className: "absolute left-3 right-3 top-14 z-30", style: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 6, borderRadius: 13, padding: "6px 9px", background: "rgba(255,255,250,.95)", color: "#293e37", border: "1px solid " + (artMoveId === selected.id ? "#c63822" : "#a7c3b7"), fontSize: 12 } }, React.createElement("b", null, artMoveId === selected.id ? "移動中：作品をドラッグ" : "ドラッグで視点回転"), artMoveButton(selected.id)) : null;
-  const batchStatusOverlay = batchFocus && mode === "edit" && !replacement && !arrange && !placeMode ? React.createElement("div", { "aria-label": "一括操作の対象", className: "absolute left-3 right-3 top-14 z-30", style: { padding: "8px 10px", borderRadius: 13, background: "rgba(233,246,255,.97)", border: "1px solid #258dd1", color: "#174c6d", fontSize: 12, lineHeight: 1.5 } }, React.createElement("div", { className: "flex items-center justify-between gap-2" }, React.createElement("b", null, batchFocus.title, "（", batchItems.length, batchFocus.liveBulk ? "灯）" : "点）"), React.createElement("button", { type: "button", onClick: closeBatchTargets, style: { minHeight: 36, flexShrink: 0, textDecoration: "underline" } }, "確認を終了")), React.createElement("p", null, "青枠が対象です。ドラッグで視点を回せます。", batchFocus.liveBulk ? "一括スライダーの変更は対象の灯にすぐ反映します。" : ""), React.createElement("details", null, React.createElement("summary", { style: { minHeight: 28, cursor: "pointer" } }, "対象の一覧"), React.createElement("p", { style: { maxHeight: "18vh", overflowY: "auto" } }, batchItems.length ? batchItems.map(batchTargetLabel).join("・") : "対象はありません"))) : null;
+  const artInteractionOverlay = mode === "edit" && selected?.kind === "placement" && !artworkSwap && !replacement && !arrange && !placeMode && !batchFocus ? React.createElement("div", { "aria-label": "作品のドラッグ操作", className: "absolute left-3 right-3 top-14 z-30", style: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 6, borderRadius: 13, padding: "6px 9px", background: "rgba(255,255,250,.95)", color: "#293e37", border: "1px solid " + (artMoveId === selected.id ? "#c63822" : "#a7c3b7"), fontSize: 12 } }, React.createElement("b", null, artMoveId === selected.id ? "移動中：作品をドラッグ" : "ドラッグで視点回転"), artMoveButton(selected.id), React.createElement("button", { type: "button", className: "chip text-xs", style: { minHeight: 40 }, onClick: () => startArtworkSwap(selected.id) }, "↔ 入れ替え")) : null;
+  const batchStatusOverlay = batchFocus && mode === "edit" && !artworkSwap && !replacement && !arrange && !placeMode ? React.createElement("div", { "aria-label": "一括操作の対象", className: "absolute left-3 right-3 top-14 z-30", style: { padding: "8px 10px", borderRadius: 13, background: "rgba(233,246,255,.97)", border: "1px solid #258dd1", color: "#174c6d", fontSize: 12, lineHeight: 1.5 } }, React.createElement("div", { className: "flex items-center justify-between gap-2" }, React.createElement("b", null, batchFocus.title, "（", batchItems.length, batchFocus.liveBulk ? "灯）" : "点）"), React.createElement("button", { type: "button", onClick: closeBatchTargets, style: { minHeight: 36, flexShrink: 0, textDecoration: "underline" } }, "確認を終了")), React.createElement("p", null, "青枠が対象です。ドラッグで視点を回せます。", batchFocus.liveBulk ? "一括スライダーの変更は対象の灯にすぐ反映します。" : ""), React.createElement("details", null, React.createElement("summary", { style: { minHeight: 28, cursor: "pointer" } }, "対象の一覧"), React.createElement("p", { style: { maxHeight: "18vh", overflowY: "auto" } }, batchItems.length ? batchItems.map(batchTargetLabel).join("・") : "対象はありません"))) : null;
   const entranceTestOverlay = entranceTest ? React.createElement("div", { "aria-label": "入口接続のテスト", className: "absolute left-3 right-3 bottom-16 z-40", style: { borderRadius: 12, background: "#e9f6ff", border: "1px solid #258dd1", color: "#174c6d", fontSize: 12, padding: "8px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 } }, React.createElement("b", null, "入口の接続をテスト中"), React.createElement("button", { type: "button", className: "chip text-xs font-bold", style: { minHeight: 40 }, onClick: returnEntranceTest }, "テストから戻る")) : null;
+  const activeComparison = exhibitionPlans[curRoomId];
+  const planComparisonOverlay = activeComparison && !artworkSwap && !replacement && !arrange && !placeMode ? React.createElement("div", { "aria-label": "展示案の比較切り替え", className: "absolute left-3 right-3 bottom-16 z-30", style: { display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", justifyContent: "space-between", padding: "6px 9px", borderRadius: 13, background: "rgba(246,248,255,.96)", border: "1px solid #8a98b5", color: "#253452", fontSize: 12 } }, React.createElement("b", null, `表示中：${activeComparison.active}案`), React.createElement("div", { className: "flex gap-1" }, ...["A", "B"].map((key) => React.createElement("button", { type: "button", key, disabled: !!photoTask, "aria-pressed": key === activeComparison.active, onClick: () => switchExhibitionPlan(key), className: "chip text-xs " + (key === activeComparison.active ? "tab-active" : ""), style: { minHeight: 40 } }, `${key}案 ${key === activeComparison.active ? placements.length : activeComparison.slots[key].placements.length}点`)))) : null;
+  const artworkSwapOverlay = artworkSwap ? React.createElement("div", { "aria-label": "入れ替えの仮表示", className: "absolute left-3 right-3 bottom-16 z-40", style: { display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 6, padding: "8px 10px", borderRadius: 13, background: "#fff2cc", border: "2px solid #e6a526", color: "#713509", fontSize: 12 } }, React.createElement("b", null, artworkSwap.second ? "入れ替えの仮表示・未確定" : "次は入れ替える相手をタップ"), artworkSwap.second && swapConfirmButton(true)) : null;
+  const artworkSwapExitDialog = artworkSwapExit && artworkSwap ? React.createElement("div", { className: "fixed inset-0 z-[9999]", style: { display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(0,0,0,.55)" }, onPointerDown: (e) => e.stopPropagation() }, React.createElement("div", { role: "dialog", "aria-modal": true, "aria-label": "作品の入れ替えが未確定です", style: { width: "min(360px,100%)", background: "var(--surface)", color: "var(--ink)", padding: 20, borderRadius: 20 } }, React.createElement("h2", { style: { fontSize: 19, fontWeight: 900, marginBottom: 10 } }, "入れ替えはまだ確定していません"), React.createElement("p", { className: "small mb-3" }, "現在は仮表示です。確定するか、元の展示に戻して閉じるかを選んでください。"), swapConfirmButton(false, () => finishArtworkSwapExit("commit")), React.createElement("div", { className: "flex gap-2 mt-3" }, React.createElement("button", { type: "button", className: "chip text-sm flex-1", onClick: () => finishArtworkSwapExit("stay") }, "編集に戻る"), React.createElement("button", { type: "button", className: "chip text-sm flex-1", onClick: () => finishArtworkSwapExit("discard") }, "破棄して閉じる")))) : null;
   const replacementStatusOverlay = replacementNeedsCommit(replacement) ? React.createElement("div", { className: "absolute left-3 right-3 bottom-16 z-40", "aria-label": "写真差し替え未確定", style: { display: "flex", alignItems: "center", gap: 10, justifyContent: "space-between", flexWrap: "wrap", padding: "8px 10px", borderRadius: 14, background: "rgba(255,244,210,.97)", border: "2px solid #e6a526", boxShadow: "0 3px 12px rgba(0,0,0,.2)", color: "#713509" } }, React.createElement("span", { style: { fontSize: 12, lineHeight: 1.4 } }, React.createElement("b", { style: { display: "block", fontSize: 14 } }, "仮表示・未確定"), replacement?.showOriginal ? "変更前を表示中です" : "最後に確定が必要です"), replacementConfirmButton(true)) : replacementSuccess ? React.createElement("div", { className: "absolute left-3 right-3 bottom-16 z-40", role: "status", style: { borderRadius: 12, padding: "11px 14px", background: replacementSuccess.saved ? "#e0f4e8" : "#fff0c2", border: "2px solid " + (replacementSuccess.saved ? "#2b8050" : "#e6a526"), color: replacementSuccess.saved ? "#155d34" : "#713509", fontSize: 14, fontWeight: 800 } }, replacementSuccess.text) : null;
   const replacementExitDialog = replacementExit && replacement ? React.createElement("div", { className: "fixed inset-0 z-[9999]", style: { display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(0,0,0,.55)" }, onPointerDown: (e) => e.stopPropagation() }, React.createElement("div", { role: "dialog", "aria-modal": true, "aria-label": "写真の差し替えが未確定です", style: { width: "min(360px,100%)", borderRadius: 20, padding: 20, background: "var(--surface)", color: "var(--ink)", boxShadow: "0 12px 48px rgba(0,0,0,.35)" } }, React.createElement("h2", { style: { fontSize: 19, fontWeight: 900, marginBottom: 10 } }, "まだ確定していません"), React.createElement("p", { className: "text-sm", style: { marginBottom: 16, lineHeight: 1.7 } }, "現在の写真は仮表示です。確定せずに閉じると、元の写真に戻ります。"), React.createElement("button", { type: "button", disabled: !!photoTask, onClick: () => finishReplacementExit("commit"), style: { width: "100%", minHeight: 54, borderRadius: 99, background: "#c63822", color: "#fff", fontSize: 17, fontWeight: 900, marginBottom: 12, opacity: photoTask ? 0.5 : 1 } }, "✓ この写真で確定"), React.createElement("div", { className: "flex gap-2" }, React.createElement("button", { type: "button", className: "chip text-sm flex-1", style: { minHeight: 44 }, disabled: !!photoTask, onClick: () => finishReplacementExit("stay") }, "編集に戻る"), React.createElement("button", { type: "button", className: "chip text-sm flex-1", style: { minHeight: 44, color: "#a72d1a" }, disabled: !!photoTask, onClick: () => finishReplacementExit("discard") }, "破棄して閉じる")), (photoTask || replacementExitError) && React.createElement("p", { role: "alert", className: "small mt-2" }, photoTask || replacementExitError))) : null;
 
@@ -6052,7 +6281,7 @@ function App() {
     setNotice("この部屋の物をすべて削除しました。写真は残っています。「元に戻す」で戻せます");
   }
   const footerRow = React.createElement("div", { className: "p-3 border-t border-[var(--line)] flex gap-2" }, React.createElement("button", { disabled: mode === "view", onClick: resetExhibits, className: "chip text-xs flex-1 disabled:opacity-50" }, "この部屋の展示を外す"), React.createElement("button", { disabled: mode === "view", onClick: clearRoomObjects, className: "chip text-xs flex-1 text-red-600 disabled:opacity-50" }, "この部屋を空にする"));
-  const objectEditBody = replacement ? replacementPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, selCol && resizeReviewPanel(), selPlace && artMoveButton(selPlace.id, true), selPlace && React.createElement("button", { type: "button", className: "chip text-sm w-full font-bold", onClick: () => choosePhotoReplacement(selPlace.photo, selPlace.id) }, "写真を差し替え"), (selWin || selEnt && !selEnt.col) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "設置する壁"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1", role: "group", "aria-label": "設置する壁" }, ["北", "南", "東", "西"].map((wallOpt) => {
+  const objectEditBody = artworkSwap ? artworkSwapPanel() : replacement ? replacementPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, selCol && resizeReviewPanel(), selPlace && artMoveButton(selPlace.id, true), selPlace && React.createElement("button", { type: "button", className: "chip text-sm w-full font-bold", onClick: () => startArtworkSwap(selPlace.id) }, "↔ 作品を入れ替え"), selPlace && React.createElement("button", { type: "button", className: "chip text-sm w-full font-bold", onClick: () => choosePhotoReplacement(selPlace.photo, selPlace.id) }, "写真を差し替え"), (selWin || selEnt && !selEnt.col) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "設置する壁"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1", role: "group", "aria-label": "設置する壁" }, ["北", "南", "東", "西"].map((wallOpt) => {
     const cur = selWin ? selWin.wall : selEnt?.wall;
     const active = cur === wallOpt;
     return /* @__PURE__ */ React.createElement("button", { key: wallOpt, type: "button", "aria-pressed": active, onClick: () => {
@@ -6137,13 +6366,13 @@ function App() {
     setTab(t);
     if (sheetSnap === "mini") setSheetSnap("half");
   })), /* @__PURE__ */ React.createElement("div", { className: "min-h-0 flex-1 overflow-y-auto p-3 space-y-4" }, tab === "選択中" ? selected ? /* @__PURE__ */ React.createElement("div", { key: selected.kind + selected.id, className: "sel-glow -m-1 p-1" }, objectEditBody) : null : tabContent, tab === "展示" && !replacement && footerRow)));
-  return /* @__PURE__ */ React.createElement("div", { ref: shellRef, "data-safe-area-inset-root": true, style: { boxSizing: "border-box", paddingTop: "var(--safe-area-inset-top)", minHeight: "100dvh", display: "flex", flexDirection: "column", ...isPhone ? { height: "100dvh", overflow: "hidden" } : {} }, className: `${pseudoFullscreen ? "fixed inset-0 z-[9999] overflow-hidden h-[100dvh] " : ""}bg-[var(--bg)] text-[var(--ink)]` }, replacementInput, replacementExitDialog, arrangeExitDialog, !isFullscreen && /* @__PURE__ */ React.createElement("header", { "data-safe-area-sticky-top": true, style: { top: isPhone ? 0 : "var(--safe-area-inset-top)" }, className: "sticky z-30 border-b border-[var(--line)] bg-[var(--surface)] shrink-0" }, isPhone ? phoneHeader : headerCollapsed ? /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 flex items-center justify-between gap-2", style: { height: 44, minHeight: 44 } }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, React.createElement("span", { className: "font-black tracking-tight text-sm sm:text-base truncate block" }, "写真展シミュレーション"), saveIndicator), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 shrink-0" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setHeaderCollapsed(false), className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-xs sm:text-sm font-bold whitespace-nowrap" }, "▼ 上部を表示"), /* @__PURE__ */ React.createElement("button", { onClick: () => {
+  return /* @__PURE__ */ React.createElement("div", { ref: shellRef, "data-safe-area-inset-root": true, style: { boxSizing: "border-box", paddingTop: "var(--safe-area-inset-top)", minHeight: "100dvh", display: "flex", flexDirection: "column", ...isPhone ? { height: "100dvh", overflow: "hidden" } : {} }, className: `${pseudoFullscreen ? "fixed inset-0 z-[9999] overflow-hidden h-[100dvh] " : ""}bg-[var(--bg)] text-[var(--ink)]` }, replacementInput, artworkSwapExitDialog, replacementExitDialog, arrangeExitDialog, !isFullscreen && /* @__PURE__ */ React.createElement("header", { "data-safe-area-sticky-top": true, style: { top: isPhone ? 0 : "var(--safe-area-inset-top)" }, className: "sticky z-30 border-b border-[var(--line)] bg-[var(--surface)] shrink-0" }, isPhone ? phoneHeader : headerCollapsed ? /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 flex items-center justify-between gap-2", style: { height: 44, minHeight: 44 } }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, React.createElement("span", { className: "font-black tracking-tight text-sm sm:text-base truncate block" }, "写真展シミュレーション"), saveIndicator), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 shrink-0" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setHeaderCollapsed(false), className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-xs sm:text-sm font-bold whitespace-nowrap" }, "▼ 上部を表示"), /* @__PURE__ */ React.createElement("button", { onClick: () => {
     if (roomPanelOpen) closeRoomPanel();
     else openRoomPanel();
   }, "aria-pressed": roomPanelOpen, className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] text-xs sm:text-sm font-bold whitespace-nowrap", style: roomPanelOpen ? { background: "var(--accent)", color: "#fff" } : { background: "var(--surface2)" } }, "部屋を調整"), /* @__PURE__ */ React.createElement("div", { className: "hidden sm:flex rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { onClick: () => switchMode("edit"), className: `px-2.5 py-1.5 text-xs font-bold ${mode === "edit" ? "tab-active" : ""}` }, "配置"), /* @__PURE__ */ React.createElement("button", { onClick: () => switchMode("view"), className: `px-2.5 py-1.5 text-xs font-bold ${mode === "view" ? "tab-active" : ""}` }, "視点")), /* @__PURE__ */ React.createElement("div", { className: "flex sm:hidden rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { "aria-label": "配置モード", onClick: () => switchMode("edit"), className: `px-2 py-1.5 text-xs font-bold ${mode === "edit" ? "tab-active" : ""}` }, "配置"), /* @__PURE__ */ React.createElement("button", { "aria-label": "視点モード", onClick: () => switchMode("view"), className: `px-2 py-1.5 text-xs font-bold ${mode === "view" ? "tab-active" : ""}` }, "視点")), /* @__PURE__ */ React.createElement("button", { onClick: toggleFullscreen, className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-xs sm:text-sm font-bold whitespace-nowrap" }, "⛶ 全画面"), /* @__PURE__ */ React.createElement("button", { onClick: requestSave, className: "h-[32px] px-3 rounded-full bg-[var(--accent)] text-white text-xs sm:text-sm font-bold whitespace-nowrap" }, "保存"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 py-2 flex flex-wrap gap-2 items-center justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement(LayoutGrid, { size: 22 }), /* @__PURE__ */ React.createElement("h1", { className: "text-lg sm:text-2xl font-black tracking-tight" }, "写真展シミュレーション")), /* @__PURE__ */ React.createElement("p", { className: "small" }, "実寸で確かめる、静かな展示室"), saveIndicator), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 items-center" }, /* @__PURE__ */ React.createElement("span", { ref: personPosRef, className: "text-xs font-bold bg-[var(--surface2)] px-3 py-2 rounded-full" }, "人の位置 X: 0.00 m / Z: 1.40 m"), /* @__PURE__ */ React.createElement("div", { className: "flex rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { onClick: () => switchView("orbit"), className: `px-3 py-2 text-sm ${view === "orbit" ? "tab-active" : ""}` }, "俯瞰（Orbit）"), /* @__PURE__ */ React.createElement("button", { onClick: () => switchView("walk"), title: mode === "edit" ? "押すと視点モードに自動で切り替わります" : "", className: `px-3 py-2 text-sm ${view === "walk" ? "tab-active" : ""}` }, "人の視点（Walk）", mode === "edit" ? " → 視点モードへ" : "")), /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-2 text-xs font-bold bg-[var(--surface2)] px-3 py-2 rounded-full" }, /* @__PURE__ */ React.createElement(Eye, { size: 14 }), "目線 ", eyeHeight.toFixed(2), " m", /* @__PURE__ */ React.createElement("input", { type: "range", min: "1.4", max: "1.8", step: "0.05", value: eyeHeight, onChange: (e) => setEyeHeight(Number(e.target.value)), className: "w-20 sm:w-24" })), /* @__PURE__ */ React.createElement("div", { className: "flex rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { onClick: () => updateRoom({ theme: "white" }), className: `px-3 py-2 text-sm ${room.theme === "white" ? "tab-active" : ""}` }, "内装 白"), /* @__PURE__ */ React.createElement("button", { onClick: () => updateRoom({ theme: "black" }), className: `px-3 py-2 text-sm ${room.theme === "black" ? "tab-active" : ""}` }, "内装 黒")), rooms.length > 1 && /* @__PURE__ */ React.createElement("select", { "aria-label": "表示する部屋", value: curRoomId, onChange: (e) => switchRoom(e.target.value), className: "px-3 py-2 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-sm font-bold" }, rooms.map((r) => /* @__PURE__ */ React.createElement("option", { key: r.id, value: r.id }, r.floor, " ", r.name))), /* @__PURE__ */ React.createElement("button", { onClick: () => {
     if (roomPanelOpen) closeRoomPanel();
     else openRoomPanel();
-  }, "aria-pressed": roomPanelOpen, className: "px-3 py-2 rounded-full border border-[var(--line)] text-sm font-bold whitespace-nowrap", style: roomPanelOpen ? { background: "var(--accent)", color: "#fff" } : { background: "var(--surface2)" } }, "部屋を調整"), /* @__PURE__ */ React.createElement("button", { onClick: requestSave, className: "bg-[var(--accent)] text-white px-4 py-2 rounded-full text-sm font-bold" }, "保存する"), /* @__PURE__ */ React.createElement("button", { onClick: () => setHeaderCollapsed(true), className: "px-3 py-2 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-sm font-bold whitespace-nowrap" }, "▲ 上部を隠す"))), /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 pb-2" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 rounded-2xl border border-[var(--line)] bg-[var(--surface2)] p-1.5", role: "tablist", "aria-label": "モード切替" }, /* @__PURE__ */ React.createElement("button", { role: "tab", "aria-selected": mode === "edit", onClick: () => switchMode("edit"), className: "min-h-[44px] rounded-xl px-3 py-2 text-sm sm:text-base font-black flex items-center justify-center gap-2", style: mode === "edit" ? { background: "#ea580c", color: "#fff" } : { background: "transparent", color: "var(--ink)" } }, "🖐️ 配置を動かす", mode === "edit" && /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "・編集中")), /* @__PURE__ */ React.createElement("button", { role: "tab", "aria-selected": mode === "view", onClick: () => switchMode("view"), className: "min-h-[44px] rounded-xl px-3 py-2 text-sm sm:text-base font-black flex items-center justify-center gap-2", style: mode === "view" ? { background: "#2563eb", color: "#fff" } : { background: "transparent", color: "var(--ink)" } }, "👁️ 視点で見る", mode === "view" && /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "・ロック中"))), /* @__PURE__ */ React.createElement("p", { className: "small mt-1.5 text-center" }, mode === "edit" ? "配置モード：俯瞰のみ。人の視点ボタンを押すと視点モードに自動で切り替わります。" : "視点モード：オブジェはロック中です。ドラッグは視点回転のみで、オブジェは動きません。")))), phoneMenu, storageAlert, /* @__PURE__ */ React.createElement("main", { className: isPhone && !previewOnly ? `flex-1 min-h-0 w-full flex ${isPortrait ? "flex-col" : "flex-row"}` : previewOnly ? `flex-1 min-h-0 w-full mx-auto flex ${isFullscreen ? "p-0" : "p-2 sm:p-3"}` : panelActive ? `flex-1 min-h-0 w-full max-w-[1500px] mx-auto p-3 flex gap-3 ${isPortrait ? "flex-col" : "flex-row"}` : "max-w-[1500px] mx-auto p-3 sm:p-4 grid lg:grid-cols-[360px_1fr] gap-3 items-start w-full", style: isPhone && !previewOnly ? void 0 : previewOnly && !isFullscreen ? { height: "calc(100dvh - var(--safe-area-inset-top) - 44px)", maxHeight: "calc(100dvh - var(--safe-area-inset-top) - 44px)" } : panelActive && !isFullscreen ? { height: "calc(100dvh - var(--safe-area-inset-top) - 44px)", maxHeight: "calc(100dvh - var(--safe-area-inset-top) - 44px)" } : void 0 }, /* @__PURE__ */ React.createElement("aside", { className: `${panelActive || previewOnly || isPhone ? "hidden" : ""} order-2 lg:order-1 bg-[var(--surface)] border border-[var(--line)] rounded-2xl overflow-hidden lg:sticky lg:top-20` }, !isPhone && /* @__PURE__ */ React.createElement(React.Fragment, null, selRow, /* @__PURE__ */ React.createElement("div", { className: "p-2 border-b border-[var(--line)]" }, tabTrack(["部屋", "柱・窓・入口", "光", "写真", "展示"], (t) => setTab(t))), mode === "view" && /* @__PURE__ */ React.createElement("div", { className: "p-3 border-b border-[var(--line)] bg-[#2563eb] text-white text-sm font-bold" }, "🔒 視点モード：編集はロック中です。配置を変えるには「🖐️ 配置を動かす」に切り替えてください。"), /* @__PURE__ */ React.createElement("div", { className: `p-4 space-y-4 max-h-[72vh] overflow-auto ${mode === "view" ? "pointer-events-none opacity-60 select-none" : ""}` }, tabContent), footerRow)), /* @__PURE__ */ React.createElement("section", { className: panelActive || previewOnly || isPhone ? "flex-1 min-h-0 min-w-0 flex" : "order-1 lg:order-2 space-y-3 min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `flex ${isPhone ? "gap-0" : "gap-3"} items-stretch min-h-0 min-w-0 ${panelActive || previewOnly || isPhone ? isPortrait ? "flex-col flex-1" : "flex-row flex-1" : ""}`, style: panelActive || previewOnly || isPhone ? { height: "100%", maxHeight: "100%" } : void 0 }, /* @__PURE__ */ React.createElement("div", { className: `canvas-wrap ${idleDim && mode === "view" ? "idle-dim " : ""}${previewOnly ? "rounded-none sm:rounded-2xl border-0 sm:border" : ""} border border-[var(--line)] touch-none select-none ${panelActive || previewOnly || isPhone ? "flex-1 min-h-0 min-w-0" : "flex-1 min-w-0 h-[58vh] lg:h-[68vh]"}`, style: panelActive || previewOnly || isPhone ? { cursor: mode === "edit" ? "grab" : "move", minHeight: isPhone ? "25%" : isPortrait ? "45%" : void 0, minWidth: 0 } : { cursor: mode === "edit" ? "grab" : "move" }, ref: mountRef, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp, "aria-label": mode === "edit" ? "3Dキャンバス（配置モード）" : "3Dキャンバス（視点モード・オブジェはロック中）" }, isFullscreen && React.createElement("div", { className: "absolute top-14 left-3 z-30", style: { background: "var(--surface)", borderRadius: 8, padding: "3px 7px" } }, saveIndicator), replacementStatusOverlay, arrangeStatusOverlay, placementStatusOverlay, artInteractionOverlay, batchStatusOverlay, entranceTestOverlay, mode === "view" && nearLink && (() => {
+  }, "aria-pressed": roomPanelOpen, className: "px-3 py-2 rounded-full border border-[var(--line)] text-sm font-bold whitespace-nowrap", style: roomPanelOpen ? { background: "var(--accent)", color: "#fff" } : { background: "var(--surface2)" } }, "部屋を調整"), /* @__PURE__ */ React.createElement("button", { onClick: requestSave, className: "bg-[var(--accent)] text-white px-4 py-2 rounded-full text-sm font-bold" }, "保存する"), /* @__PURE__ */ React.createElement("button", { onClick: () => setHeaderCollapsed(true), className: "px-3 py-2 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-sm font-bold whitespace-nowrap" }, "▲ 上部を隠す"))), /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 pb-2" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 rounded-2xl border border-[var(--line)] bg-[var(--surface2)] p-1.5", role: "tablist", "aria-label": "モード切替" }, /* @__PURE__ */ React.createElement("button", { role: "tab", "aria-selected": mode === "edit", onClick: () => switchMode("edit"), className: "min-h-[44px] rounded-xl px-3 py-2 text-sm sm:text-base font-black flex items-center justify-center gap-2", style: mode === "edit" ? { background: "#ea580c", color: "#fff" } : { background: "transparent", color: "var(--ink)" } }, "🖐️ 配置を動かす", mode === "edit" && /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "・編集中")), /* @__PURE__ */ React.createElement("button", { role: "tab", "aria-selected": mode === "view", onClick: () => switchMode("view"), className: "min-h-[44px] rounded-xl px-3 py-2 text-sm sm:text-base font-black flex items-center justify-center gap-2", style: mode === "view" ? { background: "#2563eb", color: "#fff" } : { background: "transparent", color: "var(--ink)" } }, "👁️ 視点で見る", mode === "view" && /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "・ロック中"))), /* @__PURE__ */ React.createElement("p", { className: "small mt-1.5 text-center" }, mode === "edit" ? "配置モード：俯瞰のみ。人の視点ボタンを押すと視点モードに自動で切り替わります。" : "視点モード：オブジェはロック中です。ドラッグは視点回転のみで、オブジェは動きません。")))), phoneMenu, storageAlert, /* @__PURE__ */ React.createElement("main", { className: isPhone && !previewOnly ? `flex-1 min-h-0 w-full flex ${isPortrait ? "flex-col" : "flex-row"}` : previewOnly ? `flex-1 min-h-0 w-full mx-auto flex ${isFullscreen ? "p-0" : "p-2 sm:p-3"}` : panelActive ? `flex-1 min-h-0 w-full max-w-[1500px] mx-auto p-3 flex gap-3 ${isPortrait ? "flex-col" : "flex-row"}` : "max-w-[1500px] mx-auto p-3 sm:p-4 grid lg:grid-cols-[360px_1fr] gap-3 items-start w-full", style: isPhone && !previewOnly ? void 0 : previewOnly && !isFullscreen ? { height: "calc(100dvh - var(--safe-area-inset-top) - 44px)", maxHeight: "calc(100dvh - var(--safe-area-inset-top) - 44px)" } : panelActive && !isFullscreen ? { height: "calc(100dvh - var(--safe-area-inset-top) - 44px)", maxHeight: "calc(100dvh - var(--safe-area-inset-top) - 44px)" } : void 0 }, /* @__PURE__ */ React.createElement("aside", { className: `${panelActive || previewOnly || isPhone ? "hidden" : ""} order-2 lg:order-1 bg-[var(--surface)] border border-[var(--line)] rounded-2xl overflow-hidden lg:sticky lg:top-20` }, !isPhone && /* @__PURE__ */ React.createElement(React.Fragment, null, selRow, /* @__PURE__ */ React.createElement("div", { className: "p-2 border-b border-[var(--line)]" }, tabTrack(["部屋", "柱・窓・入口", "光", "写真", "展示"], (t) => setTab(t))), mode === "view" && /* @__PURE__ */ React.createElement("div", { className: "p-3 border-b border-[var(--line)] bg-[#2563eb] text-white text-sm font-bold" }, "🔒 視点モード：編集はロック中です。配置を変えるには「🖐️ 配置を動かす」に切り替えてください。"), /* @__PURE__ */ React.createElement("div", { className: `p-4 space-y-4 max-h-[72vh] overflow-auto ${mode === "view" ? "pointer-events-none opacity-60 select-none" : ""}` }, tabContent), footerRow)), /* @__PURE__ */ React.createElement("section", { className: panelActive || previewOnly || isPhone ? "flex-1 min-h-0 min-w-0 flex" : "order-1 lg:order-2 space-y-3 min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `flex ${isPhone ? "gap-0" : "gap-3"} items-stretch min-h-0 min-w-0 ${panelActive || previewOnly || isPhone ? isPortrait ? "flex-col flex-1" : "flex-row flex-1" : ""}`, style: panelActive || previewOnly || isPhone ? { height: "100%", maxHeight: "100%" } : void 0 }, /* @__PURE__ */ React.createElement("div", { className: `canvas-wrap ${idleDim && mode === "view" ? "idle-dim " : ""}${previewOnly ? "rounded-none sm:rounded-2xl border-0 sm:border" : ""} border border-[var(--line)] touch-none select-none ${panelActive || previewOnly || isPhone ? "flex-1 min-h-0 min-w-0" : "flex-1 min-w-0 h-[58vh] lg:h-[68vh]"}`, style: panelActive || previewOnly || isPhone ? { cursor: mode === "edit" ? "grab" : "move", minHeight: isPhone ? "25%" : isPortrait ? "45%" : void 0, minWidth: 0 } : { cursor: mode === "edit" ? "grab" : "move" }, ref: mountRef, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp, "aria-label": mode === "edit" ? "3Dキャンバス（配置モード）" : "3Dキャンバス（視点モード・オブジェはロック中）" }, isFullscreen && React.createElement("div", { className: "absolute top-14 left-3 z-30", style: { background: "var(--surface)", borderRadius: 8, padding: "3px 7px" } }, saveIndicator), replacementStatusOverlay, arrangeStatusOverlay, placementStatusOverlay, artInteractionOverlay, batchStatusOverlay, entranceTestOverlay, planComparisonOverlay, artworkSwapOverlay, mode === "view" && nearLink && (() => {
     const e = entrances.find((x) => x.id === nearLink);
     return e && e.link ? /* @__PURE__ */ React.createElement("button", { type: "button", onClick: goThroughLink, className: "absolute bottom-32 left-1/2 -translate-x-1/2 z-30 bg-[var(--accent)] text-white font-black px-5 py-3 rounded-full shadow-lg whitespace-nowrap" }, "→ ", roomLabel(e.link.room), " へ") : null;
   })(), mode === "view" && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: exitToEdit, className: "soft absolute top-3 left-3 z-20 text-xs sm:text-sm px-4 h-9 rounded-full" }, "← 配置に戻る"), mode === "view" && showHints && /* @__PURE__ */ React.createElement("div", { className: "absolute top-12 left-3 z-20 bg-[#2563eb] text-white text-xs sm:text-sm font-black px-4 py-2 rounded-full pointer-events-none shadow" }, "🔒 視点移動中：オブジェはロック中です"), mode === "edit" && showHints && /* @__PURE__ */ React.createElement("div", { className: "absolute top-3 left-3 z-10 bg-black/75 text-white text-xs px-3 py-2 rounded-full pointer-events-none" }, "タップで選択 / 選択中の物をドラッグで移動 / ハンドルでサイズ変更 / Escで解除", isDragging ? " ・ ドラッグ中" : ""), mode === "view" && showHints && /* @__PURE__ */ React.createElement("div", { className: "absolute top-24 left-3 z-10 bg-black/75 text-white text-xs px-3 py-2 rounded-full pointer-events-none" }, "ドラッグ＝視点回転のみ / WASD・矢印ボタンで歩く"), mode === "edit" && showHints && /* @__PURE__ */ React.createElement("div", { className: "absolute top-12 left-3 z-10 bg-black/60 text-white text-[11px] px-3 py-1.5 rounded-full pointer-events-none" }, "俯瞰では来場者の人型をタップで選んでからドラッグで移動できます ・ Walkではドラッグ＝視線、ボタン/WASD＝移動"), /* @__PURE__ */ React.createElement("div", { className: "absolute top-3 right-3 lg:right-24 z-30 flex flex-col items-end gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5" }, view === "orbit" && /* @__PURE__ */ React.createElement("div", { className: "soft h-9 rounded-full p-[3px] flex text-[13px]" }, [["room", "室内"], ["full", "全体"]].map(([k, lb]) => /* @__PURE__ */ React.createElement("button", { key: k, type: "button", "aria-pressed": camStyle === k, onClick: () => {
