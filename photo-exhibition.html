@@ -179,6 +179,7 @@ function validateExhibitionFile(j) {
         if (["columns", "lights", "blocks", "furniture"].includes(k) && !finite(o, ["x", "z"])) fail();
         if (k === "columns" && !((o.w || o.size) > 0 && (o.d || o.size) > 0)) fail();
         if (["windows", "entrances"].includes(k) && (!walls.includes(o.wall) || !finite(o, ["pos", "w", "h"]) || o.w <= 0 || o.h <= 0 || k === "windows" && !Number.isFinite(o.sill))) fail();
+        if (k === "entrances" && (o.col !== undefined && (!idOK(o.col) || !(d.columns || []).some((c) => c.id === o.col)) || o.base !== undefined && (!Number.isFinite(o.base) || o.base < 0))) fail();
         if (k === "placements" && (typeof o.photo !== "string" || !SIZE_MM[o.size] || !["壁掛け", "イーゼル"].includes(o.method) || !finite(o, ["pos", "center", "x", "z", "rot"]) || !walls.includes(o.wall))) fail();
         if (k === "furniture" && (!FURN_DIM[o.type] || o.rot !== undefined && !Number.isFinite(o.rot))) fail();
         if (k === "blocks" && (!finite(o, ["w", "d", "h"]) || o.w <= 0 || o.d <= 0 || o.h <= 0)) fail();
@@ -514,6 +515,77 @@ function colFace(c, face) {
   if (face === "東") return { cx: c.x + w / 2, cz: c.z, nx: 1, nz: 0, len: d, rot: Math.PI / 2, ax: "z" };
   return { cx: c.x - w / 2, cz: c.z, nx: -1, nz: 0, len: d, rot: -Math.PI / 2, ax: "z" };
 }
+// Internal doors are mounted on columns used as thin partition walls.
+// The opening cuts all the way through the short axis; both faces share one door.
+function columnDoorAxis(c) { return colW(c) >= colD(c) ? "x" : "z"; }
+function columnDoorFaces(c) { return columnDoorAxis(c) === "x" ? ["南", "北"] : ["西", "東"]; }
+function entranceLength(r, e, cols) {
+  const c = e.col && cols.find((c) => c.id === e.col);
+  return c ? columnDoorAxis(c) === "x" ? colW(c) : colD(c) : wallLen(r, e.wall);
+}
+function floorSurface(r, blocks, x, z) {
+  let y = floorBase(r, x, z);
+  (blocks || []).forEach((b) => {
+    if (!b.ceil && Math.abs(x - b.x) <= b.w / 2 + 1e-6 && Math.abs(z - b.z) <= b.d / 2 + 1e-6) y = Math.max(y, floorBase(r, b.x, b.z) + b.h);
+  });
+  return y;
+}
+function entranceBase(r, e, cols, blocks) {
+  if (Number.isFinite(e.base)) return Math.max(0, e.base);
+  if (!e.col) return wallBase(r, e.wall, e.pos);
+  const c = cols.find((c) => c.id === e.col);
+  if (!c) return 0;
+  const f = colFace(c, e.face || columnDoorFaces(c)[0]);
+  const x = f.cx + (f.ax === "x" ? e.pos : 0) + f.nx * 0.06;
+  const z = f.cz + (f.ax === "z" ? e.pos : 0) + f.nz * 0.06;
+  return floorSurface(r, blocks, x, z);
+}
+function entrancePoint(r, e, cols, blocks, height = 0, off = 0) {
+  const c = e.col && cols.find((c) => c.id === e.col);
+  const y = entranceBase(r, e, cols, blocks) + height;
+  return c ? colArt(c, e.face || columnDoorFaces(c)[0], e.pos, y, off) : wallWorld(r, e.wall, e.pos, y - wallBase(r, e.wall, e.pos), off);
+}
+function entranceNormal(e, cols) {
+  const c = e.col && cols.find((c) => c.id === e.col);
+  if (!c) return wallNormal(e.wall);
+  const f = colFace(c, e.face || columnDoorFaces(c)[0]);
+  return new THREE.Vector3(f.nx, 0, f.nz);
+}
+function normalizeEntrances(list, r, cols, blocks) {
+  return list.filter((e) => !e.col || cols.some((c) => c.id === e.col)).map((e) => {
+    const c = e.col && cols.find((c) => c.id === e.col);
+    const face = c ? columnDoorFaces(c).includes(e.face) ? e.face : columnDoorFaces(c)[0] : e.wall;
+    const next = c ? { ...e, wall: face, face } : { ...e };
+    const L = entranceLength(r, next, cols), maxW = Math.max(0.1, L - (c ? 0.04 : 0));
+    const w = clamp(Number.isFinite(next.w) ? next.w : 0.8, 0.1, maxW);
+    const base = clamp(entranceBase(r, next, cols, blocks), 0, Math.max(0, r.h - 0.2));
+    return { ...next, w, pos: clamp(Number.isFinite(next.pos) ? next.pos : 0, -L / 2 + w / 2, L / 2 - w / 2), h: clamp(Number.isFinite(next.h) ? next.h : 2, 0.1, Math.max(0.1, r.h - base)), ...(Number.isFinite(next.base) ? { base } : {}) };
+  });
+}
+function columnSolids(c, r, entrances, blocks) {
+  const axis = columnDoorAxis(c), L = axis === "x" ? colW(c) : colD(c);
+  const doors = (entrances || []).filter((e) => e.col === c.id).map((e) => ({ lo: clamp(e.pos - e.w / 2, -L / 2, L / 2), hi: clamp(e.pos + e.w / 2, -L / 2, L / 2), bottom: entranceBase(r, e, [c], blocks), top: Math.min(r.h, entranceBase(r, e, [c], blocks) + e.h) }));
+  const xs = [...new Set([-L / 2, L / 2, ...doors.flatMap((e) => [e.lo, e.hi])])].sort((a, b) => a - b);
+  const ys = [...new Set([0, r.h, ...doors.flatMap((e) => [clamp(e.bottom, 0, r.h), clamp(e.top, 0, r.h)])])].sort((a, b) => a - b);
+  const solids = [];
+  for (let i = 0; i < xs.length - 1; i++) for (let j = 0; j < ys.length - 1; j++) {
+    const along = (xs[i] + xs[i + 1]) / 2, y = (ys[j] + ys[j + 1]) / 2;
+    if (xs[i + 1] - xs[i] < 1e-6 || ys[j + 1] - ys[j] < 1e-6 || doors.some((e) => along > e.lo && along < e.hi && y > e.bottom && y < e.top)) continue;
+    solids.push({ x: c.x + (axis === "x" ? along : 0), y, z: c.z + (axis === "z" ? along : 0), w: axis === "x" ? xs[i + 1] - xs[i] : colW(c), h: ys[j + 1] - ys[j], d: axis === "z" ? xs[i + 1] - xs[i] : colD(c) });
+  }
+  return solids;
+}
+function pushOutColumn(x, z, c, r, entrances, blocks, radius, eye, foot) {
+  for (const b of columnSolids(c, r, entrances, blocks)) {
+    if (b.y + b.h / 2 <= foot + STEP_MAX + 1e-6 || b.y - b.h / 2 >= foot + eye + 0.1) continue;
+    const hx = b.w / 2 + radius, hz = b.d / 2 + radius, dx = x - b.x, dz = z - b.z;
+    if (Math.abs(dx) < hx && Math.abs(dz) < hz) {
+      if (hx - Math.abs(dx) < hz - Math.abs(dz)) x = b.x + (dx >= 0 ? 1 : -1) * hx;
+      else z = b.z + (dz >= 0 ? 1 : -1) * hz;
+    }
+  }
+  return { x, z };
+}
 function colArt(c, face, pos, y, off) {
   const f = colFace(c, face);
   return new THREE.Vector3(f.cx + (f.ax === "x" ? pos : 0) + f.nx * off, y, f.cz + (f.ax === "z" ? pos : 0) + f.nz * off);
@@ -762,10 +834,7 @@ function fitToRoom(r, d) {
     const h = Math.min(w.h, r.h);
     return { ...w, h, pos: clamp(w.pos, -L / 2 + w.w / 2, L / 2 - w.w / 2), sill: clamp(w.sill, 0, r.h - h) };
   });
-  const entrances = d.entrances.map((e) => {
-    const L = wallLen(r, e.wall);
-    return { ...e, h: Math.min(e.h, r.h), pos: clamp(e.pos, -L / 2 + e.w / 2, L / 2 - e.w / 2) };
-  });
+  const entrances = normalizeEntrances(d.entrances, r, columns, d.blocks || []);
   const placements = d.placements.map((p) => {
     if (p.col) return p;
     const L = wallLen(r, p.wall);
@@ -922,17 +991,13 @@ function App() {
     const e = (ps.ent ? entrances.find((x) => x.id === ps.ent) : null) || entrances[0];
     const wr = walkRef.current;
     const eh = stateRef.current.eyeHeight;
-    let sp;
-    if (e) {
-      const m = 0.6;
-      sp = e.wall === "南" ? new THREE.Vector3(e.pos, eh, room.d / 2 - m) : e.wall === "北" ? new THREE.Vector3(e.pos, eh, -room.d / 2 + m) : e.wall === "東" ? new THREE.Vector3(room.w / 2 - m, eh, e.pos) : new THREE.Vector3(-room.w / 2 + m, eh, e.pos);
-    } else sp = new THREE.Vector3(0, eh, room.d / 2 - 0.6);
+    let sp = e ? entrancePoint(room, e, columns, blocks, eh, 0.6) : new THREE.Vector3(0, eh, room.d / 2 - 0.6);
     sp.x = clamp(sp.x, -room.w / 2 + 0.35, room.w / 2 - 0.35);
     sp.z = clamp(sp.z, -room.d / 2 + 0.35, room.d / 2 - 0.35);
     wr.pos.copy(sp);
-    wr.yaw = Math.atan2(sp.x, sp.z);
+    wr.yaw = e ? Math.atan2(-entranceNormal(e, columns).x, -entranceNormal(e, columns).z) : Math.atan2(sp.x, sp.z);
     wr.pitch = 0;
-    wr.floorY = floorBase(room, sp.x, sp.z);
+    wr.floorY = floorSurface(room, blocks, sp.x, sp.z);
     walkInitRef.current = true;
   }, [curRoomId]);
   const [arrange, setArrange] = useState(null);
@@ -1263,6 +1328,8 @@ function App() {
       d.env = { ...defaultEnv(), ...v.env };
       setEnv(d.env);
     }
+    d.entrances = normalizeEntrances(d.entrances, d.room, d.columns, d.blocks);
+    setEntrances(d.entrances);
     dataRef.current = d;
     if (persist) saveAll();
   }
@@ -1366,9 +1433,10 @@ function App() {
     setBlocks(f.blocks);
     setFurniture(f.furniture);
     dataRef.current = { ...dataRef.current, ...f };
+    dataRef.current.entrances = normalizeEntrances(f.entrances, dataRef.current.room, f.columns, f.blocks);
     const store = projectStore();
     if (v.roomEntrances) Object.entries(v.roomEntrances).forEach(([id, es]) => {
-      if (store[id]) store[id] = { ...store[id], entrances: id === curRoomRef.current ? f.entrances : es };
+      if (store[id]) store[id] = { ...store[id], entrances: id === curRoomRef.current ? dataRef.current.entrances : es };
     });
     syncEntranceStore(cleanEntranceLinks(store));
     saveAll();
@@ -1403,9 +1471,12 @@ function App() {
   }
   function updateColumns(n, save = true) {
     if (stateRef.current.mode === "view") return;
-    if (save) pushHistory();
+    const removed = dataRef.current.columns.filter((c) => !n.some((next) => next.id === c.id)).map((c) => c.id);
+    if (save) { if (removed.length) pushHistoryRaw(snapStr()); else pushHistory(); }
     setColumns(n);
     dataRef.current = { ...dataRef.current, columns: n };
+    if (removed.length) updatePlacements(dataRef.current.placements.filter((p) => !removed.includes(p.col)), false);
+    updateEntrances(dataRef.current.entrances, false);
     if (save) saveAll();
   }
   function updateWindows(n, save = true) {
@@ -1420,7 +1491,7 @@ function App() {
     const removed = dataRef.current.entrances.some((e) => !n.some((p) => p.id === e.id));
     if (save) { if (removed) pushHistoryRaw(snapStr()); else pushHistory(); }
     const store = projectStore();
-    store[curRoomRef.current] = { ...store[curRoomRef.current], entrances: n };
+    store[curRoomRef.current] = { ...store[curRoomRef.current], entrances: normalizeEntrances(n, dataRef.current.room, dataRef.current.columns, dataRef.current.blocks) };
     syncEntranceStore(cleanEntranceLinks(store));
     if (save) saveAll();
   }
@@ -1540,10 +1611,10 @@ function App() {
       setNotice(`窓の壁を${newWall}に変更しました：幅・高さ・床からの高さは維持されます`);
     } else {
       const e = entrances.find((x) => x.id === id);
-      if (!e || e.wall === newWall) return;
+      if (!e || !e.col && e.wall === newWall) return;
       const len = wallLen(room, newWall);
       const np = clamp(e.pos, -len / 2 + e.w / 2, len / 2 - e.w / 2);
-      updateEntrances(entrances.map((x) => x.id === id ? { ...x, wall: newWall, pos: np } : x));
+      updateEntrances(entrances.map((x) => x.id === id ? { ...x, wall: newWall, pos: np, col: undefined, face: undefined, base: undefined } : x));
       setNotice(`入口の壁を${newWall}に変更しました：幅・高さは維持されます`);
     }
   }
@@ -1551,19 +1622,13 @@ function App() {
     const s = stateRef.current;
     const eyeH = eyeOverride ?? s.eyeHeight;
     const e = s.entrances[0];
-    let spawn;
-    if (e) {
-      const margin = 0.6;
-      if (e.wall === "南") spawn = new THREE.Vector3(e.pos, eyeH, s.room.d / 2 - margin);
-      else if (e.wall === "北") spawn = new THREE.Vector3(e.pos, eyeH, -s.room.d / 2 + margin);
-      else if (e.wall === "東") spawn = new THREE.Vector3(s.room.w / 2 - margin, eyeH, e.pos);
-      else spawn = new THREE.Vector3(-s.room.w / 2 + margin, eyeH, e.pos);
-    } else spawn = new THREE.Vector3(0, eyeH, s.room.d / 2 - 0.6);
+    let spawn = e ? entrancePoint(s.room, e, s.columns, s.blocks, eyeH, 0.6) : new THREE.Vector3(0, eyeH, s.room.d / 2 - 0.6);
     spawn.x = clamp(spawn.x, -s.room.w / 2 + 0.35, s.room.w / 2 - 0.35);
     spawn.z = clamp(spawn.z, -s.room.d / 2 + 0.35, s.room.d / 2 - 0.35);
     const dx = 0 - spawn.x, dz = 0 - spawn.z;
     walkRef.current.pos.copy(spawn);
     walkRef.current.pos.y = eyeH;
+    walkRef.current.floorY = floorSurface(s.room, s.blocks, spawn.x, spawn.z);
     walkRef.current.yaw = Math.atan2(-dx, -dz);
     walkRef.current.pitch = 0;
   }
@@ -1925,7 +1990,7 @@ function App() {
       }
       const wallMat = new THREE.MeshStandardMaterial({ color: wallC, roughness: 0.9 });
       const mkWall = (width, x, z, ry, name) => {
-        const holes = s.windows.filter((o) => o.wall === name).map((o) => ({ c: WALL_SIGN[name] * o.pos, w: o.w, y0: o.sill, y1: o.sill + o.h }));
+        const holes = [...s.windows.filter((o) => o.wall === name).map((o) => ({ c: WALL_SIGN[name] * o.pos, w: o.w, y0: o.sill, y1: o.sill + o.h })), ...s.entrances.filter((e) => !e.col && e.wall === name).map((e) => ({ c: WALL_SIGN[name] * e.pos, w: e.w, y0: entranceBase(s.room, e, s.columns, s.blocks), y1: entranceBase(s.room, e, s.columns, s.blocks) + e.h }))];
         const m = new THREE.Mesh(wallGeom(width, h, holes), wallMat);
         m.position.set(x, h / 2, z);
         m.rotation.y = ry;
@@ -2013,10 +2078,17 @@ function App() {
       s.columns.forEach((c) => {
         const isSel = sel?.kind === "column" && sel.id === c.id;
         const mat2 = new THREE.MeshStandardMaterial({ color: theme === "white" ? 15329248 : 3421236, roughness: 0.8, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.55 : 0 });
-        const m = new THREE.Mesh(new THREE.BoxGeometry(colW(c), h, colD(c)), mat2);
+        const m = new THREE.Group();
         m.position.set(c.x, h / 2, c.z);
-        m.castShadow = true;
         m.userData = { kind: "column", id: c.id };
+        columnSolids(c, s.room, s.entrances, s.blocks).forEach((b) => {
+          const part = new THREE.Mesh(new THREE.BoxGeometry(b.w, b.h, b.d), mat2);
+          part.position.set(b.x - c.x, b.y - h / 2, b.z - c.z);
+          part.castShadow = true;
+          part.receiveShadow = true;
+          part.userData = { kind: "column", id: c.id };
+          m.add(part);
+        });
         group.add(m);
         if (isSel) {
           addWire(m, colW(c), h, colD(c));
@@ -2124,49 +2196,43 @@ function App() {
         }
       });
       s.entrances.forEach((e) => {
-        if (e.link) {
-          const rm = s.rooms.find((r) => r.id === e.link.room);
-          if (rm) {
-            const lp = wallWorld(s.room, e.wall, e.pos, e.h + 0.35, 0.12);
-            spriteLabel(`→ ${rm.floor} ${rm.name}`, lp, 1.3);
-          }
-        }
         const isSel = sel?.kind === "entrance" && sel.id === e.id;
         const g = new THREE.Group();
-        const dark = new THREE.Mesh(new THREE.PlaneGeometry(e.w, e.h), new THREE.MeshBasicMaterial({ color: isSel ? 1923656 : 460551 }));
+        const internal = !!e.col;
+        const dark = new THREE.Mesh(new THREE.PlaneGeometry(e.w, e.h), new THREE.MeshBasicMaterial({ color: isSel ? 1923656 : 460551, transparent: internal, opacity: internal ? 0 : 1, depthWrite: !internal, side: THREE.DoubleSide }));
         dark.userData = { kind: "entrance", id: e.id };
-        const fr = new THREE.Mesh(new THREE.BoxGeometry(e.w + 0.14, e.h + 0.08, 0.1), new THREE.MeshStandardMaterial({ color: isSel ? 9429190 : frameMat.color, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.5 : 0 }));
-        fr.position.z = -0.02;
-        fr.userData = { kind: "entrance", id: e.id };
-        g.add(fr, dark);
+        const fm = new THREE.MeshStandardMaterial({ color: isSel ? 9429190 : frameMat.color, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.5 : 0 });
+        if (internal) {
+          const t = 0.025;
+          for (const [bw, bh, x, y] of [[t, e.h, -e.w / 2 - t / 2, 0], [t, e.h, e.w / 2 + t / 2, 0], [e.w + 2 * t, t, 0, e.h / 2 + t / 2]]) {
+            const bar = new THREE.Mesh(new THREE.BoxGeometry(bw, bh, 0.035), fm);
+            bar.position.set(x, y, 0.015);
+            bar.userData = { kind: "entrance", id: e.id };
+            g.add(bar);
+          }
+        } else {
+          const fr = new THREE.Mesh(new THREE.BoxGeometry(e.w + 0.14, e.h + 0.08, 0.1), fm);
+          fr.position.z = -0.02;
+          fr.userData = { kind: "entrance", id: e.id };
+          g.add(fr);
+        }
+        g.add(dark);
         dark.position.z = 0.04;
+        const normal = entranceNormal(e, s.columns);
+        g.rotation.y = Math.atan2(normal.x, normal.z);
+        g.position.copy(entrancePoint(s.room, e, s.columns, s.blocks, e.h / 2, 0.025));
+        if (e.link) {
+          const rm = s.rooms.find((r) => r.id === e.link.room);
+          if (rm) spriteLabel(`→ ${rm.floor} ${rm.name}`, entrancePoint(s.room, e, s.columns, s.blocks, e.h + 0.35, 0.12), 1.3);
+        }
         if (isSel) {
-          addWire(g, e.w + 0.2, e.h + 0.2, 0.16);
+          addWire(g, e.w + 0.15, e.h + 0.15, 0.12);
           addHandle(g, e.w / 2 + 0.16, 0, 0.12, "entrance", e.id, "width");
           addHandle(g, 0, e.h / 2 + 0.16, 0.12, "entrance", e.id, "height");
-        }
-        const y = e.h / 2 + wallBase(s.room, e.wall, e.pos);
-        if (e.wall === "北") {
-          g.position.set(e.pos, y, -d / 2 + 0.02);
-        }
-        if (e.wall === "南") {
-          g.position.set(e.pos, y, d / 2 - 0.02);
-          g.rotation.y = Math.PI;
-        }
-        if (e.wall === "東") {
-          g.position.set(w / 2 - 0.02, y, e.pos);
-          g.rotation.y = -Math.PI / 2;
-        }
-        if (e.wall === "西") {
-          g.position.set(-w / 2 + 0.02, y, e.pos);
-          g.rotation.y = Math.PI / 2;
+          const ring = entrancePoint(s.room, e, s.columns, s.blocks, 0, 0.25);
+          addRing(ring.x, ring.z);
         }
         group.add(g);
-        if (isSel) {
-          const rx = e.wall === "北" || e.wall === "南" ? e.pos : e.wall === "東" ? w / 2 - 0.25 : -w / 2 + 0.25;
-          const rz = e.wall === "北" || e.wall === "南" ? e.wall === "北" ? -d / 2 + 0.25 : d / 2 - 0.25 : e.pos;
-          addRing(rx, rz);
-        }
       });
       s.placements.forEach((p) => {
         const photo = photoOf(p.photo);
@@ -2406,7 +2472,7 @@ function App() {
             }
             spriteLabel(txt, new THREE.Vector3((a.x + b.x) / 2, (a.y + b.y) / 2 + 0.14, (a.z + b.z) / 2), 1.4);
           };
-          const wallItems = (wall2) => [...s.placements.filter((p) => p.method === "壁掛け" && !p.col && p.wall === wall2).map((p) => ({ id: p.id, pos: p.pos, half: frameW(p) / 2 })), ...s.windows.filter((o) => o.wall === wall2).map((o) => ({ id: o.id, pos: o.pos, half: o.w / 2 })), ...s.entrances.filter((o) => o.wall === wall2).map((o) => ({ id: o.id, pos: o.pos, half: o.w / 2 }))];
+          const wallItems = (wall2) => [...s.placements.filter((p) => p.method === "壁掛け" && !p.col && p.wall === wall2).map((p) => ({ id: p.id, pos: p.pos, half: frameW(p) / 2 })), ...s.windows.filter((o) => o.wall === wall2).map((o) => ({ id: o.id, pos: o.pos, half: o.w / 2 })), ...s.entrances.filter((o) => !o.col && o.wall === wall2).map((o) => ({ id: o.id, pos: o.pos, half: o.w / 2 }))];
           const wp = (wall2, pos2, y) => {
             const o = 0.07;
             return wall2 === "北" ? new THREE.Vector3(pos2, y, -d / 2 + o) : wall2 === "南" ? new THREE.Vector3(pos2, y, d / 2 - o) : wall2 === "東" ? new THREE.Vector3(w / 2 - o, y, pos2) : new THREE.Vector3(-w / 2 + o, y, pos2);
@@ -2420,7 +2486,7 @@ function App() {
             if (o) wallSel = { wall: o.wall, id: o.id, pos: o.pos, half: o.w / 2, y: o.sill + o.h / 2 };
           } else if (sel2.kind === "entrance") {
             const o = s.entrances.find((x) => x.id === sel2.id);
-            if (o) wallSel = { wall: o.wall, id: o.id, pos: o.pos, half: o.w / 2, y: o.h / 2 };
+            if (o && !o.col) wallSel = { wall: o.wall, id: o.id, pos: o.pos, half: o.w / 2, y: o.h / 2 };
           }
           if (wallSel) {
             const L = wallLen(s.room, wallSel.wall);
@@ -2686,11 +2752,9 @@ function App() {
         wr.pos.x = clamp(wr.pos.x, -halfW, halfW);
         wr.pos.z = clamp(wr.pos.z, -halfD, halfD);
         s.columns.forEach((c) => {
-          const hx = colW(c) / 2 + 0.3, hz = colD(c) / 2 + 0.3, dx = wr.pos.x - c.x, dz = wr.pos.z - c.z;
-          if (Math.abs(dx) < hx && Math.abs(dz) < hz) {
-            if (hx - Math.abs(dx) < hz - Math.abs(dz)) wr.pos.x = c.x + (dx >= 0 ? 1 : -1) * hx;
-            else wr.pos.z = c.z + (dz >= 0 ? 1 : -1) * hz;
-          }
+          const p = pushOutColumn(wr.pos.x, wr.pos.z, c, s.room, s.entrances, s.blocks, 0.3, s.eyeHeight, wr.floorY || 0);
+          wr.pos.x = p.x;
+          wr.pos.z = p.z;
         });
         s.placements.forEach((p) => {
           if (p.method !== "イーゼル") return;
@@ -2780,7 +2844,7 @@ function App() {
             let bd = 1.3;
             s.entrances.forEach((e) => {
               if (!e.link) return;
-              const p = wallWorld(s.room, e.wall, e.pos, 0, 0);
+              const p = entrancePoint(s.room, e, s.columns, s.blocks);
               const dd = Math.hypot(p.x - wr.pos.x, p.z - wr.pos.z);
               if (dd < bd) {
                 bd = dd;
@@ -2891,24 +2955,36 @@ function App() {
     }
     return null;
   }
-  function pickWall(e) {
+  function pickWall(e, internal = false) {
     const hits = getRay(e).intersectObjects(groupRef.current.children, true);
     for (const h of hits) {
       const o = h.object;
       if (!o.isMesh) continue;
       let hidden = false;
-      for (let q = o; q; q = q.parent) if (q.visible === false) {
-        hidden = true;
-        break;
-      }
+      for (let q = o; q; q = q.parent) if (q.visible === false) { hidden = true; break; }
       if (hidden) continue;
-      return o.userData?.wallTap ? { wall: o.userData.wallTap, point: h.point.clone() } : null;
+      if (o.userData?.wallTap) return { wall: o.userData.wallTap, point: h.point.clone() };
+      if (internal && o.userData?.kind === "column") {
+        const c = dataRef.current.columns.find((c) => c.id === o.userData.id);
+        if (c) {
+          const face = columnDoorAxis(c) === "x" ? h.point.z >= c.z ? "南" : "北" : h.point.x >= c.x ? "東" : "西";
+          return { wall: face, face, col: c.id, point: h.point.clone() };
+        }
+      }
+      return null;
     }
     return null;
   }
   function moveSelToWall(t) {
     const sel = stateRef.current.selected;
     if (!sel) return;
+    if (t.col && sel.kind === "entrance") {
+      const d = dataRef.current, c = d.columns.find((c) => c.id === t.col);
+      if (!c) return;
+      const along = columnDoorAxis(c) === "x" ? t.point.x - c.x : t.point.z - c.z;
+      updateEntrances(d.entrances.map((x) => x.id === sel.id ? { ...x, col: c.id, wall: t.face, face: t.face, pos: along, base: undefined } : x));
+      return;
+    }
     const r = dataRef.current.room, L = wallLen(r, t.wall), along = axisCoord(t.point, t.wall), cp = (half) => Math.round(clamp(along, -L / 2 + half, Math.max(-L / 2 + half, L / 2 - half)) * 100) / 100;
     if (sel.kind === "placement") {
       const p = dataRef.current.placements.find((x) => x.id === sel.id);
@@ -2924,7 +3000,7 @@ function App() {
     } else if (sel.kind === "entrance") {
       const en = dataRef.current.entrances.find((x) => x.id === sel.id);
       if (!en) return;
-      updateEntrances(dataRef.current.entrances.map((x) => x.id === en.id ? { ...x, wall: t.wall, pos: cp(en.w / 2) } : x));
+      updateEntrances(dataRef.current.entrances.map((x) => x.id === en.id ? { ...x, wall: t.wall, pos: cp(en.w / 2), col: undefined, face: undefined, base: undefined } : x));
       setNotice(`入口を${t.wall}壁に移しました`);
     }
   }
@@ -2954,7 +3030,11 @@ function App() {
     }
     let wall2 = "北";
     if (kind === "window") wall2 = s.windows.find((x) => x.id === id)?.wall || "北";
-    if (kind === "entrance") wall2 = s.entrances.find((x) => x.id === id)?.wall || "北";
+    if (kind === "entrance") {
+      const e = s.entrances.find((x) => x.id === id);
+      if (e?.col) return new THREE.Plane().setFromNormalAndCoplanarPoint(entranceNormal(e, s.columns), entrancePoint(s.room, e, s.columns, s.blocks));
+      wall2 = e?.wall || "北";
+    }
     if (kind === "placement") wall2 = s.placements.find((x) => x.id === id)?.wall || "北";
     const n = wallNormal(wall2);
     const pt = wallPoint(s.room, wall2);
@@ -2980,9 +3060,9 @@ function App() {
     } else if (kind === "entrance") {
       const e = s.entrances.find((x) => x.id === id);
       if (e) {
-        const fromEdge = (e.pos + wallLen(s.room, e.wall) / 2).toFixed(2);
-        text = `壁端から ${fromEdge} m ・ 幅 ${e.w.toFixed(2)} m`;
-        pos2.set(e.wall === "北" || e.wall === "南" ? e.pos : e.wall === "東" ? s.room.w / 2 - 0.2 : -s.room.w / 2 + 0.2, e.h + 0.25, e.wall === "北" || e.wall === "南" ? e.wall === "北" ? -s.room.d / 2 + 0.2 : s.room.d / 2 - 0.2 : e.pos);
+        const fromEdge = (e.pos + entranceLength(s.room, e, s.columns) / 2).toFixed(2);
+        text = `${e.col ? "室内壁" : e.wall + "壁"}・壁端から ${fromEdge} m ・ 幅 ${e.w.toFixed(2)} m`;
+        pos2.copy(entrancePoint(s.room, e, s.columns, s.blocks, e.h + 0.25, 0.2));
       }
     } else if (kind === "placement") {
       const p = s.placements.find((x) => x.id === id);
@@ -3091,8 +3171,10 @@ function App() {
     } else if (kind === "entrance") {
       const e = s.entrances.find((x) => x.id === id);
       if (!e) return;
-      const along = axisCoord(target, e.wall);
-      const nx = clamp(along, -wallLen(s.room, e.wall) / 2 + e.w / 2, wallLen(s.room, e.wall) / 2 - e.w / 2);
+      const c = e.col && s.columns.find((c) => c.id === e.col);
+      const along = c ? columnDoorAxis(c) === "x" ? target.x - c.x : target.z - c.z : axisCoord(target, e.wall);
+      const L = entranceLength(s.room, e, s.columns);
+      const nx = clamp(along, -L / 2 + e.w / 2, L / 2 - e.w / 2);
       updateEntrances(s.entrances.map((x) => x.id === id ? { ...x, pos: nx } : x), false);
       updateDragInfo(kind, id, target);
     }
@@ -3134,12 +3216,15 @@ function App() {
       const e = s.entrances.find((x) => x.id === id);
       if (!e) return;
       if (handle === "width") {
-        const along = axisCoord(hit, e.wall);
-        const nw = clamp((Math.abs(along - e.pos) - 0.16) * 2, 0.9, 2);
-        const clampedPos = clamp(e.pos, -wallLen(s.room, e.wall) / 2 + nw / 2, wallLen(s.room, e.wall) / 2 - nw / 2);
+        const c = e.col && s.columns.find((c) => c.id === e.col);
+        const along = c ? columnDoorAxis(c) === "x" ? hit.x - c.x : hit.z - c.z : axisCoord(hit, e.wall);
+        const L = entranceLength(s.room, e, s.columns);
+        const nw = clamp((Math.abs(along - e.pos) - 0.16) * 2, 0.3, Math.min(3, L - 0.04));
+        const clampedPos = clamp(e.pos, -L / 2 + nw / 2, L / 2 - nw / 2);
         updateEntrances(s.entrances.map((x) => x.id === id ? { ...x, w: nw, pos: clampedPos } : x), false);
       } else if (handle === "height") {
-        const nh = clamp(hit.y - 0.16, 1.9, Math.min(2.6, s.room.h));
+        const base = entranceBase(s.room, e, s.columns, s.blocks);
+        const nh = clamp(hit.y - base - 0.16, 0.3, s.room.h - base);
         updateEntrances(s.entrances.map((x) => x.id === id ? { ...x, h: nh } : x), false);
       }
       updateDragInfo(kind, id, hit);
@@ -3291,7 +3376,7 @@ function App() {
         offset.copy(intersect).sub(cur);
       } else if (hit.kind === "entrance") {
         const en = s.entrances.find((x) => x.id === hit.id);
-        const cur = new THREE.Vector3(en.wall === "北" || en.wall === "南" ? en.pos : en.wall === "東" ? s.room.w / 2 : -s.room.w / 2, en.h / 2, en.wall === "北" || en.wall === "南" ? en.wall === "北" ? -s.room.d / 2 : s.room.d / 2 : en.pos);
+        const cur = entrancePoint(s.room, en, s.columns, s.blocks, en.h / 2);
         offset.copy(intersect).sub(cur);
       }
       dragRef.current = { x: e.clientX, y: e.clientY, mode: "move", kind: hit.kind, id: hit.id, plane, offset, startX: e.clientX, startY: e.clientY, moved: false, t0: performance.now() };
@@ -3299,7 +3384,7 @@ function App() {
       updateDragInfo(hit.kind, hit.id, intersect);
       return;
     }
-    const wallTap = selected && (selected.kind === "entrance" || selected.kind === "window" || selected.kind === "placement" && placements.find((p) => p.id === selected.id)?.method === "壁掛け") ? pickWall(e) : null;
+    const wallTap = selected && (selected.kind === "entrance" || selected.kind === "window" || selected.kind === "placement" && placements.find((p) => p.id === selected.id)?.method === "壁掛け") ? pickWall(e, selected?.kind === "entrance") : null;
     dragRef.current = { x: e.clientX, y: e.clientY, mode: view === "orbit" ? "orbit" : "look", startX: e.clientX, startY: e.clientY, moved: false, pendingClear: !wallTap && !!selected && !panelOpen && !roomPanelOpen, blank: true, wallTap, t0: performance.now() };
   }
   function onPointerMove(e) {
@@ -3347,11 +3432,9 @@ function App() {
       let nx = clamp(hit.x - (d.offset?.x || 0), -s.room.w / 2 + 0.3, s.room.w / 2 - 0.3);
       let nz = clamp(hit.z - (d.offset?.z || 0), -s.room.d / 2 + 0.3, s.room.d / 2 - 0.3);
       s.columns.forEach((c) => {
-        const hx = colW(c) / 2 + 0.35, hz = colD(c) / 2 + 0.35, dx2 = nx - c.x, dz2 = nz - c.z;
-        if (Math.abs(dx2) < hx && Math.abs(dz2) < hz) {
-          if (hx - Math.abs(dx2) < hz - Math.abs(dz2)) nx = c.x + (dx2 >= 0 ? 1 : -1) * hx;
-          else nz = c.z + (dz2 >= 0 ? 1 : -1) * hz;
-        }
+        const p = pushOutColumn(nx, nz, c, s.room, s.entrances, s.blocks, 0.3, s.eyeHeight, floorSurface(s.room, s.blocks, nx, nz));
+        nx = p.x;
+        nz = p.z;
       });
       s.placements.forEach((p) => {
         if (p.method !== "イーゼル") return;
@@ -3646,7 +3729,7 @@ function App() {
   function wallBlocked(wall2, yLo, yHi, exclude) {
     const o = [];
     windows.filter((x) => x.wall === wall2 && x.sill < yHi && x.sill + x.h > yLo).forEach((x) => o.push({ a: x.pos - x.w / 2 - 0.08, b: x.pos + x.w / 2 + 0.08 }));
-    entrances.filter((x) => x.wall === wall2 && x.h > yLo).forEach((x) => o.push({ a: x.pos - x.w / 2 - 0.08, b: x.pos + x.w / 2 + 0.08 }));
+    entrances.filter((x) => !x.col && x.wall === wall2 && x.h > yLo).forEach((x) => o.push({ a: x.pos - x.w / 2 - 0.08, b: x.pos + x.w / 2 + 0.08 }));
     placements.filter((p) => p.method === "壁掛け" && !p.col && p.wall === wall2 && !(exclude && exclude.has(p.id))).forEach((p) => {
       const hh = frameH(p) / 2;
       if (p.center - hh < yHi && p.center + hh > yLo) o.push({ a: p.pos - frameW(p) / 2 - 0.05, b: p.pos + frameW(p) / 2 + 0.05 });
@@ -3721,6 +3804,7 @@ function App() {
         return Math.round((rg.lo + rg.hi) / 2 * 100) / 100;
       })() : center;
       const blocked = placements.filter((q) => q.col === c.id && (q.face || "南") === mountFace2 && q.center - frameH(q) / 2 < cen + hm / 2 && q.center + frameH(q) / 2 > cen - hm / 2).map((q) => ({ a: q.pos - frameW(q) / 2 - 0.05, b: q.pos + frameW(q) / 2 + 0.05 }));
+      if (!bk) entrances.filter((e) => e.col === c.id && entranceBase(room, e, columns, blocks) < cen + hm / 2 && entranceBase(room, e, columns, blocks) + e.h > cen - hm / 2).forEach((e) => blocked.push({ a: e.pos - e.w / 2 - 0.05, b: e.pos + e.w / 2 + 0.05 }));
       let px;
       if (n === 1) {
         const p1 = findWallSpot(L, ws[0], 0, blocked);
@@ -4176,12 +4260,13 @@ function App() {
     } else if (sel.kind === "entrance") {
       const me = entrances.find((x) => x.id === sel.id);
       if (!me) return;
+      if (me.col) { addEntranceOnColumn(me.col, { face: me.face, pos: me.pos + me.w + 0.15 }); return; }
       const p = wallDup(me.wall, me.w, me.pos, 0, me.h);
       if (p === null) {
         setNotice(`${me.wall}壁には複製を置ける空きがありません`);
         return;
       }
-      const np = { ...me, id: uid(), pos: p };
+      const np = { ...me, id: uid(), pos: p, link: undefined };
       updateEntrances([...entrances, np]);
       selectObj("entrance", np.id);
     } else if (sel.kind === "column") {
@@ -4504,9 +4589,16 @@ function App() {
     const R = dataRef.current.room;
     let ok = false;
     if (pm.kind === "window" || pm.kind === "entrance" || pm.kind === "photoWall") {
-      const t = pickWall(e);
+      const t = pickWall(e, pm.kind === "entrance");
       if (!t) {
         setNotice("壁の空いている所をタップしてください");
+        return;
+      }
+      if (pm.kind === "entrance" && t.col) {
+        const c = dataRef.current.columns.find((c) => c.id === t.col);
+        const pos = columnDoorAxis(c) === "x" ? t.point.x - c.x : t.point.z - c.z;
+        const id = addEntranceOnColumn(t.col, { face: t.face, pos });
+        if (id && !placeRepeat) endPlace();
         return;
       }
       const L = wallLen(R, t.wall), along = axisCoord(t.point, t.wall), cp = (half) => Math.round(clamp(along, -L / 2 + half, Math.max(-L / 2 + half, L / 2 - half)) * 100) / 100;
@@ -4736,6 +4828,43 @@ function App() {
   function entrancesOf(id) {
     return id === curRoomRef.current ? dataRef.current.entrances : roomStore.current[id]?.entrances || [];
   }
+  function addEntranceOnColumn(id, at) {
+    if (stateRef.current.mode === "view") return;
+    const d = dataRef.current, c = d.columns.find((c) => c.id === id);
+    if (!c) return;
+    const face = at?.face || columnDoorFaces(c)[0];
+    const L = columnDoorAxis(c) === "x" ? colW(c) : colD(c);
+    if (L < 0.5) { setNotice("入口を付けるには、壁の長さを0.5m以上にしてください"); return; }
+    const width = Math.min(0.8, L - 0.08);
+    const blocked = d.entrances.filter((e) => e.col === id).map((e) => ({ a: e.pos - e.w / 2 - 0.05, b: e.pos + e.w / 2 + 0.05 }));
+    d.placements.filter((p) => p.col === id).forEach((p) => blocked.push({ a: p.pos - frameW(p) / 2 - 0.05, b: p.pos + frameW(p) / 2 + 0.05 }));
+    const pos = findWallSpot(L, width, at?.pos || 0, blocked);
+    if (pos === null) { setNotice("この壁には入口を置ける空きがありません"); return; }
+    const e = { id: uid(), col: id, face, wall: face, pos, w: width, h: 2.05 };
+    updateEntrances([...d.entrances, e]);
+    selectObj("entrance", e.id);
+    setNotice("壁に入口を付けました。幅・高さ・壁沿い位置と、床からの高さを調整できます");
+    return e.id;
+  }
+  function changeEntranceHost(id, host) {
+    const d = dataRef.current, e = d.entrances.find((e) => e.id === id);
+    if (!e) return;
+    if (host.startsWith("outer:")) { changeWall("entrance", id, host.slice(6)); return; }
+    const c = d.columns.find((c) => c.id === host);
+    if (!c) return;
+    const face = columnDoorFaces(c)[0];
+    updateEntrances(d.entrances.map((x) => x.id === id ? { ...x, col: host, face, wall: face, pos: 0, base: undefined } : x));
+  }
+  function entranceMountControls(e) {
+    const c = e.col && columns.find((c) => c.id === e.col);
+    return React.createElement("div", { className: "col-span-2 space-y-1" },
+      React.createElement("label", { className: "block text-xs" }, "入口を付ける壁", React.createElement("select", { className: "field", value: e.col || "outer:" + e.wall, onChange: (ev) => changeEntranceHost(e.id, ev.target.value) },
+        ...["北", "南", "東", "西"].map((wall) => React.createElement("option", { key: "outer:" + wall, value: "outer:" + wall }, wall + "の外壁")),
+        ...columns.map((c, i) => React.createElement("option", { key: c.id, value: c.id }, c.name || `壁・柱 ${i + 1}`)))),
+      c && React.createElement("label", { className: "block text-xs" }, "入口の正面", React.createElement("select", { className: "field", value: e.face || columnDoorFaces(c)[0], onChange: (ev) => updateEntrances(dataRef.current.entrances.map((x) => x.id === e.id ? { ...x, wall: ev.target.value, face: ev.target.value } : x)) }, ...columnDoorFaces(c).map((f) => React.createElement("option", { key: f, value: f }, f + "面")))),
+      c && React.createElement("label", { className: "block text-xs" }, "開口の下端（床の基準から m）", React.createElement("input", { className: "field", type: "number", min: "0", max: Math.max(0, room.h - e.h), step: ".01", value: entranceBase(room, e, columns, blocks), onChange: (ev) => updateEntrances(dataRef.current.entrances.map((x) => x.id === e.id ? { ...x, base: Math.max(0, Number(ev.target.value)) } : x)) })),
+      c && React.createElement("p", { className: "small" }, "壁の表裏を貫通する開口です。接続先を指定しなくても同じ部屋の中を歩いて通れます。"));
+  }
   function setEntranceLink(entId, target) {
     if (stateRef.current.mode === "view") return;
     const cur = curRoomRef.current;
@@ -4858,7 +4987,7 @@ function App() {
     const cur = r.id === curRoomId;
     const links = entrancesOf(r.id).filter((e) => e.link).map((e) => `入口（${e.wall}壁）→ ${roomLabel(e.link.room)}`);
     return /* @__PURE__ */ React.createElement("div", { key: r.id, className: `border rounded-xl p-2 space-y-1 ${cur ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "text-left text-sm font-bold w-full", onClick: () => switchRoom(r.id) }, r.name, cur ? "（表示中）" : ""), links.length > 0 && /* @__PURE__ */ React.createElement("p", { className: "small" }, links.join(" ／ ")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 text-xs" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "underline", onClick: () => renameRoom(r.id) }, "名前"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "underline", onClick: () => setRoomFloor(r.id) }, "階"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "underline", onClick: () => duplicateRoom(r.id) }, "複製"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "text-red-600 underline", onClick: () => deleteRoom(r.id) }, "削除")));
-  }))), /* @__PURE__ */ React.createElement("p", { className: "small" }, "部屋どうしは「柱・窓・入口」で入口を選び、「つながり先」で結びます。写真ライブラリと時間帯はすべての部屋で共通です。")), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement("button", { className: "chip text-sm", onClick: () => preset(6, 4) }, "小さなギャラリー 6×4m"), /* @__PURE__ */ React.createElement("button", { className: "chip text-sm", onClick: () => preset(12, 8) }, "大きなホール 12×8m")), room.stair ? stairPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, [["幅", "w", 3, 15], ["奥行き", "d", 3, 15], ["高さ", "h", 2.4, 5]].map(([label, key, min, max]) => /* @__PURE__ */ React.createElement("label", { key, className: "block" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, label), /* @__PURE__ */ React.createElement("b", null, fmt(room[key]), " m")), /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min, max, step: 0.1, value: room[key], onChange: (e) => updateRoom({ [key]: Number(e.target.value) }) })))), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "目線高さ"), /* @__PURE__ */ React.createElement("b", null, eyeHeight.toFixed(2), " m")), /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: "1.4", max: "1.8", step: "0.05", value: eyeHeight, onChange: (e) => setEyeHeight(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("p", { className: "small" }, "床には 1m グリッドと寸法ラベルを表示しています。壁に飾った作品がスポットライトで明るく見えます。人の視点ではカメラは常に目線高さに固定されます。")), tab === "柱・窓・入口" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: "space-y-1" }, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "追加 ", /* @__PURE__ */ React.createElement("span", { className: "font-normal text-[var(--muted)]" }, "押してから、置く場所を3Dでタップ")), (() => {
+  }))), /* @__PURE__ */ React.createElement("p", { className: "small" }, "部屋どうしは「柱・窓・入口」で入口を選び、「つながり先」で結びます。写真ライブラリと時間帯はすべての部屋で共通です。")), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement("button", { className: "chip text-sm", onClick: () => preset(6, 4) }, "小さなギャラリー 6×4m"), /* @__PURE__ */ React.createElement("button", { className: "chip text-sm", onClick: () => preset(12, 8) }, "大きなホール 12×8m")), room.stair ? stairPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, [["幅", "w", 2, 15], ["奥行き", "d", 2, 15], ["高さ", "h", 2.4, 5]].map(([label, key, min, max]) => /* @__PURE__ */ React.createElement("label", { key, className: "block" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, label), /* @__PURE__ */ React.createElement("b", null, fmt(room[key]), " m")), /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min, max, step: 0.1, value: room[key], onChange: (e) => updateRoom({ [key]: Number(e.target.value) }) })))), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "目線高さ"), /* @__PURE__ */ React.createElement("b", null, eyeHeight.toFixed(2), " m")), /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: "1.4", max: "1.8", step: "0.05", value: eyeHeight, onChange: (e) => setEyeHeight(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("p", { className: "small" }, "床には 1m グリッドと寸法ラベルを表示しています。壁に飾った作品がスポットライトで明るく見えます。人の視点ではカメラは常に目線高さに固定されます。")), tab === "柱・窓・入口" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: "space-y-1" }, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "追加 ", /* @__PURE__ */ React.createElement("span", { className: "font-normal text-[var(--muted)]" }, "押してから、置く場所を3Dでタップ")), (() => {
     const ic = {
       柱: /* @__PURE__ */ React.createElement("rect", { x: "9", y: "3", width: "8", height: "20", rx: "1", fill: "none", stroke: "currentColor", strokeWidth: "1.8" }),
       窓: /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("rect", { x: "4", y: "5", width: "18", height: "15", rx: "1.5", fill: "none", stroke: "currentColor", strokeWidth: "1.8" }), /* @__PURE__ */ React.createElement("path", { d: "M13 5v15M4 12.5h18", stroke: "currentColor", strokeWidth: "1.5" })),
@@ -4874,7 +5003,7 @@ function App() {
     const T = (key, label, go) => /* @__PURE__ */ React.createElement("button", { key, type: "button", onClick: go, "aria-label": `${label}を追加`, className: "soft h-[62px] rounded-[14px] flex flex-col items-center justify-center gap-[3px] text-[11px] font-extrabold" }, /* @__PURE__ */ React.createElement("svg", { width: "26", height: "26", viewBox: "0 0 26 26", "aria-hidden": "true" }, ic[key]), label);
     const G = (title, items) => /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("p", { className: "pt-1.5 text-[11px] font-extrabold text-[var(--muted)]" }, title), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-4 gap-1.5" }, items));
     return /* @__PURE__ */ React.createElement(React.Fragment, null, G("壁・天井", [T("柱", "柱", () => startPlace("column", "柱")), T("窓", "窓", () => startPlace("window", "窓")), T("入口", "入口", () => startPlace("entrance", "入口")), T("下がり天井", "下がり天井", () => startPlace("block", "下がり天井", { w: Math.min(2, room.w), d: 1, h: 0.4, ceil: true }))]), G("床に置く", BLOCK_PRESETS.map((pr) => T(pr.label, pr.label, () => startPlace("block", pr.label, pr)))), G("家具", ["chair", "tableRect", "tableRound"].map((t) => T(t, t === "tableRect" ? "角テーブル" : FURN_NAMES[t], () => startPlace("furniture", FURN_NAMES[t], t)))));
-  })()), /* @__PURE__ */ React.createElement("section", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "柱")), columns.map((c, i) => /* @__PURE__ */ React.createElement("div", { key: c.id, className: `border rounded-xl p-3 mt-2 grid grid-cols-3 gap-2 ${selected?.kind === "column" && selected.id === c.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { className: "col-span-3 text-left text-xs font-bold", onClick: () => selectObj("column", c.id) }, "柱を選択して3Dで動かす"), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: ".1", value: c.x, onChange: (e) => {
+  })()), /* @__PURE__ */ React.createElement("section", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "柱")), columns.map((c, i) => /* @__PURE__ */ React.createElement("div", { key: c.id, className: `border rounded-xl p-3 mt-2 grid grid-cols-3 gap-2 ${selected?.kind === "column" && selected.id === c.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { className: "col-span-3 text-left text-xs font-bold", onClick: () => selectObj("column", c.id) }, "柱を選択して3Dで動かす"), React.createElement("button", { type: "button", className: "col-span-3 chip text-xs", onClick: () => addEntranceOnColumn(c.id) }, "＋ この壁に入口を追加"), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: ".1", value: c.x, onChange: (e) => {
     const n = [...columns];
     n[i].x = Number(e.target.value);
     updateColumns(n);
@@ -4911,19 +5040,17 @@ function App() {
     const n = [...windows];
     n[i].sill = Number(e.target.value);
     updateWindows(n);
-  } })), /* @__PURE__ */ React.createElement("button", { className: "text-xs text-red-600 flex gap-1 items-center", onClick: () => updateWindows(windows.filter((x) => x.id !== w.id)) }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "削除")))), /* @__PURE__ */ React.createElement("section", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "入口")), entrances.map((e, i) => /* @__PURE__ */ React.createElement("div", { key: e.id, className: `border rounded-xl p-3 mt-2 grid grid-cols-2 gap-2 ${selected?.kind === "entrance" && selected.id === e.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { className: "col-span-2 text-left text-xs font-bold", onClick: () => selectObj("entrance", e.id) }, "入口を選択して3Dで動かす"), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "壁", /* @__PURE__ */ React.createElement("select", { className: "field", value: e.wall, onChange: (ev) => {
-    const n = [...entrances];
-    n[i].wall = ev.target.value;
-    updateEntrances(n);
+  } })), /* @__PURE__ */ React.createElement("button", { className: "text-xs text-red-600 flex gap-1 items-center", onClick: () => updateWindows(windows.filter((x) => x.id !== w.id)) }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "削除")))), /* @__PURE__ */ React.createElement("section", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "入口")), entrances.map((e, i) => /* @__PURE__ */ React.createElement("div", { key: e.id, className: `border rounded-xl p-3 mt-2 grid grid-cols-2 gap-2 ${selected?.kind === "entrance" && selected.id === e.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { className: "col-span-2 text-left text-xs font-bold", onClick: () => selectObj("entrance", e.id) }, "入口を選択して3Dで動かす"), entranceMountControls(e), !e.col && /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "外壁", /* @__PURE__ */ React.createElement("select", { className: "field", value: e.wall, onChange: (ev) => {
+    changeWall("entrance", e.id, ev.target.value);
   } }, ["北", "南", "東", "西"].map((x) => /* @__PURE__ */ React.createElement("option", { key: x }, x)))), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: ".1", value: e.pos, onChange: (ev) => {
     const n = [...entrances];
     n[i].pos = Number(ev.target.value);
     updateEntrances(n);
-  } })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "幅 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", min: ".9", max: "2", step: ".1", value: e.w, onChange: (ev) => {
+  } })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "幅 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", min: ".3", max: Math.max(0.3, entranceLength(room, e, columns) - 0.04), step: ".01", value: e.w, onChange: (ev) => {
     const n = [...entrances];
     n[i].w = Number(ev.target.value);
     updateEntrances(n);
-  } })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "高さ (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", min: "1.9", max: "2.6", step: ".1", value: e.h, onChange: (ev) => {
+  } })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "高さ (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", min: ".3", max: room.h - entranceBase(room, e, columns, blocks), step: ".01", value: e.h, onChange: (ev) => {
     const n = [...entrances];
     n[i].h = Number(ev.target.value);
     updateEntrances(n);
@@ -4967,7 +5094,7 @@ function App() {
     } }), React.createElement("button", { type: "button", onClick: exportBackup, disabled: !!photoTask, className: "chip text-sm w-full font-bold disabled:opacity-50" }, "📦 写真込みバックアップ"), (photoTask || notice) && React.createElement("p", { className: "small", role: "status" }, photoTask || notice), /* @__PURE__ */ React.createElement("p", { className: "small" }, "「写真込みバックアップ」は全室の配置と取り込んだ写真を1つのJSONに保存し、「読み込む」から復元できます（アプリ内の最大1600px画像。原本は含みません）。上の通常の書き出しは配置のみです。")));
   })());
   const replacementInput = React.createElement("input", { ref: replaceRef, type: "file", accept: "image/*", className: "hidden", onChange: (e) => { const file = e.target.files?.[0]; const target = replaceTargetRef.current; replaceTargetRef.current = null; e.target.value = ""; replacePhoto(file, target); } });
-  const selRow = mode === "edit" && selected ? /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b border-[var(--line)] bg-[var(--surface2)] flex items-center gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0 flex-1" }, /* @__PURE__ */ React.createElement("p", { className: "text-[13px] font-bold leading-tight truncate" }, selected.kind === "column" ? "柱" : selected.kind === "window" ? "窓枠" : selected.kind === "entrance" ? "入口" : selected.kind === "light" ? "照明" : selected.kind === "block" ? selBlock?.ceil ? "下がり天井" : "台" : selected.kind === "furniture" ? selFurn ? FURN_NAMES[selFurn.type] : "家具" : selPhoto ? selPhoto.title : "作品"), /* @__PURE__ */ React.createElement("p", { className: "text-[11px] leading-tight text-[var(--muted)] truncate" }, selected.kind === "furniture" && selFurn ? `X ${selFurn.x.toFixed(2)} m ・ Z ${selFurn.z.toFixed(2)} m ・ 回転 ${selFurn.rot}°` : selected.kind === "block" && selBlock ? `X ${selBlock.x.toFixed(2)} m ・ Z ${selBlock.z.toFixed(2)} m ・ ${selBlock.ceil ? `${fmt(selBlock.w)}×${fmt(selBlock.d)} m ・ 下面 ${fmt(ceilBot(room, selBlock))} m` : `${fmt(selBlock.w)}×${fmt(selBlock.d)}×${fmt(selBlock.h)} m`}` : selected.kind === "light" && selLight ? `X ${selLight.x.toFixed(2)} m ・ Z ${selLight.z.toFixed(2)} m ・ 強度 ${selLight.intensity} ・ ${selLight.kelvin} K` : selected.kind === "column" && selCol ? `X ${selCol.x.toFixed(2)} m ・ Z ${selCol.z.toFixed(2)} m ・ ${fmt(colW(selCol))}×${fmt(colD(selCol))} m` : selected.kind === "window" && selWin ? `${selWin.wall}壁 ・ 壁端から ${(selWin.pos + wallLen(room, selWin.wall) / 2).toFixed(2)} m ・ ${selWin.w.toFixed(2)}×${selWin.h.toFixed(2)} m` : selected.kind === "entrance" && selEnt ? `${selEnt.wall}壁 ・ 壁端から ${(selEnt.pos + wallLen(room, selEnt.wall) / 2).toFixed(2)} m ・ 幅 ${selEnt.w.toFixed(2)} m` : selected.kind === "placement" && selPlace ? selPlace.method === "壁掛け" ? `${selPlace.wall}壁 ・ 壁端から ${(selPlace.pos + wallLen(room, selPlace.wall) / 2).toFixed(2)} m ・ 中心 ${selPlace.center.toFixed(2)} m` : `X ${selPlace.x.toFixed(2)} m ・ Z ${selPlace.z.toFixed(2)} m` : "")), /* @__PURE__ */ React.createElement("button", { onClick: deleteSelected, className: "shrink-0 px-3 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold flex items-center gap-1" }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "削除"), /* @__PURE__ */ React.createElement("button", { onClick: clearSelection, className: "shrink-0 px-3 py-1.5 rounded-lg border border-[var(--line)] text-xs font-bold" }, "解除")) : null;
+  const selRow = mode === "edit" && selected ? /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b border-[var(--line)] bg-[var(--surface2)] flex items-center gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0 flex-1" }, /* @__PURE__ */ React.createElement("p", { className: "text-[13px] font-bold leading-tight truncate" }, selected.kind === "column" ? "柱" : selected.kind === "window" ? "窓枠" : selected.kind === "entrance" ? "入口" : selected.kind === "light" ? "照明" : selected.kind === "block" ? selBlock?.ceil ? "下がり天井" : "台" : selected.kind === "furniture" ? selFurn ? FURN_NAMES[selFurn.type] : "家具" : selPhoto ? selPhoto.title : "作品"), /* @__PURE__ */ React.createElement("p", { className: "text-[11px] leading-tight text-[var(--muted)] truncate" }, selected.kind === "furniture" && selFurn ? `X ${selFurn.x.toFixed(2)} m ・ Z ${selFurn.z.toFixed(2)} m ・ 回転 ${selFurn.rot}°` : selected.kind === "block" && selBlock ? `X ${selBlock.x.toFixed(2)} m ・ Z ${selBlock.z.toFixed(2)} m ・ ${selBlock.ceil ? `${fmt(selBlock.w)}×${fmt(selBlock.d)} m ・ 下面 ${fmt(ceilBot(room, selBlock))} m` : `${fmt(selBlock.w)}×${fmt(selBlock.d)}×${fmt(selBlock.h)} m`}` : selected.kind === "light" && selLight ? `X ${selLight.x.toFixed(2)} m ・ Z ${selLight.z.toFixed(2)} m ・ 強度 ${selLight.intensity} ・ ${selLight.kelvin} K` : selected.kind === "column" && selCol ? `X ${selCol.x.toFixed(2)} m ・ Z ${selCol.z.toFixed(2)} m ・ ${fmt(colW(selCol))}×${fmt(colD(selCol))} m` : selected.kind === "window" && selWin ? `${selWin.wall}壁 ・ 壁端から ${(selWin.pos + wallLen(room, selWin.wall) / 2).toFixed(2)} m ・ ${selWin.w.toFixed(2)}×${selWin.h.toFixed(2)} m` : selected.kind === "entrance" && selEnt ? `${selEnt.wall}壁 ・ 壁端から ${(selEnt.pos + entranceLength(room, selEnt, columns) / 2).toFixed(2)} m ・ 幅 ${selEnt.w.toFixed(2)} m` : selected.kind === "placement" && selPlace ? selPlace.method === "壁掛け" ? `${selPlace.wall}壁 ・ 壁端から ${(selPlace.pos + wallLen(room, selPlace.wall) / 2).toFixed(2)} m ・ 中心 ${selPlace.center.toFixed(2)} m` : `X ${selPlace.x.toFixed(2)} m ・ Z ${selPlace.z.toFixed(2)} m` : "")), /* @__PURE__ */ React.createElement("button", { onClick: deleteSelected, className: "shrink-0 px-3 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold flex items-center gap-1" }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "削除"), /* @__PURE__ */ React.createElement("button", { onClick: clearSelection, className: "shrink-0 px-3 py-1.5 rounded-lg border border-[var(--line)] text-xs font-bold" }, "解除")) : null;
   function clearRoomObjects() {
     if (stateRef.current.mode === "view") return;
     pushHistoryRaw(snapStr());
@@ -4986,14 +5113,14 @@ function App() {
     updatePlacements([]);
     setNotice("配置をリセットしました");
   }, className: "chip text-sm flex-1 disabled:opacity-50" }, "配置リセット"), /* @__PURE__ */ React.createElement("button", { disabled: mode === "view", onClick: clearRoomObjects, className: "chip text-sm flex-1 text-red-600 disabled:opacity-50" }, "全削除"));
-  const objectEditBody = /* @__PURE__ */ React.createElement(React.Fragment, null, (selWin || selEnt) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "設置する壁"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1", role: "group", "aria-label": "設置する壁" }, ["北", "南", "東", "西"].map((wallOpt) => {
+  const objectEditBody = /* @__PURE__ */ React.createElement(React.Fragment, null, (selWin || selEnt && !selEnt.col) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "設置する壁"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1", role: "group", "aria-label": "設置する壁" }, ["北", "南", "東", "西"].map((wallOpt) => {
     const cur = selWin ? selWin.wall : selEnt?.wall;
     const active = cur === wallOpt;
     return /* @__PURE__ */ React.createElement("button", { key: wallOpt, type: "button", "aria-pressed": active, onClick: () => {
       if (selWin) changeWall("window", selWin.id, wallOpt);
       else if (selEnt) changeWall("entrance", selEnt.id, wallOpt);
     }, className: "rounded-lg border px-2 py-2.5 text-sm font-black", style: active ? { background: "#ea580c", color: "#fff", borderColor: "#ea580c" } : { background: "var(--surface2)", color: "var(--ink)", borderColor: "var(--line)" } }, wallOpt, "壁");
-  })), /* @__PURE__ */ React.createElement("p", { className: "small mt-1" }, "北＝奥の壁、南＝手前の壁（入口側）、東＝右の壁、西＝左の壁。壁を変えても幅・高さ・床からの高さは維持され、壁沿い位置は新しい壁に合わせてクランプされます。")), selCol && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(colW(selCol)), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "柱の幅", className: "w-full", type: "range", min: "0.1", max: String(Math.min(15, room.w)), step: "0.1", value: colW(selCol), onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "奥行き"), /* @__PURE__ */ React.createElement("b", null, fmt(colD(selCol)), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "柱の奥行き", className: "w-full", type: "range", min: "0.1", max: String(Math.min(15, room.d)), step: "0.1", value: colD(selCol), onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, d: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ（部屋の高さ）"), /* @__PURE__ */ React.createElement("b", null, fmt(room.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "部屋の高さ", className: "w-full", type: "range", min: "2.4", max: "5", step: "0.1", value: room.h, onChange: (e) => updateRoom({ h: Number(e.target.value) }) })), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selCol.x, onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selCol.z, onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, z: Number(e.target.value) } : x)) })))), selWin && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.w), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の幅", className: "w-full", type: "range", min: "0.6", max: "3", step: "0.1", value: selWin.w, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の高さ", className: "w-full", type: "range", min: "0.6", max: "2", step: "0.1", value: selWin.h, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, h: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "床からの高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.sill), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の床からの高さ", className: "w-full", type: "range", min: "0", max: "2", step: "0.1", value: selWin.sill, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, sill: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "壁沿い位置 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selWin.pos, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, pos: Number(e.target.value) } : x)) }))), selEnt && rooms.length > 1 && /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "font-bold" }, "つながり先（別の部屋の入口）"), /* @__PURE__ */ React.createElement("select", { className: "field mt-1", value: selEnt.link ? `${selEnt.link.room}|${selEnt.link.ent}` : "", onChange: (e) => setEntranceLink(selEnt.id, e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "つながりなし"), rooms.filter((r) => r.id !== curRoomId).map((r) => entrancesOf(r.id).map((en, i) => /* @__PURE__ */ React.createElement("option", { key: r.id + en.id, value: `${r.id}|${en.id}` }, r.floor, " ", r.name, "・入口", i + 1, "（", en.wall, "壁）")))), /* @__PURE__ */ React.createElement("span", { className: "small block mt-1" }, "視点モードでこの入口に近づくと、つながり先の部屋へ移るボタンが出ます。")), selEnt && rooms.length <= 1 && /* @__PURE__ */ React.createElement("p", { className: "small" }, "「部屋」タブで部屋を追加すると、別の部屋の入口とつなげられます。"), selEnt && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(selEnt.w), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "入口の幅", className: "w-full", type: "range", min: "0.9", max: "2", step: "0.1", value: selEnt.w, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selEnt.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "入口の高さ", className: "w-full", type: "range", min: "1.9", max: "2.6", step: "0.1", value: selEnt.h, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, h: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "壁沿い位置 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selEnt.pos, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, pos: Number(e.target.value) } : x)) }))), selFurn && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, furnSliders(selFurn)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selFurn.x, onChange: (e) => updateFurniture(furniture.map((x) => x.id === selFurn.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selFurn.z, onChange: (e) => updateFurniture(furniture.map((x) => x.id === selFurn.id ? { ...x, z: Number(e.target.value) } : x)) })))), selBlock && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, blockSliders(selBlock)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selBlock.x, onChange: (e) => updateBlocks(blocks.map((x) => x.id === selBlock.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selBlock.z, onChange: (e) => updateBlocks(blocks.map((x) => x.id === selBlock.id ? { ...x, z: Number(e.target.value) } : x)) })))), selLight && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("b", { className: "text-sm" }, "この照明だけ調整（照明", lights.findIndex((l) => l.id === selLight.id) + 1, "）", selLight.solo ? /* @__PURE__ */ React.createElement("span", { className: "ml-1 rounded-full border border-[var(--line)] px-2 py-0.5 text-[11px]" }, "個別") : null), selLight.solo ? /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs shrink-0", onClick: () => rejoinBulk(selLight) }, "一括に戻す") : /* @__PURE__ */ React.createElement("span", { className: "small text-right" }, "動かすと一括の対象から外れます")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, lightSliders(selLight)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selLight.x, onChange: (e) => updateLights(lights.map((x) => x.id === selLight.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selLight.z, onChange: (e) => updateLights(lights.map((x) => x.id === selLight.id ? { ...x, z: Number(e.target.value) } : x)) })))), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => selPlace && aimLightAt(selPlace.id), className: "chip text-sm" }, "💡 近くの照明をこの作品に向ける"), selPlace && selPlace.col && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "柱の面"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1" }, ["北", "南", "東", "西"].map((fc) => /* @__PURE__ */ React.createElement("button", { key: fc, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, face: fc, pos: 0 } : p)), className: `chip text-sm ${(selPlace.face || "南") === fc ? "tab-active" : ""}` }, fc, "面")))), selPlace && selPlace.method === "壁掛け" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "額装サイズ"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex flex-wrap gap-1" }, SIZE_LIST.map((x) => /* @__PURE__ */ React.createElement("button", { key: x, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, size: x, ...x === "スクエア" ? { sq: p.sq || 300 } : {} } : p)), className: `chip text-sm ${selPlace.size === x ? "tab-active" : ""}` }, x))), selPlace.size === "スクエア" && /* @__PURE__ */ React.createElement("label", { className: "mt-2 block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "スクエアの一辺"), /* @__PURE__ */ React.createElement("b", null, mmOf("スクエア", selPlace.sq)[0], " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "スクエアの一辺", className: "w-full", type: "range", min: "100", max: "1000", rstep: "10", value: mmOf("スクエア", selPlace.sq)[0], onChange: (e) => {
+  })), /* @__PURE__ */ React.createElement("p", { className: "small mt-1" }, "北＝奥の壁、南＝手前の壁（入口側）、東＝右の壁、西＝左の壁。壁を変えても幅・高さ・床からの高さは維持され、壁沿い位置は新しい壁に合わせてクランプされます。")), selCol && /* @__PURE__ */ React.createElement(React.Fragment, null, React.createElement("button", { type: "button", className: "chip text-sm w-full", onClick: () => addEntranceOnColumn(selCol.id) }, "＋ この壁に入口を追加"), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(colW(selCol)), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "柱の幅", className: "w-full", type: "range", min: "0.1", max: String(Math.min(15, room.w)), step: "0.1", value: colW(selCol), onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "奥行き"), /* @__PURE__ */ React.createElement("b", null, fmt(colD(selCol)), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "柱の奥行き", className: "w-full", type: "range", min: "0.1", max: String(Math.min(15, room.d)), step: "0.1", value: colD(selCol), onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, d: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ（部屋の高さ）"), /* @__PURE__ */ React.createElement("b", null, fmt(room.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "部屋の高さ", className: "w-full", type: "range", min: "2.4", max: "5", step: "0.1", value: room.h, onChange: (e) => updateRoom({ h: Number(e.target.value) }) })), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selCol.x, onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selCol.z, onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, z: Number(e.target.value) } : x)) })))), selWin && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.w), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の幅", className: "w-full", type: "range", min: "0.6", max: "3", step: "0.1", value: selWin.w, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の高さ", className: "w-full", type: "range", min: "0.6", max: "2", step: "0.1", value: selWin.h, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, h: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "床からの高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.sill), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の床からの高さ", className: "w-full", type: "range", min: "0", max: "2", step: "0.1", value: selWin.sill, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, sill: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "壁沿い位置 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selWin.pos, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, pos: Number(e.target.value) } : x)) }))), selEnt && rooms.length > 1 && /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "font-bold" }, "つながり先（別の部屋の入口）"), /* @__PURE__ */ React.createElement("select", { className: "field mt-1", value: selEnt.link ? `${selEnt.link.room}|${selEnt.link.ent}` : "", onChange: (e) => setEntranceLink(selEnt.id, e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "つながりなし"), rooms.filter((r) => r.id !== curRoomId).map((r) => entrancesOf(r.id).map((en, i) => /* @__PURE__ */ React.createElement("option", { key: r.id + en.id, value: `${r.id}|${en.id}` }, r.floor, " ", r.name, "・入口", i + 1, "（", en.wall, "壁）")))), /* @__PURE__ */ React.createElement("span", { className: "small block mt-1" }, "視点モードでこの入口に近づくと、つながり先の部屋へ移るボタンが出ます。")), selEnt && rooms.length <= 1 && /* @__PURE__ */ React.createElement("p", { className: "small" }, "「部屋」タブで部屋を追加すると、別の部屋の入口とつなげられます。"), selEnt && /* @__PURE__ */ React.createElement(React.Fragment, null, entranceMountControls(selEnt), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(selEnt.w), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "入口の幅", className: "w-full", type: "range", min: "0.3", max: String(Math.max(0.3, Math.min(3, entranceLength(room, selEnt, columns) - 0.04))), step: "0.01", value: selEnt.w, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selEnt.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "入口の高さ", className: "w-full", type: "range", min: "0.3", max: String(Math.max(0.3, room.h - entranceBase(room, selEnt, columns, blocks))), step: "0.01", value: selEnt.h, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, h: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "壁沿い位置 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selEnt.pos, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, pos: Number(e.target.value) } : x)) }))), selFurn && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, furnSliders(selFurn)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selFurn.x, onChange: (e) => updateFurniture(furniture.map((x) => x.id === selFurn.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selFurn.z, onChange: (e) => updateFurniture(furniture.map((x) => x.id === selFurn.id ? { ...x, z: Number(e.target.value) } : x)) })))), selBlock && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, blockSliders(selBlock)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selBlock.x, onChange: (e) => updateBlocks(blocks.map((x) => x.id === selBlock.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selBlock.z, onChange: (e) => updateBlocks(blocks.map((x) => x.id === selBlock.id ? { ...x, z: Number(e.target.value) } : x)) })))), selLight && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("b", { className: "text-sm" }, "この照明だけ調整（照明", lights.findIndex((l) => l.id === selLight.id) + 1, "）", selLight.solo ? /* @__PURE__ */ React.createElement("span", { className: "ml-1 rounded-full border border-[var(--line)] px-2 py-0.5 text-[11px]" }, "個別") : null), selLight.solo ? /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs shrink-0", onClick: () => rejoinBulk(selLight) }, "一括に戻す") : /* @__PURE__ */ React.createElement("span", { className: "small text-right" }, "動かすと一括の対象から外れます")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, lightSliders(selLight)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selLight.x, onChange: (e) => updateLights(lights.map((x) => x.id === selLight.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selLight.z, onChange: (e) => updateLights(lights.map((x) => x.id === selLight.id ? { ...x, z: Number(e.target.value) } : x)) })))), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => selPlace && aimLightAt(selPlace.id), className: "chip text-sm" }, "💡 近くの照明をこの作品に向ける"), selPlace && selPlace.col && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "柱の面"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1" }, ["北", "南", "東", "西"].map((fc) => /* @__PURE__ */ React.createElement("button", { key: fc, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, face: fc, pos: 0 } : p)), className: `chip text-sm ${(selPlace.face || "南") === fc ? "tab-active" : ""}` }, fc, "面")))), selPlace && selPlace.method === "壁掛け" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "額装サイズ"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex flex-wrap gap-1" }, SIZE_LIST.map((x) => /* @__PURE__ */ React.createElement("button", { key: x, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, size: x, ...x === "スクエア" ? { sq: p.sq || 300 } : {} } : p)), className: `chip text-sm ${selPlace.size === x ? "tab-active" : ""}` }, x))), selPlace.size === "スクエア" && /* @__PURE__ */ React.createElement("label", { className: "mt-2 block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "スクエアの一辺"), /* @__PURE__ */ React.createElement("b", null, mmOf("スクエア", selPlace.sq)[0], " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "スクエアの一辺", className: "w-full", type: "range", min: "100", max: "1000", rstep: "10", value: mmOf("スクエア", selPlace.sq)[0], onChange: (e) => {
     const v = clamp(Math.round(Number(e.target.value)), 100, 1e3);
     updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, sq: v } : p));
   } }))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "縦横向き"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex gap-1" }, ["縦", "横"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, orient: x } : p)), className: `chip ${selPlace.orient === x ? "tab-active" : ""}` }, x, "向き")))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "額縁色・パネル"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex flex-wrap gap-1" }, ["白", "黒", "木目", "パネル"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, frame: x } : p)), className: `chip ${selPlace.frame === x ? "tab-active" : ""}` }, x === "パネル" ? "パネル（縁なし）" : `額 ${x}`)))), selPlace.frame !== "パネル" && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, mat: !p.mat } : p)), className: `chip ${selPlace.mat ? "tab-active" : ""}` }, "マット ", selPlace.mat ? "あり" : "なし"), selPlace.frame === "パネル" && /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "パネルの厚さ"), /* @__PURE__ */ React.createElement("b", null, Math.round((selPlace.thick ?? PANEL_T) * 1e3), " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "パネルの厚さ", className: "w-full", type: "range", min: "2", max: "20", rstep: "1", value: Math.round((selPlace.thick ?? PANEL_T) * 1e3), onChange: (e) => {
