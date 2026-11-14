@@ -179,6 +179,7 @@ function validateExhibitionFile(j) {
         if (["columns", "lights", "blocks", "furniture"].includes(k) && !finite(o, ["x", "z"])) fail();
         if (k === "columns" && !((o.w || o.size) > 0 && (o.d || o.size) > 0)) fail();
         if (["windows", "entrances"].includes(k) && (!walls.includes(o.wall) || !finite(o, ["pos", "w", "h"]) || o.w <= 0 || o.h <= 0 || k === "windows" && !Number.isFinite(o.sill))) fail();
+        if (k === "entrances" && o.transition !== undefined && !["pass", "portal"].includes(o.transition)) fail();
         if (k === "entrances" && (o.col !== undefined && (!idOK(o.col) || !(d.columns || []).some((c) => c.id === o.col)) || o.base !== undefined && (!Number.isFinite(o.base) || o.base < 0))) fail();
         if (k === "placements" && (typeof o.photo !== "string" || !SIZE_MM[o.size] || !["壁掛け", "イーゼル"].includes(o.method) || !finite(o, ["pos", "center", "x", "z", "rot"]) || !walls.includes(o.wall))) fail();
         if (k === "furniture" && (!FURN_DIM[o.type] || o.rot !== undefined && !Number.isFinite(o.rot))) fail();
@@ -517,6 +518,9 @@ function colFace(c, face) {
 }
 // Internal doors are mounted on columns used as thin partition walls.
 // The opening cuts all the way through the short axis; both faces share one door.
+const PORTAL_RECESS = 0.22;
+function entranceMode(e) { return e.transition === "pass" || e.transition === "portal" ? e.transition : e.link ? "portal" : "pass"; }
+function isTransferEntrance(e) { return entranceMode(e) === "portal"; }
 function columnDoorAxis(c) { return colW(c) >= colD(c) ? "x" : "z"; }
 function columnDoorFaces(c) { return columnDoorAxis(c) === "x" ? ["南", "北"] : ["西", "東"]; }
 function entranceLength(r, e, cols) {
@@ -574,6 +578,140 @@ function columnSolids(c, r, entrances, blocks) {
     solids.push({ x: c.x + (axis === "x" ? along : 0), y, z: c.z + (axis === "z" ? along : 0), w: axis === "x" ? xs[i + 1] - xs[i] : colW(c), h: ys[j + 1] - ys[j], d: axis === "z" ? xs[i + 1] - xs[i] : colD(c) });
   }
   return solids;
+}
+let portalFillCache = null;
+function portalAutoFill(r, columns, entrances, blocks) {
+  if (portalFillCache && portalFillCache.r === r && portalFillCache.columns === columns && portalFillCache.entrances === entrances && portalFillCache.blocks === blocks) return portalFillCache.value;
+  const value = { regions: [], boxes: [], info: new Map(), portals: [] };
+  const remember = () => { portalFillCache = { r, columns, entrances, blocks, value }; return value; };
+  const portals = entrances.filter((e) => e.col && isTransferEntrance(e) && columns.some((c) => c.id === e.col));
+  if (!portals.length) return remember();
+  const xLo = -r.w / 2, xHi = r.w / 2, zLo = -r.d / 2, zHi = r.d / 2;
+  const snap = (v, lo, hi) => Math.abs(v - lo) < 0.002 ? lo : Math.abs(v - hi) < 0.002 ? hi : clamp(v, lo, hi);
+  const rects = columns.map((c) => ({ id: c.id, x0: snap(c.x - colW(c) / 2, xLo, xHi), x1: snap(c.x + colW(c) / 2, xLo, xHi), z0: snap(c.z - colD(c) / 2, zLo, zHi), z1: snap(c.z + colD(c) / 2, zLo, zHi) })).filter((c) => c.x1 > c.x0 && c.z1 > c.z0);
+  const gaps = entrances.filter((e) => e.col && !isTransferEntrance(e)).map((e) => {
+    const c = columns.find((c) => c.id === e.col);
+    if (!c) return null;
+    return columnDoorAxis(c) === "x" ? { col: c.id, x0: c.x + e.pos - e.w / 2, x1: c.x + e.pos + e.w / 2, z0: c.z - colD(c) / 2 - 0.00001, z1: c.z + colD(c) / 2 + 0.00001 } : { col: c.id, x0: c.x - colW(c) / 2 - 0.00001, x1: c.x + colW(c) / 2 + 0.00001, z0: c.z + e.pos - e.w / 2, z1: c.z + e.pos + e.w / 2 };
+  }).filter(Boolean);
+  const recesses = portals.map((e) => {
+    const c = columns.find((c) => c.id === e.col), n = entranceNormal(e, columns), p = entrancePoint(r, e, columns, blocks);
+    const thick = columnDoorAxis(c) === "x" ? colD(c) : colW(c);
+    const alongX = columnDoorAxis(c) === "x";
+    const depth = PORTAL_RECESS;
+    const end = { x: p.x - n.x * depth, z: p.z - n.z * depth };
+    const recess = { e, n, p, thick, depth, x0: alongX ? p.x - e.w / 2 : Math.min(p.x, end.x), x1: alongX ? p.x + e.w / 2 : Math.max(p.x, end.x), z0: alongX ? Math.min(p.z, end.z) : p.z - e.w / 2, z1: alongX ? Math.max(p.z, end.z) : p.z + e.w / 2, bottom: entranceBase(r, e, columns, blocks), top: entranceBase(r, e, columns, blocks) + e.h };
+    value.portals.push(recess);
+    return recess;
+  });
+  const coords = (lo, hi, vals) => [...new Set([lo, hi, ...vals.map((v) => clamp(v, lo, hi))].map((v) => Math.round(v * 100000) / 100000))].sort((a, b) => a - b);
+  const xs = coords(xLo, xHi, [...rects, ...gaps, ...recesses].flatMap((v) => [v.x0, v.x1]));
+  const zs = coords(zLo, zHi, [...rects, ...gaps, ...recesses].flatMap((v) => [v.z0, v.z1]));
+  const nx = xs.length - 1, nz = zs.length - 1, count = nx * nz;
+  if (count > 120000) { portals.forEach((e) => value.info.set(e.id, "壁が多いため、自動充填の対象を絞れませんでした")); return remember(); }
+  const labels = new Int32Array(count); labels.fill(-1);
+  const contains = (b, x, z) => x > b.x0 - 1e-8 && x < b.x1 + 1e-8 && z > b.z0 - 1e-8 && z < b.z1 + 1e-8;
+  for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) {
+    const x = (xs[i] + xs[i + 1]) / 2, z = (zs[j] + zs[j + 1]) / 2;
+    if (rects.some((c) => contains(c, x, z) && !gaps.some((g) => g.col === c.id && contains(g, x, z)))) labels[j * nx + i] = -2;
+  }
+  const components = [], queue = new Int32Array(count);
+  for (let start = 0; start < count; start++) {
+    if (labels[start] !== -1) continue;
+    const id = components.length, comp = { cells: [], area: 0, outer: false };
+    let head = 0, tail = 0; queue[tail++] = start; labels[start] = id;
+    while (head < tail) {
+      const k = queue[head++], i = k % nx, j = Math.floor(k / nx);
+      comp.cells.push(k); comp.area += (xs[i + 1] - xs[i]) * (zs[j + 1] - zs[j]);
+      if (i === 0 || j === 0 || i === nx - 1 || j === nz - 1) comp.outer = true;
+      for (const next of [i > 0 ? k - 1 : -1, i < nx - 1 ? k + 1 : -1, j > 0 ? k - nx : -1, j < nz - 1 ? k + nx : -1]) if (next >= 0 && labels[next] === -1) { labels[next] = id; queue[tail++] = next; }
+    }
+    components.push(comp);
+  }
+  const cellAt = (x, z) => {
+    if (x < xLo || x > xHi || z < zLo || z > zHi) return -1;
+    const i = xs.findIndex((v, i) => i < nx && x >= v - 1e-8 && x < xs[i + 1] - 1e-8), j = zs.findIndex((v, j) => j < nz && z >= v - 1e-8 && z < zs[j + 1] - 1e-8);
+    return i < 0 || j < 0 ? -1 : labels[j * nx + i];
+  };
+  const regions = new Map();
+  for (const rec of recesses) {
+    const { e, n, p, thick } = rec;
+    const front = cellAt(p.x + n.x * 0.004, p.z + n.z * 0.004), back = cellAt(p.x - n.x * (thick + 0.004), p.z - n.z * (thick + 0.004));
+    // Never fill the gallery through an unfinished wall or a reversed door face.
+    if (front < 0 || back < 0 || front === back || !components[back].outer) {
+      value.info.set(e.id, "背面に閉じた空洞がありません。壁のつながりと入口の正面を確認してください");
+      continue;
+    }
+    if (components[back].area > components[front].area + 1e-6) {
+      value.info.set(e.id, "背面が展示側より広いため、自動では埋めません。入口の正面を確認してください");
+      continue;
+    }
+    if (!regions.has(back)) regions.set(back, { id: back, portals: [], area: components[back].area, cells: components[back].cells });
+    regions.get(back).portals.push(rec);
+    value.info.set(e.id, "入口の奥にある閉じた空洞を自動で埋めています");
+  }
+  // Merge grid cells into a small set of full-height boxes, leaving only shallow door recesses.
+  for (const region of regions.values()) {
+    const active = new Set(region.cells), owner = region.portals[0].e;
+    const rowBoxes = [];
+    for (let j = 0; j < nz; j++) {
+      let run = null;
+      const finish = () => { if (run) rowBoxes.push(run); run = null; };
+      for (let i = 0; i <= nx; i++) {
+        if (i === nx || !active.has(j * nx + i)) { finish(); continue; }
+        const x = (xs[i] + xs[i + 1]) / 2, z = (zs[j] + zs[j + 1]) / 2;
+        const cuts = region.portals.filter((v) => contains(v, x, z));
+        const heights = [0, r.h, ...cuts.flatMap((v) => [clamp(v.bottom, 0, r.h), clamp(v.top, 0, r.h)])].sort((a, b) => a - b);
+        const intervals = [];
+        for (let k = 0; k < heights.length - 1; k++) if (heights[k + 1] - heights[k] > 1e-7 && !cuts.some((v) => (heights[k] + heights[k + 1]) / 2 > v.bottom && (heights[k] + heights[k + 1]) / 2 < v.top)) intervals.push([heights[k], heights[k + 1]]);
+        const key = JSON.stringify(intervals);
+        if (run && run.key === key) run.x1 = xs[i + 1];
+        else { finish(); run = { key, intervals, x0: xs[i], x1: xs[i + 1], z0: zs[j], z1: zs[j + 1] }; }
+      }
+    }
+    const merged = [], previous = new Map();
+    for (const row of rowBoxes) for (const [y0, y1] of row.intervals) {
+      const key = [row.x0, row.x1, y0, y1].join("|");
+      const last = previous.get(key);
+      if (last && Math.abs(last.z1 - row.z0) < 1e-8) last.z1 = row.z1;
+      else { const b = { x0: row.x0, x1: row.x1, z0: row.z0, z1: row.z1, y0, y1, entrance: owner.id, col: owner.col }; merged.push(b); previous.set(key, b); }
+    }
+    region.boxes = merged.map((b) => ({ x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2, z: (b.z0 + b.z1) / 2, w: b.x1 - b.x0, h: b.y1 - b.y0, d: b.z1 - b.z0, entrance: b.entrance, col: b.col }));
+    value.boxes.push(...region.boxes);
+    value.regions.push(region);
+  }
+  return remember();
+}
+function resolvePortalVolumes(x, z, r, columns, entrances, blocks, radius, eye, foot) {
+  const fill = portalAutoFill(r, columns, entrances, blocks);
+  let relocated = false;
+  const within = (b) => Math.abs(x - b.x) < b.w / 2 - 1e-6 && Math.abs(z - b.z) < b.d / 2 - 1e-6 && b.y + b.h / 2 > foot + STEP_MAX && b.y - b.h / 2 < foot + eye;
+  for (const region of fill.regions) if (region.boxes.some(within)) {
+    const rec = region.portals[0];
+    const p = entrancePoint(r, rec.e, columns, blocks, 0, 0.6);
+    x = clamp(p.x, -r.w / 2 + radius, r.w / 2 - radius);
+    z = clamp(p.z, -r.d / 2 + radius, r.d / 2 - radius);
+    foot = floorSurface(r, blocks, x, z); relocated = true;
+    break;
+  }
+  for (const b of fill.boxes) {
+    if (b.y + b.h / 2 <= foot + STEP_MAX || b.y - b.h / 2 >= foot + eye + 0.1) continue;
+    const hx = b.w / 2 + radius, hz = b.d / 2 + radius, dx = x - b.x, dz = z - b.z;
+    if (Math.abs(dx) < hx && Math.abs(dz) < hz) {
+      if (hx - Math.abs(dx) < hz - Math.abs(dz)) x = b.x + (dx >= 0 ? 1 : -1) * hx;
+      else z = b.z + (dz >= 0 ? 1 : -1) * hz;
+    }
+  }
+  for (const rec of fill.portals) {
+    if (rec.top <= foot + STEP_MAX || rec.bottom >= foot + eye + 0.1) continue;
+    const dx = x - rec.p.x, dz = z - rec.p.z;
+    const along = Math.abs(rec.n.z) > 0 ? dx : dz, signed = dx * rec.n.x + dz * rec.n.z;
+    if (Math.abs(along) < rec.e.w / 2 + radius && signed < -rec.depth + radius && signed > -rec.depth - radius - 0.1) {
+      const delta = -rec.depth + radius - signed;
+      x += rec.n.x * delta; z += rec.n.z * delta;
+    }
+  }
+  return { x, z, relocated, foot };
 }
 function pushOutColumn(x, z, c, r, entrances, blocks, radius, eye, foot) {
   for (const b of columnSolids(c, r, entrances, blocks)) {
@@ -2102,6 +2240,14 @@ function App() {
           addHandle(hg, 0, 0.55, -colD(c) / 2 - 0.12, "column", c.id, "depth");
         }
       });
+      portalAutoFill(s.room, s.columns, s.entrances, s.blocks).boxes.forEach((b) => {
+        const mat = new THREE.MeshStandardMaterial({ color: theme === "white" ? 15329248 : 3421236, roughness: 0.8 });
+        const m = new THREE.Mesh(new THREE.BoxGeometry(b.w, b.h, b.d), mat);
+        m.position.set(b.x, b.y, b.z);
+        m.castShadow = true; m.receiveShadow = true;
+        m.userData = { kind: "column", id: b.col, autoFill: true };
+        group.add(m);
+      });
       s.blocks.forEach((b) => {
         const isSel = sel?.kind === "block" && sel.id === b.id;
         const ci = b.ceil ? ceilInfo(s.room, b) : null;
@@ -2199,7 +2345,9 @@ function App() {
         const isSel = sel?.kind === "entrance" && sel.id === e.id;
         const g = new THREE.Group();
         const internal = !!e.col;
-        const dark = new THREE.Mesh(new THREE.PlaneGeometry(e.w, e.h), new THREE.MeshBasicMaterial({ color: isSel ? 1923656 : 460551, transparent: internal, opacity: internal ? 0 : 1, depthWrite: !internal, side: THREE.DoubleSide }));
+        const transfer = isTransferEntrance(e);
+        const rec = internal && transfer ? portalAutoFill(s.room, s.columns, s.entrances, s.blocks).portals.find((p) => p.e.id === e.id) : null;
+        const dark = new THREE.Mesh(new THREE.PlaneGeometry(e.w, e.h), new THREE.MeshBasicMaterial({ color: isSel ? 1923656 : 460551, transparent: internal && !transfer, opacity: internal && !transfer ? 0 : 1, depthWrite: !internal || transfer, side: THREE.DoubleSide }));
         dark.userData = { kind: "entrance", id: e.id };
         const fm = new THREE.MeshStandardMaterial({ color: isSel ? 9429190 : frameMat.color, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.5 : 0 });
         if (internal) {
@@ -2217,11 +2365,11 @@ function App() {
           g.add(fr);
         }
         g.add(dark);
-        dark.position.z = 0.04;
+        dark.position.z = rec ? -rec.depth - 0.025 : 0.04;
         const normal = entranceNormal(e, s.columns);
         g.rotation.y = Math.atan2(normal.x, normal.z);
         g.position.copy(entrancePoint(s.room, e, s.columns, s.blocks, e.h / 2, 0.025));
-        if (e.link) {
+        if (e.link && isTransferEntrance(e)) {
           const rm = s.rooms.find((r) => r.id === e.link.room);
           if (rm) spriteLabel(`→ ${rm.floor} ${rm.name}`, entrancePoint(s.room, e, s.columns, s.blocks, e.h + 0.35, 0.12), 1.3);
         }
@@ -2756,6 +2904,11 @@ function App() {
           wr.pos.x = p.x;
           wr.pos.z = p.z;
         });
+        {
+          const p = resolvePortalVolumes(wr.pos.x, wr.pos.z, s.room, s.columns, s.entrances, s.blocks, 0.3, s.eyeHeight, wr.floorY || 0);
+          wr.pos.x = p.x; wr.pos.z = p.z;
+          if (p.relocated) wr.floorY = p.foot;
+        }
         s.placements.forEach((p) => {
           if (p.method !== "イーゼル") return;
           const dx = wr.pos.x - p.x, dz = wr.pos.z - p.z;
@@ -2843,7 +2996,7 @@ function App() {
           if (s.mode === "view") {
             let bd = 1.3;
             s.entrances.forEach((e) => {
-              if (!e.link) return;
+              if (!e.link || !isTransferEntrance(e)) return;
               const p = entrancePoint(s.room, e, s.columns, s.blocks);
               const dd = Math.hypot(p.x - wr.pos.x, p.z - wr.pos.z);
               if (dd < bd) {
@@ -2874,6 +3027,11 @@ function App() {
           const txt = pick2 ? `作品まで ${pick2.d.toFixed(2)} m（${pick2.t}）` : "作品まで —";
           if (artDistRef.current.textContent !== txt) artDistRef.current.textContent = txt;
         }
+      }
+      if (s.view === "orbit") {
+        const p = resolvePortalVolumes(wr.pos.x, wr.pos.z, s.room, s.columns, s.entrances, s.blocks, 0.3, s.eyeHeight, wr.floorY || 0);
+        wr.pos.x = p.x; wr.pos.z = p.z;
+        if (p.relocated) wr.floorY = p.foot;
       }
       const sg = sceneSig();
       if (sg.some((v, i) => v !== lastSig[i])) {
@@ -2964,7 +3122,7 @@ function App() {
       for (let q = o; q; q = q.parent) if (q.visible === false) { hidden = true; break; }
       if (hidden) continue;
       if (o.userData?.wallTap) return { wall: o.userData.wallTap, point: h.point.clone() };
-      if (internal && o.userData?.kind === "column") {
+      if (internal && !o.userData?.autoFill && o.userData?.kind === "column") {
         const c = dataRef.current.columns.find((c) => c.id === o.userData.id);
         if (c) {
           const face = columnDoorAxis(c) === "x" ? h.point.z >= c.z ? "南" : "北" : h.point.x >= c.x ? "東" : "西";
@@ -3436,6 +3594,10 @@ function App() {
         nx = p.x;
         nz = p.z;
       });
+      {
+        const p = resolvePortalVolumes(nx, nz, s.room, s.columns, s.entrances, s.blocks, 0.3, s.eyeHeight, floorSurface(s.room, s.blocks, nx, nz));
+        nx = p.x; nz = p.z;
+      }
       s.placements.forEach((p) => {
         if (p.method !== "イーゼル") return;
         const dx2 = nx - p.x, dz2 = nz - p.z;
@@ -4855,15 +5017,28 @@ function App() {
     const face = columnDoorFaces(c)[0];
     updateEntrances(d.entrances.map((x) => x.id === id ? { ...x, col: host, face, wall: face, pos: 0, base: undefined } : x));
   }
+  function setEntranceMode(id, transition) {
+    if (stateRef.current.mode === "view" || !["pass", "portal"].includes(transition)) return;
+    pushHistoryRaw(snapStr());
+    updateEntrances(dataRef.current.entrances.map((e) => e.id === id ? { ...e, transition } : e), false);
+    saveAll();
+    setNotice(transition === "portal" ? "別フロアへの入口にしました。背面に閉じた空洞があれば自動で埋めます" : "通り抜けできる入口にしました");
+  }
   function entranceMountControls(e) {
     const c = e.col && columns.find((c) => c.id === e.col);
+    const transfer = isTransferEntrance(e);
+    const fillInfo = transfer && c ? portalAutoFill(room, columns, entrances, blocks).info.get(e.id) : "";
     return React.createElement("div", { className: "col-span-2 space-y-1" },
+      React.createElement("div", { className: "flex gap-1", role: "group", "aria-label": "入口の種類" }, ...[["pass", "通り抜け"], ["portal", "別フロアへ移動"]].map(([mode, label]) => React.createElement("button", { key: mode, type: "button", className: "chip text-xs " + (entranceMode(e) === mode ? "tab-active" : ""), "aria-pressed": entranceMode(e) === mode, onClick: () => setEntranceMode(e.id, mode) }, label))),
+      !transfer && e.link && React.createElement("p", { className: "small" }, "保存済みの接続先は、通り抜け中には使いません。"),
+      transfer && React.createElement("p", { className: "small" }, e.link ? "入口に近づき、移動ボタンから接続先へ移動します。" : "別フロアへ移動するには「つながり先」を設定してください。"),
+      fillInfo && React.createElement("p", { className: "small", role: "status" }, fillInfo),
       React.createElement("label", { className: "block text-xs" }, "入口を付ける壁", React.createElement("select", { className: "field", value: e.col || "outer:" + e.wall, onChange: (ev) => changeEntranceHost(e.id, ev.target.value) },
         ...["北", "南", "東", "西"].map((wall) => React.createElement("option", { key: "outer:" + wall, value: "outer:" + wall }, wall + "の外壁")),
         ...columns.map((c, i) => React.createElement("option", { key: c.id, value: c.id }, c.name || `壁・柱 ${i + 1}`)))),
       c && React.createElement("label", { className: "block text-xs" }, "入口の正面", React.createElement("select", { className: "field", value: e.face || columnDoorFaces(c)[0], onChange: (ev) => updateEntrances(dataRef.current.entrances.map((x) => x.id === e.id ? { ...x, wall: ev.target.value, face: ev.target.value } : x)) }, ...columnDoorFaces(c).map((f) => React.createElement("option", { key: f, value: f }, f + "面")))),
       c && React.createElement("label", { className: "block text-xs" }, "開口の下端（床の基準から m）", React.createElement("input", { className: "field", type: "number", min: "0", max: Math.max(0, room.h - e.h), step: ".01", value: entranceBase(room, e, columns, blocks), onChange: (ev) => updateEntrances(dataRef.current.entrances.map((x) => x.id === e.id ? { ...x, base: Math.max(0, Number(ev.target.value)) } : x)) })),
-      c && React.createElement("p", { className: "small" }, "壁の表裏を貫通する開口です。接続先を指定しなくても同じ部屋の中を歩いて通れます。"));
+      c && !transfer && React.createElement("p", { className: "small" }, "壁の表裏を貫通する開口です。同じ部屋の中を歩いて通れます。"));
   }
   function setEntranceLink(entId, target) {
     if (stateRef.current.mode === "view") return;
@@ -4879,8 +5054,8 @@ function App() {
     // Detach only these two endpoints; other door pairs between the same rooms remain intact.
     const next = detachEntrances(store, [{ room: cur, ent: entId }, ...(target ? [{ room: rid, ent: eid }] : [])]);
     if (target) {
-      next[cur].entrances = next[cur].entrances.map((e) => e.id === entId ? { ...e, link: { room: rid, ent: eid } } : e);
-      next[rid].entrances = next[rid].entrances.map((e) => e.id === eid ? { ...e, link: { room: cur, ent: entId } } : e);
+      next[cur].entrances = next[cur].entrances.map((e) => e.id === entId ? { ...e, transition: "portal", link: { room: rid, ent: eid } } : e);
+      next[rid].entrances = next[rid].entrances.map((e) => e.id === eid ? { ...e, transition: "portal", link: { room: cur, ent: entId } } : e);
     }
     syncEntranceStore(cleanEntranceLinks(next));
     saveAll();
@@ -4888,7 +5063,7 @@ function App() {
   }
   function goThroughLink() {
     const e = dataRef.current.entrances.find((x) => x.id === nearLinkRef.current);
-    if (!e?.link) return;
+    if (!e?.link || !isTransferEntrance(e)) return;
     const peer = entrancesOf(e.link.room).find((p) => p.id === e.link.ent);
     if (!roomsRef.current.some((r) => r.id === e.link.room) || !peer || peer.link?.room !== curRoomRef.current || peer.link?.ent !== e.id) {
       syncEntranceStore(cleanEntranceLinks(projectStore()));
