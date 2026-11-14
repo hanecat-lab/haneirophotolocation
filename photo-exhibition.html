@@ -85,29 +85,146 @@ function idb() {
 }
 async function idbAll() {
   const db = await idb();
-  return new Promise((res, rej) => {
-    const q = db.transaction("photos").objectStore("photos").getAll();
-    q.onsuccess = () => res(q.result);
-    q.onerror = () => rej(q.error);
-  });
+  try {
+    return await new Promise((res, rej) => {
+      const tx = db.transaction("photos");
+      const q = tx.objectStore("photos").getAll();
+      let records;
+      q.onsuccess = () => { records = q.result; };
+      tx.oncomplete = () => res(records);
+      tx.onerror = () => rej(tx.error);
+      tx.onabort = () => rej(tx.error || new Error("写真の読み込みを中断しました"));
+    });
+  } finally { db.close(); }
 }
 async function idbPut(rec) {
+  await idbWritePhotos([rec]);
+}
+async function idbWritePhotos(records) {
   const db = await idb();
-  return new Promise((res, rej) => {
-    const t = db.transaction("photos", "readwrite");
-    t.objectStore("photos").put(rec);
-    t.oncomplete = () => res();
-    t.onerror = () => rej(t.error);
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("photos", "readwrite");
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error || new Error("写真の保存に失敗しました"));
+      tx.onabort = () => reject(tx.error || new Error("写真の保存を中断しました"));
+      records.forEach((rec) => tx.objectStore("photos").put(rec));
+    });
+  } finally { db.close(); }
+}
+async function idbReplacePhotos(records) {
+  const db = await idb();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("photos", "readwrite");
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error || new Error("写真の保存に失敗しました"));
+      tx.onabort = () => reject(tx.error || new Error("写真の保存を中断しました"));
+      const store = tx.objectStore("photos");
+      store.clear();
+      records.forEach((rec) => store.put(rec));
+    });
+  } finally { db.close(); }
+}
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error || new Error("写真を読み込めませんでした"));
+    reader.onabort = () => reject(new Error("写真の読み込みを中断しました"));
+    reader.readAsDataURL(blob);
   });
+}
+function dataURLToBlob(value) {
+  const m = typeof value === "string" && /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]*={0,2})$/.exec(value);
+  if (!m || !m[2]) throw new Error("バックアップの写真データが不正です");
+  const bin = atob(m[2]);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: m[1] });
+}
+function cleanEntranceLinks(store) {
+  const out = {};
+  Object.entries(store).forEach(([rid, d]) => {
+    out[rid] = { ...d, entrances: (d.entrances || []).map((e) => {
+      if (!e.link) return e;
+      const peer = store[e.link.room]?.entrances?.find((p) => p.id === e.link.ent);
+      return peer && !(e.link.room === rid && e.link.ent === e.id) && peer.link?.room === rid && peer.link?.ent === e.id ? e : { ...e, link: undefined };
+    }) };
+  });
+  return out;
+}
+function detachEntrances(store, targets) {
+  const isTarget = (rid, eid) => targets.some((t) => t.room === rid && t.ent === eid);
+  const out = {};
+  Object.entries(store).forEach(([rid, d]) => {
+    out[rid] = { ...d, entrances: (d.entrances || []).map((e) => e.link && (isTarget(rid, e.id) || isTarget(e.link.room, e.link.ent)) ? { ...e, link: undefined } : e) };
+  });
+  return out;
+}
+function validateExhibitionFile(j) {
+  const fail = () => { throw new Error("部屋や配置のデータが不正です。現在の展示は変更していません"); };
+  const idOK = (id) => typeof id === "string" && id.length > 0 && !["__proto__", "constructor", "prototype"].includes(id);
+  const finite = (o, keys) => keys.every((k) => Number.isFinite(o[k]));
+  const walls = ["北", "南", "東", "西"];
+  function check(d) {
+    if (!d || !d.room || !finite(d.room, ["w", "d", "h"]) || [d.room.w, d.room.d, d.room.h].some((v) => v <= 0 || v > 1000)) fail();
+    if (d.room.stair && (!["straight", "fold"].includes(d.room.stair.type) || !finite(d.room.stair, ["sw", "steps", "riser", "tread", "land", "clear"]) || ["sw", "steps", "riser", "tread", "land", "clear"].some((k) => d.room.stair[k] <= 0))) fail();
+    const ids = new Set();
+    for (const k of ["columns", "windows", "entrances", "placements", "lights", "blocks", "furniture"]) {
+      if (d[k] !== undefined && !Array.isArray(d[k])) fail();
+      for (const o of d[k] || []) {
+        if (!o || !idOK(o.id) || ids.has(o.id)) fail();
+        ids.add(o.id);
+        if (["columns", "lights", "blocks", "furniture"].includes(k) && !finite(o, ["x", "z"])) fail();
+        if (k === "columns" && !((o.w || o.size) > 0 && (o.d || o.size) > 0)) fail();
+        if (["windows", "entrances"].includes(k) && (!walls.includes(o.wall) || !finite(o, ["pos", "w", "h"]) || o.w <= 0 || o.h <= 0 || k === "windows" && !Number.isFinite(o.sill))) fail();
+        if (k === "placements" && (typeof o.photo !== "string" || !SIZE_MM[o.size] || !["壁掛け", "イーゼル"].includes(o.method) || !finite(o, ["pos", "center", "x", "z", "rot"]) || !walls.includes(o.wall))) fail();
+        if (k === "furniture" && (!FURN_DIM[o.type] || o.rot !== undefined && !Number.isFinite(o.rot))) fail();
+        if (k === "blocks" && (!finite(o, ["w", "d", "h"]) || o.w <= 0 || o.d <= 0 || o.h <= 0)) fail();
+      }
+    }
+  }
+  if (!j || j.app !== "photo-exhibition") fail();
+  if (j.version === 2) {
+    if (!Array.isArray(j.rooms) || !j.rooms.length || !j.store || typeof j.store !== "object" || Array.isArray(j.store)) fail();
+    const ids = new Set();
+    for (const r of j.rooms) {
+      if (!r || !idOK(r.id) || ids.has(r.id) || !Object.hasOwn(j.store, r.id)) fail();
+      ids.add(r.id);
+      check(j.store[r.id]);
+    }
+  } else if (j.version === 1 && Array.isArray(j.placements)) check(j);
+  else fail();
+  const photoIds = new Set();
+  if (j.photos !== undefined && !Array.isArray(j.photos)) fail();
+  for (const ph of j.photos || []) {
+    if (!ph || !idOK(ph.id) || photoIds.has(ph.id) || !Number.isFinite(ph.ratio) || ph.ratio <= 0) fail();
+    photoIds.add(ph.id);
+  }
+  if (j.backup !== undefined && (j.backup !== "photos-v1" || j.version !== 2 || !Array.isArray(j.photos))) fail();
+  return j;
+}
+function downloadJSON(value, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(value)], { type: "application/json" }));
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 30000);
 }
 async function idbDel(id) {
   const db = await idb();
-  return new Promise((res, rej) => {
-    const t = db.transaction("photos", "readwrite");
-    t.objectStore("photos").delete(id);
-    t.oncomplete = () => res();
-    t.onerror = () => rej(t.error);
-  });
+  try {
+    await new Promise((res, rej) => {
+      const tx = db.transaction("photos", "readwrite");
+      tx.oncomplete = res;
+      tx.onerror = () => rej(tx.error);
+      tx.onabort = () => rej(tx.error || new Error("写真の削除を中断しました"));
+      tx.objectStore("photos").delete(id);
+    });
+  } finally { db.close(); }
 }
 function loadImg(b) {
   return new Promise((res, rej) => {
@@ -823,6 +940,38 @@ function App() {
   const [photos, setPhotos] = useState([]);
   const [photoVer, setPhotoVer] = useState(0);
   const photosRef = useRef([]);
+  const [photoTask, setPhotoTask] = useState("写真を読み込んでいます…");
+  const photoBusyRef = useRef(true);
+  const replaceRef = useRef(null);
+  const replaceTargetRef = useRef(null);
+  function beginPhotoTask(label) {
+    if (photoBusyRef.current) {
+      setNotice("写真の処理中です。完了してから操作してください");
+      return false;
+    }
+    photoBusyRef.current = true;
+    setPhotoTask(label);
+    return true;
+  }
+  function endPhotoTask() {
+    photoBusyRef.current = false;
+    setPhotoTask("");
+  }
+  function projectStore() {
+    const store = {};
+    roomsRef.current.forEach((r) => {
+      store[r.id] = r.id === curRoomRef.current ? roomDataOf(dataRef.current) : roomStore.current[r.id] || emptyRoomData();
+    });
+    return store;
+  }
+  function syncEntranceStore(store) {
+    roomStore.current = store;
+    const next = store[curRoomRef.current]?.entrances || [];
+    dataRef.current = { ...dataRef.current, entrances: next };
+    setEntrances(next);
+    nearLinkRef.current = null;
+    setNearLink(null);
+  }
   const fileRef = useRef(null);
   const layoutRef = useRef(null);
   const [dragLock, setDragLock] = useState(null);
@@ -1119,13 +1268,19 @@ function App() {
   }
   function loadProject(v) {
     if (v && v.version === 2 && Array.isArray(v.rooms) && v.rooms.length && v.store) {
-      const list = v.rooms.filter((r) => r && typeof r.id === "string").map((r) => ({ id: r.id, name: String(r.name || "部屋"), floor: String(r.floor || "1F") }));
+      const list = v.rooms.filter((r) => r && typeof r.id === "string" && !["__proto__", "constructor", "prototype"].includes(r.id)).map((r) => ({ id: r.id, name: String(r.name || "部屋"), floor: String(r.floor || "1F") }));
+      if (!list.length) { setNotice("保存データに有効な部屋がありません"); return; }
       const cur = list.some((r) => r.id === v.currentRoom) ? v.currentRoom : list[0].id;
-      roomStore.current = { ...v.store };
+      const store = {};
+      list.forEach((r) => { store[r.id] = roomDataOf(v.store[r.id] || emptyRoomData()); });
+      roomStore.current = cleanEntranceLinks(store);
       setRooms(list);
       curRoomRef.current = cur;
       setCurRoomId(cur);
-      applyLayout({ ...roomDataOf(v.store[cur] || emptyRoomData()), env: v.env });
+      applyLayout({ ...roomStore.current[cur], env: v.env });
+      roomCamRef.current.init = false;
+      walkInitRef.current = false;
+      walkAnimRef.current = null;
     } else applyLayout(v);
   }
   function commitPhotos(list) {
@@ -1156,6 +1311,8 @@ function App() {
         if (list.length) commitPhotos(list);
       } catch {
         setNotice("写真の保存領域を開けませんでした。追加した写真はこの回だけ表示されます。");
+      } finally {
+        endPhotoTask();
       }
     })();
   }, []);
@@ -1165,8 +1322,10 @@ function App() {
       const store = { ...roomStore.current, [curRoomRef.current]: roomDataOf(dataRef.current) };
       localStorage.setItem(APP_KEY, JSON.stringify({ version: 2, rooms: roomsRef.current, currentRoom: curRoomRef.current, env: dataRef.current.env, store }));
       setNotice("配置と空間を保存しました（この端末のブラウザ内）");
+      return true;
     } catch {
       setNotice("保存できませんでした");
+      return false;
     }
   }
   const histRef = useRef([]);
@@ -1175,9 +1334,10 @@ function App() {
   const [histLen, setHistLen] = useState(0);
   function snapStr() {
     const d = dataRef.current;
-    return JSON.stringify({ furniture: d.furniture, blocks: d.blocks, columns: d.columns, windows: d.windows, entrances: d.entrances, placements: d.placements, lights: d.lights });
+    return JSON.stringify({ furniture: d.furniture, blocks: d.blocks, columns: d.columns, windows: d.windows, entrances: d.entrances, placements: d.placements, lights: d.lights, roomEntrances: Object.fromEntries(Object.entries(projectStore()).map(([id, r]) => [id, r.entrances])) });
   }
   function pushHistoryRaw(str) {
+    histTime.current = 0;
     histRef.current.push(str);
     if (histRef.current.length > 40) histRef.current.shift();
     setHistLen(histRef.current.length);
@@ -1185,10 +1345,11 @@ function App() {
   function pushHistory() {
     const now = Date.now();
     const quick = now - histTime.current < 700;
-    histTime.current = now;
     if (!quick) pushHistoryRaw(snapStr());
+    histTime.current = now;
   }
   function undo() {
+    if (stateRef.current.mode === "view") return;
     const str = histRef.current.pop();
     setHistLen(histRef.current.length);
     if (!str) {
@@ -1205,6 +1366,11 @@ function App() {
     setBlocks(f.blocks);
     setFurniture(f.furniture);
     dataRef.current = { ...dataRef.current, ...f };
+    const store = projectStore();
+    if (v.roomEntrances) Object.entries(v.roomEntrances).forEach(([id, es]) => {
+      if (store[id]) store[id] = { ...store[id], entrances: id === curRoomRef.current ? f.entrances : es };
+    });
+    syncEntranceStore(cleanEntranceLinks(store));
     saveAll();
     clearSelection();
     setArrange(null);
@@ -1236,42 +1402,44 @@ function App() {
     saveAll();
   }
   function updateColumns(n, save = true) {
-    if (mode === "view") return;
+    if (stateRef.current.mode === "view") return;
     if (save) pushHistory();
     setColumns(n);
     dataRef.current = { ...dataRef.current, columns: n };
     if (save) saveAll();
   }
   function updateWindows(n, save = true) {
-    if (mode === "view") return;
+    if (stateRef.current.mode === "view") return;
     if (save) pushHistory();
     setWindows(n);
     dataRef.current = { ...dataRef.current, windows: n };
     if (save) saveAll();
   }
   function updateEntrances(n, save = true) {
-    if (mode === "view") return;
-    if (save) pushHistory();
-    setEntrances(n);
-    dataRef.current = { ...dataRef.current, entrances: n };
+    if (stateRef.current.mode === "view") return;
+    const removed = dataRef.current.entrances.some((e) => !n.some((p) => p.id === e.id));
+    if (save) { if (removed) pushHistoryRaw(snapStr()); else pushHistory(); }
+    const store = projectStore();
+    store[curRoomRef.current] = { ...store[curRoomRef.current], entrances: n };
+    syncEntranceStore(cleanEntranceLinks(store));
     if (save) saveAll();
   }
   function updateBlocks(n, save = true) {
-    if (mode === "view") return;
+    if (stateRef.current.mode === "view") return;
     if (save) pushHistory();
     setBlocks(n);
     dataRef.current = { ...dataRef.current, blocks: n };
     if (save) saveAll();
   }
   function updateFurniture(n, save = true) {
-    if (mode === "view") return;
+    if (stateRef.current.mode === "view") return;
     if (save) pushHistory();
     setFurniture(n);
     dataRef.current = { ...dataRef.current, furniture: n };
     if (save) saveAll();
   }
   function updateLights(n, save = true) {
-    if (mode === "view") return;
+    if (stateRef.current.mode === "view") return;
     if (save) pushHistory();
     setLights(n);
     dataRef.current = { ...dataRef.current, lights: n };
@@ -1284,7 +1452,7 @@ function App() {
     saveAll();
   }
   function updatePlacements(n, save = true) {
-    if (mode === "view") return;
+    if (stateRef.current.mode === "view") return;
     if (save) pushHistory();
     setPlacements(n);
     dataRef.current = { ...dataRef.current, placements: n };
@@ -1341,29 +1509,25 @@ function App() {
     else if (mode === "view") setPanelCollapsed(true);
   }, [selected, mode]);
   function deleteSelected() {
-    if (mode === "view") return;
+    if (stateRef.current.mode === "view") return;
     const s = stateRef.current.selected;
     if (!s) return;
-    if (s.kind === "column") {
-      updateColumns(columns.filter((x) => x.id !== s.id));
-      if (placements.some((p) => p.col === s.id)) updatePlacements(placements.filter((p) => p.col !== s.id));
-    }
-    if (s.kind === "window") updateWindows(windows.filter((x) => x.id !== s.id));
-    if (s.kind === "entrance") updateEntrances(entrances.filter((x) => x.id !== s.id));
-    if (s.kind === "placement") updatePlacements(placements.filter((x) => x.id !== s.id));
-    if (s.kind === "furniture") updateFurniture(furniture.filter((x) => x.id !== s.id));
-    if (s.kind === "block") {
-      updateBlocks(blocks.filter((x) => x.id !== s.id));
-      if (placements.some((p) => p.col === s.id)) updatePlacements(placements.filter((p) => p.col !== s.id));
-    }
-    if (s.kind === "light") updateLights(lights.filter((x) => x.id !== s.id));
+    const d = dataRef.current;
+    const fields = { column: "columns", window: "windows", entrance: "entrances", placement: "placements", furniture: "furniture", block: "blocks", light: "lights" };
+    const key = fields[s.kind];
+    if (!key || !d[key].some((x) => x.id === s.id)) return;
+    pushHistoryRaw(snapStr());
+    const updates = { column: updateColumns, window: updateWindows, entrance: updateEntrances, placement: updatePlacements, furniture: updateFurniture, block: updateBlocks, light: updateLights };
+    updates[s.kind](d[key].filter((x) => x.id !== s.id), false);
+    if (s.kind === "column" || s.kind === "block") updatePlacements(d.placements.filter((p) => p.col !== s.id), false);
+    saveAll();
     clearSelection();
     setNotice("選択したオブジェクトを削除しました");
   }
   function deletePlacementById(id) {
-    if (mode === "view") return;
-    updatePlacements(placements.filter((x) => x.id !== id));
-    if (selectedPlacement === id) clearSelection();
+    if (stateRef.current.mode === "view") return;
+    updatePlacements(dataRef.current.placements.filter((x) => x.id !== id));
+    if (stateRef.current.selected?.id === id) clearSelection();
   }
   function changeWall(kind, id, newWall) {
     if (mode === "view") return;
@@ -3326,7 +3490,7 @@ function App() {
       window.removeEventListener("keyup", up);
       window.removeEventListener("blur", blur);
     };
-  }, [columns, windows, entrances, placements]);
+  }, [columns, windows, entrances, placements, furniture, blocks, lights, mode]);
   const lib = photos.length > 0 ? photos : PHOTOS.filter((p) => SAMPLE_IDS.includes(p.id));
   function togglePhoto(id) {
     setSelPhotos((a) => a.includes(id) ? a.filter((x) => x !== id) : [...a, id]);
@@ -3338,6 +3502,8 @@ function App() {
       setNotice("画像ファイルを選んでください");
       return;
     }
+    if (!beginPhotoTask(`写真を読み込んでいます…（${list.length}枚）`)) return;
+    try {
     setNotice(`写真を読み込んでいます…（${list.length}枚）`);
     const cur = [...photosRef.current];
     let added = 0, matched = 0, failed = 0, saveFail = false;
@@ -3370,34 +3536,113 @@ function App() {
     }
     commitPhotos(cur);
     setNotice([added ? `写真を${added}枚追加しました（サンプルは非表示になります）` : "", matched ? `${matched}枚を未読込の写真に対応づけました` : "", failed ? `${failed}枚は読み込めませんでした` : "", saveFail ? "保存領域に書き込めなかったため、この回だけ表示されます" : ""].filter(Boolean).join("。"));
+    } finally { endPhotoTask(); }
   }
-  function deletePhoto(id) {
-    const ph = photosRef.current.find((p) => p.id === id);
-    if (!ph) return;
-    const used = placements.filter((p) => p.photo === id).length;
-    if (!confirm(used ? `「${ph.title}」は展示中（${used}点）です。展示中の作品も一緒に削除しますか？` : `「${ph.title}」を削除しますか？`)) return;
-    if (used) {
-      updatePlacements(placements.filter((p) => p.photo !== id));
+  async function deletePhoto(id) {
+    if (stateRef.current.mode === "view" || !beginPhotoTask("写真を削除しています…")) return;
+    try {
+      const ph = photosRef.current.find((p) => p.id === id);
+      if (!ph) return;
+      const store = projectStore();
+      const used = Object.entries(store).map(([rid, d]) => ({ rid, count: d.placements.filter((p) => p.photo === id).length })).filter((r) => r.count);
+      const count = used.reduce((n, r) => n + r.count, 0);
+      if (!confirm(count ? `「${ph.title}」は${used.length}部屋で展示中（合計${count}点）です。すべての部屋からこの写真の展示も削除しますか？` : `「${ph.title}」を削除しますか？`)) return;
+      // Commit the durable deletion first; a storage failure must not masquerade as success.
+      await idbDel(id);
+      const latest = projectStore();
+      Object.values(latest).forEach((d) => { d.placements = d.placements.filter((p) => p.photo !== id); });
+      roomStore.current = latest;
+      const next = latest[curRoomRef.current].placements;
+      dataRef.current = { ...dataRef.current, placements: next };
+      setPlacements(next);
+      // Earlier snapshots could otherwise resurrect placements of this deleted image.
+      histRef.current = [];
+      setHistLen(0);
+      invalidatePhoto(id);
+      photoCanvasMap.delete(id);
+      if (ph.thumb) URL.revokeObjectURL(ph.thumb);
+      setSelPhotos((a) => a.filter((x) => x !== id));
+      commitPhotos(photosRef.current.filter((p) => p.id !== id));
       clearSelection();
+      const saved = saveAll();
+      setNotice(saved ? `写真を削除しました${count ? `（全室の展示${count}点も削除）` : ""}` : "写真は削除しましたが、配置を保存できませんでした。空き容量を確認して再保存してください");
+    } catch {
+      setNotice("写真を削除できませんでした。現在の写真と配置は変更していません");
+    } finally { endPhotoTask(); }
+  }
+  function invalidatePhoto(id) {
+    for (const key of sourceCache.keys()) if (key.startsWith(id + "|")) sourceCache.delete(key);
+    for (const [key, tex] of frameTexCache) if (key.startsWith(id + "|")) { tex.dispose(); frameTexCache.delete(key); }
+  }
+  function choosePhotoReplacement(id, placementId) {
+    if (stateRef.current.mode === "view" || photoBusyRef.current) return;
+    replaceTargetRef.current = { photo: id, placement: placementId || null, room: curRoomRef.current };
+    if (replaceRef.current) { replaceRef.current.value = ""; replaceRef.current.click(); }
+  }
+  async function replacePhoto(file, target) {
+    if (!file || !target || !beginPhotoTask("写真を差し替えています…")) return;
+    let thumb;
+    try {
+      if (!file.type.startsWith("image/")) throw new Error("画像ファイルを選んでください");
+      const old = photoOf(target.photo);
+      const used = Object.values(projectStore()).reduce((n, d) => n + d.placements.filter((p) => p.photo === target.photo).length, 0);
+      if (!confirm(target.placement ? "この作品1点の写真を差し替えます。位置・額・サイズ・向きは維持します。よろしいですか？" : `「${old.title}」を差し替えます。同じ写真を使う全室の展示${used}点に反映され、位置・額・サイズ・向きは維持します。よろしいですか？`)) return;
+      const big = await blobToCanvas(file, 1600);
+      const blob = await canvasToJpeg(big);
+      if (!blob) throw new Error("写真を変換できませんでした");
+      const store = projectStore();
+      const placed = target.placement && store[target.room]?.placements.find((p) => p.id === target.placement && p.photo === target.photo);
+      if (target.placement && !placed) throw new Error("差し替え対象の作品が変更・削除されています。もう一度選んでください");
+      if (!target.placement && !photosRef.current.some((p) => p.id === target.photo)) throw new Error("差し替え対象の写真がありません");
+      const id = target.placement ? "u" + uid() + uid() : target.photo;
+      const title = target.placement ? file.name.replace(/\.[^.]+$/, "") : old.title;
+      const next = { id, title, ratio: big.width / big.height, hue: 200, kind: "追加", uploaded: true, missing: false, rev: target.placement ? 1 : (old.rev || 1) + 1, blob, t: target.placement ? Date.now() : old.t || Date.now() };
+      const preview = scaleCanvas(big, 1024);
+      thumb = URL.createObjectURL(blob);
+      await idbPut({ id, title, ratio: next.ratio, blob, t: next.t });
+      // Re-read after the asynchronous write: unrelated room edits must survive.
+      if (target.placement) {
+        const latest = projectStore();
+        const d = latest[target.room];
+        if (!d?.placements.some((p) => p.id === target.placement && p.photo === target.photo)) {
+          await idbDel(id);
+          throw new Error("差し替え対象の作品が変更・削除されています。もう一度選んでください");
+        }
+        if (target.room === curRoomRef.current) pushHistoryRaw(snapStr());
+        d.placements = d.placements.map((p) => p.id === target.placement ? { ...p, photo: id } : p);
+        roomStore.current = latest;
+        if (target.room === curRoomRef.current) { dataRef.current = { ...dataRef.current, placements: d.placements }; setPlacements(d.placements); }
+      }
+      invalidatePhoto(id);
+      photoCanvasMap.set(id, preview);
+      next.thumb = thumb;
+      thumb = null;
+      commitPhotos(target.placement ? [...photosRef.current, next] : photosRef.current.map((p) => p.id === id ? next : p));
+      if (!target.placement && old.thumb) URL.revokeObjectURL(old.thumb);
+      const saved = saveAll();
+      setNotice(saved ? `写真を差し替えました（${target.placement ? "この作品1点" : `全室の展示${used}点`}・配置は維持）` : "写真は差し替えましたが、配置を保存できませんでした。再保存してください");
+    } catch (err) {
+      setNotice(err.message || "写真を差し替えられませんでした");
+    } finally {
+      if (thumb) URL.revokeObjectURL(thumb);
+      endPhotoTask();
     }
-    idbDel(id).catch(() => {
-    });
-    photoCanvasMap.delete(id);
-    if (ph.thumb) URL.revokeObjectURL(ph.thumb);
-    setSelPhotos((a) => a.filter((x) => x !== id));
-    commitPhotos(photosRef.current.filter((p) => p.id !== id));
-    setNotice("写真を削除しました");
   }
-  function renamePhoto(id) {
-    const ph = photosRef.current.find((p) => p.id === id);
-    if (!ph) return;
-    const t = window.prompt("写真の名前", ph.title);
-    if (t === null || !t.trim()) return;
-    const next = { ...ph, title: t.trim(), rev: (ph.rev || 1) + 1 };
-    idbPut({ id, title: next.title, ratio: next.ratio, blob: next.blob || null, t: next.t }).catch(() => {
-    });
-    commitPhotos(photosRef.current.map((p) => p.id === id ? next : p));
+  async function renamePhoto(id) {
+    if (stateRef.current.mode === "view" || !beginPhotoTask("写真の名前を保存しています…")) return;
+    try {
+      const ph = photosRef.current.find((p) => p.id === id);
+      if (!ph) return;
+      const t = window.prompt("写真の名前", ph.title);
+      if (t === null || !t.trim()) return;
+      const next = { ...ph, title: t.trim(), rev: (ph.rev || 1) + 1 };
+      await idbPut({ id, title: next.title, ratio: next.ratio, blob: next.blob || null, t: next.t });
+      commitPhotos(photosRef.current.map((p) => p.id === id ? next : p));
+      setNotice("写真の名前を変更しました");
+    } catch { setNotice("名前を保存できませんでした。空き容量を確認してください"); }
+    finally { endPhotoTask(); }
   }
+
   function wallBlocked(wall2, yLo, yHi, exclude) {
     const o = [];
     windows.filter((x) => x.wall === wall2 && x.sill < yHi && x.sill + x.h > yLo).forEach((x) => o.push({ a: x.pos - x.w / 2 - 0.08, b: x.pos + x.w / 2 + 0.08 }));
@@ -3986,47 +4231,122 @@ function App() {
     setTimeout(() => URL.revokeObjectURL(a.href), 1e3);
     setNotice("レイアウトを書き出しました（写真そのものは含まれません）");
   }
-  function importLayout(file) {
-    if (!file) return;
-    const r = new FileReader();
-    r.onload = async () => {
+  async function importLayout(file) {
+    if (!file || stateRef.current.mode === "view" || !beginPhotoTask("ファイルを読み込んでいます…")) return;
+    const staged = [];
+    let adopted = false;
+    try {
       let j;
-      try {
-        j = JSON.parse(String(r.result));
-      } catch {
-        setNotice("読み込めませんでした（JSONとして不正です）");
-        return;
-      }
-      const isProj = !!(j && j.version === 2 && Array.isArray(j.rooms));
-      if (!j || j.app !== "photo-exhibition" || !isProj && !Array.isArray(j.placements)) {
-        setNotice("このアプリのレイアウトファイルではありません");
-        return;
-      }
-      if (!confirm(isProj ? `展覧会（${j.rooms.length}部屋）を読み込み、今の展覧会と置き換えます。よろしいですか？` : "読み込んだ部屋を、新しい部屋として追加します。よろしいですか？")) return;
-      const have = new Set(photosRef.current.map((p) => p.id));
-      const miss = [];
-      (Array.isArray(j.photos) ? j.photos : []).forEach((p) => {
-        if (p && typeof p.id === "string" && !have.has(p.id) && !photoReg.has(p.id)) miss.push({ id: p.id, title: String(p.title || "写真"), ratio: Number(p.ratio) || 1.5, hue: 200, kind: "追加", uploaded: true, missing: true, rev: 1, blob: null, t: Date.now() });
-      });
-      if (miss.length) {
-        commitPhotos([...photosRef.current, ...miss]);
-        for (const p of miss) {
-          try {
-            await idbPut({ id: p.id, title: p.title, ratio: p.ratio, blob: null, t: p.t });
-          } catch {
-          }
+      try { j = JSON.parse(await file.text()); } catch { throw new Error("読み込めませんでした（JSONとして不正です）"); }
+      validateExhibitionFile(j);
+      const backup = j.backup === "photos-v1";
+      const isProj = j.version === 2;
+      if (backup) {
+        for (let i = 0; i < j.photos.length; i++) {
+          const p = j.photos[i];
+          if (PHOTOS.some((s) => s.id === p.id)) throw new Error("写真IDがサンプルと重複しています");
+          setPhotoTask(`バックアップの写真を確認しています…（${i + 1}/${j.photos.length}枚）`);
+          const ph = { id: p.id, title: String(p.title || "写真"), ratio: p.ratio, hue: 200, kind: "追加", uploaded: true, missing: true, rev: 1, blob: null, t: Number(p.t) || Date.now() };
+          if (p.dataUrl != null) {
+            const blob = dataURLToBlob(p.dataUrl);
+            const canvas = await blobToCanvas(blob, 1024);
+            ph.blob = blob;
+            ph.missing = false;
+            ph.canvas = canvas;
+            ph.thumb = URL.createObjectURL(blob);
+          } else if (p.missing !== true) throw new Error(`「${ph.title}」の写真データがありません`);
+          staged.push(ph);
+        }
+        const available = new Set([...PHOTOS.map((p) => p.id), ...staged.map((p) => p.id)]);
+        for (const r of j.rooms) for (const p of j.store[r.id].placements || []) if (!available.has(p.photo)) throw new Error("展示作品に対応する写真情報が不足しています");
+      } else {
+        const have = new Set(photosRef.current.map((p) => p.id));
+        for (const p of j.photos || []) if (!have.has(p.id) && !photoReg.has(p.id)) {
+          staged.push({ id: p.id, title: String(p.title || "写真"), ratio: p.ratio, hue: 200, kind: "追加", uploaded: true, missing: true, rev: 1, blob: null, t: Date.now() });
+          have.add(p.id);
         }
       }
-      clearSelection();
-      if (isProj) {
-        histRef.current = [];
-        setHistLen(0);
-        loadProject(j);
+      const msg = backup ? `写真込みバックアップ（${j.rooms.length}部屋・写真${staged.length}枚）を復元し、現在の展覧会と写真ライブラリを置き換えます。よろしいですか？` : isProj ? `展覧会（${j.rooms.length}部屋）を読み込み、今の展覧会と置き換えます。よろしいですか？` : "読み込んだ部屋を、新しい部屋として追加します。よろしいですか？";
+      if (!confirm(msg)) return;
+      if (backup) {
+        // Validate/decode everything before either saved data or visible state changes.
+        const store = {};
+        j.rooms.forEach((r) => { store[r.id] = roomDataOf(j.store[r.id]); });
+        const normalized = { version: 2, rooms: j.rooms, currentRoom: j.rooms.some((r) => r.id === j.currentRoom) ? j.currentRoom : j.rooms[0].id, env: j.env || defaultEnv(), store: cleanEntranceLinks(store) };
+        const previousPhotos = await idbAll();
+        const previous = localStorage.getItem(APP_KEY);
+        const serialized = JSON.stringify(normalized);
+        localStorage.setItem(APP_KEY, serialized);
+        let photosWritten = false;
+        try {
+          await idbReplacePhotos(staged.map(({ id, title, ratio, blob, t }) => ({ id, title, ratio, blob, t })));
+          photosWritten = true;
+          // An edit made while IndexedDB was writing must not leave the old layout saved.
+          localStorage.setItem(APP_KEY, serialized);
+        } catch (err) {
+          if (photosWritten) await idbReplacePhotos(previousPhotos);
+          if (previous === null) localStorage.removeItem(APP_KEY); else localStorage.setItem(APP_KEY, previous);
+          throw err;
+        }
+        photosRef.current.forEach((p) => { if (p.thumb) URL.revokeObjectURL(p.thumb); });
+        photoCanvasMap.clear();
+        sourceCache.clear();
+        frameTexCache.forEach((t) => t.dispose());
+        frameTexCache.clear();
+        staged.forEach((p) => { if (p.canvas) photoCanvasMap.set(p.id, p.canvas); delete p.canvas; });
+        commitPhotos(staged);
+        adopted = true;
+        loadProject(normalized);
+      } else {
+        // One transaction prevents a partly imported photo list on quota failure.
+        if (staged.length) await idbWritePhotos(staged.map(({ id, title, ratio, blob, t }) => ({ id, title, ratio, blob, t })));
+        if (staged.length) commitPhotos([...photosRef.current, ...staged]);
+        if (isProj) loadProject(j); else addRoom(j, "読み込んだ部屋");
         saveAll();
-      } else addRoom(j, "読み込んだ部屋");
-      setNotice(miss.length ? `レイアウトを読み込みました。写真${miss.length}枚は未読込です（同じファイル名の写真を追加すると対応づきます）` : "レイアウトを読み込みました");
-    };
-    r.readAsText(file);
+      }
+      clearSelection();
+      setArrange(null);
+      setSelPhotos([]);
+      histRef.current = [];
+      setHistLen(0);
+      nearLinkRef.current = null;
+      setNearLink(null);
+      const missing = staged.filter((p) => p.missing).length;
+      setNotice(backup ? `バックアップを復元しました（${j.rooms.length}部屋・写真${staged.length - missing}枚${missing ? `・未読込${missing}枚` : ""}）` : missing ? `レイアウトを読み込みました。写真${missing}枚は未読込です（同じファイル名の写真を追加すると対応づきます）` : "レイアウトを読み込みました");
+    } catch (err) {
+      setNotice(`読み込めませんでした：${err.message || "ファイルや空き容量を確認してください"}`);
+    } finally {
+      if (!adopted) staged.forEach((p) => { if (p.thumb) URL.revokeObjectURL(p.thumb); });
+      endPhotoTask();
+    }
+  }
+  async function exportBackup() {
+    if (!beginPhotoTask("写真込みバックアップを作っています…")) return;
+    try {
+      const out = JSON.parse(JSON.stringify({ app: "photo-exhibition", version: 2, backup: "photos-v1", exportedAt: new Date().toISOString(), rooms: roomsRef.current, currentRoom: curRoomRef.current, env: dataRef.current.env, store: projectStore() }));
+      const photos = [...photosRef.current];
+      // Older layouts can contain orphaned references from a previous photo deletion.
+      // Keep those as explicit missing records so our own backup always restores.
+      const known = new Set([...PHOTOS.map((p) => p.id), ...photos.map((p) => p.id)]);
+      Object.values(out.store).forEach((d) => (d.placements || []).forEach((placed) => {
+        if (!known.has(placed.photo)) {
+          const missing = photoOf(placed.photo);
+          photos.push({ id: placed.photo, title: missing.title, ratio: missing.ratio, blob: null, missing: true, t: Date.now() });
+          known.add(placed.photo);
+        }
+      }));
+      out.photos = [];
+      for (let i = 0; i < photos.length; i++) {
+        const p = photos[i];
+        setPhotoTask(`写真込みバックアップを作っています…（${i + 1}/${photos.length}枚）`);
+        out.photos.push({ id: p.id, title: p.title, ratio: p.ratio, t: p.t, missing: !p.blob, dataUrl: p.blob ? await blobToDataURL(p.blob) : null });
+      }
+      const missing = out.photos.filter((p) => p.missing).length;
+      if (missing && !confirm(`${missing}枚は未読込のため画像本体を保存できません。読込済みの写真と全室の配置をバックアップしますか？`)) return;
+      downloadJSON(out, "photo-exhibition-backup_" + new Date().toISOString().slice(0, 10) + ".json");
+      setNotice(`写真込みバックアップを書き出しました（${out.rooms.length}部屋・写真${out.photos.length - missing}枚${missing ? `・未読込${missing}枚` : ""}）`);
+    } catch (err) { setNotice(`バックアップを作れませんでした：${err.message || "空き容量を確認してください"}`); }
+    finally { endPhotoTask(); }
   }
   function preset(w, d) {
     updateRoom({ w, d });
@@ -4381,23 +4701,31 @@ function App() {
     saveAll();
   }
   function deleteRoom(id) {
-    if (roomsRef.current.length <= 1) {
-      setNotice("部屋が1つだけのときは削除できません");
-      return;
-    }
+    if (stateRef.current.mode === "view") return;
+    if (roomsRef.current.length <= 1) { setNotice("部屋が1つだけのときは削除できません"); return; }
     const m = roomsRef.current.find((r) => r.id === id);
-    if (!confirm(`「${m?.name}」を削除しますか？（この部屋の配置もすべて消えます）`)) return;
-    if (id === curRoomRef.current) {
-      const other = roomsRef.current.find((r) => r.id !== id);
-      switchRoom(other.id, void 0, true);
-    }
-    delete roomStore.current[id];
-    setRooms(roomsRef.current.filter((r) => r.id !== id));
-    Object.keys(roomStore.current).forEach((k) => {
-      const d = roomStore.current[k];
-      if (d && d.entrances) d.entrances = d.entrances.map((e) => e.link && e.link.room === id ? { ...e, link: void 0 } : e);
-    });
-    if (entrances.some((e) => e.link && e.link.room === id)) updateEntrances(entrances.map((e) => e.link && e.link.room === id ? { ...e, link: void 0 } : e));
+    if (!m || !confirm(`「${m.name}」を削除しますか？（この部屋の配置もすべて消えます）`)) return;
+    const store = projectStore();
+    delete store[id];
+    const remaining = roomsRef.current.filter((r) => r.id !== id);
+    const wasCurrent = id === curRoomRef.current;
+    setRooms(remaining);
+    roomStore.current = cleanEntranceLinks(store);
+    if (wasCurrent) {
+      const next = remaining[0].id;
+      curRoomRef.current = next;
+      setCurRoomId(next);
+      applyLayout(roomStore.current[next]);
+      pendingSpawn.current = { ent: "" };
+      walkInitRef.current = false;
+      walkAnimRef.current = null;
+    } else syncEntranceStore(roomStore.current);
+    histRef.current = [];
+    setHistLen(0);
+    nearLinkRef.current = null;
+    setNearLink(null);
+    clearSelection();
+    setArrange(null);
     saveAll();
     setNotice("部屋を削除しました");
   }
@@ -4406,33 +4734,37 @@ function App() {
     return m ? `${m.floor} ${m.name}` : "（削除された部屋）";
   }
   function entrancesOf(id) {
-    return id === curRoomRef.current ? entrances : roomStore.current[id] && roomStore.current[id].entrances || [];
+    return id === curRoomRef.current ? dataRef.current.entrances : roomStore.current[id]?.entrances || [];
   }
   function setEntranceLink(entId, target) {
+    if (stateRef.current.mode === "view") return;
     const cur = curRoomRef.current;
-    const me = entrances.find((e) => e.id === entId);
-    if (!me) return;
-    if (me.link) {
-      const pd = roomStore.current[me.link.room];
-      if (pd && pd.entrances) pd.entrances = pd.entrances.map((e) => e.id === me.link.ent ? { ...e, link: void 0 } : e);
+    const store = projectStore();
+    if (!store[cur]?.entrances.some((e) => e.id === entId)) return;
+    let rid, eid;
+    if (target) {
+      [rid, eid] = target.split("|");
+      if (rid === cur || !store[rid]?.entrances.some((e) => e.id === eid)) { setNotice("つながり先の入口がありません"); return; }
     }
-    if (!target) {
-      updateEntrances(entrances.map((e) => e.id === entId ? { ...e, link: void 0 } : e));
-      setNotice("つながりを外しました");
-      return;
+    pushHistoryRaw(snapStr());
+    // Detach only these two endpoints; other door pairs between the same rooms remain intact.
+    const next = detachEntrances(store, [{ room: cur, ent: entId }, ...(target ? [{ room: rid, ent: eid }] : [])]);
+    if (target) {
+      next[cur].entrances = next[cur].entrances.map((e) => e.id === entId ? { ...e, link: { room: rid, ent: eid } } : e);
+      next[rid].entrances = next[rid].entrances.map((e) => e.id === eid ? { ...e, link: { room: cur, ent: entId } } : e);
     }
-    const [rid, eid] = target.split("|");
-    const td = roomStore.current[rid];
-    if (!td) return;
-    td.entrances = (td.entrances || []).map((e) => e.link && e.link.room === cur && e.id !== eid ? { ...e, link: void 0 } : e).map((e) => e.id === eid ? { ...e, link: { room: cur, ent: entId } } : e);
-    updateEntrances(entrances.map((e) => e.id === entId ? { ...e, link: { room: rid, ent: eid } } : e.link && e.link.room === rid && e.link.ent === eid ? { ...e, link: void 0 } : e));
-    setNotice(`${roomLabel(rid)}とつなぎました`);
+    syncEntranceStore(cleanEntranceLinks(next));
+    saveAll();
+    setNotice(target ? `${roomLabel(rid)}とつなぎました` : "つながりを外しました");
   }
   function goThroughLink() {
-    const e = entrances.find((x) => x.id === nearLink);
-    if (!e || !e.link) return;
-    if (!roomsRef.current.some((r) => r.id === e.link.room)) {
-      setNotice("つながり先の部屋がありません");
+    const e = dataRef.current.entrances.find((x) => x.id === nearLinkRef.current);
+    if (!e?.link) return;
+    const peer = entrancesOf(e.link.room).find((p) => p.id === e.link.ent);
+    if (!roomsRef.current.some((r) => r.id === e.link.room) || !peer || peer.link?.room !== curRoomRef.current || peer.link?.ent !== e.id) {
+      syncEntranceStore(cleanEntranceLinks(projectStore()));
+      saveAll();
+      setNotice("つながり先の入口がないため、接続を解除しました");
       return;
     }
     switchRoom(e.link.room, { ent: e.link.ent });
@@ -4453,12 +4785,6 @@ function App() {
     const ns = { ...st, [k]: v };
     const dm = stairDims(ns);
     if (k === "type" && v !== st.type) {
-      entrances.forEach((e) => {
-        if (e.link) {
-          const pd = roomStore.current[e.link.room];
-          if (pd && pd.entrances) pd.entrances = pd.entrances.map((x) => x.id === e.link.ent ? { ...x, link: void 0 } : x);
-        }
-      });
       updateRoom({ stair: ns, ...dm });
       updateEntrances(stairEntrances(ns));
       {
@@ -4622,37 +4948,44 @@ function App() {
   } }, /* @__PURE__ */ React.createElement("p", { className: "small rounded-lg bg-[var(--surface2)] px-3 py-2" }, "① 額装 → ② 飾り方 → ③ 写真ライブラリで写真を選ぶと、プレビューの下に「＋ 写真を飾る」が出ます。"), /* @__PURE__ */ React.createElement("section", { className: "space-y-3 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold text-sm" }, "① 額装"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, SIZE_LIST.map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => setSize(x), className: `chip text-sm ${size === x ? "tab-active" : ""}` }, x === "スクエア" ? "スクエア（正方形）" : `${x} ${SIZE_MM[x][0]}×${SIZE_MM[x][1]} mm`))), size === "スクエア" && /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "スクエアの一辺"), /* @__PURE__ */ React.createElement("b", null, sqMM, " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "スクエアの一辺（これから飾る写真）", className: "w-full", type: "range", min: "100", max: "1000", rstep: "10", value: sqMM, onChange: (e) => setSqMM(clamp(Math.round(Number(e.target.value)), 100, 1e3)) })), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, ["自動", "縦", "横"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => setOrient(x), className: `chip text-sm ${orient === x ? "tab-active" : ""}` }, x === "自動" ? "向き 自動" : `${x}向き`)), ["白", "黒", "木目", "パネル"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => setFrame(x), className: `chip text-sm ${frame === x ? "tab-active" : ""}` }, x === "パネル" ? "パネル（縁なし）" : `額 ${x}`)), frame !== "パネル" && /* @__PURE__ */ React.createElement("button", { onClick: () => setMat(!mat), className: `chip text-sm ${mat ? "tab-active" : ""}` }, "マット ", mat ? "あり" : "なし")), frame === "パネル" && /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "パネルの厚さ"), /* @__PURE__ */ React.createElement("b", null, panelMM, " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "パネルの厚さ（これから飾る写真）", className: "w-full", type: "range", min: "2", max: "20", rstep: "1", value: panelMM, onChange: (e) => setPanelMM(clamp(Math.round(Number(e.target.value)), 2, 20)) })), orient === "自動" && /* @__PURE__ */ React.createElement("p", { className: "small" }, "向きは写真の縦横比に合わせます。")), /* @__PURE__ */ React.createElement("section", { className: "space-y-3 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold text-sm" }, "② 飾り方"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, ["壁掛け", "イーゼル"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => setMethod(x), className: `chip text-sm ${method === x ? "tab-active" : ""}` }, x))), method === "壁掛け" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, ["北", "南", "東", "西"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => {
     setWall(x);
     setMountCol("");
-  }, className: `chip text-sm ${wall === x && !mountCol ? "tab-active" : ""}` }, x, "壁")), columns.length > 0 && /* @__PURE__ */ React.createElement("button", { onClick: () => setMountCol(mountCol && columns.some((c) => c.id === mountCol) ? mountCol : columns[0].id), className: `chip text-sm ${mountCol && columns.some((c) => c.id === mountCol) ? "tab-active" : ""}` }, "柱"), blocks.some((b) => b.ceil) && /* @__PURE__ */ React.createElement("button", { onClick: () => setMountCol(mountCol && blocks.some((b) => b.ceil && b.id === mountCol) ? mountCol : blocks.find((b) => b.ceil).id), className: `chip text-sm ${mountCol && blocks.some((b) => b.id === mountCol) ? "tab-active" : ""}` }, "下がり天井")), mountCol && blocks.some((b) => b.id === mountCol) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, blocks.map((b, i) => b.ceil ? /* @__PURE__ */ React.createElement("button", { key: b.id, onClick: () => setMountCol(b.id), className: `chip text-xs ${mountCol === b.id ? "tab-active" : ""}` }, "下がり天井", i + 1, "（", fmt(b.w), "×", fmt(b.d), "）") : null)), /* @__PURE__ */ React.createElement("p", { className: "small" }, "前の面（上り口側を向いた面）の高さの中央にかけます。高さは選んでから取っ手で調整できます。")), mountCol && columns.some((c) => c.id === mountCol) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, columns.map((c, i) => /* @__PURE__ */ React.createElement("button", { key: c.id, onClick: () => setMountCol(c.id), className: `chip text-xs ${mountCol === c.id ? "tab-active" : ""}` }, "柱", i + 1, "（", fmt(colW(c)), "×", fmt(colD(c)), "）"))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, ["北", "南", "東", "西"].map((fc) => /* @__PURE__ */ React.createElement("button", { key: fc, onClick: () => setMountFace(fc), className: `chip text-xs ${mountFace === fc ? "tab-active" : ""}` }, fc, "面")))), /* @__PURE__ */ React.createElement("div", { className: "hidden" }), selPhotos.length <= 1 && !mountCol && /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "壁沿い位置 ", fmt(pos), " m", /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: "-4", max: "4", step: ".1", value: pos, onChange: (e) => setPos(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "中心高さ ", center.toFixed(2), " m", /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: ".2", max: "3", step: ".05", value: center, onChange: (e) => setCenter(Number(e.target.value)) }))) : /* @__PURE__ */ React.createElement(React.Fragment, null, selPhotos.length <= 1 && /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "位置 X ", fmt(ex), " m", /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: "-4", max: "4", step: ".1", value: ex, onChange: (e) => setEx(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "位置 Z ", fmt(ez), " m", /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: "-4", max: "4", step: ".1", value: ez, onChange: (e) => setEz(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "回転 ", rot, "°", /* @__PURE__ */ React.createElement("input", { className: "w-full", type: "range", min: "-180", max: "180", step: "5", value: rot, onChange: (e) => setRot(Number(e.target.value)) }))), /* @__PURE__ */ React.createElement("p", { className: "small" }, selPhotos.length >= 2 ? method === "壁掛け" ? "2点以上を選ぶと、壁の両端と作品の隙間がすべて同じになるように並べます。" : "2台以上を選ぶと、部屋の幅を等分した横一列に置きます（前後はZ位置）。" : "1点だけ選ぶと、上の位置に飾ります。")), /* @__PURE__ */ React.createElement("section", { className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "③ 写真を選ぶ（写真ライブラリ） ", /* @__PURE__ */ React.createElement("span", { className: "text-sm font-normal text-[var(--muted)]" }, photos.length ? `${photos.length} 枚` : "サンプル")), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => fileRef.current?.click(), className: "chip text-sm flex gap-1 items-center font-bold" }, "📥 写真を取り込む")), /* @__PURE__ */ React.createElement("input", { ref: fileRef, type: "file", accept: "image/*", multiple: true, className: "hidden", onChange: (e) => {
+  }, className: `chip text-sm ${wall === x && !mountCol ? "tab-active" : ""}` }, x, "壁")), columns.length > 0 && /* @__PURE__ */ React.createElement("button", { onClick: () => setMountCol(mountCol && columns.some((c) => c.id === mountCol) ? mountCol : columns[0].id), className: `chip text-sm ${mountCol && columns.some((c) => c.id === mountCol) ? "tab-active" : ""}` }, "柱"), blocks.some((b) => b.ceil) && /* @__PURE__ */ React.createElement("button", { onClick: () => setMountCol(mountCol && blocks.some((b) => b.ceil && b.id === mountCol) ? mountCol : blocks.find((b) => b.ceil).id), className: `chip text-sm ${mountCol && blocks.some((b) => b.id === mountCol) ? "tab-active" : ""}` }, "下がり天井")), mountCol && blocks.some((b) => b.id === mountCol) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, blocks.map((b, i) => b.ceil ? /* @__PURE__ */ React.createElement("button", { key: b.id, onClick: () => setMountCol(b.id), className: `chip text-xs ${mountCol === b.id ? "tab-active" : ""}` }, "下がり天井", i + 1, "（", fmt(b.w), "×", fmt(b.d), "）") : null)), /* @__PURE__ */ React.createElement("p", { className: "small" }, "前の面（上り口側を向いた面）の高さの中央にかけます。高さは選んでから取っ手で調整できます。")), mountCol && columns.some((c) => c.id === mountCol) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, columns.map((c, i) => /* @__PURE__ */ React.createElement("button", { key: c.id, onClick: () => setMountCol(c.id), className: `chip text-xs ${mountCol === c.id ? "tab-active" : ""}` }, "柱", i + 1, "（", fmt(colW(c)), "×", fmt(colD(c)), "）"))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, ["北", "南", "東", "西"].map((fc) => /* @__PURE__ */ React.createElement("button", { key: fc, onClick: () => setMountFace(fc), className: `chip text-xs ${mountFace === fc ? "tab-active" : ""}` }, fc, "面")))), /* @__PURE__ */ React.createElement("div", { className: "hidden" }), selPhotos.length <= 1 && !mountCol && /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "壁沿い位置 ", fmt(pos), " m", /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: "-4", max: "4", step: ".1", value: pos, onChange: (e) => setPos(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "中心高さ ", center.toFixed(2), " m", /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: ".2", max: "3", step: ".05", value: center, onChange: (e) => setCenter(Number(e.target.value)) }))) : /* @__PURE__ */ React.createElement(React.Fragment, null, selPhotos.length <= 1 && /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "位置 X ", fmt(ex), " m", /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: "-4", max: "4", step: ".1", value: ex, onChange: (e) => setEx(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "位置 Z ", fmt(ez), " m", /* @__PURE__ */ React.createElement(RangeNum, { className: "w-full", type: "range", min: "-4", max: "4", step: ".1", value: ez, onChange: (e) => setEz(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, "回転 ", rot, "°", /* @__PURE__ */ React.createElement("input", { className: "w-full", type: "range", min: "-180", max: "180", step: "5", value: rot, onChange: (e) => setRot(Number(e.target.value)) }))), /* @__PURE__ */ React.createElement("p", { className: "small" }, selPhotos.length >= 2 ? method === "壁掛け" ? "2点以上を選ぶと、壁の両端と作品の隙間がすべて同じになるように並べます。" : "2台以上を選ぶと、部屋の幅を等分した横一列に置きます（前後はZ位置）。" : "1点だけ選ぶと、上の位置に飾ります。")), /* @__PURE__ */ React.createElement("section", { className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "③ 写真を選ぶ（写真ライブラリ） ", /* @__PURE__ */ React.createElement("span", { className: "text-sm font-normal text-[var(--muted)]" }, photos.length ? `${photos.length} 枚` : "サンプル")), /* @__PURE__ */ React.createElement("button", { type: "button", disabled: !!photoTask, onClick: () => fileRef.current?.click(), className: "chip text-sm flex gap-1 items-center font-bold" }, "📥 写真を取り込む")), /* @__PURE__ */ React.createElement("input", { ref: fileRef, type: "file", accept: "image/*", multiple: true, className: "hidden", onChange: (e) => {
     addFiles(e.target.files);
     e.target.value = "";
-  } }), photos.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small" }, "サンプル（森・海）です。写真を取り込むとサンプルは消えます。複数まとめて選べます（ここへドラッグでも追加できます）。"), photos.some((p) => p.missing) && /* @__PURE__ */ React.createElement("p", { className: "small" }, "「未読込」の写真は、同じファイル名の写真を追加すると自動で対応づきます。"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs", onClick: () => setSelPhotos(lib.map((p) => p.id)) }, "すべて選択"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs", onClick: () => setSelPhotos([]) }, "選択を外す"), /* @__PURE__ */ React.createElement("span", { className: "small" }, "タップで選択（選んだ順に並びます）")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, lib.map((p) => {
+  } }), (photoTask || notice) && React.createElement("p", { className: "small", role: "status" }, photoTask || notice), photos.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small" }, "サンプル（森・海）です。写真を取り込むとサンプルは消えます。複数まとめて選べます（ここへドラッグでも追加できます）。"), photos.some((p) => p.missing) && /* @__PURE__ */ React.createElement("p", { className: "small" }, "「未読込」の写真は、同じファイル名の写真を追加すると自動で対応づきます。"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs", onClick: () => setSelPhotos(lib.map((p) => p.id)) }, "すべて選択"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs", onClick: () => setSelPhotos([]) }, "選択を外す"), /* @__PURE__ */ React.createElement("span", { className: "small" }, "タップで選択（選んだ順に並びます）")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, lib.map((p) => {
     const order = selPhotos.indexOf(p.id);
     const on = order >= 0;
     const used = placements.filter((x) => x.photo === p.id).length;
-    return /* @__PURE__ */ React.createElement("div", { key: p.id, className: `rounded-xl overflow-hidden border-2 bg-[var(--surface)] ${on ? "border-[var(--accent)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { type: "button", "aria-pressed": on, onClick: () => togglePhoto(p.id), className: "relative block w-full text-left" }, p.thumb ? /* @__PURE__ */ React.createElement("img", { src: p.thumb, alt: p.title, className: "w-full object-cover", style: { aspectRatio: "4/3" } }) : /* @__PURE__ */ React.createElement("div", { style: { aspectRatio: "4/3", background: p.missing ? "#8a8a84" : `linear-gradient(135deg,hsl(${p.hue} 42% 72%),hsl(${(p.hue + 70) % 360} 35% 28%))` }, className: "flex items-end p-2 text-white text-xs font-bold" }, p.missing ? "未読込" : p.title), on && /* @__PURE__ */ React.createElement("span", { className: "absolute top-1.5 left-1.5 w-6 h-6 rounded-full bg-[var(--accent)] text-white text-xs font-black flex items-center justify-center" }, order + 1), used > 0 && /* @__PURE__ */ React.createElement("span", { className: "absolute bottom-1.5 left-1.5 bg-black/70 text-white text-[10px] font-bold px-2 py-0.5 rounded-full" }, "展示 ×", used)), /* @__PURE__ */ React.createElement("div", { className: "p-2 text-xs" }, /* @__PURE__ */ React.createElement("div", { className: "font-bold truncate" }, p.title), /* @__PURE__ */ React.createElement("div", { className: "text-[var(--muted)]" }, "縦横比 ", p.ratio.toFixed(2)), p.uploaded && /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex gap-3" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "underline", onClick: () => renamePhoto(p.id) }, "名前"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "text-red-600 underline", onClick: () => deletePhoto(p.id) }, "削除"))));
+    return /* @__PURE__ */ React.createElement("div", { key: p.id, className: `rounded-xl overflow-hidden border-2 bg-[var(--surface)] ${on ? "border-[var(--accent)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { type: "button", "aria-pressed": on, onClick: () => togglePhoto(p.id), className: "relative block w-full text-left" }, p.thumb ? /* @__PURE__ */ React.createElement("img", { src: p.thumb, alt: p.title, className: "w-full object-cover", style: { aspectRatio: "4/3" } }) : /* @__PURE__ */ React.createElement("div", { style: { aspectRatio: "4/3", background: p.missing ? "#8a8a84" : `linear-gradient(135deg,hsl(${p.hue} 42% 72%),hsl(${(p.hue + 70) % 360} 35% 28%))` }, className: "flex items-end p-2 text-white text-xs font-bold" }, p.missing ? "未読込" : p.title), on && /* @__PURE__ */ React.createElement("span", { className: "absolute top-1.5 left-1.5 w-6 h-6 rounded-full bg-[var(--accent)] text-white text-xs font-black flex items-center justify-center" }, order + 1), used > 0 && /* @__PURE__ */ React.createElement("span", { className: "absolute bottom-1.5 left-1.5 bg-black/70 text-white text-[10px] font-bold px-2 py-0.5 rounded-full" }, "展示 ×", used)), /* @__PURE__ */ React.createElement("div", { className: "p-2 text-xs" }, /* @__PURE__ */ React.createElement("div", { className: "font-bold truncate" }, p.title), /* @__PURE__ */ React.createElement("div", { className: "text-[var(--muted)]" }, "縦横比 ", p.ratio.toFixed(2)), p.uploaded && /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex gap-3" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "underline", disabled: !!photoTask, onClick: () => renamePhoto(p.id) }, "名前"), React.createElement("button", { type: "button", className: "underline", disabled: !!photoTask, onClick: () => choosePhotoReplacement(p.id) }, "差し替え"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "text-red-600 underline", disabled: !!photoTask, onClick: () => deletePhoto(p.id) }, "削除"))));
   })))), tab === "展示" && (() => {
     const groupList = [...["北", "南", "東", "西"].map((wl) => ({ key: wl, label: `${wl}壁`, items: placements.filter((p) => p.method === "壁掛け" && !p.col && p.wall === wl), g: { t: "wall", wall: wl } })), { key: "col", label: "柱・下がり天井", items: placements.filter((p) => p.method === "壁掛け" && !!p.col), g: null }, { key: "easel", label: "イーゼル", items: placements.filter((p) => p.method === "イーゼル"), g: { t: "easel" } }].filter((x) => x.items.length > 0);
     return /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("section", { className: "space-y-2 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("h4", { className: "text-sm font-bold" }, "作品の高さをそろえる"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, [["center", "中心"], ["top", "上端"], ["bottom", "下端"]].map(([k, lb]) => /* @__PURE__ */ React.createElement("button", { key: k, type: "button", onClick: () => setAlignMode(k), className: `chip text-xs ${alignMode === k ? "tab-active" : ""}` }, lb, "でそろえる"))), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "基準の高さ（床から）"), /* @__PURE__ */ React.createElement("b", null, fmt(alignH), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "基準の高さ", className: "w-full", type: "range", min: "0.5", max: String(Math.max(1, room.h - 0.1)), step: "0.1", value: alignH, onChange: (e) => setAlignH(Number(e.target.value)) })), /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-2 text-xs" }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: showLine, onChange: (e) => setShowLine(e.target.checked) }), "壁に基準線を表示"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => alignHeights(() => true, "壁・柱"), className: "w-full bg-[var(--accent)] text-white py-2 rounded-xl font-bold text-sm" }, "壁掛けの作品をすべて", alignLabel, " ", fmt(alignH), " m にそろえる"), /* @__PURE__ */ React.createElement("p", { className: "small" }, "一般的な展示では、作品の中心を 1.45 m 前後にそろえます。壁ごとにそろえるときは、下の各壁の「↕ 高さ」を押します。")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "展示中 ", /* @__PURE__ */ React.createElement("span", { className: "text-sm font-normal text-[var(--muted)]" }, placements.length, " 点")), /* @__PURE__ */ React.createElement("span", { className: "small" }, "タップで3Dに選択表示")), placements.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small py-3 text-center" }, "まだ飾っていません。「写真」タブで写真を選んで飾ってください。"), groupList.map((grp) => /* @__PURE__ */ React.createElement("section", { key: grp.key, className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("h4", { className: "text-sm font-bold" }, grp.label, "（", grp.items.length, "点）"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, grp.key !== "easel" && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => alignHeights(grp.key === "col" ? ((p) => !!p.col) : ((p) => !p.col && p.wall === grp.key), grp.label), className: "chip text-xs" }, "↕ 高さ"), /* @__PURE__ */ React.createElement("button", { type: "button", disabled: grp.items.length < 3 || !grp.g, onClick: () => grp.g && distributeGroup(grp.g), className: "chip text-xs disabled:opacity-40" }, "↔ 等間隔に並べる"))), grp.items.map((p) => {
       const ph = photoOf(p.photo);
-      return /* @__PURE__ */ React.createElement("article", { key: p.id, className: `border rounded-xl p-2 flex items-center gap-2 ${selectedPlacement === p.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex flex-1 min-w-0 items-center gap-2 text-left", onClick: () => selectObj("placement", p.id) }, ph.thumb ? /* @__PURE__ */ React.createElement("img", { src: ph.thumb, alt: "", className: "w-12 h-10 rounded object-cover shrink-0" }) : /* @__PURE__ */ React.createElement("span", { className: "w-12 h-10 rounded shrink-0", style: { background: ph.missing ? "#8a8a84" : `linear-gradient(135deg,hsl(${ph.hue} 42% 72%),hsl(${(ph.hue + 70) % 360} 35% 28%))` } }), /* @__PURE__ */ React.createElement("span", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("span", { className: "block font-bold text-sm truncate" }, ph.title, ph.missing && ph.uploaded ? "（未読込）" : ""), /* @__PURE__ */ React.createElement("span", { className: "small block" }, p.size, " ・ ", p.orient, " ・ ", p.frame === "パネル" ? `パネル ${Math.round((p.thick ?? PANEL_T) * 1e3)}mm` : `額${p.frame}`, " ・ ", p.method === "壁掛け" ? p.col ? (columns.some((c) => c.id === p.col) ? `柱${columns.findIndex((c) => c.id === p.col) + 1}の${p.face || "南"}面` : `下がり天井${blocks.findIndex((b) => b.id === p.col) + 1}の前の面`) + ` ・ 中心 ${fmt(p.center)} m` : `壁端から ${fmt(p.pos + wallLen(room, p.wall) / 2)} m ・ 中心 ${fmt(p.center)} m` : `X ${fmt(p.x)} m, Z ${fmt(p.z)} m`))), /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs text-red-600 shrink-0", onClick: () => deletePlacementById(p.id) }, "削除"));
-    }))), /* @__PURE__ */ React.createElement("section", { className: "space-y-2 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("h4", { className: "text-sm font-bold" }, "レイアウトの書き出し／読み込み"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: exportProject, className: "chip text-sm flex-1" }, "📤 展覧会まるごと"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: exportLayout, className: "chip text-sm flex-1" }, "📤 この部屋だけ"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => layoutRef.current?.click(), className: "chip text-sm flex-1" }, "📥 読み込む")), /* @__PURE__ */ React.createElement("input", { ref: layoutRef, type: "file", accept: ".json,application/json", className: "hidden", onChange: (e) => {
+      return /* @__PURE__ */ React.createElement("article", { key: p.id, className: `border rounded-xl p-2 flex items-center gap-2 ${selectedPlacement === p.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex flex-1 min-w-0 items-center gap-2 text-left", onClick: () => selectObj("placement", p.id) }, ph.thumb ? /* @__PURE__ */ React.createElement("img", { src: ph.thumb, alt: "", className: "w-12 h-10 rounded object-cover shrink-0" }) : /* @__PURE__ */ React.createElement("span", { className: "w-12 h-10 rounded shrink-0", style: { background: ph.missing ? "#8a8a84" : `linear-gradient(135deg,hsl(${ph.hue} 42% 72%),hsl(${(ph.hue + 70) % 360} 35% 28%))` } }), /* @__PURE__ */ React.createElement("span", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("span", { className: "block font-bold text-sm truncate" }, ph.title, ph.missing && ph.uploaded ? "（未読込）" : ""), /* @__PURE__ */ React.createElement("span", { className: "small block" }, p.size, " ・ ", p.orient, " ・ ", p.frame === "パネル" ? `パネル ${Math.round((p.thick ?? PANEL_T) * 1e3)}mm` : `額${p.frame}`, " ・ ", p.method === "壁掛け" ? p.col ? (columns.some((c) => c.id === p.col) ? `柱${columns.findIndex((c) => c.id === p.col) + 1}の${p.face || "南"}面` : `下がり天井${blocks.findIndex((b) => b.id === p.col) + 1}の前の面`) + ` ・ 中心 ${fmt(p.center)} m` : `壁端から ${fmt(p.pos + wallLen(room, p.wall) / 2)} m ・ 中心 ${fmt(p.center)} m` : `X ${fmt(p.x)} m, Z ${fmt(p.z)} m`))), React.createElement("button", { type: "button", className: "chip text-xs shrink-0", disabled: !!photoTask, onClick: () => choosePhotoReplacement(p.photo, p.id) }, "差し替え"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs text-red-600 shrink-0", onClick: () => deletePlacementById(p.id) }, "削除"));
+    }))), /* @__PURE__ */ React.createElement("section", { className: "space-y-2 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("h4", { className: "text-sm font-bold" }, "レイアウトの書き出し／読み込み"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: exportProject, className: "chip text-sm flex-1" }, "📤 展覧会まるごと"), /* @__PURE__ */ React.createElement("button", { type: "button", onClick: exportLayout, className: "chip text-sm flex-1" }, "📤 この部屋だけ"), /* @__PURE__ */ React.createElement("button", { type: "button", disabled: !!photoTask, onClick: () => layoutRef.current?.click(), className: "chip text-sm flex-1" }, "📥 読み込む")), /* @__PURE__ */ React.createElement("input", { ref: layoutRef, type: "file", accept: ".json,application/json", className: "hidden", onChange: (e) => {
       importLayout(e.target.files?.[0]);
       e.target.value = "";
-    } }), /* @__PURE__ */ React.createElement("p", { className: "small" }, "部屋・柱・窓・入口・照明・時間帯・作品の配置をJSONで保存します。写真そのものは含みません。別の端末では、同じファイル名の写真を追加すると自動で対応づきます。")));
+    } }), React.createElement("button", { type: "button", onClick: exportBackup, disabled: !!photoTask, className: "chip text-sm w-full font-bold disabled:opacity-50" }, "📦 写真込みバックアップ"), (photoTask || notice) && React.createElement("p", { className: "small", role: "status" }, photoTask || notice), /* @__PURE__ */ React.createElement("p", { className: "small" }, "「写真込みバックアップ」は全室の配置と取り込んだ写真を1つのJSONに保存し、「読み込む」から復元できます（アプリ内の最大1600px画像。原本は含みません）。上の通常の書き出しは配置のみです。")));
   })());
+  const replacementInput = React.createElement("input", { ref: replaceRef, type: "file", accept: "image/*", className: "hidden", onChange: (e) => { const file = e.target.files?.[0]; const target = replaceTargetRef.current; replaceTargetRef.current = null; e.target.value = ""; replacePhoto(file, target); } });
   const selRow = mode === "edit" && selected ? /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b border-[var(--line)] bg-[var(--surface2)] flex items-center gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0 flex-1" }, /* @__PURE__ */ React.createElement("p", { className: "text-[13px] font-bold leading-tight truncate" }, selected.kind === "column" ? "柱" : selected.kind === "window" ? "窓枠" : selected.kind === "entrance" ? "入口" : selected.kind === "light" ? "照明" : selected.kind === "block" ? selBlock?.ceil ? "下がり天井" : "台" : selected.kind === "furniture" ? selFurn ? FURN_NAMES[selFurn.type] : "家具" : selPhoto ? selPhoto.title : "作品"), /* @__PURE__ */ React.createElement("p", { className: "text-[11px] leading-tight text-[var(--muted)] truncate" }, selected.kind === "furniture" && selFurn ? `X ${selFurn.x.toFixed(2)} m ・ Z ${selFurn.z.toFixed(2)} m ・ 回転 ${selFurn.rot}°` : selected.kind === "block" && selBlock ? `X ${selBlock.x.toFixed(2)} m ・ Z ${selBlock.z.toFixed(2)} m ・ ${selBlock.ceil ? `${fmt(selBlock.w)}×${fmt(selBlock.d)} m ・ 下面 ${fmt(ceilBot(room, selBlock))} m` : `${fmt(selBlock.w)}×${fmt(selBlock.d)}×${fmt(selBlock.h)} m`}` : selected.kind === "light" && selLight ? `X ${selLight.x.toFixed(2)} m ・ Z ${selLight.z.toFixed(2)} m ・ 強度 ${selLight.intensity} ・ ${selLight.kelvin} K` : selected.kind === "column" && selCol ? `X ${selCol.x.toFixed(2)} m ・ Z ${selCol.z.toFixed(2)} m ・ ${fmt(colW(selCol))}×${fmt(colD(selCol))} m` : selected.kind === "window" && selWin ? `${selWin.wall}壁 ・ 壁端から ${(selWin.pos + wallLen(room, selWin.wall) / 2).toFixed(2)} m ・ ${selWin.w.toFixed(2)}×${selWin.h.toFixed(2)} m` : selected.kind === "entrance" && selEnt ? `${selEnt.wall}壁 ・ 壁端から ${(selEnt.pos + wallLen(room, selEnt.wall) / 2).toFixed(2)} m ・ 幅 ${selEnt.w.toFixed(2)} m` : selected.kind === "placement" && selPlace ? selPlace.method === "壁掛け" ? `${selPlace.wall}壁 ・ 壁端から ${(selPlace.pos + wallLen(room, selPlace.wall) / 2).toFixed(2)} m ・ 中心 ${selPlace.center.toFixed(2)} m` : `X ${selPlace.x.toFixed(2)} m ・ Z ${selPlace.z.toFixed(2)} m` : "")), /* @__PURE__ */ React.createElement("button", { onClick: deleteSelected, className: "shrink-0 px-3 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold flex items-center gap-1" }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "削除"), /* @__PURE__ */ React.createElement("button", { onClick: clearSelection, className: "shrink-0 px-3 py-1.5 rounded-lg border border-[var(--line)] text-xs font-bold" }, "解除")) : null;
+  function clearRoomObjects() {
+    if (stateRef.current.mode === "view") return;
+    pushHistoryRaw(snapStr());
+    updateFurniture([], false);
+    updateBlocks([], false);
+    updateColumns([], false);
+    updateWindows([], false);
+    updateEntrances([], false);
+    updatePlacements([], false);
+    clearSelection();
+    setArrange(null);
+    saveAll();
+    setNotice("すべて削除しました");
+  }
   const footerRow = /* @__PURE__ */ React.createElement("div", { className: "p-3 border-t border-[var(--line)] flex gap-2" }, /* @__PURE__ */ React.createElement("button", { disabled: mode === "view", onClick: () => {
     updatePlacements([]);
     setNotice("配置をリセットしました");
-  }, className: "chip text-sm flex-1 disabled:opacity-50" }, "配置リセット"), /* @__PURE__ */ React.createElement("button", { disabled: mode === "view", onClick: () => {
-    updateFurniture([]);
-    updateBlocks([]);
-    updateColumns([]);
-    updateWindows([]);
-    updateEntrances([]);
-    updatePlacements([]);
-    setNotice("すべて削除しました");
-  }, className: "chip text-sm flex-1 text-red-600 disabled:opacity-50" }, "全削除"));
+  }, className: "chip text-sm flex-1 disabled:opacity-50" }, "配置リセット"), /* @__PURE__ */ React.createElement("button", { disabled: mode === "view", onClick: clearRoomObjects, className: "chip text-sm flex-1 text-red-600 disabled:opacity-50" }, "全削除"));
   const objectEditBody = /* @__PURE__ */ React.createElement(React.Fragment, null, (selWin || selEnt) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "設置する壁"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1", role: "group", "aria-label": "設置する壁" }, ["北", "南", "東", "西"].map((wallOpt) => {
     const cur = selWin ? selWin.wall : selEnt?.wall;
     const active = cur === wallOpt;
@@ -4738,7 +5071,7 @@ function App() {
     setTab(t);
     if (sheetSnap === "mini") setSheetSnap("half");
   })), /* @__PURE__ */ React.createElement("div", { className: "min-h-0 flex-1 overflow-y-auto p-3 space-y-4" }, tab === "選択中" ? selected ? /* @__PURE__ */ React.createElement("div", { key: selected.kind + selected.id, className: "sel-glow -m-1 p-1" }, objectEditBody) : null : tabContent, tab === "展示" && footerRow)));
-  return /* @__PURE__ */ React.createElement("div", { ref: shellRef, "data-safe-area-inset-root": true, style: { boxSizing: "border-box", paddingTop: "var(--safe-area-inset-top)", minHeight: "100dvh", display: "flex", flexDirection: "column", ...isPhone ? { height: "100dvh", overflow: "hidden" } : {} }, className: `${pseudoFullscreen ? "fixed inset-0 z-[9999] overflow-hidden h-[100dvh] " : ""}bg-[var(--bg)] text-[var(--ink)]` }, !isFullscreen && /* @__PURE__ */ React.createElement("header", { "data-safe-area-sticky-top": true, style: { top: isPhone ? 0 : "var(--safe-area-inset-top)" }, className: "sticky z-30 border-b border-[var(--line)] bg-[var(--surface)] shrink-0" }, isPhone ? phoneHeader : headerCollapsed ? /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 flex items-center justify-between gap-2", style: { height: 44, minHeight: 44 } }, /* @__PURE__ */ React.createElement("span", { className: "font-black tracking-tight text-sm sm:text-base truncate" }, "写真展シミュレーション"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 shrink-0" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setHeaderCollapsed(false), className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-xs sm:text-sm font-bold whitespace-nowrap" }, "▼ 上部を表示"), /* @__PURE__ */ React.createElement("button", { onClick: () => {
+  return /* @__PURE__ */ React.createElement("div", { ref: shellRef, "data-safe-area-inset-root": true, style: { boxSizing: "border-box", paddingTop: "var(--safe-area-inset-top)", minHeight: "100dvh", display: "flex", flexDirection: "column", ...isPhone ? { height: "100dvh", overflow: "hidden" } : {} }, className: `${pseudoFullscreen ? "fixed inset-0 z-[9999] overflow-hidden h-[100dvh] " : ""}bg-[var(--bg)] text-[var(--ink)]` }, replacementInput, !isFullscreen && /* @__PURE__ */ React.createElement("header", { "data-safe-area-sticky-top": true, style: { top: isPhone ? 0 : "var(--safe-area-inset-top)" }, className: "sticky z-30 border-b border-[var(--line)] bg-[var(--surface)] shrink-0" }, isPhone ? phoneHeader : headerCollapsed ? /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 flex items-center justify-between gap-2", style: { height: 44, minHeight: 44 } }, /* @__PURE__ */ React.createElement("span", { className: "font-black tracking-tight text-sm sm:text-base truncate" }, "写真展シミュレーション"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 shrink-0" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setHeaderCollapsed(false), className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-xs sm:text-sm font-bold whitespace-nowrap" }, "▼ 上部を表示"), /* @__PURE__ */ React.createElement("button", { onClick: () => {
     if (roomPanelOpen) closeRoomPanel();
     else openRoomPanel();
   }, "aria-pressed": roomPanelOpen, className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] text-xs sm:text-sm font-bold whitespace-nowrap", style: roomPanelOpen ? { background: "var(--accent)", color: "#fff" } : { background: "var(--surface2)" } }, "部屋を調整"), /* @__PURE__ */ React.createElement("div", { className: "hidden sm:flex rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { onClick: () => switchMode("edit"), className: `px-2.5 py-1.5 text-xs font-bold ${mode === "edit" ? "tab-active" : ""}` }, "配置"), /* @__PURE__ */ React.createElement("button", { onClick: () => switchMode("view"), className: `px-2.5 py-1.5 text-xs font-bold ${mode === "view" ? "tab-active" : ""}` }, "視点")), /* @__PURE__ */ React.createElement("div", { className: "flex sm:hidden rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { "aria-label": "配置モード", onClick: () => switchMode("edit"), className: `px-2 py-1.5 text-xs font-bold ${mode === "edit" ? "tab-active" : ""}` }, "配置"), /* @__PURE__ */ React.createElement("button", { "aria-label": "視点モード", onClick: () => switchMode("view"), className: `px-2 py-1.5 text-xs font-bold ${mode === "view" ? "tab-active" : ""}` }, "視点")), /* @__PURE__ */ React.createElement("button", { onClick: toggleFullscreen, className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-xs sm:text-sm font-bold whitespace-nowrap" }, "⛶ 全画面"), /* @__PURE__ */ React.createElement("button", { onClick: () => saveAll(), className: "h-[32px] px-3 rounded-full bg-[var(--accent)] text-white text-xs sm:text-sm font-bold whitespace-nowrap" }, "保存"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 py-2 flex flex-wrap gap-2 items-center justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement(LayoutGrid, { size: 22 }), /* @__PURE__ */ React.createElement("h1", { className: "text-lg sm:text-2xl font-black tracking-tight" }, "写真展シミュレーション")), /* @__PURE__ */ React.createElement("p", { className: "small" }, "実寸で確かめる、静かな展示室")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 items-center" }, /* @__PURE__ */ React.createElement("span", { ref: personPosRef, className: "text-xs font-bold bg-[var(--surface2)] px-3 py-2 rounded-full" }, "人の位置 X: 0.00 m / Z: 1.40 m"), /* @__PURE__ */ React.createElement("div", { className: "flex rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { onClick: () => switchView("orbit"), className: `px-3 py-2 text-sm ${view === "orbit" ? "tab-active" : ""}` }, "俯瞰（Orbit）"), /* @__PURE__ */ React.createElement("button", { onClick: () => switchView("walk"), title: mode === "edit" ? "押すと視点モードに自動で切り替わります" : "", className: `px-3 py-2 text-sm ${view === "walk" ? "tab-active" : ""}` }, "人の視点（Walk）", mode === "edit" ? " → 視点モードへ" : "")), /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-2 text-xs font-bold bg-[var(--surface2)] px-3 py-2 rounded-full" }, /* @__PURE__ */ React.createElement(Eye, { size: 14 }), "目線 ", eyeHeight.toFixed(2), " m", /* @__PURE__ */ React.createElement("input", { type: "range", min: "1.4", max: "1.8", step: "0.05", value: eyeHeight, onChange: (e) => setEyeHeight(Number(e.target.value)), className: "w-20 sm:w-24" })), /* @__PURE__ */ React.createElement("div", { className: "flex rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { onClick: () => updateRoom({ theme: "white" }), className: `px-3 py-2 text-sm ${room.theme === "white" ? "tab-active" : ""}` }, "内装 白"), /* @__PURE__ */ React.createElement("button", { onClick: () => updateRoom({ theme: "black" }), className: `px-3 py-2 text-sm ${room.theme === "black" ? "tab-active" : ""}` }, "内装 黒")), rooms.length > 1 && /* @__PURE__ */ React.createElement("select", { "aria-label": "表示する部屋", value: curRoomId, onChange: (e) => switchRoom(e.target.value), className: "px-3 py-2 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-sm font-bold" }, rooms.map((r) => /* @__PURE__ */ React.createElement("option", { key: r.id, value: r.id }, r.floor, " ", r.name))), /* @__PURE__ */ React.createElement("button", { onClick: () => {
