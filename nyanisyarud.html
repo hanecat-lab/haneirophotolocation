@@ -4022,6 +4022,9 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
 /* リプレイの操作板：ゴールの板と同じ下の位置に出し、リプレイ中はゴールの板とゴーストの名前を隠す */
 #replayPanel{position:absolute;left:50%;bottom:calc(14px + var(--safe-bottom,0px));transform:translateX(-50%);width:min(560px,calc(100% - 32px));box-sizing:border-box;z-index:120;padding:10px 12px;border-radius:16px;background:#fff9ebf0;border:1px solid #e7c789;color:#4a3415;font:800 13px 'Zen Maru Gothic',sans-serif;box-shadow:0 6px 20px #0003;pointer-events:auto;}
 #replayPanel[hidden]{display:none!important;}
+/* 再生中に3秒触らなければ操作板を薄くする(押せるまま)。触ると すぐ戻す */
+#replayPanel{transition:opacity .15s;}
+#replayPanel.idle{opacity:.3;transition:opacity .6s;}
 #app[data-replay="on"] #goalBanner,#app[data-replay="on"] #ghostNameTags{display:none!important;}
 /* READYの画面から開いた時は、景色だけ見る時と同じものと走り出すボタンを隠す */
 #app[data-replay="on"] :is(#touchLayer,#driveModeToggle,#startOverlay,#indicator,#minimapBox,#centerMsg,#bottomRaceInfo,#brakeChargeHUD,#timePillWrap,#rightBottomCluster,#catGuideDock,#nikukyuLayer,#brakeJudgmentLayer,#driveModeIndicator,#btnStart,#btnReadyUi){visibility:hidden!important;pointer-events:none!important;}
@@ -23112,7 +23115,7 @@ function validReplayCamera(record){
 }
 const replayState={active:false,record:null,events:[],camera:null,time:0,playing:false,dragging:false,eventCursor:0,sources:[],token:0,saved:null,snapCamera:true,end:null,collapsed:false,photoSaved:null,director:null,shot:null,
   player:{index:0,record:null,label:'',model:null,nodes:[],material:null,cardboard:null,shape:null,cursor:0,opacity:1},
-  camDir:new THREE.Vector3(0,0,1),camPos:new THREE.Vector3(),camLook:new THREE.Vector3()};
+  camDir:new THREE.Vector3(0,0,1),camPos:new THREE.Vector3(),camLook:new THREE.Vector3(),camOff:new THREE.Vector3(),lookOff:new THREE.Vector3(),speedNow:null,lastInput:0,idle:false,wakeLock:null,wakeState:''};
 const replaySparkGroup=new THREE.Group();replaySparkGroup.name='replaySparks';scene.add(replaySparkGroup);
 // リプレイの猫の影：走行中の影と同じ見た目で、猫の真下の道の面に平らに置く(リプレイの時だけ出す)
 const replayShadow=createContactShadow('replayShadow',8,.23);replayShadow.visible=false;scene.add(replayShadow);
@@ -23151,6 +23154,7 @@ async function openReplay(first=null){
   replayState.savedWorld=saveReplayWorld();
   replayState.active=true;replayState.record=null;replayState.dragging=false;
   document.getElementById('app').dataset.replay='on';document.getElementById('replayPanel').hidden=false;
+  replayState.lastInput=performance.now();requestReplayWakeLock();
   setReplayPanelCollapsed(false);syncReplayUI();
   await chooseReplaySource((sources.find(source=>source.id===first)||sources[0]).id);
 }
@@ -23182,7 +23186,24 @@ function closeReplay(){
   if(saved){replayHiddenObjects().forEach((object,i)=>object.visible=saved.visible[i]);camera.position.copy(saved.position);camera.quaternion.copy(saved.quaternion);camera.fov=saved.fov;camera.updateProjectionMatrix();camLook.copy(saved.look);}
   clearTimeout(wallFlashTimeout);document.getElementById('wallFlash').classList.remove('on');
   delete document.getElementById('app').dataset.replay;document.getElementById('replayPanel').hidden=true;document.getElementById('btnReplayShow').hidden=true;
+  setReplayPanelIdle(false);releaseReplayWakeLock();
 }
+// リプレイ中だけ画面を消灯させない(Vlog-Studio と同じ方式。画面が隠れると外れるので、戻った時にかけ直す)
+function requestReplayWakeLock(){
+  const r=replayState;if(!r.active||r.wakeLock||document.visibilityState!=='visible')return;
+  if(!navigator.wakeLock?.request){r.wakeState='使えない';return;}
+  r.wakeState='かけています';
+  try{navigator.wakeLock.request('screen').then(lock=>{
+    if(!replayState.active){lock.release().catch(()=>{});return;}
+    r.wakeLock=lock;r.wakeState='かけている';
+    lock.addEventListener('release',()=>{if(r.wakeLock===lock){r.wakeLock=null;r.wakeState='外れた';}});
+  }).catch(error=>{r.wakeState='使えない:'+(error?.name||'不明');});}catch(error){r.wakeState='使えない:'+(error?.name||'不明');}
+}
+function releaseReplayWakeLock(){const r=replayState,lock=r.wakeLock;r.wakeLock=null;r.wakeState='';lock?.release().catch(()=>{});}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&replayState.active)requestReplayWakeLock();});
+// 無操作の判定：触る・マウスを動かす・キーを押すと、最後の操作の時刻を更新して操作板を戻す
+function setReplayPanelIdle(on){if(replayState.idle===on)return;replayState.idle=on;document.getElementById('replayPanel').classList.toggle('idle',on);}
+for(const type of ['pointerdown','pointermove','keydown'])document.addEventListener(type,()=>{if(!replayState.active)return;replayState.lastInput=performance.now();setReplayPanelIdle(false);},{capture:true,passive:true});
 // 操作板を隠す：再生は続け、下に小さな「操作を出す」だけを残す
 function setReplayPanelCollapsed(on){
   replayState.collapsed=on;document.getElementById('replayPanel').hidden=on;document.getElementById('btnReplayShow').hidden=!on;
@@ -23212,6 +23233,7 @@ function updateReplay(dt){
   if(end?.photo&&end.t>=GOAL_PHOTO.cut){if(!end.frame)prepareReplayEndPhoto();applyReplayEndPose();placeReplayEndCamera();}
   else{const pose=applyReplayPose(r.time);if(r.director&&replayCamMode==='broadcast')placeBroadcastCamera(pose,dt);else placeReplayCamera(pose,dt);}
   updateReplayWorld(r.time);replayCamDiag?.(dt);
+  setReplayPanelIdle(r.playing&&!r.dragging&&!r.end&&performance.now()-r.lastInput>3000);
   syncReplayUI();
 }
 function applyReplayPose(time){
@@ -23596,11 +23618,11 @@ function placeBroadcastCamera(pose,dt){
   let fov=FOLLOW_FOV,fixed=false;
   const {a,b,t}=pose,cat=r.player.model.position,path=r.path,i=a/GHOST_STRIDE,j=b/GHOST_STRIDE,hyakken=TRACKS[currentKey]?.hyakken,dir=r.director;
   // 猫が走っていた道(本線か分岐の右の道)の上で計算する
-  const rk=dir.route[t<.5?i:j],R=dir.routes[rk],run=R.run;r.routeNow=rk;
+  const rk=dir.route[t<.5?i:j],R=dir.routes[rk],run=R.run;r.routeNow=rk;r.speedNow=null;
   const want=replayWantPos,look=replayWantLook.copy(cat);look.y+=.45;
   replayOnRoute(R,()=>{
   const d0=dir.rdist[i],d1=dir.rdist[j],d=dir.route[i]===dir.route[j]&&Math.abs(d1-d0)<totalLength/2?THREE.MathUtils.lerp(d0,d1,t):(t<.5?d0:d1);
-  const lat=dir.route[i]===dir.route[j]?THREE.MathUtils.lerp(dir.rlat[i],dir.rlat[j],t):dir.rlat[t<.5?i:j],spd=THREE.MathUtils.lerp(path.spd[i],path.spd[j],t);
+  const lat=dir.route[i]===dir.route[j]?THREE.MathUtils.lerp(dir.rlat[i],dir.rlat[j],t):dir.rlat[t<.5?i:j],spd=THREE.MathUtils.lerp(path.spd[i],path.spd[j],t);r.speedNow=spd;
   const tr=getTrackAtDist(replayWrapDist(d)),fw=replayCamFw.set(tr.t.x,0,tr.t.z).normalize(),indoor=replayIndoorAt(d,run);
   // 猫からコースに沿って along m 先・道の中心から side m 横(壁の内側まで)・足元の道から h m
   const at=(along,side,h,outdoorLimit=ROAD_HALF-.5)=>{
@@ -23618,8 +23640,10 @@ function placeBroadcastCamera(pose,dt){
     default:at(-9,lat*.8,indoor?Math.min(5.5,HYAKKEN.ceiling-1.6):6);look.addScaledVector(fw,5);break;
   }
   });
-  if(r.snapCamera){r.camPos.copy(want);r.camLook.copy(look);r.snapCamera=false;}
-  else{r.camPos.lerp(want,fixed?1:1-Math.exp(-dt*7));r.camLook.lerp(look,1-Math.exp(-dt*10));}
+  // 追いかけは猫から見たずれ(カメラ−猫・見る点−猫)をなめらかにする。ワールド座標のままだと、速い猫(60m/s前後)に0.14秒ぶん(8m以上)遅れ続ける
+  if(r.snapCamera){r.camPos.copy(want);r.camLook.copy(look);r.camOff.subVectors(want,cat);r.lookOff.subVectors(look,cat);r.snapCamera=false;}
+  else if(fixed){r.camPos.copy(want);r.camLook.lerp(look,1-Math.exp(-dt*10));r.camOff.subVectors(want,cat);r.lookOff.subVectors(r.camLook,cat);}
+  else{r.camOff.lerp(replayCamV1.subVectors(want,cat),1-Math.exp(-dt*7));r.lookOff.lerp(replayCamV2.subVectors(look,cat),1-Math.exp(-dt*10));r.camPos.addVectors(cat,r.camOff);r.camLook.addVectors(cat,r.lookOff);}
   camera.position.copy(r.camPos);camera.fov=fov;camera.updateProjectionMatrix();camera.lookAt(r.camLook);
 }
 // ?replaycam：中継カメラを実機で読む表示。今のカット・残り時間・再生の速さ・カメラと猫の距離・画角・カットの表を作った時間・遮る物の数・外した定点の数・コマ数/秒
@@ -23632,7 +23656,7 @@ const replayCamDiag=(()=>{
     const r=replayState,dir=r.director,shot=r.shot,cat=r.player.model?.position;
     el.textContent=[`カメラ ${replayCamMode==='broadcast'?'中継':'走行視点'}${dir?'':'（中継なし）'}${r.end?' 終わりの場面':''}`,
       dir&&shot?`カット ${dir.cursor+1}/${dir.shots.length} ${shot.name} 残り${Math.max(0,shot.e-r.time).toFixed(1)}秒`:'カット -',
-      `再生の速さ ×${replayTimeScale(r.time).toFixed(2)}${dir&&dir.routes.length>1?'  道 '+(r.routeNow?'分岐'+r.routeNow:'本線'):''}`,`カメラ〜猫 ${cat?camera.position.distanceTo(cat).toFixed(1):'-'}m 画角${camera.fov.toFixed(0)}°`,
+      `再生の速さ ×${replayTimeScale(r.time).toFixed(2)}${dir&&dir.routes.length>1?'  道 '+(r.routeNow?'分岐'+r.routeNow:'本線'):''}`,`カメラ〜猫 ${cat?camera.position.distanceTo(cat).toFixed(1):'-'}m 画角${camera.fov.toFixed(0)}° 猫の速さ ${shot&&shot.type!=='recorded'&&r.speedNow!=null?r.speedNow.toFixed(1)+'m/s':'-'}`,`消灯防止 ${r.wakeState||'-'}`,
       dir?`表 ${dir.ms.toFixed(0)}ms 遮る物${dir.stats.blockers} 外した定点${dir.stats.rejected}`:'表 -',`${fps.toFixed(1)}fps`].join('\n');
   };
 })();
