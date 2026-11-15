@@ -1279,6 +1279,49 @@ function shortObjectName(value, max = 12) {
 }
 // Bounded ambient approximation, not a light-transport simulation. Reuses the
 // existing two fill lights so large exhibitions do not add lighting/shadow passes.
+// Render-only floor shading and shadow selection; never persisted in layouts.
+function galleryFloorTone(room, solids, x, y, z) {
+  const ex=1-sm(0,.6,Math.max(0,room.w/2-Math.abs(x))),ez=1-sm(0,.6,Math.max(0,room.d/2-Math.abs(z)));
+  let partition=0;
+  for(const b of solids){
+    if(b.y-b.h/2>y+.01||b.y+b.h/2<y+.02)continue;
+    const dx=Math.max(0,Math.abs(x-b.x)-b.w/2),dz=Math.max(0,Math.abs(z-b.z)-b.d/2);
+    partition=Math.max(partition,1-sm(0,.4,Math.hypot(dx,dz)));
+  }
+  const loss=Math.min(.18,.075*ex+.075*ez+.03*ex*ez+.065*partition);
+  return 1-loss*(room.theme==="black"?.55:1);
+}
+function galleryFloorGeometry(width,height,depth,x,y,z,room,solids) {
+  // Only the receiving floor needs subdivisions; capped to keep mobile scenes small.
+  const nx=Math.min(32,Math.max(2,Math.ceil(width/.3))),nz=Math.min(32,Math.max(2,Math.ceil(depth/.3)));
+  const geometry=new THREE.BoxGeometry(width,height,depth,nx,1,nz),p=geometry.getAttribute("position"),n=geometry.getAttribute("normal"),colors=[];
+  for(let i=0;i<p.count;i++){
+    const tone=n.getY(i)>.5?galleryFloorTone(room,solids,x+p.getX(i),y+p.getY(i),z+p.getZ(i)):1;
+    colors.push(tone,tone,tone);
+  }
+  geometry.setAttribute("color",new THREE.Float32BufferAttribute(colors,3));
+  geometry.userData.floorGradient=true;return geometry;
+}
+function galleryLampPose(room,l) {
+  const cy=ceilAt(room,l.x,l.z),tilt=l.tilt*Math.PI/180,dir=l.dir*Math.PI/180;
+  const aim=new THREE.Vector3(Math.sin(dir)*Math.sin(tilt),-Math.cos(tilt),-Math.cos(dir)*Math.sin(tilt));
+  return {origin:new THREE.Vector3(l.x,cy-.09,l.z).addScaledVector(aim,.14),aim};
+}
+function galleryShadowFixture(room,env,lights,furniture,placements,blocks,columns) {
+  if(!env.lightsOn||(!furniture.length&&!columns.length&&!blocks.length&&!placements.some(p=>p.method==="イーゼル")))return null;
+  const receivers=[...furniture.map(f=>({x:f.x,z:f.z,y:floorSurface(room,blocks,f.x,f.z)+(FURN_DIM[f.type]?.h||.7)*.5})),...placements.filter(p=>p.method==="イーゼル").map(p=>({x:p.x,z:p.z,y:floorSurface(room,blocks,p.x,p.z)+.8})),...blocks.filter(b=>!b.ceil).map(b=>({x:b.x,z:b.z,y:floorBase(room,b.x,b.z)+b.h}))];
+  if(!receivers.length)receivers.push({x:0,z:0,y:floorBase(room,0,0)});
+  let chosen=null,best=0;
+  for(const l of [...lights].sort((a,b)=>String(a.id).localeCompare(String(b.id)))){
+    if(!(l.intensity>0))continue;
+    const {origin,aim}=galleryLampPose(room,l),edge=Math.cos(l.angle*Math.PI/180),inner=Math.cos(l.angle*.2*Math.PI/180);
+    let score=0;
+    for(const p of receivers){const delta=new THREE.Vector3(p.x,p.y,p.z).sub(origin),distance=delta.length(),cone=sm(edge,inner,delta.normalize().dot(aim));score+=l.intensity*cone/Math.max(1,distance**1.4);}
+    if(score>best){best=score;chosen=l.id;}
+  }
+  return chosen;
+}
+
 function galleryLightingResponse(room, env, lights, solarDay) {
   const daylight = env.sun && Number.isFinite(solarDay) ? clamp(solarDay, 0, 1) : 0;
   const area = Math.max(4, (Number(room.w) || 6) * (Number(room.d) || 4));
@@ -2753,19 +2796,20 @@ function App() {
       }
       geometry.setAttribute("uv", new THREE.BufferAttribute(uv, 2)); return geometry;
     }
-    function contactTexture(edge) {
+    function contactTexture(edge, round = false) {
       const size = 64, data = new Uint8Array(size * size * 4);
       for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
-        const u = x / (size - 1), v = y / (size - 1), r = Math.max(Math.abs(u - 0.5), Math.abs(v - 0.5)) * 2;
-        const t = clamp((r - 0.64) / 0.36, 0, 1), alpha = edge ? Math.pow(1 - v, 2) : 1 - t * t * (3 - 2 * t);
+        const u = x / (size - 1), v = y / (size - 1), r = (round ? Math.hypot(u - 0.5, v - 0.5) : Math.max(Math.abs(u - 0.5), Math.abs(v - 0.5))) * 2;
+        const t = clamp((r - (round ? 0.25 : 0.64)) / (round ? 0.75 : 0.36), 0, 1), alpha = edge ? Math.pow(1 - v, 2) : 1 - t * t * (3 - 2 * t);
         data[(y * size + x) * 4 + 3] = Math.round(alpha * 255);
       }
       const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
       texture.magFilter = texture.minFilter = THREE.LinearFilter;
-      texture.userData = { cached: true, contactMask: edge ? "edge" : "soft" };
+      texture.userData = { cached: true, contactMask: edge ? "edge" : round ? "round" : "soft" };
       texture.needsUpdate = true; surfaceTextures.push(texture); return texture;
     }
-    const contactMaps = { soft: contactTexture(false), edge: contactTexture(true) };
+    const contactMaps = { soft: contactTexture(false), edge: contactTexture(true), round: contactTexture(false,true) };
+    let exhibitShadowLight = null;
     const frameFinishCache = new Map(), frameFinishUsed = new Set();
     function frameFinish(p) {
       if(p.frame === "パネル") return {};
@@ -2836,6 +2880,7 @@ function App() {
       group.traverse((o) => {
         if (o.userData && o.userData.keepRes) return;
         o.geometry?.dispose();
+        if(o !== exhibitShadowLight) o.shadow?.dispose();
         (Array.isArray(o.material) ? o.material : o.material ? [o.material] : []).forEach((m) => {
           if (m.map && !m.map.userData?.cached) m.map.dispose();
           m.dispose();
@@ -2978,7 +3023,7 @@ function App() {
         if (active) { mat.color.lerp(new THREE.Color("#63d6bd"), 0.32); mat.emissive.set("#247665"); mat.emissiveIntensity = 0.2; mat.userData.placementHint = surface; }
         return mat;
       };
-      const contactBatches = { floor: { positions: [], uv: [], opacity: 0.13, map: contactMaps.soft }, edge: { positions: [], uv: [], opacity: 0.075, map: contactMaps.edge }, artwork: { positions: [], uv: [], opacity: 0.12, map: contactMaps.soft } };
+      const contactBatches = { floor: { positions: [], uv: [], opacity: 0.13, map: contactMaps.soft }, round: { positions: [], uv: [], opacity: 0.11, map: contactMaps.round }, edge: { positions: [], uv: [], opacity: 0.075, map: contactMaps.edge }, artwork: { positions: [], uv: [], opacity: 0.12, map: contactMaps.soft } };
       function contactQuad(batch, a, b, c, d, u0, v0, u1, v1, flip = false) {
         (flip ? [a,d,b,b,d,c] : [a,b,d,b,c,d]).forEach((v) => batch.positions.push(v.x, v.y, v.z));
         if (flip) batch.uv.push(u0,v0, u0,v1, u1,v0, u1,v0, u0,v1, u1,v1);
@@ -3019,17 +3064,19 @@ function App() {
         const a = new THREE.Vector3(-width/2-pad,-height/2-pad-0.008,-off+0.0015).applyMatrix4(g.matrixWorld), b = new THREE.Vector3(width/2+pad,-height/2-pad-0.008,-off+0.0015).applyMatrix4(g.matrixWorld), c = new THREE.Vector3(width/2+pad,height/2+pad-0.008,-off+0.0015).applyMatrix4(g.matrixWorld), d0 = new THREE.Vector3(-width/2-pad,height/2+pad-0.008,-off+0.0015).applyMatrix4(g.matrixWorld);
         contactQuad(contactBatches.artwork,a,b,c,d0,0,0,1,1);
       }
-      const floor = new THREE.Mesh(finishUV(new THREE.BoxGeometry(w, 0.08, d), "floor"), hintMaterial(finishMaterial("floor", { color: floorC, roughness: 0.85 }), floorHint, "floor"));
+      const floorSolids=s.columns.flatMap(c=>columnSolids(c,s.room,s.entrances,s.blocks));
+      const floorGeometry=(width,height,depth,x,y,z)=>finishUV(galleryFloorGeometry(width,height,depth,x,y,z,s.room,floorSolids),"floor");
+      const floor = new THREE.Mesh(floorGeometry(w,.08,d,0,-.04,0), hintMaterial(finishMaterial("floor", { color: floorC, roughness: 0.85, vertexColors:true }), floorHint, "floor"));
       floor.position.y = -0.04;
       floor.receiveShadow = true;
       group.add(floor);
       const ceilMat = hintMaterial(new THREE.MeshStandardMaterial({ color: theme === "white" ? 16448247 : 2236962 }), ceilingHint, "ceiling");
       if (s.room.stair) {
         const st = s.room.stair, n1 = stairN1(st), n2 = st.steps - n1, zS = d / 2 - st.land, R = st.riser, T = st.tread, tot = st.steps * R;
-        const sm2 = hintMaterial(finishMaterial("floor", { color: floorC, roughness: 0.85 }), floorHint, "floor");
+        const sm2 = hintMaterial(finishMaterial("floor", { color: floorC, roughness: 0.85, vertexColors:true }), floorHint, "floor");
         const box = (x0, x1, z0, z1, hh) => {
           if (hh <= 0 || Math.abs(z1 - z0) < 1e-6) return;
-          const m = new THREE.Mesh(finishUV(new THREE.BoxGeometry(Math.abs(x1 - x0), hh, Math.abs(z1 - z0)), "floor"), sm2);
+          const m = new THREE.Mesh(floorGeometry(Math.abs(x1-x0),hh,Math.abs(z1-z0),(x0+x1)/2,hh/2,(z0+z1)/2), sm2);
           m.position.set((x0 + x1) / 2, hh / 2, (z0 + z1) / 2);
           m.castShadow = true;
           m.receiveShadow = true;
@@ -3155,6 +3202,7 @@ function App() {
         group.add(arrow);
         spriteLabel("北", origin.clone().addScaledVector(dir, 0.7), 0.65);
       }
+      const shadowFixture=galleryShadowFixture(s.room,s.env,s.lights,s.furniture,s.placements,s.blocks,s.columns);
       s.lights.forEach((l) => {
         const isSel = s.selected?.kind === "light" && s.selected.id === l.id;
         const ly = ceilAt(s.room, l.x, l.z) - 0.1, fl = floorBase(s.room, l.x, l.z), lr = ly - fl;
@@ -3190,8 +3238,24 @@ function App() {
         group.add(fx);
         const lensPos = new THREE.Vector3(l.x, jy, l.z).addScaledVector(dv, 0.05 + 0.09);
         if (s.env.lightsOn) {
-          const spot = new THREE.SpotLight(col, l.intensity, Math.max(12, h * 2.5), l.angle * Math.PI / 180, 0.8, 1.4);
-          spot.userData = { galleryRole: "exhibit", fixtureId: l.id };
+          const casts=l.id===shadowFixture;
+          let spot;
+          if(casts){
+            if(!exhibitShadowLight){
+              exhibitShadowLight=new THREE.SpotLight();
+              exhibitShadowLight.shadow.mapSize.set(1024,1024);
+              exhibitShadowLight.shadow.bias=-.0001;
+              exhibitShadowLight.shadow.normalBias=.003;
+              exhibitShadowLight.shadow.radius=2;
+              exhibitShadowLight.shadow.intensity=.65;
+              exhibitShadowLight.shadow.autoUpdate=false;
+              exhibitShadowLight.shadow.camera.near=.08;
+            }
+            spot=exhibitShadowLight;
+            spot.color.copy(col);spot.intensity=l.intensity;spot.distance=Math.max(12,h*2.5);spot.angle=l.angle*Math.PI/180;spot.penumbra=.8;spot.decay=1.4;
+            spot.castShadow=true;spot.shadow.needsUpdate=true;
+          }else spot=new THREE.SpotLight(col,l.intensity,Math.max(12,h*2.5),l.angle*Math.PI/180,.8,1.4);
+          spot.userData = { galleryRole: "exhibit", fixtureId: l.id, localShadow:casts };
           spot.position.copy(lensPos);
           spot.target.position.set(tx, fl, tz);
           group.add(spot, spot.target);
@@ -3308,7 +3372,18 @@ function App() {
         const sy = supportY(s.blocks, f.x, f.z);
         g.position.set(f.x, sy, f.z);
         g.rotation.y = f.rot * Math.PI / 180;
-        groundContact(f.x,f.z,dm.w+0.18,dm.d+0.18,g.rotation.y,sy);
+        g.traverse(o=>{if(o.isMesh){o.castShadow=true;o.receiveShadow=true;}});
+        const ca=Math.cos(g.rotation.y),sa=Math.sin(g.rotation.y);
+        const foot=(x,z,width,depth=width)=>groundContact(f.x+ca*x+sa*z,f.z-sa*x+ca*z,width,depth,g.rotation.y,sy,contactBatches.round);
+        if(f.type==="tableRound"){
+          // Circular canopy occlusion plus the smaller pedestal contact; no square decal.
+          groundContact(f.x,f.z,dm.w+.18,dm.d+.18,0,sy,contactBatches.round);
+          foot(0,0,.66);
+        }else{
+          groundContact(f.x,f.z,dm.w+.12,dm.d+.12,g.rotation.y,sy);
+          const feet=f.type==="tableRect"?[[-.65,-.285],[-.65,.285],[.65,-.285],[.65,.285]]:[[-.215,-.245],[-.215,.235],[.215,-.245],[.215,.235]];
+          for(const [x,z] of feet)foot(x,z,.15);
+        }
         if (isSel) {
           const wb = new THREE.Mesh(new THREE.BoxGeometry(dm.w + 0.1, dm.h + 0.1, dm.d + 0.1), new THREE.MeshBasicMaterial({ color: SEL_C, wireframe: true, transparent: true, opacity: 0.9 }));
           wb.position.y = dm.h / 2;
@@ -3489,7 +3564,11 @@ function App() {
           g.position.set(p.x, sy, p.z);
           g.rotation.y = p.rot * Math.PI / 180;
           group.add(g);
-          groundContact(p.x,p.z,0.82,0.92,g.rotation.y,sy);
+          groundContact(p.x,p.z,.82,.92,g.rotation.y,sy,contactBatches.round);
+          for(const [x,z] of [[-.3,.12],[.3,.12],[0,-.48]]){
+            const ca=Math.cos(g.rotation.y),sa=Math.sin(g.rotation.y);
+            groundContact(p.x+ca*x+sa*z,p.z-sa*x+ca*z,.15,.15,0,sy,contactBatches.round);
+          }
           if (isSel) addRing(p.x, p.z, sy + 0.02);
         } else if (p.method === "壁掛け" && p.col) {
           const c = mountOf(s.columns, s.blocks, p.col);
@@ -3570,6 +3649,7 @@ function App() {
           const ept = p.frame === "パネル" ? clamp(p.thick ?? PANEL_T, 2e-3, 0.02) : 0.02;
           const backing = new THREE.Mesh(isPanel ? new THREE.BoxGeometry(pw, ph, ept) : galleryFrameGeometry(p, ept), isPanel ? new THREE.MeshStandardMaterial({ color: 16250351, roughness: 0.7 }) : mat2);
           backing.userData = { kind: "placement", id: p.id };
+          backing.castShadow=true;backing.receiveShadow=true;
           const front = isPanel ? new THREE.Mesh(new THREE.PlaneGeometry(pw, ph), mat2) : null;
           if (front) front.position.z = -0.01 + ept + 2e-3;
           backing.position.z = -0.01 + ept / 2;
@@ -3588,7 +3668,11 @@ function App() {
           g.position.set(p.x, sy, p.z);
           g.rotation.y = p.rot * Math.PI / 180;
           group.add(g);
-          groundContact(p.x,p.z,0.82,0.92,g.rotation.y,sy);
+          groundContact(p.x,p.z,.82,.92,g.rotation.y,sy,contactBatches.round);
+          for(const [x,z] of [[-.3,.3],[.3,.3],[0,-.42]]){
+            const ca=Math.cos(g.rotation.y),sa=Math.sin(g.rotation.y);
+            groundContact(p.x+ca*x+sa*z,p.z-sa*x+ca*z,.15,.15,0,sy,contactBatches.round);
+          }
           if (isSel) addRing(p.x, p.z, sy + 0.02);
         }
       });
@@ -4184,6 +4268,8 @@ function App() {
       ro.disconnect();
       el.removeEventListener("wheel", onWheelNative);
       disposeGroup();
+      exhibitShadowLight?.shadow.dispose();
+      sunLight.shadow.dispose();
       surfaceTextures.forEach((texture) => texture.dispose());
       frameFinishCache.forEach(disposeFrameFinish); frameFinishCache.clear();
       renderer.dispose();
