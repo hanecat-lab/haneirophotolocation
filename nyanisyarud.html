@@ -23115,7 +23115,7 @@ function validReplayCamera(record){
 }
 const replayState={active:false,record:null,events:[],camera:null,time:0,playing:false,dragging:false,eventCursor:0,sources:[],token:0,saved:null,snapCamera:true,end:null,collapsed:false,photoSaved:null,director:null,shot:null,
   player:{index:0,record:null,label:'',model:null,nodes:[],material:null,cardboard:null,shape:null,cursor:0,opacity:1},
-  camDir:new THREE.Vector3(0,0,1),camPos:new THREE.Vector3(),camLook:new THREE.Vector3(),camOff:new THREE.Vector3(),lookOff:new THREE.Vector3(),speedNow:null,lastInput:0,idle:false,wakeLock:null,wakeState:''};
+  camDir:new THREE.Vector3(0,0,1),camPos:new THREE.Vector3(),camLook:new THREE.Vector3(),camOff:new THREE.Vector3(),lookOff:new THREE.Vector3(),speedNow:null,nearList:null,nearHidden:0,lastInput:0,idle:false,wakeLock:null,wakeState:''};
 const replaySparkGroup=new THREE.Group();replaySparkGroup.name='replaySparks';scene.add(replaySparkGroup);
 // リプレイの猫の影：走行中の影と同じ見た目で、猫の真下の道の面に平らに置く(リプレイの時だけ出す)
 const replayShadow=createContactShadow('replayShadow',8,.23);replayShadow.visible=false;scene.add(replayShadow);
@@ -23171,13 +23171,13 @@ async function chooseReplaySource(id){
   // 竜のコースは竜が動くので、記録したカメラでは猫が外れる。猫の後ろから追う
   replayState.camera=validReplayCamera(record)&&!TRACKS[record.track]?.dragon?record.replayCamera:null;
   replayState.events=cleanReplayEvents(record.replayEvents)||[];
-  replayState.shot=null;try{replayState.director=buildReplayDirector(record);}catch(e){replayState.director=null;}
+  replayState.shot=null;replayState.nearList=null;try{replayState.director=buildReplayDirector(record);}catch(e){replayState.director=null;}
   document.getElementById('replaySeek').max=String(record.time);
   seekReplay(0);replayState.playing=true;syncReplayUI();
 }
 function closeReplay(){
   if(!replayState.active)return;
-  leaveReplayEnd();restoreReplayEndPhoto();replayState.director=null;replayState.shot=null;replayCamDiag?.(-1);
+  leaveReplayEnd();restoreReplayEndPhoto();replayState.director=null;replayState.nearList=null;replayState.shot=null;replayCamDiag?.(-1);
   replayState.token++;replayState.active=false;replayState.playing=false;replayState.record=null;replayState.dragging=false;
   disposeGhostModel(replayState.player);replayState.player.record=null;replayShadow.visible=false;
   restoreReplayWorld(replayState.savedWorld);replayState.savedWorld=null;replayState.world=null;replayState.path=null;
@@ -23646,6 +23646,54 @@ function placeBroadcastCamera(pose,dt){
   else{r.camOff.lerp(replayCamV1.subVectors(want,cat),1-Math.exp(-dt*7));r.lookOff.lerp(replayCamV2.subVectors(look,cat),1-Math.exp(-dt*10));r.camPos.addVectors(cat,r.camOff);r.camLook.addVectors(cat,r.lookOff);}
   camera.position.copy(r.camPos);camera.fov=fov;camera.updateProjectionMatrix();camera.lookAt(r.camLook);
 }
+// 中継の間だけ、描く直前に「カメラのすぐ前」と「カメラと猫の間」に来た小さな物(人魂・玉・炎・岩など)を隠し、描いた後に戻す。
+// 光の筋は横から見ると白い板に見えるので、見る向きが横に近いほど薄くする(後ろ・前から見た時は今まで通り)
+const REPLAY_NEAR={size:12,near:2.5,blockSize:6,catGap:2,beamCos:[.35,.85]};
+const replayNearV=new THREE.Vector3(),replayNearW=new THREE.Vector3(),replayNearSeg=new THREE.Line3();
+// 候補：シーンを上から見て、包む球の半径が size m 以下になった所の塊(GLBの1体・光の玉など)。猫・リプレイの猫・火花・目の光・空は除く
+function buildReplayNearList(){
+  const skip=new Set([replayState.player.model,catRoot,replaySparkGroup,catEyeLight.group,nightSky].filter(Boolean)),list=[],box=new THREE.Box3(),sphere=new THREE.Sphere(),inv=new THREE.Matrix4();
+  scene.updateMatrixWorld(true);
+  const walk=o=>{
+    if(skip.has(o)||o.isLight||o.isCamera)return;
+    if(o!==scene&&(o.isMesh||o.isSprite||o.children.length)&&!o.isInstancedMesh){
+      box.setFromObject(o);
+      if(!box.isEmpty()){box.getBoundingSphere(sphere);if(sphere.radius<=REPLAY_NEAR.size){list.push({o,c:sphere.center.clone().applyMatrix4(inv.copy(o.matrixWorld).invert()),r:sphere.radius});return;}}
+    }
+    for(const c of o.children)walk(c);
+  };
+  walk(scene);return list;
+}
+function replayBroadcastRendering(){
+  const r=replayState,shot=r.shot;
+  return r.active&&!r.end&&r.director&&replayCamMode==='broadcast'&&shot&&shot.type!=='recorded'&&r.player.model?.visible;
+}
+function replayBeforeRender(){
+  const r=replayState;r.nearHidden=0;if(!replayBroadcastRendering())return null;
+  r.nearList??=buildReplayNearList();
+  const cam=camera.position,cat=r.player.model.position,len=cam.distanceTo(cat),hidden=[];replayNearSeg.set(cam,cat);
+  for(const it of r.nearList){
+    const o=it.o;if(!o.visible)continue;
+    const c=replayNearV.copy(it.c).applyMatrix4(o.matrixWorld);
+    let hide=c.distanceTo(cam)-it.r<REPLAY_NEAR.near;
+    if(!hide&&it.r<=REPLAY_NEAR.blockSize&&c.distanceTo(cat)>it.r+.5){
+      const t=replayNearSeg.closestPointToPointParameter(c,true);
+      hide=t*len<len-REPLAY_NEAR.catGap&&replayNearSeg.at(t,replayNearW).distanceTo(c)<it.r;
+    }
+    if(hide){o.visible=false;hidden.push(o);}
+  }
+  r.nearHidden=hidden.length;
+  let beam=null;const b=catEyeLight.beam;
+  if(b.visible&&b.parent){
+    const axis=b.getWorldDirection(replayNearV),view=b.getWorldPosition(replayNearW).sub(cam).normalize();
+    beam={opacity:b.material.opacity};b.material.opacity*=THREE.MathUtils.smoothstep(Math.abs(axis.dot(view)),...REPLAY_NEAR.beamCos);
+  }
+  return {hidden,beam};
+}
+function replayAfterRender(state){
+  if(!state)return;for(const o of state.hidden)o.visible=true;
+  if(state.beam)catEyeLight.beam.material.opacity=state.beam.opacity;
+}
 // ?replaycam：中継カメラを実機で読む表示。今のカット・残り時間・再生の速さ・カメラと猫の距離・画角・カットの表を作った時間・遮る物の数・外した定点の数・コマ数/秒
 const replayCamDiag=(()=>{
   if(!new URLSearchParams(location.search).has('replaycam'))return null;
@@ -23656,7 +23704,7 @@ const replayCamDiag=(()=>{
     const r=replayState,dir=r.director,shot=r.shot,cat=r.player.model?.position;
     el.textContent=[`カメラ ${replayCamMode==='broadcast'?'中継':'走行視点'}${dir?'':'（中継なし）'}${r.end?' 終わりの場面':''}`,
       dir&&shot?`カット ${dir.cursor+1}/${dir.shots.length} ${shot.name} 残り${Math.max(0,shot.e-r.time).toFixed(1)}秒`:'カット -',
-      `再生の速さ ×${replayTimeScale(r.time).toFixed(2)}${dir&&dir.routes.length>1?'  道 '+(r.routeNow?'分岐'+r.routeNow:'本線'):''}`,`カメラ〜猫 ${cat?camera.position.distanceTo(cat).toFixed(1):'-'}m 画角${camera.fov.toFixed(0)}° 猫の速さ ${shot&&shot.type!=='recorded'&&r.speedNow!=null?r.speedNow.toFixed(1)+'m/s':'-'}`,`消灯防止 ${r.wakeState||'-'}`,
+      `再生の速さ ×${replayTimeScale(r.time).toFixed(2)}${dir&&dir.routes.length>1?'  道 '+(r.routeNow?'分岐'+r.routeNow:'本線'):''}`,`カメラ〜猫 ${cat?camera.position.distanceTo(cat).toFixed(1):'-'}m 画角${camera.fov.toFixed(0)}° 猫の速さ ${shot&&shot.type!=='recorded'&&r.speedNow!=null?r.speedNow.toFixed(1)+'m/s':'-'}`,`消灯防止 ${r.wakeState||'-'}  隠した物 ${r.nearHidden||0}`,
       dir?`表 ${dir.ms.toFixed(0)}ms 遮る物${dir.stats.blockers} 外した定点${dir.stats.rejected}`:'表 -',`${fps.toFixed(1)}fps`].join('\n');
   };
 })();
@@ -23806,7 +23854,7 @@ function advanceGameFrame(realDelta){
 }
 function animate(){requestAnimationFrame(animate);const frameDelta0=clock.getDelta();advanceGameFrame(frameDelta0);
   // ぽーず中は演出の時間も止める(走りの計算は advanceGameFrame で止めている)
-  const frameDelta=pausedNow()?0:frameDelta0;updateGhostPlayback(Math.min(frameDelta,.1));renderGhostSplitHUD();updateMini();if(debugEnabled)updateDebugPanel();updateRoadsideVisibility();updateTownCulling();updateNightLights(Math.min(frameDelta,.1));updateTunnel(Math.min(frameDelta,.1));updateBay777();updatePerfectFinish(Math.min(frameDelta,.1));updateFishBowl(Math.min(frameDelta,.1));syncCardboardCat();syncRoboCat(Math.min(frameDelta,.1));syncRedcatPose(Math.min(frameDelta,.1));syncManekiCat(Math.min(frameDelta,.1));syncYukionnaCat(Math.min(frameDelta,.1));syncAkaoniCat(Math.min(frameDelta,.1));syncKimonoCat(Math.min(frameDelta,.1));syncSuberiCat(Math.min(frameDelta,.1));syncTakenekoCat(Math.min(frameDelta,.1));syncNekomataCat(Math.min(frameDelta,.1));updateYokai(Math.min(frameDelta,.1));updateBambooHazards(Math.min(frameDelta,.1));updateOni(Math.min(frameDelta,.1));updateHyakken(Math.min(frameDelta,.1));updateSnow(Math.min(frameDelta,.1));updateGoalBanner(Math.min(frameDelta,.033));updateBonusStreaks();updateCatMotionFx(Math.min(frameDelta,.1));updateCatWaterRingGuide();faceRoadsideTrees();applyPhotoCam();updateBamboo();updateLandscapeZoom(Math.min(frameDelta,.1));renderDragonLight();renderer.render(scene,camera);renderSkyPeripheralBlur();placeBridgeBoostTag();placeSuberiJudge(Math.min(frameDelta,.1));placeSlideStarTag(Math.min(frameDelta,.1));placeSlideRingMeter(Math.min(frameDelta,.1));updateSlideLights();updateSlideScenery(Math.min(frameDelta,.1));updateSlideFlow(Math.min(frameDelta,.1));updateSlideFx(Math.min(frameDelta,.1));updateSuberiRings(Math.min(frameDelta,.1));perfHud?.(frameDelta0);renderCountdownPaw(Math.min(frameDelta,.1));}
+  const frameDelta=pausedNow()?0:frameDelta0;updateGhostPlayback(Math.min(frameDelta,.1));renderGhostSplitHUD();updateMini();if(debugEnabled)updateDebugPanel();updateRoadsideVisibility();updateTownCulling();updateNightLights(Math.min(frameDelta,.1));updateTunnel(Math.min(frameDelta,.1));updateBay777();updatePerfectFinish(Math.min(frameDelta,.1));updateFishBowl(Math.min(frameDelta,.1));syncCardboardCat();syncRoboCat(Math.min(frameDelta,.1));syncRedcatPose(Math.min(frameDelta,.1));syncManekiCat(Math.min(frameDelta,.1));syncYukionnaCat(Math.min(frameDelta,.1));syncAkaoniCat(Math.min(frameDelta,.1));syncKimonoCat(Math.min(frameDelta,.1));syncSuberiCat(Math.min(frameDelta,.1));syncTakenekoCat(Math.min(frameDelta,.1));syncNekomataCat(Math.min(frameDelta,.1));updateYokai(Math.min(frameDelta,.1));updateBambooHazards(Math.min(frameDelta,.1));updateOni(Math.min(frameDelta,.1));updateHyakken(Math.min(frameDelta,.1));updateSnow(Math.min(frameDelta,.1));updateGoalBanner(Math.min(frameDelta,.033));updateBonusStreaks();updateCatMotionFx(Math.min(frameDelta,.1));updateCatWaterRingGuide();faceRoadsideTrees();applyPhotoCam();updateBamboo();updateLandscapeZoom(Math.min(frameDelta,.1));renderDragonLight();const replayRenderState=replayBeforeRender();renderer.render(scene,camera);replayAfterRender(replayRenderState);renderSkyPeripheralBlur();placeBridgeBoostTag();placeSuberiJudge(Math.min(frameDelta,.1));placeSlideStarTag(Math.min(frameDelta,.1));placeSlideRingMeter(Math.min(frameDelta,.1));updateSlideLights();updateSlideScenery(Math.min(frameDelta,.1));updateSlideFlow(Math.min(frameDelta,.1));updateSlideFx(Math.min(frameDelta,.1));updateSuberiRings(Math.min(frameDelta,.1));perfHud?.(frameDelta0);renderCountdownPaw(Math.min(frameDelta,.1));}
 
 
 // === スマホ向けトップバー修正 - startupクラスを確実に解除 ===
