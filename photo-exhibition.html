@@ -2172,6 +2172,8 @@ function App() {
   const walkInitRef = useRef(false);
   const dragRef = useRef(null);
   const pointersRef = useRef(/* @__PURE__ */ new Map());
+  const selectionHoldRef = useRef(null);
+  const selectionHoldConsumedRef = useRef(null);
   const pinchRef = useRef(null);
   const stairZoom = useRef(false);
   const walkAnimRef = useRef(null);
@@ -2187,6 +2189,14 @@ function App() {
     if (objectMoveRef.current && (objectMoveRef.current !== targetKey || mode !== "edit" || replacement || artworkSwap || arrange || placeMode || batchFocus)) stopArtMove();
   }, [selected?.kind, selected?.id, personSel, mode, curRoomId, replacement, artworkSwap, arrange, placeMode, batchFocus]);
   useEffect(() => { closeBatchTargets(); }, [tab, curRoomId, mode]);
+  useEffect(() => { cancelSelectionHold(); }, [selected?.kind,selected?.id,personSel,mode,curRoomId,isFullscreen,placeMode,batchFocus]);
+  useEffect(() => {
+    const cancel=()=>loseSelectionHold({pointerId:selectionHoldRef.current?.pointerId??selectionHoldConsumedRef.current});
+    const hidden=()=>{if(document.hidden)cancel();};
+    window.addEventListener("blur",cancel);
+    document.addEventListener("visibilitychange",hidden);
+    return ()=>{cancelSelectionHold();selectionHoldConsumedRef.current=null;window.removeEventListener("blur",cancel);document.removeEventListener("visibilitychange",hidden);};
+  }, []);
   const [placeRepeat, setPlaceRepeat] = useState(false);
   const [lightSub, setLightSub] = useState("light");
   const panKeyRef = useRef({ x: 0, y: 0 });
@@ -2583,6 +2593,7 @@ function App() {
     if (artworkSwapRef.current && (kind !== "placement" || id !== artworkSwapRef.current.first) && !cancelArtworkSwap(false, () => selectObj(kind, id))) return;
     if (replacementRef.current && (kind !== "placement" || id !== replacementRef.current.placement) && !cancelReplacement(true, false, () => selectObj(kind, id))) return;
     const moving = dragIntentRef.current === "move";
+    cancelSelectionHold();
     setPreviewSelectionMenu(null);
     closeBatchTargets();
     if (objectMoveRef.current !== kind + ":" + id) stopArtMove();
@@ -2608,6 +2619,7 @@ function App() {
   }
   function clearSelection() {
     if (!guardPendingAction(clearSelection)) return false;
+    cancelSelectionHold();
     setPreviewSelectionMenu(null);
     const drag = dragRef.current;
     if (drag?.moved && (drag.mode === "move" || drag.mode === "handle") && canMoveObject(drag.kind, drag.id)) {
@@ -2809,7 +2821,7 @@ function App() {
     renderer.toneMappingExposure = 0.9;
     renderer.shadowMap.autoUpdate = false;
     // Keep layout independent of the canvas drawing buffer dimensions.
-    Object.assign(renderer.domElement.style, { position: "absolute", inset: "0", display: "block", width: "100%", height: "100%" });
+    Object.assign(renderer.domElement.style, { position: "absolute", inset: "0", display: "block", width: "100%", height: "100%", WebkitTouchCallout: "none", userSelect: "none" });
     el.appendChild(renderer.domElement);
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(1710618);
@@ -4372,6 +4384,7 @@ function App() {
         build();
         rebN++;
       }
+      updateSelectionHoldFeedback();
       renderer.render(scene, camera);
       if (diagRef.current && now - lastDiag > 250) {
         lastDiag = now;
@@ -4764,6 +4777,55 @@ function App() {
       updateDragInfo(kind, id, hit);
     }
   }
+  function cancelSelectionHold(){
+    const hold=selectionHoldRef.current;
+    if(!hold)return;
+    selectionHoldRef.current=null;
+    clearTimeout(hold.timer);
+    hold.materials.forEach((original,material)=>{material.color?.copy(original);});
+    hold.materials.clear();
+  }
+  function loseSelectionHold(e){
+    const id=e.pointerId;
+    if(id==null||(selectionHoldRef.current?.pointerId!==id&&selectionHoldConsumedRef.current!==id))return;
+    cancelSelectionHold();selectionHoldConsumedRef.current=null;pointersRef.current.delete(id);
+    dragRef.current=null;dragInfoRef.current=null;pendingSelRef.current={has:false,sel:null};
+    dragLockRef.current=null;setDragLock(null);setIsDragging(false);
+  }
+  function updateSelectionHoldFeedback(){
+    const hold=selectionHoldRef.current;if(!hold)return;
+    groupRef.current?.traverse(o=>{
+      if(!o.userData?.selectionMarker)return;
+      const materials=Array.isArray(o.material)?o.material:[o.material];
+      for(const material of materials){
+        if(!material?.color||!(o.userData.photoFocus||material.wireframe)||hold.materials.has(material))continue;
+        hold.materials.set(material,material.color.clone());
+        material.color.set("#fff2cc");
+      }
+    });
+  }
+  function beginSelectionHold(e){
+    cancelSelectionHold();
+    const st=stateRef.current;
+    if(st.mode!=="edit"||e.isPrimary===false||(e.button!=null&&e.button!==0)||pointersRef.current.size!==1||placeRef.current||batchFocusRef.current||selectionHoldConsumedRef.current!=null)return;
+    const target=st.selected||(st.personSel?{kind:"person",id:"person"}:null);
+    if(!target)return;
+    const hit=pick(e);
+    if(!hit?.obj||hit.marker||hit.handle||hit.kind!==target.kind||hit.id!==target.id)return;
+    const hold={key:selectionTargetKey(),pointerId:e.pointerId,x:e.clientX,y:e.clientY,materials:new Map(),timer:null};
+    selectionHoldRef.current=hold;
+    updateSelectionHoldFeedback();
+    hold.timer=setTimeout(()=>{
+      if(selectionHoldRef.current!==hold)return;
+      if(selectionTargetKey()!==hold.key||stateRef.current.mode!=="edit"||pointersRef.current.size!==1||!pointersRef.current.has(hold.pointerId)||pinchRef.current||!dragRef.current||dragRef.current.moved||placeRef.current||batchFocusRef.current){cancelSelectionHold();return;}
+      cancelSelectionHold();
+      selectionHoldConsumedRef.current=hold.pointerId;
+      dragRef.current=null;dragInfoRef.current=null;
+      pendingSelRef.current={has:false,sel:null};
+      dragLockRef.current=null;setDragLock(null);setIsDragging(false);
+      releaseSelection(hold.key);
+    },600);
+  }
   function onPointerDown(e) {
     if (viewMenu && e.target.tagName === "CANVAS") setViewMenu(false);
     if (e.target.tagName !== "CANVAS") {
@@ -4771,6 +4833,7 @@ function App() {
       return;
     }
     pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if(pointersRef.current.size>1)cancelSelectionHold();
     if (pointersRef.current.size === 2 && view === "orbit") {
       const [p1, p2] = [...pointersRef.current.values()];
       dbgPinchRef.current = { dd: 0, dy: 0 };
@@ -4783,6 +4846,7 @@ function App() {
     }
     beginDragPanelLock();
     e.target.setPointerCapture(e.pointerId);
+    beginSelectionHold(e);
     if (placeRef.current && mode === "edit") {
       dragRef.current = { x: e.clientX, y: e.clientY, mode: view === "orbit" ? "orbit" : "look", startX: e.clientX, startY: e.clientY, moved: false, placeTap: true, t0: performance.now() };
       return;
@@ -4907,6 +4971,9 @@ function App() {
     dragRef.current = { x: e.clientX, y: e.clientY, mode: view === "orbit" ? "orbit" : "look", startX: e.clientX, startY: e.clientY, moved: false, pendingClear: false, blank: true, wallTap, t0: performance.now() };
   }
   function onPointerMove(e) {
+    const hold=selectionHoldRef.current;
+    if(hold&&hold.pointerId===e.pointerId&&Math.hypot(e.clientX-hold.x,e.clientY-hold.y)>=8)cancelSelectionHold();
+    if(selectionHoldConsumedRef.current===e.pointerId)return;
     if (pointersRef.current.has(e.pointerId)) pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pinchRef.current && pointersRef.current.size >= 2) {
       const [p1, p2] = [...pointersRef.current.values()];
@@ -5000,6 +5067,8 @@ function App() {
     }
   }
   function onPointerUp(e) {
+    if(selectionHoldRef.current?.pointerId===e.pointerId)cancelSelectionHold();
+    if(selectionHoldConsumedRef.current===e.pointerId){selectionHoldConsumedRef.current=null;pointersRef.current.delete(e.pointerId);return;}
     {
       const d2 = dragRef.current;
       if (d2 || pinchRef.current) dbgDragRef.current = `${e.pointerType} ・ ${pinchRef.current ? `2本指（幅の変化 ${dbgPinchRef.current.dd} px・上下 ${dbgPinchRef.current.dy} px）` : d2.mode === "orbit" ? stateRef.current.camStyle === "room" && stateRef.current.view === "orbit" ? "見回し" : "回転" : d2.mode === "look" ? "視線" : d2.mode === "handle" ? "取っ手で調整" : d2.mode === "person" ? "人物を移動" : "物を移動"}${d2 && d2.tapSel ? `（${d2.tapSel.kind}の上から開始）` : ""}${d2 && d2.tapPerson ? "（人物の上から開始）" : ""} ・ ${d2 ? Math.round(Math.hypot(e.clientX - d2.startX, e.clientY - d2.startY)) : 0} px${d2 && d2.t0 ? ` ・ ${Math.round(performance.now() - d2.t0)} ms` : ""}`;
@@ -7295,7 +7364,7 @@ function App() {
   }, "aria-pressed": roomPanelOpen, className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] text-xs sm:text-sm font-bold whitespace-nowrap", style: roomPanelOpen ? { background: "var(--accent)", color: "#fff" } : { background: "var(--surface2)" } }, "部屋を調整"), /* @__PURE__ */ React.createElement("div", { className: "hidden sm:flex rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { onClick: () => switchMode("edit"), className: `px-2.5 py-1.5 text-xs font-bold ${mode === "edit" ? "tab-active" : ""}` }, "編集"), /* @__PURE__ */ React.createElement("button", { onClick: () => switchMode("view"), className: `px-2.5 py-1.5 text-xs font-bold ${mode === "view" ? "tab-active" : ""}` }, "鑑賞")), /* @__PURE__ */ React.createElement("div", { className: "flex sm:hidden rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { "aria-label": "編集モード", onClick: () => switchMode("edit"), className: `px-2 py-1.5 text-xs font-bold ${mode === "edit" ? "tab-active" : ""}` }, "編集"), /* @__PURE__ */ React.createElement("button", { "aria-label": "鑑賞モード", onClick: () => switchMode("view"), className: `px-2 py-1.5 text-xs font-bold ${mode === "view" ? "tab-active" : ""}` }, "鑑賞")), /* @__PURE__ */ React.createElement("button", { onClick: toggleFullscreen, className: "h-[32px] px-2.5 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-xs sm:text-sm font-bold whitespace-nowrap" }, "⛶ 全画面"), /* @__PURE__ */ React.createElement("button", { onClick: requestSave, className: "h-[32px] px-3 rounded-full bg-[var(--accent)] text-white text-xs sm:text-sm font-bold whitespace-nowrap" }, "保存"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 py-2 flex flex-wrap gap-2 items-center justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement(LayoutGrid, { size: 22 }), /* @__PURE__ */ React.createElement("h1", { className: "text-lg sm:text-2xl font-black tracking-tight" }, "写真展シミュレーション")), /* @__PURE__ */ React.createElement("p", { className: "small" }, "実寸で確かめる、静かな展示室"), saveIndicator), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 items-center" }, /* @__PURE__ */ React.createElement("span", { ref: personPosRef, className: "text-xs font-bold bg-[var(--surface2)] px-3 py-2 rounded-full" }, "人の位置 X: 0.00 m / Z: 1.40 m"), /* @__PURE__ */ React.createElement("div", { className: "flex rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { onClick: () => switchView("orbit"), className: `px-3 py-2 text-sm ${view === "orbit" ? "tab-active" : ""}` }, "俯瞰（Orbit）"), /* @__PURE__ */ React.createElement("button", { onClick: () => switchView("walk"), title: mode === "edit" ? "押すと鑑賞モードに自動で切り替わります" : "", className: `px-3 py-2 text-sm ${view === "walk" ? "tab-active" : ""}` }, "人の視点（Walk）", mode === "edit" ? " → 鑑賞モードへ" : "")), /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-2 text-xs font-bold bg-[var(--surface2)] px-3 py-2 rounded-full" }, /* @__PURE__ */ React.createElement(Eye, { size: 14 }), "目線 ", eyeHeight.toFixed(2), " m", /* @__PURE__ */ React.createElement("input", { type: "range", min: "1.4", max: "1.8", step: "0.05", value: eyeHeight, onChange: (e) => setEyeHeight(Number(e.target.value)), className: "w-20 sm:w-24" })), /* @__PURE__ */ React.createElement("div", { className: "flex rounded-full overflow-hidden border border-[var(--line)]" }, /* @__PURE__ */ React.createElement("button", { onClick: () => updateRoom({ theme: "white" }), className: `px-3 py-2 text-sm ${room.theme === "white" ? "tab-active" : ""}` }, "内装 白"), /* @__PURE__ */ React.createElement("button", { onClick: () => updateRoom({ theme: "black" }), className: `px-3 py-2 text-sm ${room.theme === "black" ? "tab-active" : ""}` }, "内装 黒")), rooms.length > 1 && /* @__PURE__ */ React.createElement("select", { "aria-label": "表示する部屋", value: curRoomId, onChange: (e) => switchRoom(e.target.value), className: "px-3 py-2 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-sm font-bold" }, rooms.map((r) => /* @__PURE__ */ React.createElement("option", { key: r.id, value: r.id }, r.floor, " ", r.name))), /* @__PURE__ */ React.createElement("button", { onClick: () => {
     if (roomPanelOpen) closeRoomPanel();
     else openRoomPanel();
-  }, "aria-pressed": roomPanelOpen, className: "px-3 py-2 rounded-full border border-[var(--line)] text-sm font-bold whitespace-nowrap", style: roomPanelOpen ? { background: "var(--accent)", color: "#fff" } : { background: "var(--surface2)" } }, "部屋を調整"), /* @__PURE__ */ React.createElement("button", { onClick: requestSave, className: "bg-[var(--accent)] text-white px-4 py-2 rounded-full text-sm font-bold" }, "保存する"), /* @__PURE__ */ React.createElement("button", { onClick: () => setHeaderCollapsed(true), className: "px-3 py-2 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-sm font-bold whitespace-nowrap" }, "▲ 上部を隠す"))), /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 pb-2" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 rounded-2xl border border-[var(--line)] bg-[var(--surface2)] p-1.5", role: "tablist", "aria-label": "モード切替" }, /* @__PURE__ */ React.createElement("button", { role: "tab", "aria-selected": mode === "edit", onClick: () => switchMode("edit"), className: "min-h-[44px] rounded-xl px-3 py-2 text-sm sm:text-base font-black flex items-center justify-center gap-2", style: mode === "edit" ? { background: "#ea580c", color: "#fff" } : { background: "transparent", color: "var(--ink)" } }, "🖐️ 配置を動かす", mode === "edit" && /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "・編集中")), /* @__PURE__ */ React.createElement("button", { role: "tab", "aria-selected": mode === "view", onClick: () => switchMode("view"), className: "min-h-[44px] rounded-xl px-3 py-2 text-sm sm:text-base font-black flex items-center justify-center gap-2", style: mode === "view" ? { background: "#2563eb", color: "#fff" } : { background: "transparent", color: "var(--ink)" } }, "👁️ 視点で見る", mode === "view" && /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "・ロック中"))), /* @__PURE__ */ React.createElement("p", { className: "small mt-1.5 text-center" }, mode === "edit" ? "編集モード：俯瞰のみ。人の視点ボタンを押すと鑑賞モードに自動で切り替わります。" : "鑑賞モード：オブジェはロック中です。ドラッグは見回すのみで、オブジェは動きません。")))), !isPhone && dragModeControl), isFullscreen && mode === "edit" && React.createElement("div", { "aria-label": "全画面のドラッグ操作", style: { flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", flexWrap: "wrap", gap: 4, background: "var(--surface)", borderBottom: "1px solid var(--line)" } }, dragModeControl, React.createElement("div", { style: { padding: "0 8px 3px" } }, saveIndicator)), phoneMenu, storageAlert, /* @__PURE__ */ React.createElement("main", { className: isPhone && !previewOnly ? `flex-1 min-h-0 w-full flex ${isPortrait ? "flex-col" : "flex-row"}` : previewOnly ? `flex-1 min-h-0 w-full mx-auto flex ${isFullscreen ? "p-0" : "p-2 sm:p-3"}` : panelActive ? `flex-1 min-h-0 w-full max-w-[1500px] mx-auto p-3 flex gap-3 ${isPortrait ? "flex-col" : "flex-row"}` : "max-w-[1500px] mx-auto p-3 sm:p-4 grid lg:grid-cols-[360px_1fr] gap-3 items-start w-full", style: isPhone && !previewOnly ? void 0 : previewOnly && !isFullscreen ? { height: "calc(100dvh - var(--safe-area-inset-top) - 44px)", maxHeight: "calc(100dvh - var(--safe-area-inset-top) - 44px)" } : panelActive && !isFullscreen ? { height: "calc(100dvh - var(--safe-area-inset-top) - 44px)", maxHeight: "calc(100dvh - var(--safe-area-inset-top) - 44px)" } : void 0 }, /* @__PURE__ */ React.createElement("aside", { className: `${panelActive || previewOnly || isPhone ? "hidden" : ""} order-2 lg:order-1 bg-[var(--surface)] border border-[var(--line)] rounded-2xl overflow-hidden lg:sticky lg:top-20`, style:replacement&&!panelActive&&!previewOnly&&!isPhone?{display:"flex",flexDirection:"column",height:"74dvh",minHeight:0}:undefined }, !isPhone && /* @__PURE__ */ React.createElement(React.Fragment, null, !replacement&&selRow, !replacement&& /* @__PURE__ */ React.createElement("div", { className: "p-2 border-b border-[var(--line)]" }, tabTrack(["部屋", "柱・窓・入口", "光", "写真", "展示"], (t) => setTab(t))), mode === "view" && /* @__PURE__ */ React.createElement("div", { className: "p-3 border-b border-[var(--line)] bg-[#2563eb] text-white text-sm font-bold" }, "🔒 鑑賞モード：編集はロック中です。変更する時は「編集」に戻ってください。"), /* @__PURE__ */ React.createElement("div", { "aria-label":replacement?"写真差し替えのスクロール領域":undefined, className: `${replacement?"p-3 min-h-0 flex-1 overflow-y-auto":"p-4 max-h-[72vh] overflow-auto"} space-y-4 ${mode === "view" ? "pointer-events-none opacity-60 select-none" : ""}` }, tabContent), replacement?replacementActions():footerRow)), /* @__PURE__ */ React.createElement("section", { className: panelActive || previewOnly || isPhone ? "flex-1 min-h-0 min-w-0 flex" : "order-1 lg:order-2 space-y-3 min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `flex ${isPhone ? "gap-0" : "gap-3"} items-stretch min-h-0 min-w-0 ${panelActive || previewOnly || isPhone ? isPortrait ? "flex-col flex-1" : "flex-row flex-1" : ""}`, style: panelActive || previewOnly || isPhone ? { height: "100%", maxHeight: "100%" } : void 0 }, /* @__PURE__ */ React.createElement("div", { className: `canvas-wrap ${idleDim && mode === "view" ? "idle-dim " : ""}${previewOnly ? "rounded-none sm:rounded-2xl border-0 sm:border" : ""} border border-[var(--line)] touch-none select-none ${panelActive || previewOnly || isPhone ? "flex-1 min-h-0 min-w-0" : "flex-1 min-w-0 h-[58vh] lg:h-[68vh]"}`, style: panelActive || previewOnly || isPhone ? { cursor: mode === "edit" ? "grab" : "move", minHeight: isPhone ? "max(25%,120px)" : isPortrait ? "45%" : 120, minWidth: 0 } : { cursor: mode === "edit" ? "grab" : "move" }, ref: mountRef, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp, "aria-label": mode === "edit" ? "3Dキャンバス（編集モード）" : "3Dキャンバス（鑑賞モード・オブジェはロック中）" }, isFullscreen && mode === "view" && React.createElement("div", { className: "absolute top-14 left-3 z-30", style: { background: "var(--surface)", borderRadius: 8, padding: "3px 7px" } }, saveIndicator), !fullscreenHasPanel && replacementStatusOverlay, !fullscreenHasPanel && arrangeStatusOverlay, placementStatusOverlay, artMoveFinishOverlay, batchStatusOverlay, entranceTestOverlay, planComparisonOverlay, !fullscreenHasPanel && artworkSwapOverlay, mode === "view" && nearLink && (() => {
+  }, "aria-pressed": roomPanelOpen, className: "px-3 py-2 rounded-full border border-[var(--line)] text-sm font-bold whitespace-nowrap", style: roomPanelOpen ? { background: "var(--accent)", color: "#fff" } : { background: "var(--surface2)" } }, "部屋を調整"), /* @__PURE__ */ React.createElement("button", { onClick: requestSave, className: "bg-[var(--accent)] text-white px-4 py-2 rounded-full text-sm font-bold" }, "保存する"), /* @__PURE__ */ React.createElement("button", { onClick: () => setHeaderCollapsed(true), className: "px-3 py-2 rounded-full border border-[var(--line)] bg-[var(--surface2)] text-sm font-bold whitespace-nowrap" }, "▲ 上部を隠す"))), /* @__PURE__ */ React.createElement("div", { className: "max-w-[1500px] mx-auto px-3 sm:px-5 pb-2" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 rounded-2xl border border-[var(--line)] bg-[var(--surface2)] p-1.5", role: "tablist", "aria-label": "モード切替" }, /* @__PURE__ */ React.createElement("button", { role: "tab", "aria-selected": mode === "edit", onClick: () => switchMode("edit"), className: "min-h-[44px] rounded-xl px-3 py-2 text-sm sm:text-base font-black flex items-center justify-center gap-2", style: mode === "edit" ? { background: "#ea580c", color: "#fff" } : { background: "transparent", color: "var(--ink)" } }, "🖐️ 配置を動かす", mode === "edit" && /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "・編集中")), /* @__PURE__ */ React.createElement("button", { role: "tab", "aria-selected": mode === "view", onClick: () => switchMode("view"), className: "min-h-[44px] rounded-xl px-3 py-2 text-sm sm:text-base font-black flex items-center justify-center gap-2", style: mode === "view" ? { background: "#2563eb", color: "#fff" } : { background: "transparent", color: "var(--ink)" } }, "👁️ 視点で見る", mode === "view" && /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "・ロック中"))), /* @__PURE__ */ React.createElement("p", { className: "small mt-1.5 text-center" }, mode === "edit" ? "編集モード：俯瞰のみ。人の視点ボタンを押すと鑑賞モードに自動で切り替わります。" : "鑑賞モード：オブジェはロック中です。ドラッグは見回すのみで、オブジェは動きません。")))), !isPhone && dragModeControl), isFullscreen && mode === "edit" && React.createElement("div", { "aria-label": "全画面のドラッグ操作", style: { flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", flexWrap: "wrap", gap: 4, background: "var(--surface)", borderBottom: "1px solid var(--line)" } }, dragModeControl, React.createElement("div", { style: { padding: "0 8px 3px" } }, saveIndicator)), phoneMenu, storageAlert, /* @__PURE__ */ React.createElement("main", { className: isPhone && !previewOnly ? `flex-1 min-h-0 w-full flex ${isPortrait ? "flex-col" : "flex-row"}` : previewOnly ? `flex-1 min-h-0 w-full mx-auto flex ${isFullscreen ? "p-0" : "p-2 sm:p-3"}` : panelActive ? `flex-1 min-h-0 w-full max-w-[1500px] mx-auto p-3 flex gap-3 ${isPortrait ? "flex-col" : "flex-row"}` : "max-w-[1500px] mx-auto p-3 sm:p-4 grid lg:grid-cols-[360px_1fr] gap-3 items-start w-full", style: isPhone && !previewOnly ? void 0 : previewOnly && !isFullscreen ? { height: "calc(100dvh - var(--safe-area-inset-top) - 44px)", maxHeight: "calc(100dvh - var(--safe-area-inset-top) - 44px)" } : panelActive && !isFullscreen ? { height: "calc(100dvh - var(--safe-area-inset-top) - 44px)", maxHeight: "calc(100dvh - var(--safe-area-inset-top) - 44px)" } : void 0 }, /* @__PURE__ */ React.createElement("aside", { className: `${panelActive || previewOnly || isPhone ? "hidden" : ""} order-2 lg:order-1 bg-[var(--surface)] border border-[var(--line)] rounded-2xl overflow-hidden lg:sticky lg:top-20`, style:replacement&&!panelActive&&!previewOnly&&!isPhone?{display:"flex",flexDirection:"column",height:"74dvh",minHeight:0}:undefined }, !isPhone && /* @__PURE__ */ React.createElement(React.Fragment, null, !replacement&&selRow, !replacement&& /* @__PURE__ */ React.createElement("div", { className: "p-2 border-b border-[var(--line)]" }, tabTrack(["部屋", "柱・窓・入口", "光", "写真", "展示"], (t) => setTab(t))), mode === "view" && /* @__PURE__ */ React.createElement("div", { className: "p-3 border-b border-[var(--line)] bg-[#2563eb] text-white text-sm font-bold" }, "🔒 鑑賞モード：編集はロック中です。変更する時は「編集」に戻ってください。"), /* @__PURE__ */ React.createElement("div", { "aria-label":replacement?"写真差し替えのスクロール領域":undefined, className: `${replacement?"p-3 min-h-0 flex-1 overflow-y-auto":"p-4 max-h-[72vh] overflow-auto"} space-y-4 ${mode === "view" ? "pointer-events-none opacity-60 select-none" : ""}` }, tabContent), replacement?replacementActions():footerRow)), /* @__PURE__ */ React.createElement("section", { className: panelActive || previewOnly || isPhone ? "flex-1 min-h-0 min-w-0 flex" : "order-1 lg:order-2 space-y-3 min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: `flex ${isPhone ? "gap-0" : "gap-3"} items-stretch min-h-0 min-w-0 ${panelActive || previewOnly || isPhone ? isPortrait ? "flex-col flex-1" : "flex-row flex-1" : ""}`, style: panelActive || previewOnly || isPhone ? { height: "100%", maxHeight: "100%" } : void 0 }, /* @__PURE__ */ React.createElement("div", { className: `canvas-wrap ${idleDim && mode === "view" ? "idle-dim " : ""}${previewOnly ? "rounded-none sm:rounded-2xl border-0 sm:border" : ""} border border-[var(--line)] touch-none select-none ${panelActive || previewOnly || isPhone ? "flex-1 min-h-0 min-w-0" : "flex-1 min-w-0 h-[58vh] lg:h-[68vh]"}`, style: panelActive || previewOnly || isPhone ? { cursor: mode === "edit" ? "grab" : "move", minHeight: isPhone ? "max(25%,120px)" : isPortrait ? "45%" : 120, minWidth: 0 } : { cursor: mode === "edit" ? "grab" : "move" }, ref: mountRef, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp, onLostPointerCapture:loseSelectionHold,onContextMenu:e=>{if(selectionHoldRef.current||selectionHoldConsumedRef.current!=null)e.preventDefault();}, "aria-label": mode === "edit" ? "3Dキャンバス（編集モード）" : "3Dキャンバス（鑑賞モード・オブジェはロック中）" }, isFullscreen && mode === "view" && React.createElement("div", { className: "absolute top-14 left-3 z-30", style: { background: "var(--surface)", borderRadius: 8, padding: "3px 7px" } }, saveIndicator), !fullscreenHasPanel && replacementStatusOverlay, !fullscreenHasPanel && arrangeStatusOverlay, placementStatusOverlay, artMoveFinishOverlay, batchStatusOverlay, entranceTestOverlay, planComparisonOverlay, !fullscreenHasPanel && artworkSwapOverlay, mode === "view" && nearLink && (() => {
     const e = entrances.find((x) => x.id === nearLink);
     return e && e.link ? /* @__PURE__ */ React.createElement("button", { type: "button", onClick: goThroughLink, className: "absolute bottom-32 left-1/2 -translate-x-1/2 z-30 bg-[var(--accent)] text-white font-black px-5 py-3 rounded-full shadow-lg whitespace-nowrap" }, "→ ", roomLabel(e.link.room), " へ") : null;
   })(), mode === "view" && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: exitToEdit, style: { top: previewLayout.compact && view === "orbit" ? 64 : 12 }, className: "soft absolute left-3 z-20 text-xs sm:text-sm px-4 h-9 rounded-full" }, "← 編集に戻る"), mode === "view" && showHints && /* @__PURE__ */ React.createElement("div", { className: "absolute top-12 left-3 z-20 bg-[#2563eb] text-white text-xs sm:text-sm font-black px-4 py-2 rounded-full pointer-events-none shadow" }, "🔒 視点移動中：オブジェはロック中です"), mode === "edit" && showHints && /* @__PURE__ */ React.createElement("div", { className: "absolute top-3 left-3 z-10 bg-black/75 text-white text-xs px-3 py-2 rounded-full pointer-events-none" }, "タップで選択 / 上部でドラッグ操作を切替 / 見回すで選択解除", isDragging ? " ・ ドラッグ中" : ""), mode === "view" && showHints && /* @__PURE__ */ React.createElement("div", { className: "absolute top-24 left-3 z-10 bg-black/75 text-white text-xs px-3 py-2 rounded-full pointer-events-none" }, "ドラッグ＝見回すのみ / WASD・矢印ボタンで歩く"), mode === "edit" && showHints && /* @__PURE__ */ React.createElement("div", { className: "absolute top-12 left-3 z-10 bg-black/60 text-white text-[11px] px-3 py-1.5 rounded-full pointer-events-none" }, "来場者も「物を動かす」で選択後に移動できます ・ 鑑賞中はドラッグ＝見回す、ボタン/WASD＝移動"), /* @__PURE__ */ React.createElement("div", { "aria-label": "プレビュー上部の操作", className: "absolute top-3 right-3 z-30 flex flex-col items-end gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5" }, view === "orbit" && !previewLayout.tightControls && /* @__PURE__ */ React.createElement("div", { style: { height: 44, flexShrink: 0 }, className: "soft rounded-full p-[3px] flex text-[13px]" }, [["room", "室内"], ["full", "上から全体"]].map(([k, lb]) => /* @__PURE__ */ React.createElement("button", { key: k, type: "button", "aria-pressed": camStyle === k, title:k==="full"?"天井の上から全体を見る・もう一度押すと構図を戻す":"元の室内の位置に戻る", onClick: () => {
