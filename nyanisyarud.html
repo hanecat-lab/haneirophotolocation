@@ -14899,23 +14899,67 @@ function updateMeatDriftFeedback(dt){
   const count=meatFeedbackValidTime+1e-8<MEAT_FEEDBACK.first?0:Math.min(MEAT_FEEDBACK.cap,1+Math.floor((meatFeedbackValidTime-MEAT_FEEDBACK.first+1e-8)/MEAT_FEEDBACK.step));
   if(count>nikukyuCombo){nikukyuCombo=count;showNikukyu();}
 }
-// 膨らみ注意：肉球ドリフト中、外側の壁までの距離(壁の警告と同じ式)を、壁へ寄っていく速さ(なめらかにした値)で割って、当たるまでの時間を見積もる。
-// 1秒を切ったら札をオレンジにして「膨らみ注意」、1.5秒以上の余裕ができたら戻す(判定・得点は変えない)
-const NIKUKYU_BULGE={on:1,off:1.5,minSpeed:.3};
-const nikukyuBulge={prev:null,vel:0,on:false};
-function updateNikukyuBulge(dt){
-  const B=nikukyuBulge;
-  if(!isSliding||gameState!=='racing'||wallHitCooldown>0||!dt){B.prev=null;B.vel=0;setNikukyuBulge(false);return;}
-  const out=Math.abs(lateral);
-  if(B.prev!==null)B.vel=THREE.MathUtils.lerp(B.vel,(out-B.prev)/dt,1-Math.exp(-dt*8));
-  B.prev=out;
-  const dist=ROAD_HALF+snowfieldWidenToward(s,lateral)-out,time=B.vel>NIKUKYU_BULGE.minSpeed?Math.max(0,dist)/B.vel:Infinity;
-  setNikukyuBulge(B.on?time<NIKUKYU_BULGE.off:time<NIKUKYU_BULGE.on);
+// 膨らみ注意：肉球ドリフト中と、ドリフトを離した後の「出口の確認」の間、外側の壁に届くまでの時間を見積もる。
+// 猫の位置の動きから「進む向き」と「曲がる速さ」を出し、そのまま horizon 秒先まで step 秒ずつ進めた点を、この先の道に照らして、
+// 道の端(壁の警告と同じ式)から margin 内側に届いた時刻を「当たるまでの時間」とする(出口で道がまっすぐになると、外を向いたまま出て行くのも読める)。
+// on 秒を切ったら知らせ、off 秒以上の余裕ができたら戻す(判定・得点は変えない)
+// 出口の確認：ドリフトを離して加速した後、watch 秒たって膨らみ注意が出ておらず、出口を過ぎたら(遅くとも watchMax 秒)「連携成功」を確定する。
+// その前に道の端の壁に当たったら「膨らんで壁に当たった」(stopWallDrive)。watchGiveUp 秒で打ち切って確定する
+const NIKUKYU_BULGE={on:1,off:1.5,horizon:1.6,step:.1,margin:.3,every:.08,watch:1.5,watchMax:3,watchGiveUp:4};
+const nikukyuBulge={on:false,time:Infinity,prev:null,heading:null,turn:0,acc:0,diag:0};
+const linkExitWatch={active:false,since:0,corner:null};
+function startLinkExitWatch(){
+  Object.assign(linkExitWatch,{active:true,since:simulationElapsed,corner:cornerDrive?.corner||null});
+  // 確認の間は「連携成功」(仮の表示)を消さない。確定するか、壁で取り消すまで出しておく
+  const layer=document.getElementById('brakeJudgmentLayer');if(layer?.classList.contains('link-pending'))clearTimeout(brakeJudgmentTimeout);
 }
+function bulgeTimeToWall(B){
+  const R=NIKUKYU_BULGE,v=speed;if(v<3||B.heading===null)return Infinity;
+  let x=catRoot.position.x,z=catRoot.position.z,h=B.heading,d=s;
+  for(let t=R.step;t<=R.horizon+1e-6;t+=R.step){
+    h+=B.turn*R.step;x+=Math.sin(h)*v*R.step;z+=Math.cos(h)*v*R.step;
+    for(let k=0;k<2;k++){const tr=getTrackAtDist(replayWrapDist(d));d+=((x-tr.p.x)*tr.t.x+(z-tr.p.z)*tr.t.z)/Math.max(.01,tr.t.x*tr.t.x+tr.t.z*tr.t.z);}
+    const tr=getTrackAtDist(replayWrapDist(d)),lat=(x-tr.p.x)*tr.n.x+(z-tr.p.z)*tr.n.z;
+    if(Math.abs(lat)>ROAD_HALF+snowfieldWidenToward(replayWrapDist(d),lat)-R.margin)return t;
+  }
+  return Infinity;
+}
+function updateNikukyuBulge(dt){
+  const B=nikukyuBulge,W=linkExitWatch,R=NIKUKYU_BULGE;
+  // 進む向きと曲がる速さ(位置の動き。跳んだ・戻された時は測り直す)
+  const p=catRoot.position;
+  if(dt>0&&B.prev){const dx=p.x-B.prev.x,dz=p.z-B.prev.z,m=Math.hypot(dx,dz);
+    if(m>10){B.heading=null;B.turn=0;}
+    else if(m>1e-4){const h=Math.atan2(dx,dz);if(B.heading!==null){let dh=h-B.heading;dh=Math.atan2(Math.sin(dh),Math.cos(dh));B.turn=THREE.MathUtils.lerp(B.turn,dh/dt,1-Math.exp(-dt*6));}B.heading=h;}}
+  B.prev=(B.prev||new THREE.Vector3()).copy(p);
+  // 出口の確認
+  if(W.active){
+    const e=simulationElapsed-W.since,pastExit=!W.corner||s>=W.corner.end;
+    if(gameState!=='racing'||e<0)W.active=false;
+    else if(e>=R.watchGiveUp||e>=R.watch&&!B.on&&(pastExit||e>=R.watchMax)){W.active=false;confirmLinkSuccess();}
+  }
+  const watching=(isSliding||W.active)&&gameState==='racing'&&wallHitCooldown<=0&&dt>0;
+  if(!watching){B.time=Infinity;setNikukyuBulge(false);}
+  else{B.acc+=dt;if(B.acc>=R.every){B.acc=0;B.time=bulgeTimeToWall(B);}setNikukyuBulge(B.on?B.time<R.off:B.time<R.on);}
+  if(bulgeDiag){B.diag+=dt;if(B.diag>=.1){B.diag=0;bulgeDiag(watching);}}
+}
+// ?bulge：膨らみ注意を実機で読む表示。状態(滑り・出口の確認)・今の壁までの距離・当たるまでの時間・曲がる速さ・速さ・膨らみ注意
+const bulgeDiag=(()=>{
+  if(!new URLSearchParams(location.search).has('bulge'))return null;
+  const el=document.createElement('pre');el.style.cssText='position:fixed;left:6px;top:calc(64px + env(safe-area-inset-top));z-index:9999;margin:0;padding:6px 8px;border-radius:8px;background:rgba(0,0,0,.72);color:#fff;font:700 11px/1.45 monospace;pointer-events:none;white-space:pre';document.body.appendChild(el);
+  return watching=>{
+    const B=nikukyuBulge,W=linkExitWatch,wall=ROAD_HALF+snowfieldWidenToward(s,lateral)-Math.abs(lateral);
+    el.textContent=[`状態 ${isSliding?'滑り':W.active?'出口の確認 '+(simulationElapsed-W.since).toFixed(1)+'秒':'-'}${watching?'':'(見ていない)'}`,
+      `壁まで ${wall.toFixed(2)}m  当たるまで ${Number.isFinite(B.time)?B.time.toFixed(2)+'秒':'-'}`,
+      `曲がる ${(B.turn*180/Math.PI).toFixed(0)}°/秒  速さ ${(speed*3.6).toFixed(0)}km/h`,`膨らみ注意 ${B.on?'○':'-'}`].join('\n');
+  };
+})();
 function setNikukyuBulge(on){
   const B=nikukyuBulge;if(B.on===on)return;B.on=on;
   const layer=document.getElementById('nikukyuLayer'),label=document.getElementById('nikukyuQuality');if(!layer||!label)return;
   layer.classList.toggle('bulge',on);
+  // 出口の確認中など、連携の表示が出ている間は、その下の文字も「膨らみ注意」にする(戻ったら元の文字)
+  const judge=document.getElementById('brakeJudgmentLayer');if(judge?.dataset.feedbackState==='link')linkAccelerationCaption();
   if(on){label.dataset.bulgePrev=label.hidden?'':label.textContent;label.hidden=false;label.textContent='膨らみ注意';label.setAttribute('aria-label','膨らみ注意');}
   else{const prev=label.dataset.bulgePrev||'';delete label.dataset.bulgePrev;label.textContent=prev;label.hidden=!prev;if(prev)label.setAttribute('aria-label','今回の最高評価 '+prev);}
 }
@@ -15394,8 +15438,9 @@ function linkAccelerationCaption(){
   if(cornerDrive?.exitCancelled){sub.textContent='ブレーキ優先 · 加速ボーナス終了';return;}
   const released=Boolean(cornerDrive?.exitReleased&&!cornerDrive.blocked&&!cornerDrive.exitCancelled),perfect=linkDisplayTier===2;
   sub.textContent=released?(perfect?'つなぎも完璧！ 加速ボーナス':'ブレーキ→肉球で加速！'):(perfect?'つなぎも完璧！ 出口へ':'出口へ向きを整えよう');
+  if(nikukyuBulge.on)sub.textContent='膨らみ注意';
 }
-// 出口で加速した：仮の「連携成功！」を確定して、はっきり出し、音と振動を出す(ここから1.8秒で消す)
+// 出口の確認(updateNikukyuBulge)が済んだ：仮の「連携成功！」を確定して、はっきり出し、音と振動を出す(ここから1.8秒で消す)
 function confirmLinkSuccess(){
   const layer=document.getElementById('brakeJudgmentLayer');
   if(!layer||layer.dataset.feedbackState!=='link'||!layer.classList.contains('link-pending'))return;
@@ -15415,7 +15460,7 @@ function recordExitAcceleration(){
   if(!cornerDrive||cornerDrive.blocked||assistBonusBlocked(cornerDrive.corner))return;
   if(!cornerDrive.exitReleased)startExitBonusVisual(cornerDrive);
   const firstRelease=!cornerDrive.exitReleased;
-  if(firstRelease)confirmLinkSuccess();
+  if(firstRelease)startLinkExitWatch();
   cornerDrive.exitReleased=true;linkAccelerationCaption();
   if(firstRelease&&cornerDrive.gutter)showGutterFeedback('溝走り成功！','加速ボーナス');
   if(linkPractice.active&&cornerDrive.corner===linkPractice.corner)linkPractice.record.exitAcceleration=true;
@@ -17308,9 +17353,10 @@ function updateBrakeChargeCue(isBraking){
 }
 function stopWallDrive(reason=''){
   // ドリフト中に壁などで切れたら、失速の時と同じ所に「ドリフトが切れた」を出す(D2)。同じフレームで表示をリセットする処理があるので、その後に出す
-  // 決まっていたドリフト(加速ボーナスを受け取っていた)が道の端の壁(reason 'edge')で切れた時は、原因が分かるよう「膨らんで壁に当たった」と出す
-  const bulged=reason==='edge'&&Boolean(cornerDrive&&!cornerDrive.blocked&&cornerDrive.level>0&&!cornerDrive.exitReleased);
-  if((isSliding||isBrakingDrift)&&gameState==='racing')setTimeout(()=>{if(gameState==='racing')showNikukyuFailed(bulged?'膨らんで壁に当たった':'ドリフトが切れた');},0);
+  // 決まっていたドリフト(加速ボーナスを受け取っていた)が、滑っている間か出口の確認の間に道の端の壁(reason 'edge')で切れた時は、原因が分かるよう「膨らんで壁に当たった」と出す
+  const watching=linkExitWatch.active;linkExitWatch.active=false;
+  const bulged=reason==='edge'&&(watching||Boolean(cornerDrive&&!cornerDrive.blocked&&cornerDrive.level>0&&!cornerDrive.exitReleased));
+  if((isSliding||isBrakingDrift||watching)&&gameState==='racing')setTimeout(()=>{if(gameState==='racing')showNikukyuFailed(bulged?'膨らんで壁に当たった':'ドリフトが切れた');},0);
   cancelCornerDrive();isSliding=false;isBrakingDrift=false;brakeJustType='';
   exitBoostPower=0;exitBoostTimer=0;meatPerfectTime=0;meatLinkContext=null;
   weightTransferRatio=0;brakeChargeRatio=0;brakeTime=0;isBrakingActive=false;lastBrakeReleaseTime=0;
