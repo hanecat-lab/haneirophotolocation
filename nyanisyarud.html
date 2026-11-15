@@ -26401,11 +26401,13 @@ function updateNightLights(dt){
 }
 // === 夜・暗い道の目印(本物の猫・ゴースト・リプレイの猫) ===
 // C：足元に琥珀白の光の輪。猫の体は光らせず、足元の明るい面で暗い背景から輪郭を浮かせる。夜の全コース・鬼の隠れ家・トンネルの中で出す
-// A：ロボ猫・REDCATのテールランプに赤い光の玉と、走った跡の光の尾(長さは0.45秒・上限8m)。霧に消えないので、遠くからも位置と向きが分かる
+// A：ロボ猫・REDCATのテールランプに赤い光の玉と、走った跡の光の尾。霧に消えないので、遠くからも位置と向きが分かる
+//    尾の長さは速さ×0.06秒(上限8m)で、速さが長さで見える。白に近い細い芯と赤く淡い外側の2層で、先へ細く暗くなって消える。
+//    カメラから1.5〜3.5mの所で消し、尾を真後ろから見る角度では薄くする(太い線にしか見えず、低い後ろのカメラでは画面を覆うため)
 // B：ブレーキ中は光の玉と尾を明るくする(ふだんは小さく暗い尾灯、ブレーキ中は大きく明るい)。リプレイ・ゴーストはブレーキを記録していないので、速さの落ち方(減速)から決める
 const NIGHT_MARKS={ring:{color:0xffd9a0,opacity:.35,scale:1.2,lift:.04,fade:[.3,2.5]},
   lamp:{color:0xff2a1a,size:.35,opacity:.18,brakeSize:.9,brakeOpacity:1,back:.08},
-  trail:{time:.45,length:8,width:.07,opacity:.12,brakeOpacity:.9,points:48},
+  trail:{exposure:.06,length:8,min:.3,core:{width:.022,color:0xffc8b8},halo:{width:.11,color:0xff2a1a,gain:.55},opacity:.35,brakeOpacity:.8,near:[1.5,3.5],endOn:[.7,.95],endOnMin:.2,points:48},
   brake:{on:18,off:8,window:.15},tunnelFade:40};
 const nightMarksTexture=(()=>{const c=document.createElement('canvas');c.width=c.height=128;const g=c.getContext('2d'),gr=g.createRadialGradient(64,64,0,64,64,64);
   gr.addColorStop(0,'rgba(255,255,255,1)');gr.addColorStop(.35,'rgba(255,255,255,.55)');gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.fillRect(0,0,128,128);return new THREE.CanvasTexture(c);})();
@@ -26424,7 +26426,7 @@ function nightMarksCreate(){
   const ringMat=new THREE.MeshBasicMaterial({map:nightMarksTexture,color:NIGHT_MARKS.ring.color,transparent:true,opacity:0,blending:THREE.AdditiveBlending,depthWrite:false});ringMat.userData.glow=true;
   const ring=new THREE.Mesh(new THREE.PlaneGeometry(1,1).rotateX(-Math.PI/2),ringMat);ring.visible=false;
   const lampMat=new THREE.SpriteMaterial({map:nightMarksTexture,color:NIGHT_MARKS.lamp.color,fog:false,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false});lampMat.userData.glow=true;
-  const lamps=[0,1].map(()=>{const sp=new THREE.Sprite(lampMat);sp.visible=false;return sp;}),trails=[nightMarksTrail(),nightMarksTrail()];
+  const lamps=[0,1].map(()=>{const sp=new THREE.Sprite(lampMat);sp.visible=false;return sp;}),trails=[0,1,2,3].map(nightMarksTrail);
   nightMarksGroup.add(ring,...lamps,...trails);
   return {ring,lamps,trails,lampMat,history:[],clock:null,braking:false,size:1,sizeFor:null,hint:null,clockLive:0};
 }
@@ -26448,19 +26450,31 @@ function nightMarksBrake(st,record,t){
   st.braking=st.braking?decel>B.off:decel>B.on;return st.braking;
 }
 function nightMarksHide(st){st.ring.visible=false;for(const l of st.lamps)l.visible=false;for(const t of st.trails)t.visible=false;st.history.length=0;st.clock=null;}
-function nightMarksBuildTrail(mesh,history,which,clock,bright){
-  const R=NIGHT_MARKS.trail,pos=mesh.geometry.attributes.position,col=mesh.geometry.attributes.color,cam=camera.position;
+// 光の尾の線：新しい順のランプの位置を、根元から長さ L までたどる(最後の点は L の所で切る)。u は根元0〜先1
+const nightMarksPts=Array.from({length:NIGHT_MARKS.trail.points},()=>new THREE.Vector3()),nightMarksU=new Float32Array(NIGHT_MARKS.trail.points);
+function nightMarksPolyline(history,which,L){
   let n=0,len=0;
-  for(let i=0;i<history.length;i++){
-    const h=history[i],p=h[which];if(i>0)len+=p.distanceTo(history[i-1][which]);
-    const age=(clock-h.t)/R.time;if(age>1||len>R.length)break;
-    const prev=history[Math.max(0,i-1)][which],next=history[Math.min(history.length-1,i+1)][which];
-    nightMarksT.subVectors(prev,next);nightMarksS.crossVectors(nightMarksT,nightMarksN.subVectors(cam,p));
+  for(let i=0;i<history.length&&n<nightMarksPts.length;i++){
+    const p=history[i][which];
+    if(i>0){const q=history[i-1][which],d=p.distanceTo(q);
+      if(len+d>=L){nightMarksPts[n].lerpVectors(q,p,d>0?(L-len)/d:0);nightMarksU[n]=L;len=L;n++;break;}
+      len+=d;}
+    nightMarksPts[n].copy(p);nightMarksU[n]=len;n++;
+  }
+  // 覚えている位置が L に届かない時(走り出し)は、ある分だけで先を消す
+  for(let i=0;i<n;i++)nightMarksU[i]=len>0?nightMarksU[i]/len:1;
+  return n;
+}
+// 帯を書く：カメラに向けて広げ、根元を太く明るく、先へ細く暗く。カメラの近くは消す。gain は真後ろから見た時の薄め
+function nightMarksWriteTrail(mesh,n,width,color,bright,gain){
+  const T=NIGHT_MARKS.trail,pos=mesh.geometry.attributes.position,col=mesh.geometry.attributes.color,cam=camera.position;
+  for(let i=0;i<n;i++){
+    const p=nightMarksPts[i],u=nightMarksU[i];
+    nightMarksT.subVectors(nightMarksPts[Math.max(0,i-1)],nightMarksPts[Math.min(n-1,i+1)]);nightMarksS.crossVectors(nightMarksT,nightMarksN.subVectors(cam,p));
     if(nightMarksS.lengthSq()<1e-10)nightMarksS.set(0,1,0);nightMarksS.normalize();
-    const fade=Math.max(0,(1-age)*(1-len/R.length)),w=R.width*(1-.5*Math.min(1,age));
-    pos.setXYZ(n*2,p.x+nightMarksS.x*w,p.y+nightMarksS.y*w,p.z+nightMarksS.z*w);pos.setXYZ(n*2+1,p.x-nightMarksS.x*w,p.y-nightMarksS.y*w,p.z-nightMarksS.z*w);
-    nightMarksC.setHex(NIGHT_MARKS.lamp.color).multiplyScalar(bright*fade);col.setXYZ(n*2,nightMarksC.r,nightMarksC.g,nightMarksC.b);col.setXYZ(n*2+1,nightMarksC.r,nightMarksC.g,nightMarksC.b);
-    n++;
+    const w=width*Math.pow(1-u,.7),f=bright*gain*Math.pow(1-u,1.6)*THREE.MathUtils.smoothstep(p.distanceTo(cam),...T.near);
+    pos.setXYZ(i*2,p.x+nightMarksS.x*w,p.y+nightMarksS.y*w,p.z+nightMarksS.z*w);pos.setXYZ(i*2+1,p.x-nightMarksS.x*w,p.y-nightMarksS.y*w,p.z-nightMarksS.z*w);
+    nightMarksC.setHex(color).multiplyScalar(f);col.setXYZ(i*2,nightMarksC.r,nightMarksC.g,nightMarksC.b);col.setXYZ(i*2+1,nightMarksC.r,nightMarksC.g,nightMarksC.b);
   }
   mesh.visible=n>=2;if(!mesh.visible)return;
   mesh.geometry.setDrawRange(0,(n-1)*6);pos.needsUpdate=true;col.needsUpdate=true;
@@ -26489,8 +26503,17 @@ function nightMarksUpdate(st,root,shown,dark,opacity,lampNodes,clock,hint,brakin
     e.t=clock;e.a.copy(st.lamps[0].position);e.b.copy(st.lamps[1].position);st.history.unshift(e);
   }else if(st.history.length){st.history[0].a.copy(st.lamps[0].position);st.history[0].b.copy(st.lamps[1].position);}
   st.clock=clock;
-  const bright=(braking?R.trail.brakeOpacity:R.trail.opacity)*dark*opacity;
-  nightMarksBuildTrail(st.trails[0],st.history,'a',clock,bright);nightMarksBuildTrail(st.trails[1],st.history,'b',clock,bright);
+  // 速さ(0.1秒前のランプの位置から)で長さを決める。遅い時は出さない
+  const T=R.trail,h=st.history;let v=0;
+  for(let i=1;i<h.length;i++)if(clock-h[i].t>=.1||i===h.length-1){const dt=clock-h[i].t;if(dt>1e-3)v=h[0].a.distanceTo(h[i].a)/dt;break;}
+  const trailLen=Math.min(T.length,v*T.exposure),bright=(braking?T.brakeOpacity:T.opacity)*dark*opacity;
+  if(trailLen<T.min){for(const t of st.trails)t.visible=false;return;}
+  ['a','b'].forEach((which,k)=>{
+    const n=nightMarksPolyline(h,which,trailLen);if(n<2){st.trails[k*2].visible=st.trails[k*2+1].visible=false;return;}
+    const head=nightMarksPts[0],dir=nightMarksT.subVectors(head,nightMarksPts[n-1]),view=nightMarksN.subVectors(head,camera.position);
+    const a=dir.lengthSq()>1e-8&&view.lengthSq()>1e-8?Math.abs(dir.normalize().dot(view.normalize())):0,gain=THREE.MathUtils.lerp(1,T.endOnMin,THREE.MathUtils.smoothstep(a,...T.endOn));
+    nightMarksWriteTrail(st.trails[k*2],n,T.core.width,T.core.color,bright,gain);nightMarksWriteTrail(st.trails[k*2+1],n,T.halo.width,T.halo.color,bright*T.halo.gain,gain);
+  });
 }
 function nightMarksLampNodes(shape){return shape==='redcat'?redcatHover.driveLights?.status:shape==='robo'?roboCat.brakeLamps?.mounts:null;}
 function updateNightMarks(dt){
