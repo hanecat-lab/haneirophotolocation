@@ -384,6 +384,25 @@ function frameTexture(photo, size, orient, frame, mat, sq) {
   g.fillStyle = frame === "白" ? "#f7f5ef" : frame === "黒" ? "#171717" : "#8a5a35";
   g.fillRect(0, 0, c.width, c.height);
   const fi = FRAME_W * k;
+  if (frame === "木目") {
+    const rails = [[0,0,fi,c.height,true],[c.width-fi,0,fi,c.height,true],[0,0,c.width,fi,false],[0,c.height-fi,c.width,fi,false]];
+    rails.forEach(([x,y,width,height,vertical],side) => {
+      g.save(); g.beginPath(); g.rect(x,y,width,height); g.clip();
+      const across = vertical ? width : height, length = vertical ? height : width;
+      const lines = Math.max(3,Math.round(FRAME_W/0.0016));
+      g.lineWidth = clamp(k*0.00035,0.4,1.2);
+      for (let i=0;i<lines;i++) {
+        g.strokeStyle = `rgba(36,16,5,${0.055+(i%3)*0.018})`; g.beginPath();
+        for (let j=0;j<=20;j++) {
+          const along=length*j/20, cross=across*(i+0.5)/lines + Math.sin(along/k*18+i*0.7+side)*k*0.00045;
+          const px=x+(vertical?cross:along), py=y+(vertical?along:cross);
+          if (!j) g.moveTo(px,py); else g.lineTo(px,py);
+        }
+        g.stroke();
+      }
+      g.restore();
+    });
+  }
   g.fillStyle = mat ? "#f3f1ea" : "#fbfaf5";
   g.fillRect(fi, fi, c.width - fi * 2, c.height - fi * 2);
   const px = (FRAME_W + m) * k, pw = w0 * k, ph = h0 * k;
@@ -470,6 +489,76 @@ function solar(env) {
   const dir = new THREE.Vector3(Math.sin(b) * Math.cos(alt), Math.sin(alt), -Math.cos(b) * Math.cos(alt)).normalize();
   return { ok, altDeg, bearingDeg: (bearing * 180 / Math.PI % 360 + 360) % 360, dir, sunUp: altDeg > 0.5, day: sm(-6, 12, altDeg), atm: sm(0, 6, altDeg) * (0.55 + 0.45 * sm(0, 25, altDeg)), kelvin: 2200 + 3400 * sm(0, 35, altDeg) };
 }
+// Render-only geometry: dimensions, collision volumes and saved objects stay unchanged.
+function galleryStepGeometry(w, h, d, bevel = 0.002) {
+  const b = Math.min(bevel, w / 8, h / 4, d / 8), positions = [], colors = [];
+  const ring = (y, inset) => [[-w/2+inset,y,-d/2+inset],[-w/2+inset,y,d/2-inset],[w/2-inset,y,d/2-inset],[w/2-inset,y,-d/2+inset]];
+  const bottom = ring(-h/2,0), shoulder = ring(h/2-b,0), top = ring(h/2,b);
+  const quad = (a,b,c,d,shade) => { [a,b,d,b,c,d].forEach(p=>{positions.push(...p);colors.push(shade,shade,shade);}); };
+  quad(bottom[3],bottom[2],bottom[1],bottom[0],0.94);
+  for(let i=0;i<4;i++){const j=(i+1)%4;quad(bottom[i],bottom[j],shoulder[j],shoulder[i],0.96);quad(shoulder[i],shoulder[j],top[j],top[i],0.985);}
+  quad(top[0],top[1],top[2],top[3],1);
+  const g = new THREE.BufferGeometry();
+  g.type = "GalleryStepGeometry"; g.parameters = {width:w,height:h,depth:d,bevel:b};
+  g.setAttribute("position",new THREE.Float32BufferAttribute(positions,3));
+  g.setAttribute("color",new THREE.Float32BufferAttribute(colors,3));
+  g.computeVertexNormals(); g.computeBoundingBox(); return g;
+}
+function galleryMergeGeometry(parts) {
+  const positions=[],colors=[];
+  parts.forEach(({geometry, x=0,y=0,z=0,rotation=0})=>{
+    const p=geometry.getAttribute("position"), color=geometry.getAttribute("color"), ca=Math.cos(rotation),sa=Math.sin(rotation),index=geometry.index;
+    for(let j=0;j<(index?index.count:p.count);j++){
+      const i=index?index.getX(j):j;
+      positions.push(x+ca*p.getX(i)+sa*p.getZ(i),y+p.getY(i),z-sa*p.getX(i)+ca*p.getZ(i));
+      colors.push(color?color.getX(i):1,color?color.getY(i):1,color?color.getZ(i):1);
+    }
+    geometry.dispose();
+  });
+  const g=new THREE.BufferGeometry();
+  g.setAttribute("position",new THREE.Float32BufferAttribute(positions,3));
+  g.setAttribute("color",new THREE.Float32BufferAttribute(colors,3));
+  g.computeVertexNormals(); return g;
+}
+function gallerySkirtingSegments(r, columns, entrances, windows, blocks) {
+  const faces=[
+    {wall:"北",cx:0,cz:-r.d/2,nx:0,nz:1,len:r.w,ax:"x"},
+    {wall:"南",cx:0,cz:r.d/2,nx:0,nz:-1,len:r.w,ax:"x"},
+    {wall:"東",cx:r.w/2,cz:0,nx:-1,nz:0,len:r.d,ax:"z"},
+    {wall:"西",cx:-r.w/2,cz:0,nx:1,nz:0,len:r.d,ax:"z"}
+  ];
+  columns.forEach(c=>{const solids=columnSolids(c,r,entrances,blocks);for(const face of ["北","南","東","西"])faces.push({...colFace(c,face),wall:face,col:c.id,solids,doorFace:columnDoorFaces(c).includes(face)});});
+  const out=[],st=r.stair,stairZ=[];
+  if(st){for(let i=0;i<=stairN1(st);i++)stairZ.push(r.d/2-st.land-i*st.tread);if(st.type==="fold")for(let i=0;i<=st.steps-stairN1(st);i++)stairZ.push(-r.d/2+st.land+i*st.tread);}
+  faces.forEach(f=>{
+    const along=f.ax==="x"?f.cx:f.cz,limit=f.ax==="x"?r.w/2:r.d/2;
+    // Butt-joint perpendicular runs, rather than overlapping their top faces.
+    const joint=!f.col&&f.ax==="x"?.010:0;
+    const lo=Math.max(-f.len/2+joint,-limit-along),hi=Math.min(f.len/2-joint,limit-along);
+    const doors=entrances.filter(e=>f.col?e.col===f.col&&f.doorFace:!e.col&&e.wall===f.wall);
+    const wins=f.col?[]:windows.filter(v=>v.wall===f.wall);
+    const cuts=[lo,hi,...doors.flatMap(e=>[e.pos-e.w/2,e.pos+e.w/2]),...wins.flatMap(v=>[v.pos-v.w/2,v.pos+v.w/2]),...(f.ax==="z"?stairZ.map(v=>v-along):st?.type==="fold"?[-along]:[])].filter(v=>v>=lo&&v<=hi);
+    const xs=[...new Set(cuts)].sort((a,b)=>a-b);
+    for(let i=0;i<xs.length-1;i++){
+      const a=xs[i],b=xs[i+1],mid=(a+b)/2;
+      if(b-a<0.002||doors.some(e=>Math.abs(mid-e.pos)<e.w/2+1e-7))continue;
+      const x=f.cx+(f.ax==="x"?mid:0),z=f.cz+(f.ax==="z"?mid:0),px=x+f.nx*.005,pz=z+f.nz*.005;
+      if(Math.abs(px)>r.w/2||Math.abs(pz)>r.d/2)continue;
+      const base=floorBase(r,px,pz),y=base+.001;
+      let height=Math.min(.065,r.h-y);
+      if(wins.some(v=>Math.abs(mid-v.pos)<v.w/2&&v.sill<y+height&&v.sill+v.h>base))continue;
+      if(f.solids){
+        const solid=f.solids.find(v=>Math.abs(x-f.nx*.001-v.x)<v.w/2+1e-7&&Math.abs(z-f.nz*.001-v.z)<v.d/2+1e-7&&v.y-v.h/2<=y&&v.y+v.h/2>y);
+        if(!solid)continue;
+        height=Math.min(height,solid.y+solid.h/2-y);
+      }
+      if(height<.003)continue;
+      out.push({x:x+f.nx*.0055,z:z+f.nz*.0055,y:y+height/2,w:b-a,h:height,d:.009,rotation:f.ax==="x"?0:Math.PI/2,wall:f.wall,col:f.col,lo:a,hi:b,base});
+    }
+  });
+  return out;
+}
+
 function wallGeom(len, h, holes) {
   const sh = new THREE.Shape();
   sh.moveTo(-len / 2, -h / 2);
@@ -480,7 +569,7 @@ function wallGeom(len, h, holes) {
   const m = 0.02;
   const used = [];
   holes.forEach((o) => {
-    const x0 = clamp(o.c - o.w / 2, -len / 2 + m, len / 2 - m), x1 = clamp(o.c + o.w / 2, -len / 2 + m, len / 2 - m), y0 = clamp(o.y0, m, h - m) - h / 2, y1 = clamp(o.y1, m, h - m) - h / 2;
+    const x0 = clamp(o.c - o.w / 2, -len / 2 + m, len / 2 - m), x1 = clamp(o.c + o.w / 2, -len / 2 + m, len / 2 - m), y0 = clamp(o.y0, 0, h - m) - h / 2, y1 = clamp(o.y1, m, h - m) - h / 2;
     if (x1 - x0 < 0.1 || y1 - y0 < 0.1) return;
     if (used.some((u) => x0 < u[2] && x1 > u[0] && y0 < u[3] && y1 > u[1])) return;
     used.push([x0, y0, x1, y1]);
@@ -1197,6 +1286,35 @@ function galleryLightingResponse(room, env, lights, solarDay) {
   const energy = clamp(power / Math.max(60, area * 7.5), 0, 1);
   const reflectance = room.theme === "black" ? 0.55 : 1;
   return { daylight, energy, reflectance, hemisphere: 0.2 + 0.65 * daylight + (0.1 + 0.22 * (1 - daylight)) * energy * reflectance, bounce: (0.22 + 0.28 * daylight + 0.13 * energy) * reflectance };
+}
+function galleryFrameGeometry(p, depth = 0.03) {
+  const width=frameW(p), height=frameH(p), inset=FRAME_W+(p.mat?MAT_W:0), scale=depth/0.03;
+  const positions=[],uv=[],regions=[];
+  const project=(v)=>[v.x/width+0.5,v.y/height+0.5];
+  function quad(a,b,c,d,kind,back=false) {
+    const start=positions.length/3;
+    for (const v of [a,b,d,b,c,d]) { positions.push(v.x,v.y,v.z); uv.push(...(back?[FRAME_W/width/4,0.5]:project(v))); }
+    regions.push({kind,start,count:6});
+  }
+  const loop=(offset,z)=>[new THREE.Vector3(-width/2+offset,-height/2+offset,z*scale),new THREE.Vector3(width/2-offset,-height/2+offset,z*scale),new THREE.Vector3(width/2-offset,height/2-offset,z*scale),new THREE.Vector3(-width/2+offset,height/2-offset,z*scale)];
+  function bridge(a,b,kind) { for(let i=0;i<4;i++) { const j=(i+1)%4; quad(a[i],a[j],b[j],b[i],kind); } }
+  const profile=[[0,-0.015],[0,0.012],[0.0016,0.015],[FRAME_W-0.0015,0.015],[FRAME_W,0.0108],[FRAME_W,p.mat?0.010:0.009]];
+  for(let i=1;i<profile.length;i++) bridge(loop(...profile[i-1]),loop(...profile[i]),"frame");
+  const photoZ=p.mat?0.008:0.009;
+  if(p.mat) {
+    bridge(loop(FRAME_W,0.010),loop(inset-0.0012,0.010),"mat");
+    bridge(loop(inset-0.0012,0.010),loop(inset,0.0084),"matBevel");
+    bridge(loop(inset,0.0084),loop(inset,photoZ),"matCut");
+  }
+  const photo=loop(inset,photoZ); quad(...photo,"photo");
+  const back=loop(0,-0.015); quad(back[1],back[0],back[3],back[2],"back",true);
+  const geometry=new THREE.BufferGeometry();
+  geometry.type="GalleryFrameGeometry";
+  geometry.parameters={width,height,depth};
+  geometry.userData.frameProfile={inset,photoWidth:width-2*inset,photoHeight:height-2*inset,photoZ:photoZ*scale,matZ:p.mat?0.010*scale:null,frontZ:depth/2,regions};
+  geometry.setAttribute("position",new THREE.Float32BufferAttribute(positions,3));
+  geometry.setAttribute("uv",new THREE.Float32BufferAttribute(uv,2));
+  geometry.computeVertexNormals(); geometry.computeBoundingBox(); return geometry;
 }
 function App() {
   const [tab, setTab] = useState("部屋");
@@ -2648,6 +2766,36 @@ function App() {
       texture.needsUpdate = true; surfaceTextures.push(texture); return texture;
     }
     const contactMaps = { soft: contactTexture(false), edge: contactTexture(true) };
+    const frameFinishCache = new Map(), frameFinishUsed = new Set();
+    function frameFinish(p) {
+      if(p.frame === "パネル") return {};
+      const width=frameW(p),height=frameH(p),key=[width,height,p.frame,p.mat].join("|");
+      frameFinishUsed.add(key);
+      if(frameFinishCache.has(key)) return frameFinishCache.get(key);
+      const size=64,rough=new Uint8Array(size*size*4),bump=p.frame==="木目"?new Uint8Array(size*size*4):null;
+      const guard=Math.max(width,height)/size;
+      for(let y=0;y<size;y++) for(let x=0;x<size;x++) {
+        const px=(x+0.5)/size*width,py=(y+0.5)/size*height;
+        const dx=Math.min(px,width-px),dy=Math.min(py,height-py),edge=Math.min(dx,dy);
+        const grain=Math.sin((dx<dy?px:py)*1800+Math.sin((dx<dy?py:px)*19)*0.7);
+        const finish=edge<Math.max(0,FRAME_W-guard);
+        const r=finish?(p.frame==="白"?211:p.frame==="黒"?194:232+grain*6):255;
+        const b=finish?128+grain*14:128;
+        const i=(y*size+x)*4;
+        rough[i]=rough[i+1]=rough[i+2]=Math.round(r);rough[i+3]=255;
+        if(bump){bump[i]=bump[i+1]=bump[i+2]=Math.round(b);bump[i+3]=255;}
+      }
+      const texture=(data,channel)=>{
+        const t=new THREE.DataTexture(data,size,size,THREE.RGBAFormat);
+        t.minFilter=THREE.LinearMipmapLinearFilter;t.magFilter=THREE.LinearFilter;t.generateMipmaps=true;
+        t.userData={cached:true,frameFinish:channel};t.needsUpdate=true;return t;
+      };
+      const maps={roughnessMap:texture(rough,"rough")};
+      if(bump){maps.bumpMap=texture(bump,"wood");maps.bumpScale=0.00025;}
+      frameFinishCache.set(key,maps);return maps;
+    }
+    function disposeFrameFinish(maps){maps.roughnessMap.dispose();maps.bumpMap?.dispose();}
+
     const ro = new ResizeObserver(() => { resizePending = true; });
     function syncPreviewSize() {
       if (!resizePending) return renderWidth > 0 && renderHeight > 0;
@@ -2781,6 +2929,7 @@ function App() {
       personObj = null;
       disposeGroup();
       frameTexUsed.clear();
+      frameFinishUsed.clear();
       const s = stateRef.current;
       const { w, d, h, theme } = s.room;
       const wallC = theme === "white" ? 16119282 : 1710618;
@@ -3111,12 +3260,20 @@ function App() {
         m.userData = { kind: "column", id: b.col, autoFill: true };
         group.add(m);
       });
+      const architectureBatches = { reveal: [], threshold: [] };
+      const skirting = gallerySkirtingSegments(s.room,s.columns,s.entrances,s.windows,s.blocks);
+      if(skirting.length){
+        const geometry=galleryMergeGeometry(skirting.map(v=>({...v,geometry:galleryStepGeometry(v.w,v.h,v.d,.0015)})));
+        const mesh=new THREE.Mesh(finishUV(geometry,"wall"),finishMaterial("wall",{color:theme==="white"?0xdedbd4:0x292a29,roughness:.78,vertexColors:true}));
+        mesh.userData={architecturalDetail:"skirting"};mesh.raycast=()=>{};mesh.receiveShadow=true;group.add(mesh);
+      }
       s.blocks.forEach((b) => {
         const isSel = sel?.kind === "block" && sel.id === b.id;
         const ci = b.ceil ? ceilInfo(s.room, b) : null;
         const low = !!ci && ci.head < 1.9 && s.env.ceilWarn !== false;
-        const bg = ci ? ceilBlockGeom(s.room, b) : new THREE.BoxGeometry(b.w, b.h, b.d);
-        const m = new THREE.Mesh(bg, new THREE.MeshStandardMaterial({ color: b.color, roughness: 0.85, side: ci ? THREE.DoubleSide : THREE.FrontSide, emissive: isSel ? SEL_C : low ? 16726824 : 0, emissiveIntensity: isSel ? 0.3 : low ? 0.45 : 0 }));
+        const bg = ci ? ceilBlockGeom(s.room, b) : finishUV(galleryStepGeometry(b.w, b.h, b.d), "wall");
+        const materialProps = { color: b.color, roughness: 0.85, side: ci ? THREE.DoubleSide : THREE.FrontSide, emissive: isSel ? SEL_C : low ? 16726824 : 0, emissiveIntensity: isSel ? 0.3 : low ? 0.45 : 0, vertexColors: !ci };
+        const m = new THREE.Mesh(bg, ci ? new THREE.MeshStandardMaterial(materialProps) : finishMaterial("wall",materialProps));
         if (ci) m.position.set(0, 0, 0);
         else m.position.set(b.x, floorBase(s.room, b.x, b.z) + b.h / 2, b.z);
         m.castShadow = true;
@@ -3124,9 +3281,10 @@ function App() {
         m.userData = { kind: "block", id: b.id };
         group.add(m);
         if (!b.ceil) groundContact(b.x,b.z,b.w+0.16,b.d+0.16,0,floorBase(s.room,b.x,b.z));
-        const ed = new THREE.LineSegments(new THREE.EdgesGeometry(ci ? bg : new THREE.BoxGeometry(b.w, b.h, b.d), 25), new THREE.LineBasicMaterial({ color: theme === "white" ? 7038813 : 9078396 }));
-        ed.position.copy(m.position);
-        group.add(ed);
+        if(!s.lookClean){
+          const ed = new THREE.LineSegments(new THREE.EdgesGeometry(bg,25),new THREE.LineBasicMaterial({color:theme==="white"?7038813:9078396,transparent:true,opacity:ci?.6:.18}));
+          ed.position.copy(m.position);group.add(ed);
+        }
         if (isSel) {
           const bh = ci ? Math.max(0.02, ci.top - ci.by) : b.h;
           const wm = new THREE.Mesh(new THREE.BoxGeometry(b.w + 0.1, bh + 0.1, b.d + 0.1), new THREE.MeshBasicMaterial({ color: SEL_C, wireframe: true, transparent: true, opacity: 0.95 }));
@@ -3224,16 +3382,36 @@ function App() {
             g.add(bar);
           }
         } else {
-          const fr = new THREE.Mesh(new THREE.BoxGeometry(e.w + 0.14, e.h + 0.08, 0.1), fm);
-          fr.position.z = -0.02;
+          // Three-sided casing leaves the opening clear, down to the actual floor.
+          const fr = new THREE.Mesh(galleryMergeGeometry([
+            {geometry:new THREE.BoxGeometry(.07,e.h,.025),x:-e.w/2-.035,z:-.0105},
+            {geometry:new THREE.BoxGeometry(.07,e.h,.025),x:e.w/2+.035,z:-.0105},
+            {geometry:new THREE.BoxGeometry(e.w+.14,.04,.025),y:e.h/2+.02,z:-.0105}
+          ]),fm);
           fr.userData = { kind: "entrance", id: e.id };
           g.add(fr);
         }
         g.add(dark);
-        dark.position.z = rec ? -rec.depth - 0.025 + PORTAL_FACE_GAP : 0.04;
+        dark.position.z = internal ? (rec ? -rec.depth - 0.025 + PORTAL_FACE_GAP : 0.04) : -.112;
         const normal = entranceNormal(e, s.columns);
         g.rotation.y = Math.atan2(normal.x, normal.z);
         g.position.copy(entrancePoint(s.room, e, s.columns, s.blocks, e.h / 2, 0.025));
+        if(!internal){
+          const x=e.w/2,y=e.h/2,front=-.023,back=-.115;
+          const geometry=(quads)=>{
+            const points=[];quads.forEach(([a,b,c,d])=>[a,d,b,b,d,c].forEach(p=>points.push(...p)));
+            const geo=new THREE.BufferGeometry();geo.setAttribute("position",new THREE.Float32BufferAttribute(points,3));return geo;
+          };
+          const at={x:g.position.x,y:g.position.y,z:g.position.z,rotation:g.rotation.y};
+          architectureBatches.reveal.push({...at,geometry:geometry([
+            [[-x,-y,front],[-x,y,front],[-x,y,back],[-x,-y,back]],
+            [[x,-y,back],[x,y,back],[x,y,front],[x,-y,front]],
+            [[-x,y,front],[x,y,front],[x,y,back],[-x,y,back]]
+          ])});
+          architectureBatches.threshold.push({...at,geometry:geometry([
+            [[-x,-y+.0015,front],[-x,-y+.0015,back],[x,-y+.0015,back],[x,-y+.0015,front]]
+          ])});
+        }
         if (isSel && s.mode === "edit") {
           const origin = entrancePoint(s.room, e, s.columns, s.blocks, 0.12, 0.08);
           const arrow = new THREE.ArrowHelper(normal, origin, 0.55, 0x258dd1, 0.14, 0.07);
@@ -3258,14 +3436,16 @@ function App() {
         const focus = s.selected?.kind === "placement" && s.selected.id === p.id || replacementAffects(s.replacement, s.roomId, p) || s.artworkSwap?.room === s.roomId && [s.artworkSwap.first, s.artworkSwap.second].includes(p.id);
         const photoNumber = s.placements.findIndex((x) => x.id === p.id) + 1;
         const isSel = sel?.kind === "placement" && sel.id === p.id;
-        const mat2 = new THREE.MeshStandardMaterial({ map: frameTexture(photo, p.size, p.orient, p.frame, p.mat, p.sq), roughness: 0.7, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0 });
+        const mat2 = new THREE.MeshStandardMaterial({ map: frameTexture(photo, p.size, p.orient, p.frame, p.mat, p.sq), roughness: 0.7, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0, ...frameFinish(p) });
         const isPanel = p.frame === "パネル";
-        const edge = new THREE.MeshStandardMaterial({ color: 15921386, roughness: 0.8, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0 });
+        const edge = isPanel && p.method === "壁掛け" ? new THREE.MeshStandardMaterial({ color: 15921386, roughness: 0.8, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0 }) : null;
         const pt = clamp(p.thick ?? PANEL_T, 2e-3, 0.02);
-        const board = new THREE.Mesh(new THREE.BoxGeometry(pw, ph, isPanel ? pt : 0.03), isPanel ? [edge, edge, edge, edge, mat2, edge] : mat2);
-        if (isPanel) board.position.z = -(0.03 - pt) / 2;
-        board.castShadow = true;
-        board.userData = { kind: "placement", id: p.id };
+        const board = p.method === "壁掛け" ? new THREE.Mesh(isPanel ? new THREE.BoxGeometry(pw, ph, pt) : galleryFrameGeometry(p), isPanel ? [edge, edge, edge, edge, mat2, edge] : mat2) : null;
+        if (board) {
+          if (isPanel) board.position.z = -(0.03 - pt) / 2;
+          board.castShadow = true;
+          board.userData = { kind: "placement", id: p.id };
+        }
         if (p.method === "イーゼル" && getModel("easel")) {
           const g = new THREE.Group();
           g.userData = { kind: "placement", id: p.id };
@@ -3274,11 +3454,12 @@ function App() {
           const lean = -4.8 * Math.PI / 180, sinL = Math.sin(4.8 * Math.PI / 180), cosL = Math.cos(lean), bh = ph;
           const frameC = p.frame === "白" || p.frame === "パネル" ? 16250351 : p.frame === "黒" ? 1513239 : 9067061;
           const ept = p.frame === "パネル" ? clamp(p.thick ?? PANEL_T, 2e-3, 0.02) : 0.02;
-          const backing = new THREE.Mesh(new THREE.BoxGeometry(pw, bh, ept), new THREE.MeshStandardMaterial({ color: frameC, roughness: 0.7 }));
+          const backing = new THREE.Mesh(isPanel ? new THREE.BoxGeometry(pw, bh, ept) : galleryFrameGeometry(p, ept), isPanel ? new THREE.MeshStandardMaterial({ color: frameC, roughness: 0.7 }) : mat2);
+          backing.userData = { kind: "placement", id: p.id };
           backing.position.z = -0.01 + ept / 2;
           backing.castShadow = true;
-          const front = new THREE.Mesh(new THREE.PlaneGeometry(pw, ph), new THREE.MeshStandardMaterial({ map: frameTexture(photo, p.size, p.orient, p.frame, p.mat, p.sq), roughness: 0.7, emissive: 0, emissiveIntensity: isSel ? 0.3 : 0 }));
-          front.position.z = -0.01 + ept + 5e-4;
+          const front = isPanel ? new THREE.Mesh(new THREE.PlaneGeometry(pw, ph), mat2) : null;
+          if (front) front.position.z = -0.01 + ept + 5e-4;
           const rise = bh / 2, tanL = Math.tan(4.8 * Math.PI / 180), y0 = 0.644 + rise, z0 = 0.1 - rise * tanL;
           const topY = y0 + bh * cosL + 0.012;
           const nm = (o) => String(o.name || "").replace(/_/g, " ");
@@ -3294,7 +3475,7 @@ function App() {
             }
           });
           const bg = new THREE.Group();
-          bg.add(backing, front);
+          bg.add(backing); if(front) bg.add(front);
           if (focus) photoFocus(bg, pw, ph, p.id, photoNumber);
           bg.rotation.x = lean;
           bg.position.set(0, y0 + bh / 2 * cosL, z0 - bh / 2 * sinL);
@@ -3387,13 +3568,13 @@ function App() {
           const bottomY = 0.68 + ph / 2;
           const bottomZ = 0.23 - ph / 2 * Math.tan(10 * Math.PI / 180);
           const ept = p.frame === "パネル" ? clamp(p.thick ?? PANEL_T, 2e-3, 0.02) : 0.02;
-          const backing = new THREE.Mesh(p.frame === "パネル" ? new THREE.BoxGeometry(pw, ph, ept) : new THREE.BoxGeometry(pw + 0.04, ph + 0.04, 0.02), new THREE.MeshStandardMaterial({ color: p.frame === "白" || p.frame === "パネル" ? 16250351 : p.frame === "黒" ? 1513239 : 9067061, roughness: 0.7 }));
+          const backing = new THREE.Mesh(isPanel ? new THREE.BoxGeometry(pw, ph, ept) : galleryFrameGeometry(p, ept), isPanel ? new THREE.MeshStandardMaterial({ color: 16250351, roughness: 0.7 }) : mat2);
           backing.userData = { kind: "placement", id: p.id };
-          const front = new THREE.Mesh(new THREE.PlaneGeometry(pw, ph), new THREE.MeshStandardMaterial({ map: frameTexture(photo, p.size, p.orient, p.frame, p.mat, p.sq), roughness: 0.7, side: THREE.FrontSide }));
-          front.position.z = -0.01 + ept + 2e-3;
+          const front = isPanel ? new THREE.Mesh(new THREE.PlaneGeometry(pw, ph), mat2) : null;
+          if (front) front.position.z = -0.01 + ept + 2e-3;
           backing.position.z = -0.01 + ept / 2;
-          front.userData = { kind: "placement", id: p.id };
-          boardGroup.add(backing, front);
+          if(front) front.userData = { kind: "placement", id: p.id };
+          boardGroup.add(backing); if(front) boardGroup.add(front);
           if (focus) photoFocus(boardGroup, pw, ph, p.id, photoNumber);
           boardGroup.position.set(0, bottomY + ph / 2 * Math.cos(10 * Math.PI / 180), bottomZ - ph / 2 * Math.sin(10 * Math.PI / 180));
           boardGroup.rotation.x = lean;
@@ -3410,6 +3591,12 @@ function App() {
           groundContact(p.x,p.z,0.82,0.92,g.rotation.y,sy);
           if (isSel) addRing(p.x, p.z, sy + 0.02);
         }
+      });
+      Object.entries(architectureBatches).forEach(([kind,parts])=>{
+        if(!parts.length)return;
+        const surface=kind==="threshold"?"floor":"wall";
+        const mesh=new THREE.Mesh(finishUV(galleryMergeGeometry(parts),surface),finishMaterial(surface,{color:surface==="floor"?floorC:wallC,roughness:.85}));
+        mesh.userData={architecturalDetail:kind};mesh.raycast=()=>{};mesh.receiveShadow=true;group.add(mesh);
       });
       Object.entries(contactBatches).forEach(([kind,batch]) => {
         if (!batch.positions.length) return;
@@ -3705,6 +3892,7 @@ function App() {
         spriteLabel(di.text, new THREE.Vector3(di.pos.x, di.pos.y + 1.05, di.pos.z), 1.45);
       }
       pruneFrameTex();
+      frameFinishCache.forEach((maps,key)=>{if(!frameFinishUsed.has(key)){disposeFrameFinish(maps);frameFinishCache.delete(key);}});
     }
     let fpsN = 0, fpsT0 = performance.now(), fpsMax = 0, rebN = 0, fpsTxt = "計測中…";
     function animate() {
@@ -3997,6 +4185,7 @@ function App() {
       el.removeEventListener("wheel", onWheelNative);
       disposeGroup();
       surfaceTextures.forEach((texture) => texture.dispose());
+      frameFinishCache.forEach(disposeFrameFinish); frameFinishCache.clear();
       renderer.dispose();
       el.removeChild(renderer.domElement);
     };
