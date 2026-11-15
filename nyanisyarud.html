@@ -18628,27 +18628,31 @@ function updatePawTrail(dt){
   const moved=state.previous?Math.hypot(centre.x-state.previous.x,centre.z-state.previous.z):0;
   if(state.lastS!==null&&(Math.abs(s-state.lastS)>14||moved>14)){resetPawTrail();return;}
   state.previous=centre;state.lastS=s;state.since+=dt;
+  // 肉球の跡は「踏み込み → 滑る → 踏み出す」：滑り始めに前脚の肉球を1組(左右)、滑っている間は置かず(滑った線：updateBrakeDriftVisual)、
+  // 滑り終わって走り出す時に、くっきりした肉球を交互に4歩
   if(sliding){
-    if(!state.sliding){state.distance=0;state.since=PAW_TRAIL.minInterval;state.runCount=0;state.tail=0;}
-    else state.distance+=moved;
-  }else{
-    if(state.sliding){state.tail=state.runCount?2:0;state.tailAge=0;state.distance=0;}
-    state.tailAge+=dt;
-    if(speed<=8||state.tailAge>.75||isSliding&&!slideExitActive)state.tail=0;
-    state.distance+=moved;
+    if(!state.sliding){
+      state.distance=0;state.since=PAW_TRAIL.minInterval;state.runCount=0;state.tail=0;
+      for(const key of ['fl','fr']){const e=catFootContact(key,1,catGaitState.previousRoot);if(spawnPawPrint(e.point,e.left,{s:e.s,yaw:e.yaw,foot:key,opacity:PAW_TRAIL.opacity,life:PAW_TRAIL.life}))state.runCount++;}
+    }else state.distance+=moved;
+    state.sliding=true;return;
   }
-  state.sliding=sliding;
-  if(!sliding&&!state.tail)return;
+  if(state.sliding){state.tail=state.runCount?4:0;state.tailAge=0;state.distance=0;state.runCount=0;}
+  state.tailAge+=dt;
+  if(speed<=8||state.tailAge>1.2||isSliding&&!slideExitActive)state.tail=0;
+  state.distance+=moved;
+  state.sliding=false;
+  if(!state.tail)return;
   for(const event of catGaitState.events){
     if(event.left!==state.left)continue;
     const remainder=1-event.fraction;
-    if(state.runCount&&(state.distance-moved*remainder<PAW_TRAIL.gap*(sliding?1:1.1)||state.since-dt*remainder<PAW_TRAIL.minInterval))continue;
+    if(state.runCount&&(state.distance-moved*remainder<PAW_TRAIL.gap*1.1||state.since-dt*remainder<PAW_TRAIL.minInterval))continue;
     const contact=event.point;
     if(skidGroup.children.some(m=>m.userData.isPaw&&m.userData.life>.7&&Math.hypot(m.userData.contact[0]-contact.x,m.userData.contact[2]-contact.z)<1.1))continue;
-    const mark=spawnPawPrint(contact,event.left,{s:event.s,yaw:event.yaw,foot:event.foot,contactTime:event.time,contactPhase:event.phase,soft:!sliding,opacity:sliding?PAW_TRAIL.opacity:.18,life:sliding?PAW_TRAIL.life:1.2});
+    const mark=spawnPawPrint(contact,event.left,{s:event.s,yaw:event.yaw,foot:event.foot,contactTime:event.time,contactPhase:event.phase,opacity:PAW_TRAIL.opacity,life:PAW_TRAIL.life});
     if(!mark)continue;
     state.left=!state.left;state.distance=moved*remainder;state.since=dt*remainder;
-    if(sliding)state.runCount++;else state.tail--;
+    state.runCount++;state.tail--;
     break;
   }
 }
@@ -18791,15 +18795,18 @@ const brakeSkidTexture=(()=>{
   ctx.fillStyle=gradient;ctx.fillRect(0,0,32,8);return new THREE.CanvasTexture(canvas);
 })();
 const brakePoseBase={hipsY:chai.hips.position.y,headY:chai.head.position.y};
-let brakeVisual={amount:0,tail:0,pressed:false,contacts:null,lastS:null,dust:0,sequence:0};
+let brakeVisual={amount:0,slide:0,tail:0,pressed:false,contacts:null,lastS:null,dust:0,sequence:0};
 let brakeBarAnimation=null,brakeBarTimer=null;
 function resetCatBrakePose(){
   chai.hips.position.y=brakePoseBase.hipsY;chai.hips.rotation.x=0;chai.hips.scale.set(1,1,1);
   chai.head.position.y=brakePoseBase.headY;chai.head.rotation.x=0;
   chai.ears.forEach(ear=>ear.rotation.x=0);
 }
+// 脚を振る猫(チャトラ・ダンボール・猫又・赤鬼侍・着物猫・招き猫・竹猫)の踏ん張る姿勢の強さ：ブレーキと肉球ドリフト(滑り)の強い方。
+// 脚を振らない猫(ロボ猫のへこみ・雪女のお辞儀など)はブレーキだけ(brakeVisual.amount)のまま
+function catPoseAmount(){return Math.max(brakeVisual.amount,brakeVisual.slide||0);}
 function resetBrakeDriftVisual(){
-  brakeVisual={amount:0,tail:0,pressed:false,contacts:null,lastS:null,dust:0,sequence:0};
+  brakeVisual={amount:0,slide:0,tail:0,pressed:false,contacts:null,lastS:null,dust:0,sequence:0};
   resetCatBrakePose();brakeBarAnimation?.cancel();brakeBarAnimation=null;
   clearTimeout(brakeBarTimer);brakeBarTimer=null;
   document.getElementById('brakeChargeWrap')?.classList.remove('brake-release-sweep');
@@ -18860,8 +18867,12 @@ function updateBrakeDriftVisual(dt){
   }
   const target=pressed?(isBrakingDrift?1:.45):0;
   state.amount=THREE.MathUtils.lerp(state.amount,target,1-Math.exp(-dt*(pressed?20:12)));
-  state.tail=THREE.MathUtils.lerp(state.tail,state.amount,1-Math.exp(-dt*7));
-  const amount=state.amount*(pawMotionQuery.matches?.45:1);
+  // 肉球ドリフトで滑っている間も、ブレーキドリフトと同じ踏ん張る姿勢で脚を止める(約0.12秒で寄せ、終わったら戻す)
+  const sliding=isSliding&&!slideExitActive&&speed>2.5;
+  state.slide=THREE.MathUtils.lerp(state.slide||0,sliding?1:0,1-Math.exp(-dt*(sliding?20:12)));
+  const pose=catPoseAmount();
+  state.tail=THREE.MathUtils.lerp(state.tail,pose,1-Math.exp(-dt*7));
+  const amount=pose*(pawMotionQuery.matches?.45:1);
   chai.hips.position.y-=.075*amount;chai.hips.rotation.x+=.075*amount;
   chai.hips.scale.set(1+.035*amount,1-.045*amount,1+.025*amount);
   chai.head.position.y-=.045*amount;chai.head.rotation.x=.12*amount;
@@ -18877,7 +18888,8 @@ function updateBrakeDriftVisual(dt){
     if(catGaitState.feet[key])catGaitState.feet[key].lift*=1-amount;
   }
   chai.tails.forEach((tail,i)=>{tail.rotation.z+=(brakeDriftDir||Math.sign(bank)||1)*state.tail*.28*(1-i*.10);});
-  const tracing=pressed&&isBrakingDrift&&!isSliding&&speed>3;
+  // 滑った線：ブレーキドリフトと、肉球ドリフトで滑っている間(肉球の跡は滑り始めと滑り終わりに置く：updatePawTrail)
+  const tracing=pressed&&isBrakingDrift&&!isSliding&&speed>3||sliding&&speed>8;
   if(!tracing){state.contacts=null;state.lastS=null;state.dust=0;return;}
   const contacts=['bl','br'].map(brakeTraceContact);
   if(state.contacts&&Math.abs(s-state.lastS)<4){
@@ -24653,7 +24665,7 @@ function loadTakenekoCat(){
 function syncTakenekoCat(dt=0){
   takenekoLab?.();
   if(!takenekoCat.rig?.visible)return;
-  const M=TAKENEKO_CAT,T=takenekoCat,quiet=pawMotionQuery.matches?.45:1,bow=brakeVisual.amount*quiet,rig=T.rig;
+  const M=TAKENEKO_CAT,T=takenekoCat,quiet=pawMotionQuery.matches?.45:1,bow=catPoseAmount()*quiet,rig=T.rig;
   const fade=1-(1-M.fadeTo)*THREE.MathUtils.smoothstep(speed*3.6,...M.fadeKmh);
   const running=catGaitState.feet.fl?THREE.MathUtils.clamp((speed-2)/6,0,1)*(1-bow)*quiet*fade:0;
   // 足が着く拍子(歩みの半周ごと)。チャトラの歩みの進み方を写し、1秒あたり maxSteps 歩を超えないようにする
@@ -24668,7 +24680,7 @@ function syncTakenekoCat(dt=0){
   // C：頭のうなずき(ばね)と、加速・ブレーキ・曲がる方への向き
   const accel=dt>0?(speed-T.lastSpeed)/dt:0;T.lastSpeed=speed;
   const yaw=catRoot.rotation.y;let rate=0;if(T.lastYaw!==null&&dt>0){let d=yaw-T.lastYaw;d=Math.atan2(Math.sin(d),Math.cos(d));rate=d/dt;}T.lastYaw=yaw;
-  const lean=-THREE.MathUtils.clamp(accel*.012,0,M.accelLean)*quiet+brakeVisual.amount*M.brakeNod*quiet;
+  const lean=-THREE.MathUtils.clamp(accel*.012,0,M.accelLean)*quiet+catPoseAmount()*M.brakeNod*quiet;
   if(dt>0){T.nodV+=(-(T.nod-lean)*M.headK-T.nodV*M.headD)*dt;T.nod=THREE.MathUtils.clamp(T.nod+T.nodV*dt,...M.headRange);
     T.turn+=(THREE.MathUtils.clamp(rate*M.turn,-M.turnMax,M.turnMax)*quiet-T.turn)*(1-Math.exp(-dt*6));}
   T.head.rotation.set(T.nod,T.turn,0);
@@ -24676,7 +24688,7 @@ function syncTakenekoCat(dt=0){
   T.tailYaw+=(-T.side*M.tailSwing*running-T.tailYaw)*(1-Math.exp(-dt*M.tailSnap));
   // 先の向き(体から見た向き)は付け根の向きの(1+tipFollow)倍を遅れて追う。先の関節の回転は付け根との差
   T.tipYaw+=(T.tailYaw*(1+M.tipFollow)-T.tipYaw)*(1-Math.exp(-dt*M.tipLag));
-  T.tail.rotation.set(brakeVisual.amount*M.tailBrake*quiet,T.tailYaw,0);T.tailTip.rotation.set(0,T.tipYaw-T.tailYaw,0);
+  T.tail.rotation.set(catPoseAmount()*M.tailBrake*quiet,T.tailYaw,0);T.tailTip.rotation.set(0,T.tipYaw-T.tailYaw,0);
   const target=speed>1?THREE.MathUtils.lerp(M.spin[0],M.spin[1],THREE.MathUtils.clamp(speed/M.fullSpeed,0,1))*quiet:0;
   takenekoCat.spin=target>takenekoCat.spin?target:Math.max(target,takenekoCat.spin-takenekoCat.spin*M.stop*dt-.5*dt);
   takenekoCat.rotor.rotation.y+=takenekoCat.spin*dt;
@@ -24705,7 +24717,7 @@ function loadManekiCat(){
 // 毎コマ：走る速さに合わせて体ごと弾んで左右に揺れ、ブレーキの沈みで前へお辞儀する。鈴は加速で後ろ・減速で前へ振れてばねで戻り、走っている間は弾みに合わせて小さく揺れる
 function syncManekiCat(dt=0){
   if(!manekiCat.rig?.visible)return;
-  const M=MANEKI_CAT,quiet=pawMotionQuery.matches?.45:1,bow=brakeVisual.amount*quiet,rig=manekiCat.rig;
+  const M=MANEKI_CAT,quiet=pawMotionQuery.matches?.45:1,bow=catPoseAmount()*quiet,rig=manekiCat.rig;
   const running=catGaitState.feet.fl?THREE.MathUtils.clamp((speed-2)/6,0,1)*(1-bow)*quiet:0,step=Math.PI*2*catGaitState.phase;
   rig.position.y=M.groundY+Math.abs(Math.sin(step))*M.bob*running;rig.rotation.z=Math.sin(step)*M.waddle*running;rig.rotation.x=bow*M.bow;
   const accel=dt>0?(speed-manekiCat.lastSpeed)/dt:0;manekiCat.lastSpeed=speed;
@@ -24825,7 +24837,7 @@ function syncNekomataCat(dt=0){
   const M=NEKOMATA_CAT,parts=nekomataCat.parts;
   swingCatLegs(parts,chai.legs,M,true);
   parts.earL.holder.rotation.x=-chai.ears[0].rotation.x;parts.earR.holder.rotation.x=-chai.ears[1].rotation.x;
-  const quiet=pawMotionQuery.matches?.45:1,bow=brakeVisual.amount*quiet,rig=nekomataCat.rig;
+  const quiet=pawMotionQuery.matches?.45:1,bow=catPoseAmount()*quiet,rig=nekomataCat.rig;
   const running=catGaitState.feet.fl?THREE.MathUtils.clamp((speed-2)/6,0,1)*(1-bow)*quiet:0,step=Math.PI*2*catGaitState.phase;
   rig.position.y=M.groundY+Math.abs(Math.sin(step))*M.bob*running;rig.rotation.z=Math.sin(step)*M.waddle*running;rig.rotation.x=bow*M.bow;
   nekomataCat.mixer?.update(dt*THREE.MathUtils.lerp(M.tailSpeed[0],M.tailSpeed[1],THREE.MathUtils.clamp(speed/40,0,1))*quiet);
@@ -24866,7 +24878,7 @@ function syncAkaoniCat(dt=0){
   if(!akaoniCat.rig?.visible)return;
   const M=AKAONI_CAT,parts=akaoniCat.parts;
   swingCatLegs(parts,chai.legs,M,false);
-  const quiet=pawMotionQuery.matches?.45:1,bow=brakeVisual.amount*quiet,rig=akaoniCat.rig;
+  const quiet=pawMotionQuery.matches?.45:1,bow=catPoseAmount()*quiet,rig=akaoniCat.rig;
   const running=gameState==='racing'&&catGaitState.feet.fl?THREE.MathUtils.clamp((speed-2)/6,0,1)*(1-bow)*quiet:0,step=Math.PI*2*catGaitState.phase;
   rig.position.y=M.groundY+Math.abs(Math.sin(step))*M.bob*running;rig.rotation.z=Math.sin(step)*M.waddle*running;rig.rotation.x=bow*M.bow;
 }
@@ -24898,7 +24910,7 @@ function syncKimonoCat(dt=0){
   if(!kimonoCat.rig?.visible)return;
   const M=KIMONO_CAT,parts=kimonoCat.parts;
   swingCatLegs(parts,chai.legs,M,false);
-  const quiet=pawMotionQuery.matches?.45:1,bow=brakeVisual.amount*quiet,rig=kimonoCat.rig;
+  const quiet=pawMotionQuery.matches?.45:1,bow=catPoseAmount()*quiet,rig=kimonoCat.rig;
   const running=gameState==='racing'&&catGaitState.feet.fl?THREE.MathUtils.clamp((speed-2)/6,0,1)*(1-bow)*quiet:0,step=Math.PI*2*catGaitState.phase;
   rig.position.y=M.groundY+Math.abs(Math.sin(step))*M.bob*running;rig.rotation.z=Math.sin(step)*M.waddle*running;rig.rotation.x=bow*M.bow;
 }
@@ -25401,7 +25413,7 @@ function syncCardboardParts(parts,legs,ears,tail){
 function syncCardboardCat(){
   const parts=cardboardCat.parts;if(!parts||!cardboardCat.rig.visible)return;
   syncCardboardParts(parts,chai.legs,chai.ears,chai.tails[0]);
-  const quiet=pawMotionQuery.matches?.45:1,dent=brakeVisual.amount*quiet;
+  const quiet=pawMotionQuery.matches?.45:1,dent=catPoseAmount()*quiet;
   cardboardCat.dent.value=dent;
   const running=catGaitState.feet.fl?THREE.MathUtils.clamp((speed-2)/6,0,1)*(1-dent)*quiet:0,step=Math.PI*2*catGaitState.phase;
   cardboardCat.rig.position.y=CARDBOARD_CAT.groundY+Math.abs(Math.sin(step))*CARDBOARD_CAT.bob*running;
