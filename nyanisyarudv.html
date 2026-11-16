@@ -11939,7 +11939,7 @@ function updateTunnelRocks(){
     const along=dx*tr.t.x+dz*tr.t.z,rockLat=(o.x-tr.p.x)*tr.n.x+(o.z-tr.p.z)*tr.n.z,side=Math.sign(lateral-rockLat)||-Math.sign(rockLat)||1;
     lateral=rockLat+side*Math.sqrt(Math.max(0,reach*reach-along*along));
     if(!o.armed)continue;o.armed=false;
-    const hp=new THREE.Vector3(o.x,o.y+.6,o.z);stopWallDrive();wallHitCooldown=.65;speed=Math.max(speed*.32,Math.min(speed*.75,20,activeGripLimit*.9));lastWallHitTime=simulationElapsed;
+    const beforeRockImpact=speed,hp=new THREE.Vector3(o.x,o.y+.6,o.z);stopWallDrive();wallHitCooldown=.65;speed=Math.max(speed*.32,Math.min(speed*.75,20,activeGripLimit*.9));lastWallHitTime=simulationElapsed;speedLab?.impact('rock',beforeRockImpact,speed);
     spawnHit(hp,0xffaa44);spillWater(18);updateCup();spawnSplash(hp);triggerCupHit();playSfx('hazardHit');showDriveNotice('岩にぶつかった','減速 · 水 −18%');if(navigator.vibrate)navigator.vibrate([60,40,60]);
   }
 }
@@ -16026,7 +16026,10 @@ function speedLabSettle(grade){
   return push<=.25?flat:Math.min(cap,flat+push/NORMAL_SPEED.drag*3.6);
 }
 const speedLab=(()=>{
-  if(!new URLSearchParams(location.search).has('speedlab'))return null;
+  const diagnosticParams=new URLSearchParams(location.search);
+  if(!diagnosticParams.has('speedlab'))return null;
+  const baselineExitHold=NORMAL_SPEED.exitHold,queryExitHold=diagnosticParams.get('exitHold');
+  NORMAL_SPEED.exitHold=queryExitHold!==null&&queryExitHold.trim()!==''&&Number.isFinite(Number(queryExitHold))?THREE.MathUtils.clamp(Number(queryExitHold),0,1):0;
   const ROWS=[['accel','加速の強さ(倍)',.5,2,.05],['flat','平らな道の最高速 km/h',200,300,5],['cap','下りの上限 km/h',250,350,5],['drag','下りの伸び方(小さいほど伸びる)',.02,.3,.004],['grip','曲がれる速さ(倍)',1,1.2,.01],['drift','ドリフトの抜け(倍)',1,1.25,.01],['exitHold','ドリフトの抜けの踏ん張り(0〜1)',0,1,.05]];
   const def={flat:NORMAL_SPEED.flat,cap:NORMAL_SPEED.cap,drag:NORMAL_SPEED.drag,accel:NORMAL_SPEED.accel,grip:NORMAL_SPEED.grip,drift:NORMAL_SPEED.drift,exitHold:NORMAL_SPEED.exitHold};
   const el=document.createElement('div');el.style.cssText='position:fixed;right:6px;top:calc(64px + env(safe-area-inset-top));z-index:10000;padding:6px 8px;border-radius:8px;background:rgba(0,0,0,.75);color:#fff;font:700 11px/1.45 monospace;width:210px;max-height:calc(100dvh - 72px - env(safe-area-inset-top));overflow-y:auto';document.body.appendChild(el);
@@ -16055,6 +16058,44 @@ const speedLab=(()=>{
   // Read-only, per-run diagnostics. Only display text is replaced; all passes
   // and all exit/wing events remain available to the existing copy button.
   const records=[],latest=new Map(),exitRecords=[],wingEvents=[];
+  const impactEvents=[];
+  let frame=null,pendingExitHold=null;
+  const contactNames={foam:'発泡スチロール',hole:'穴',puddle:'水たまり',lantern:'化け提灯',avalanche:'雪崩',bundle:'竹の束',fallen:'倒竹',barrel:'樽',wood:'木箱',rock:'岩',wall:'壁接触',scrape:'壁をかすめた',rub:'壁こすり'};
+  const beginTick=dt=>{
+    if(gameState!=='racing'||!(dt>0)){frame=null;return;}
+    frame={before:speed,dt,s,curve,controllerDelta:0,taggedDelta:0};
+  };
+  const impact=(kind,before,after,side=0)=>{
+    if(gameState!=='racing'||!Number.isFinite(before)||!Number.isFinite(after)||before-after<=1e-6)return;
+    if(frame)frame.taggedDelta+=after-before;
+    const c=findDriveCorner(),last=impactEvents[impactEvents.length-1],t=simulationElapsed;
+    // Continuous wall riding is one event; keep its cumulative loss and duration.
+    if(kind==='rub'&&last?.kind===kind&&last.corner===c&&last.side===side&&last.curve===curve&&t-last.end<.25){
+      last.after=after;last.loss+=before-after;last.end=t;last.samples++;last.minS=Math.min(last.minS,s);last.maxS=Math.max(last.maxS,s);return;
+    }
+    impactEvents.push({kind,label:contactNames[kind]||kind,t,end:t,s,minS:s,maxS:s,corner:c,curve,before,after,loss:before-after,side,samples:1});
+  };
+  const impactText=e=>`${e.label}${e.side?'('+ (e.side>0?'右':'左')+')':''}：走行${e.t.toFixed(3)}秒${e.end>e.t?'〜'+e.end.toFixed(3)+'秒':''}・${k(e.before)}→${k(e.after)}km/h・減速の累計${(e.loss*3.6).toFixed(1)}km/h${e.samples>1?'('+e.samples+'コマ)':''}`;
+  const contactsFor=r=>impactEvents.filter(e=>e.curve===r.curve&&e.maxS>=r.from&&e.minS<=r.to);
+  const comparisonText=r=>{
+    const p=r.points,contacts=contactsFor(r),time=p.entry&&p.after?p.after.t-p.entry.t:null;
+    const line=key=>!p[key]?'未通過':Math.abs(p[key].lateral*r.sign)<.5?'中央':p[key].lateral*r.sign>0?'イン':'アウト';
+    return `比較用：入口→出口後 ${time===null?'未通過':time.toFixed(3)+'秒'}・ライン ${line('entry')}→${line('apex')}→${line('exit')}\n`+
+      `旋回補正設定 exitHold=${r.exitHold}${r.mixedSettings?'(計測途中で変更：タイム比較から除外)':''}・接触等${contacts.length}件${contacts.length?'(無接触のタイム比較から除外)':''}\n`+
+      `1コマ全体の加減速(接触・障害物込み) ${r.frameMin===Infinity?'-':r.frameMin.toFixed(2)}〜${r.frameMax===-Infinity?'-':r.frameMax.toFixed(2)}m/s²\n`+
+      (contacts.length?contacts.map(impactText).join('\n'):'計測範囲内の壁・障害物による減速：なし')+
+      (r.unexplained?`\n原因未確定の速度変化 ${r.unexplained.n}コマ・最大${r.unexplained.max.toFixed(1)}km/h(加速・専用ギミックを含む。接触と断定しない)`:'');
+  };
+  const finishFrame=()=>{
+    if(!frame)return;
+    const f=frame;frame=null;
+    const total=speed-f.before,residual=total-f.controllerDelta-f.taggedDelta;
+    for(const r of activeRows){
+      if(f.curve!==r.curve||f.s<r.c.start||f.s>r.c.end)continue;
+      const a=total/f.dt;r.frameMin=Math.min(r.frameMin,a);r.frameMax=Math.max(r.frameMax,a);
+      if(Math.abs(residual)*3.6>.5){r.unexplained??={n:0,max:0};r.unexplained.n++;r.unexplained.max=Math.max(r.unexplained.max,Math.abs(residual)*3.6);}
+    }
+  };
   let activeRows=[],lastSample=null,wasSliding=false,slideOwner=null,lastDesired=null;
   let runMeta=null;
   const k=v=>Number.isFinite(v)?(v*3.6).toFixed(0):'-';
@@ -16094,7 +16135,8 @@ const speedLab=(()=>{
       `アクセルの絞り 最低${Math.round(r.throttle*100)}%(100%で絞りなし)\n`+
       `実際に通った速度処理：${by}\n状態の時間割合：${states}\n`+
       `最終的な速度目標 ${k(r.targetMin)}〜${k(r.targetMax)}km/h\n`+
-      `コーナー内の実加減速(重力・最終上限込み) ${r.accelMin===Infinity?'-':r.accelMin.toFixed(2)}〜${r.accelMax===-Infinity?'-':r.accelMax.toFixed(2)}m/s²\n`+
+      `速度制御だけの加減速(重力・上限込み／接触等は別集計) ${r.accelMin===Infinity?'-':r.accelMin.toFixed(2)}〜${r.accelMax===-Infinity?'-':r.accelMax.toFixed(2)}m/s²\n`+
+      comparisonText(r)+'\n'+
       `通常の旋回計算 ${r.pathN}コマ・必要な旋回÷実際のタイヤ 最大${r.demand.toFixed(2)}倍\n`+
       `出口の旋回力上乗せ 最大${((r.tireMax-1)*100).toFixed(1)}% (${r.tireN}コマ)\n`+
       `コーナー内で外へ${r.out.toFixed(2)}m・内へ${r.inn.toFixed(2)}m(移動の累計)\n`+
@@ -16128,9 +16170,10 @@ const speedLab=(()=>{
       if(r?.done)continue;
       if(!r){
         const apex=getCornerDriveProfile(c).apex;
-        r={c,curve,from,to,apex,sign:Math.sign(roadBendAt(apex))||1,shortened:to<c.end+50-.01,assist:globalIsAssist,time:0,ratio:0,near:0,throttle:1,inside:Infinity,by:{},states:{},controlTime:0,targetMin:Infinity,targetMax:-Infinity,accelMin:Infinity,accelMax:-Infinity,pathN:0,demand:0,tireMax:1,tireN:0,out:0,inn:0,points:{},distance:0,done:false};
+        r={c,curve,from,to,apex,sign:Math.sign(roadBendAt(apex))||1,shortened:to<c.end+50-.01,assist:globalIsAssist,time:0,ratio:0,near:0,throttle:1,inside:Infinity,by:{},states:{},controlTime:0,targetMin:Infinity,targetMax:-Infinity,accelMin:Infinity,accelMax:-Infinity,pathN:0,demand:0,tireMax:1,tireN:0,out:0,inn:0,points:{},distance:0,done:false,exitHold:NORMAL_SPEED.exitHold,frameMin:Infinity,frameMax:-Infinity};
         records.push(r);latest.set(c,r);
       }
+      if(NORMAL_SPEED.exitHold!==r.exitHold)r.mixedSettings=true;
       capture(r,previous,now);
       if(s>to){r.done=true;cornerInfo.textContent=cornerText(r);continue;}
       activeRows.push(r);
@@ -16180,6 +16223,7 @@ const speedLab=(()=>{
     }
   };
   const controller=o=>{
+    if(frame)frame.controllerDelta+=o.after-o.before;
     for(const r of activeRows){
       if(s<r.c.start||s>r.c.end)continue;
       r.controlTime+=o.dt;r.by[o.branch]=(r.by[o.branch]||0)+o.dt;
@@ -16199,6 +16243,7 @@ const speedLab=(()=>{
     }
   };
   const tick=()=>{
+    finishFrame();
     observeSlide();
     const now=stamp();
     if(lastSample&&gameState==='racing'){
@@ -16221,16 +16266,21 @@ const speedLab=(()=>{
   };
   const report=()=>{
     const m=runMeta;
-    const header=`ドリフト全コーナー記録 ${m?.version||APP_VERSION}\nコース ${m?.title||COURSES[currentKey]?.title||currentKey} (${m?.course||currentKey})・猫 ${m?.cat||catModel}\n全${records.length}コーナー・滑り終わり${exitRecords.length}件・羽の記録${wingEvents.length}件\n計測の境界は前後のコマから補間。出口加速調整 exit-grip-2：ガチ峠の通常猫のみ、実際に使った旋回力の余裕に応じて加速。操作追従の要求は加速制限に使わない。旋回力上乗せの設定は維持。\n開始時の設定 ${JSON.stringify(m?.settings||NORMAL_SPEED)}\n現在の設定 ${JSON.stringify({...NORMAL_SPEED,bands:undefined})}\n出口加速の設定 ${JSON.stringify(EXIT_GRIP)}`;
+    const comparison=`比較条件：出口旋回補正 ${NORMAL_SPEED.exitHold===0?'なし':'あり'} (exitHold=${NORMAL_SPEED.exitHold})。同じコーナー・入口速度が近い無接触の走行同士を比較。`;
+    const header=`ドリフト全コーナー記録 ${m?.version||APP_VERSION}\nコース ${m?.title||COURSES[currentKey]?.title||currentKey} (${m?.course||currentKey})・猫 ${m?.cat||catModel}\n全${records.length}コーナー・滑り終わり${exitRecords.length}件・羽の記録${wingEvents.length}件・接触等減速${impactEvents.length}件\n${comparison}\n計測の境界は前後のコマから補間。出口加速調整 exit-grip-2：ガチ峠の通常猫のみ、実際に使った旋回力の余裕に応じて加速。操作追従の要求は加速制限に使わない。通常プレイの設定は維持。診断モードは旋回補正なしで開始し、診断パネル内で比較条件を変更可能。\n開始時の設定 ${JSON.stringify(m?.settings||NORMAL_SPEED)}\n現在の設定 ${JSON.stringify({...NORMAL_SPEED,bands:undefined})}\n出口加速の設定 ${JSON.stringify(EXIT_GRIP)}`;
     const rows=records.map((r,i)=>`【${i+1}】${cornerText(r)}`);
     const events=[...exitRecords.map((e,i)=>({t:e.t0,text:`【滑り終わり${i+1}】${exitText(e)}`})),...wingEvents.map(e=>({t:e.t,text:`【猫の羽】${nameOf(e.corner)}・走行${e.t.toFixed(2)}秒 ${e.msg}`}))].sort((a,b)=>a.t-b.t);
-    return [header,...rows,...events.map(e=>e.text)].join('\n\n');
+    const contacts=impactEvents.map(e=>`【接触等減速】${nameOf(e.corner)}・${impactText(e)}`);
+    return [header,...rows,...events.map(e=>e.text),...contacts].join('\n\n');
   };
   const resetRun=()=>{
+    if(pendingExitHold!==null){setExitComparison(pendingExitHold);pendingExitHold=null;}
+    impactEvents.length=0;frame=null;
     records.length=0;latest.clear();exitRecords.length=0;wingEvents.length=0;activeRows=[];lastSample=null;wasSliding=false;slideOwner=null;lastDesired=null;runMeta=null;last=0;
     exitInfo.textContent='滑り終わりの記録：まだありません';wingInfo.textContent='猫の羽：まだありません';cornerInfo.textContent='全コーナーを記録します。再スタートでリセット';
   };
   const finishRun=()=>{
+    finishFrame();
     for(const r of records)if(!r.done)r.stopped=true;
     for(const e of exitRecords)if(!e.done)e.stopped=true;
     if(records.length)cornerInfo.textContent=cornerText(records[records.length-1]);
@@ -16245,8 +16295,22 @@ const speedLab=(()=>{
     try{await navigator.clipboard.writeText(text);ok=true;}catch(e){const t=document.createElement('textarea');t.value=text;t.style.cssText='position:fixed;opacity:0';document.body.appendChild(t);t.select();try{ok=document.execCommand('copy');}catch(e2){}t.remove();}
     recCopy.textContent=ok?'コピーしました':'コピーできませんでした';setTimeout(()=>{recCopy.textContent='記録をコピー';},1500);
   });
+  const comparisonStatus=document.createElement('div');comparisonStatus.style.cssText='margin-top:5px';body.appendChild(comparisonStatus);
+  function setExitComparison(value){
+    NORMAL_SPEED.exitHold=value;
+    const field=inputs.find(r=>r.key==='exitHold');if(field){field.input.value=value;field.show();}
+    comparisonStatus.textContent='出口の旋回補正：'+(value===0?'なし':'あり')+' ('+value+')';
+  }
+  for(const [label,value] of [['補正なしで比較',0],['従来の補正あり',baselineExitHold]]){
+    const button=document.createElement('button');button.type='button';button.textContent=label;button.style.cssText='font:inherit;color:#fff;background:#334;border:0;border-radius:6px;padding:3px;margin:3px 3px 0 0';
+    button.addEventListener('click',()=>{
+      if(gameState==='racing'){pendingExitHold=value;comparisonStatus.textContent='次の再スタートから旋回補正'+(value===0?'なし':'あり')+' ('+value+')';}
+      else setExitComparison(value);
+    });body.appendChild(button);
+  }
+  setExitComparison(NORMAL_SPEED.exitHold);
   resetRun();
-  return {tick,exit,path,wing,corner,controller,resetRun,finishRun};
+  return {tick,exit,path,wing,corner,controller,resetRun,finishRun,beginTick,impact};
 })();
 let activeGripLimit=TOP_SPEED;
 // 発泡スチロール・穴・水たまりに当たった時の減速。よけるより突っ切る方が速くならないよう、割合(発泡スチロールは段の数ごと)に加えて最低の減速(km/h)を決める。
@@ -17805,6 +17869,7 @@ function hitHazard(kind,stack=1){
   speed-=Math.min(speed*.5,Math.max(speed*(1-rate),h.min/3.6));
   if(h.cut)stopWallDrive();
   if(h.slip>0)hazardSlipUntil=simulationElapsed+h.slip;
+  speedLab?.impact(kind,before,speed);
   hazardLab?.hit(kind,stack,before);
   return Math.round((before-speed)*3.6);
 }
@@ -17952,7 +18017,7 @@ function updatePortBoxes(dt){
     o.spin=new THREE.Vector3((Math.random()-.5)*(light?14:5),(Math.random()-.5)*(light?10:3),(Math.random()-.5)*(light?14:5));
     const hp=new THREE.Vector3(o.home.x,o.home.y+.5,o.home.z);
     if(light){const lost=hitHazard('foam',o.stack);spawnHit(hp,0xffffff);showDriveNotice('発泡スチロールに当たった',`減速 −${lost}km/h`);if(navigator.vibrate)navigator.vibrate([15]);}
-    else{stopWallDrive();wallHitCooldown=.65;speed=Math.max(speed*.32,Math.min(speed*.75,20,activeGripLimit*.9));lastWallHitTime=simulationElapsed;
+    else{const beforeWoodImpact=speed;stopWallDrive();wallHitCooldown=.65;speed=Math.max(speed*.32,Math.min(speed*.75,20,activeGripLimit*.9));lastWallHitTime=simulationElapsed;speedLab?.impact('wood',beforeWoodImpact,speed);
       spawnHit(hp,0xffaa44);spillWater(18);updateCup();spawnSplash(hp);triggerCupHit();playSfx('hazardWood');showDriveNotice('木箱にぶつかった','減速 · 水 −18%');if(navigator.vibrate)navigator.vibrate([60,40,60]);}
   }
 }
@@ -20249,6 +20314,7 @@ const COURSE_GRAVITY=9.81;
 function tick(dt,renderDt=dt){
   if(gameState==='practiceResult')return;
   if(gameState==='racing'){const wf=waterfallInfo(s),wind=windInfo(s);waterfallWanted=wf.level;waterfallGrandWanted=wf.grand;windWanted=redcatDrivingActive()?Math.max(wind.level,THREE.MathUtils.smoothstep(speed*3.6,120,590)*.75):wind.level;windPitchWanted=redcatDrivingActive()?Math.max(wind.pitch,THREE.MathUtils.smoothstep(speed*3.6,160,600)):wind.pitch;driftLoopWanted=isSliding&&!slideExitActive?Math.max(.3,slidePower):0;driftLoopQuality=slideLastQuality||'OK';driftLoopKmh=speed*3.6;}else{waterfallWanted=0;windWanted=0;driftLoopWanted=0;}
+  speedLab?.beginTick(dt);
   const realDt=dt;updateDragonWorld(realDt);clearSkyImpactOffset();updateSkyLandingSpray(realDt);updateSkyWaterStream(realDt);dt*=skyCrestTimeScale(realDt);
   updateLinkPracticeInput();
   updateBranchRoute();
@@ -21652,6 +21718,7 @@ function tick(dt,renderDt=dt){
       speed=globalIsAssist?Math.max(speed*.5,Math.min(speed*.8,26,activeGripLimit*.9)):Math.max(speed*.32,Math.min(speed*.75,20,activeGripLimit*.9));
       lastWallHitTime=simulationElapsed;
     }
+    speedLab?.impact(scrape?'scrape':'wall',speedBeforeWall,speed,side);
     assistDiag?.hit(side,scrape,speedBeforeWall);
     lateral=THREE.MathUtils.clamp(lateral,walls.left+(redcatRailMove?.resolvedSkin??.35),walls.right-(redcatRailMove?.resolvedSkin??.35));bank=-side*(scrape?.2:.9);
     resetSteeredLine();
@@ -21681,7 +21748,8 @@ function tick(dt,renderDt=dt){
     // speed and water continuously, using simulation time rather than frames.
     wallContactEpisode.rubTime+=dt;
     wallHitCooldown=Math.max(wallHitCooldown,.12);
-    speed*=Math.exp(-.65*dt);
+    const beforeRubbingSpeed=speed;speed*=Math.exp(-.65*dt);
+    speedLab?.impact('rub',beforeRubbingSpeed,speed,wallContactEpisode.side);
     const waterBeforeRubbing=waterLevel;
     spillWater(6*dt);updateCup();
     if(redcatMoveStep)redcatContactWaterFeedback({soft:true,pushing:true},waterBeforeRubbing-waterLevel);
