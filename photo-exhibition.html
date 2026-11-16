@@ -206,7 +206,7 @@ function validateExhibitionFile(j) {
         if (!o || !idOK(o.id) || ids.has(o.id)) fail();
         ids.add(o.id);
         if (["columns", "lights", "blocks", "furniture"].includes(k) && !finite(o, ["x", "z"])) fail();
-        if(k==='lights'&&(o.targetPlacement!==undefined&&!idOK(o.targetPlacement)||o.followTarget!==undefined&&typeof o.followTarget!=='boolean'))fail();
+        if(k==='lights'&&(o.targetPlacement!==undefined&&!idOK(o.targetPlacement)||o.followTarget!==undefined&&typeof o.followTarget!=='boolean'||o.aimMode!==undefined&&!['light','center'].includes(o.aimMode)))fail();
         if (k === "columns" && !((o.w || o.size) > 0 && (o.d || o.size) > 0)) fail();
         if (["windows", "entrances"].includes(k) && (!walls.includes(o.wall) || !finite(o, ["pos", "w", "h"]) || o.w <= 0 || o.h <= 0 || k === "windows" && !Number.isFinite(o.sill))) fail();
         if (k === "entrances" && (o.daylight!==undefined&&!['none','outdoor','adjacent'].includes(o.daylight)||o.style!==undefined&&!['open','singleGlass','doubleGlass'].includes(o.style)||o.frameTone!==undefined&&!['white','black','metal'].includes(o.frameTone)||o.adjacentStrength!==undefined&&!['low','medium','high'].includes(o.adjacentStrength)||o.sideGlass!==undefined&&typeof o.sideGlass!=='boolean'||o.sideWidth!==undefined&&(!Number.isFinite(o.sideWidth)||o.sideWidth<0||o.sideWidth>3))) fail();
@@ -663,10 +663,87 @@ function galleryArtworkTarget(data,p){
   if(p.col){const host=mountOf(data.columns||[],data.blocks||[],p.col);return host?colArt(host,p.face||'南',p.pos,p.center,.03):null;}
   return wallWorld(data.room,p.wall,p.pos,p.center,.055);
 }
-function galleryLightAim(data,light,p){
-  const target=galleryArtworkTarget(data,p);if(!target)return null;
+// The original center-ray aim is retained as an explicit compatibility option.
+// For wall-mounted work the new default instead centers the *illuminance on
+// the wall*, not the ray. This matters for oblique spots: their footprint is
+// asymmetric even when the central ray intersects the photograph's center.
+function galleryLightAimMode(light){return light?.aimMode==='center'?'center':'light';}
+function galleryCenterRayAim(data,light,target){
   const dx=target.x-light.x,dz=target.z-light.z,dy=ceilAt(data.room,light.x,light.z)-.09-target.y,hd=Math.hypot(dx,dz),raw=Math.atan2(hd,Math.max(.005,dy))*180/Math.PI;
   return {tilt:Number(clamp(raw,0,60).toFixed(3)),dir:hd<.0001?light.dir:Number((Math.atan2(dx,-dz)*180/Math.PI).toFixed(3)),limited:dy<=0||raw>60.5,target};
+}
+function galleryArtworkLightingPlane(data,p,target){
+  if(p.method==='イーゼル')return null; // tilted freestanding work: use center ray
+  const r=data.room;
+  if(p.col){
+    const host=mountOf(data.columns||[],data.blocks||[],p.col);if(!host)return null;
+    const f=colFace(host,p.face||'南');
+    return {normal:new THREE.Vector3(f.nx,0,f.nz),surfaceOffset:.03,horizontal:f.ax==='x'?'x':'z',lo:(f.ax==='x'?f.cx:f.cz)-f.len/2,hi:(f.ax==='x'?f.cx:f.cz)+f.len/2,minY:floorBase(r,target.x,target.z)+.05,maxY:ceilAt(r,target.x,target.z)-.08};
+  }
+  const alongX=p.wall==='北'||p.wall==='南',length=wallLen(r,p.wall);
+  return {normal:wallNormal(p.wall),surfaceOffset:.055,horizontal:alongX?'x':'z',lo:-length/2,hi:length/2,minY:wallBase(r,p.wall,p.pos)+.05,maxY:ceilAt(r,target.x,target.z)-.08};
+}
+function galleryWallIlluminanceCentroid(data,light,plane,target,tilt,dir){
+  // Same angular lens profile, inverse-distance exponent and Lambert factor
+  // as the exhibited SpotLight and the gallery's material shader.
+  const pose=galleryLampPose(data.room,{...light,tilt,dir});
+  const lens=pose.origin,axis=pose.aim,edge=Math.cos(clamp(light.angle,15,60)*Math.PI/180);
+  const surface=target.clone().addScaledVector(plane.normal,-plane.surfaceOffset);
+  const distance=lens.distanceTo(surface);
+  const radius=clamp(distance*Math.tan(clamp(light.angle,15,60)*Math.PI/180)*2.4,.65,2.35);
+  const n=21,step=2*radius/(n-1),axis0=plane.horizontal==='x'?surface.x:surface.z;
+  let sum=0,along=0,up=0;
+  for(let i=0;i<n;i++){
+    const u=(i-(n-1)/2)*step,coord=axis0+u;
+    if(coord<plane.lo+.005||coord>plane.hi-.005)continue;
+    for(let j=0;j<n;j++){
+      const v=(j-(n-1)/2)*step,y=target.y+v;
+      if(y<plane.minY||y>plane.maxY)continue;
+      const x=plane.horizontal==='x'?surface.x+u:surface.x;
+      const z=plane.horizontal==='z'?surface.z+u:surface.z;
+      const dx=x-lens.x,dy=y-lens.y,dz=z-lens.z;
+      const dist=Math.hypot(dx,dy,dz);if(dist<.0001)continue;
+      const angleCos=(dx*axis.x+dy*axis.y+dz*axis.z)/dist;
+      if(angleCos<=edge)continue;
+      const incidence=-(dx*plane.normal.x+dz*plane.normal.z)/dist;
+      if(incidence<=.01)continue;
+      const weight=gallerySpotFalloff(edge,angleCos)*incidence/Math.pow(Math.max(1,dist),1.4);
+      sum+=weight;along+=u*weight;up+=v*weight;
+    }
+  }
+  return sum>1e-8?{u:along/sum,v:up/sum}:null;
+}
+const galleryAimCache=new Map();
+function galleryLightAim(data,light,p){
+  if(!p)return null;
+  const target=galleryArtworkTarget(data,p);if(!target)return null;
+  const base=galleryCenterRayAim(data,light,target);
+  if(galleryLightAimMode(light)==='center'||base.limited)return base;
+  const plane=galleryArtworkLightingPlane(data,p,target);
+  if(!plane)return base;
+  const key=JSON.stringify([light.x,light.z,light.angle,p.id,p.method,p.wall,p.col,p.face,p.pos,p.center,p.x,p.z,p.rot,p.size,p.orient,p.sq,p.frame,p.mat,target.x,target.y,target.z,plane.horizontal,plane.lo,plane.hi,plane.minY,plane.maxY,plane.normal.x,plane.normal.z,plane.surfaceOffset,ceilAt(data.room,light.x,light.z)]);
+  const cached=galleryAimCache.get(key);if(cached)return {...cached,target};
+  let offsetU=0,offsetV=0,aim=base;
+  for(let iter=0;iter<5;iter++){
+    const shifted=target.clone();shifted[plane.horizontal]+=offsetU;shifted.y+=offsetV;
+    const candidate=galleryCenterRayAim(data,light,shifted);
+    if(candidate.limited)break;
+    const centroid=galleryWallIlluminanceCentroid(data,light,plane,target,candidate.tilt,candidate.dir);
+    if(!centroid)break;
+    aim=candidate;
+    const error=Math.hypot(centroid.u,centroid.v);
+    if(error<.006)break;
+    offsetU=clamp(offsetU-centroid.u*.78,-.45,.45);
+    offsetV=clamp(offsetV-centroid.v*.78,-.45,.45);
+  }
+  // Prevent a grazing wall or an edge from causing extreme correction.
+  const deltaTilt=Math.abs(aim.tilt-base.tilt);
+  let dirDelta=((aim.dir-base.dir+540)%360)-180;
+  if(deltaTilt>9||Math.abs(dirDelta)>12)aim=base;
+  const result={tilt:aim.tilt,dir:aim.dir,limited:base.limited,mode:'light'};
+  if(galleryAimCache.size>256)galleryAimCache.clear();
+  galleryAimCache.set(key,result);
+  return {...result,target};
 }
 function followBoundLights(data){
   const clean=cleanLightBindings(data.lights,data.placements),byId=new Map((data.placements||[]).map(p=>[p.id,p]));let changed=clean!==data.lights;
@@ -2809,17 +2886,33 @@ function App() {
     if(!bindingAllowed())return false;const d=dataRef.current,l=d.lights.find(l=>l.id===lid),p=d.placements.find(p=>p.id===pid);if(!l||!p)return false;
     if(l.targetPlacement&&l.targetPlacement!==pid&&!transfer){setNotice(bindingLightName(lid)+'は「'+bindingPhotoName(l.targetPlacement)+'」の担当です。担当変更は一覧から明示的に選んでください');return false;}
     const aim=galleryLightAim(d,l,p);if(!aim){setNotice('作品の位置が分かりません');return false;}
-    const next=d.lights.map(light=>light.id===lid?{...light,targetPlacement:pid,followTarget:true,tilt:aim.tilt,dir:aim.dir}:replaceLight&&light.id===replaceLight&&light.targetPlacement===pid?withoutLightBinding(light):light);
+    const next=d.lights.map(light=>light.id===lid?{...light,targetPlacement:pid,followTarget:true,aimMode:galleryLightAimMode(light),tilt:aim.tilt,dir:aim.dir}:replaceLight&&light.id===replaceLight&&light.targetPlacement===pid?withoutLightBinding(light):light);
     commitBindingLights(next,bindingLightName(lid)+'を「'+bindingPhotoName(pid)+'」の担当にしました'+(aim.limited?'。傾きの上限60°です。照明を作品に近づけてください':''));return true;
   }
   function removeLightBinding(lid){if(!bindingAllowed())return;const d=dataRef.current,l=d.lights.find(l=>l.id===lid);if(!l?.targetPlacement)return;commitBindingLights(d.lights.map(x=>x.id===lid?withoutLightBinding(x):x),bindingLightName(lid)+'と作品との紐づけを外しました');}
   function setLightFollow(lid,follow){if(!bindingAllowed())return;const d=dataRef.current;if(!d.lights.some(l=>l.id===lid&&l.targetPlacement))return;commitBindingLights(d.lights.map(l=>l.id===lid?{...l,followTarget:follow}:l),follow?'担当作品への自動追従を有効にしました':'照射方向を手動で調整できます。担当関係は維持しています');}
+  function setLightAimMode(lid,mode){
+    if(!bindingAllowed()||!['light','center','manual'].includes(mode))return;
+    const d=dataRef.current,l=d.lights.find(x=>x.id===lid);
+    if(!l?.targetPlacement)return;
+    const next=d.lights.map(x=>x.id===lid?{...x,aimMode:mode==='manual'?galleryLightAimMode(x):mode,followTarget:mode!=='manual'}:x);
+    commitBindingLights(next,mode==='manual'?'手動調整に切り替えました。担当作品は維持します':mode==='light'?'壁面の光の中心を作品に合わせて自動追従します':'照明の中心軸を作品の中心へ向けて自動追従します');
+  }
+  function lightAimModeButtons(l){
+    if(!l?.targetPlacement)return null;
+    const active=l.followTarget===false?'manual':galleryLightAimMode(l);
+    const opts=[['light','光の中心'],['center','作品の中心'],['manual','手動']];
+    return React.createElement('div',{'aria-label':'自動追従の照準方式',style:{display:'grid',gap:5}},
+      React.createElement('b',{style:{fontSize:11}},'照準方式'),
+      React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(3,minmax(0,1fr))',gap:5}},...opts.map(([key,label])=>React.createElement('button',{key,type:'button','aria-pressed':active===key,disabled:!bindingAllowed(),onClick:()=>setLightAimMode(l.id,key),style:{minHeight:37,padding:'5px 3px',fontSize:11,fontWeight:active===key?800:600,borderRadius:9,...artworkButtonSurface(active===key?'primary':'neutral',active===key,!bindingAllowed())}},label))),
+      React.createElement('span',{className:'small',style:{fontSize:10}},active==='light'?'壁面にできる明るさの重心を作品に合わせます。':active==='center'?'照明の中心軸を作品中心に向けます。':'角度を固定し、担当作品との紐づけは維持します。'));
+  }
   function addAssignedLight(pid){
     if(!bindingAllowed())return;const d=dataRef.current,p=d.placements.find(p=>p.id===pid),target=p&&galleryArtworkTarget(d,p);if(!target)return;
     const host=p.col&&mountOf(d.columns,d.blocks,p.col),face=host&&colFace(host,p.face||'南'),normal=p.method==='イーゼル'?new THREE.Vector3(Math.sin(p.rot*Math.PI/180),0,Math.cos(p.rot*Math.PI/180)):face?new THREE.Vector3(face.nx,0,face.nz):wallNormal(p.wall);
     let position=null;for(const [dx,dz]of [[0,0],[.25,0],[-.25,0],[0,.25],[0,-.25],[.5,.25],[-.5,-.25]]){const x=clamp(target.x+normal.x*.9+dx,-d.room.w/2+.2,d.room.w/2-.2),z=clamp(target.z+normal.z*.9+dz,-d.room.d/2+.2,d.room.d/2-.2);if(d.lights.every(l=>Math.hypot(l.x-x,l.z-z)>.18)){position={x,z};break;}}
     if(!position){setNotice('照明を追加できる空きがありません。「光」から位置を指定して追加してください');return;}
-    const light={...defaultLight(),id:uid(),...position,targetPlacement:pid,followTarget:true},aim=galleryLightAim(d,light,p);if(!aim)return;
+    const light={...defaultLight(),id:uid(),...position,targetPlacement:pid,followTarget:true,aimMode:"light"},aim=galleryLightAim(d,light,p);if(!aim)return;
     commitBindingLights([...d.lights,{...light,tilt:aim.tilt,dir:aim.dir}],'新しい照明を追加し「'+bindingPhotoName(pid)+'」の担当にしました');
   }
   function chooseBindingHit(hit){const choice=lightBindingRef.current;if(!choice||choice.room!==curRoomRef.current)return;if(choice.kind==='fixture'&&hit?.kind==='light')bindLightToArtwork(hit.id,choice.placement,false,choice.replaceLight);else if(choice.kind==='target'&&hit?.kind==='placement')bindLightToArtwork(choice.light,hit.id,true);}
@@ -2835,7 +2928,7 @@ function App() {
   }
   function lightBindingPanel(){
     if(!selected||!['placement','light'].includes(selected.kind))return null;const d=dataRef.current,forArt=selected.kind==='placement',bound=forArt?d.lights.filter(l=>l.targetPlacement===selected.id):d.lights.filter(l=>l.id===selected.id),blocked=!bindingAllowed();
-    const tools=bound.map(l=>{const p=d.placements.find(p=>p.id===l.targetPlacement),aim=p&&galleryLightAim(d,l,p);return React.createElement('div',{key:l.id,style:{display:'grid',gap:5,padding:'7px 0',borderTop:'1px solid var(--line)'}},React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',gap:6}},React.createElement('b',{style:{fontSize:12}},forArt?bindingLightName(l.id):p?'照射先：'+bindingPhotoName(p.id):'照射先：未設定'),React.createElement('button',{type:'button',disabled:blocked,onClick:()=>forArt?startLightBinding(selected.id,l.id):startLightTarget(l.id),style:{minHeight:32,padding:'4px 8px',borderRadius:8,fontSize:11,...artworkButtonSurface('neutral',false,blocked)}},'変更')),p&&React.createElement('label',{style:{display:'flex',alignItems:'center',gap:5,fontSize:11}},React.createElement('input',{type:'checkbox',checked:l.followTarget!==false,disabled:blocked,onChange:e=>setLightFollow(l.id,e.target.checked)}),'担当作品に光を向け続ける'),p&&aim?.limited&&React.createElement('p',{className:'small',style:{color:'#9b4c11',margin:0}},'照明が遠いか、作品が高いため、中心まで向けられません。照明の位置を調整してください。'),p&&React.createElement('button',{type:'button',disabled:blocked,onClick:()=>removeLightBinding(l.id),style:{justifySelf:'start',minHeight:30,fontSize:10,color:'var(--muted)',textDecoration:'underline'}},'作品との紐づけを外す'));});
+    const tools=bound.map(l=>{const p=d.placements.find(p=>p.id===l.targetPlacement),aim=p&&galleryLightAim(d,l,p);return React.createElement('div',{key:l.id,style:{display:'grid',gap:5,padding:'7px 0',borderTop:'1px solid var(--line)'}},React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',gap:6}},React.createElement('b',{style:{fontSize:12}},forArt?bindingLightName(l.id):p?'照射先：'+bindingPhotoName(p.id):'照射先：未設定'),React.createElement('button',{type:'button',disabled:blocked,onClick:()=>forArt?startLightBinding(selected.id,l.id):startLightTarget(l.id),style:{minHeight:32,padding:'4px 8px',borderRadius:8,fontSize:11,...artworkButtonSurface('neutral',false,blocked)}},'変更')),p&&React.createElement('label',{style:{display:'flex',alignItems:'center',gap:5,fontSize:11}},React.createElement('input',{type:'checkbox',checked:l.followTarget!==false,disabled:blocked,onChange:e=>setLightFollow(l.id,e.target.checked)}),'担当作品に光を向け続ける'),p&&forArt&&lightAimModeButtons(l),p&&aim?.limited&&React.createElement('p',{className:'small',style:{color:'#9b4c11',margin:0}},'照明が遠いか、作品が高いため、中心まで向けられません。照明の位置を調整してください。'),p&&React.createElement('button',{type:'button',disabled:blocked,onClick:()=>removeLightBinding(l.id),style:{justifySelf:'start',minHeight:30,fontSize:10,color:'var(--muted)',textDecoration:'underline'}},'作品との紐づけを外す'));});
     return React.createElement('section',{'aria-label':'作品と照明の紐づけ',style:{display:'grid',gap:6,padding:'9px 0'}},React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',gap:6}},React.createElement('h3',{style:{fontSize:13,fontWeight:800,margin:0}},forArt?'担当照明':'照らす作品'),forArt&&React.createElement('button',{type:'button',disabled:blocked,onClick:()=>startLightBinding(selected.id),style:{minHeight:32,padding:'4px 8px',borderRadius:8,fontSize:11,...artworkButtonSurface('neutral',false,blocked)}},bound.length?'＋ 照明を追加':'照明を選ぶ')),forArt&&!bound.length&&React.createElement('p',{className:'small',style:{margin:0}},'未設定。「光を当てる」で担当照明を選べます。'),...tools,lightBindingPicker());
   }
   function disposeLightBindingGuides(){const old=lightBindingGuidesRef.current;if(!old)return;old.group.traverse(o=>{o.geometry?.dispose();const list=Array.isArray(o.material)?o.material:[o.material];list.filter(Boolean).forEach(m=>{m.map?.dispose();m.dispose();});});old.group.removeFromParent();lightBindingGuidesRef.current=null;}
@@ -8272,7 +8365,7 @@ function App() {
   const lightSliders = (l) => {
     const set = (k, v) => {if((k==='tilt'||k==='dir')&&l.targetPlacement&&l.followTarget!==false)return;updateLights(lights.map((x) => x.id === l.id ? { ...x, [k]: v, ...k === "intensity" || k === "kelvin" || k === "angle" ? { solo: true } : {} } : x));};
     const row = (label, k, min, max, step, unit) => /* @__PURE__ */ React.createElement("label", { key: k, className: "block col-span-2" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, label), /* @__PURE__ */ React.createElement("b", null, l[k], unit)), /* @__PURE__ */ React.createElement("input", { "aria-label": label, className: "w-full", type: "range", min, max, step, disabled:(k==='tilt'||k==='dir')&&!!l.targetPlacement&&l.followTarget!==false,value: l[k], onChange: (e) => set(k, Number(e.target.value)) }));
-    return /* @__PURE__ */ React.createElement(React.Fragment, null, row("強度", "intensity", 10, 150, 5, ""), row("色温度", "kelvin", 2200, 6500, 100, " K"), row("照射角（半角）", "angle", 15, 60, 1, "°"), l.targetPlacement&&React.createElement('div',{className:'col-span-2',style:{display:'grid',gap:6}},React.createElement('p',{className:'small',style:{margin:0}},l.followTarget!==false?'担当作品に光を向け続けています。角度の手動調整は追従を停止してから行います。':'手動調整中。担当作品との結びつきは維持しています。'),React.createElement('button',{type:'button',onClick:()=>setLightFollow(l.id,l.followTarget===false),style:{minHeight:40,padding:8,borderRadius:10,fontSize:12,fontWeight:700,...artworkButtonSurface()}},l.followTarget!==false?'角度を手動調整に切り替える':'作品に合わせて追従を再開')),row("傾き（真下から）", "tilt", 0, 60, 1, "°"), row("向き（0°＝北壁側）", "dir", -180, 180, 5, "°"));
+    return /* @__PURE__ */ React.createElement(React.Fragment, null, row("強度", "intensity", 10, 150, 5, ""), row("色温度", "kelvin", 2200, 6500, 100, " K"), row("照射角（半角）", "angle", 15, 60, 1, "°"), l.targetPlacement&&React.createElement('div',{className:'col-span-2',style:{display:'grid',gap:6}},lightAimModeButtons(l)),row("傾き（真下から）", "tilt", 0, 60, 1, "°"), row("向き（0°＝北壁側）", "dir", -180, 180, 5, "°"));
   };
   const sol = solar(roomSolarEnv(room, env));
   arrangeRef.current = arrange;
