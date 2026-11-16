@@ -206,6 +206,7 @@ function validateExhibitionFile(j) {
         if (["columns", "lights", "blocks", "furniture"].includes(k) && !finite(o, ["x", "z"])) fail();
         if (k === "columns" && !((o.w || o.size) > 0 && (o.d || o.size) > 0)) fail();
         if (["windows", "entrances"].includes(k) && (!walls.includes(o.wall) || !finite(o, ["pos", "w", "h"]) || o.w <= 0 || o.h <= 0 || k === "windows" && !Number.isFinite(o.sill))) fail();
+        if (k === "entrances" && (o.daylight!==undefined&&!['none','outdoor','adjacent'].includes(o.daylight)||o.style!==undefined&&!['open','singleGlass','doubleGlass'].includes(o.style)||o.frameTone!==undefined&&!['white','black','metal'].includes(o.frameTone)||o.adjacentStrength!==undefined&&!['low','medium','high'].includes(o.adjacentStrength)||o.sideGlass!==undefined&&typeof o.sideGlass!=='boolean'||o.sideWidth!==undefined&&(!Number.isFinite(o.sideWidth)||o.sideWidth<0||o.sideWidth>3))) fail();
         if (k === "entrances" && o.transition !== undefined && !["pass", "portal"].includes(o.transition)) fail();
         if (k === "entrances" && (o.col !== undefined && (!idOK(o.col) || !(d.columns || []).some((c) => c.id === o.col)) || o.base !== undefined && (!Number.isFinite(o.base) || o.base < 0))) fail();
         if (k === "placements" && (typeof o.photo !== "string" || !SIZE_MM[o.size] || !["壁掛け", "イーゼル"].includes(o.method) || !finite(o, ["pos", "center", "x", "z", "rot"]) || !walls.includes(o.wall))) fail();
@@ -424,6 +425,32 @@ function frameTexture(photo, size, orient, frame, mat, sq) {
   frameTexCache.set(key, t);
   return t;
 }
+function windowRecess(win){return clamp(Number.isFinite(win.recess)?win.recess:.12,0,.6);}
+function galleryRoomJunctions(room,windows,entrances,columns,blocks){
+  const positions=[],colors=[];
+  const quad=(points,alpha,flip=false)=>{for(const i of (flip?[0,3,1,1,3,2]:[0,1,3,1,2,3])){positions.push(...points[i].toArray());colors.push(0,0,0,alpha[i]);}};
+  for(const wall of ['北','南','東','西']){
+    const len=wallLen(room,wall),h=room.h,pad=.22;
+    const holes=[...windows.filter(w=>w.wall===wall).map(w=>({a:w.pos-w.w/2,b:w.pos+w.w/2,lo:w.sill,hi:w.sill+w.h})),...entrances.filter(e=>!e.col&&e.wall===wall).map(e=>{const y=entranceBase(room,e,columns,blocks);return {a:e.pos-e.w/2,b:e.pos+e.w/2,lo:y,hi:y+e.h};})];
+    const xs=[...new Set([-len/2,-len/2+.035,-len/2+.085,-len/2+pad,0,len/2-pad,len/2-.085,len/2-.035,len/2,...holes.flatMap(q=>[clamp(q.a,-len/2,len/2),clamp(q.b,-len/2,len/2)])])].sort((a,b)=>a-b);
+    const ys=[...new Set([0,h-.26,h-.14,h-.045,h,...holes.flatMap(q=>[clamp(q.lo,0,h),clamp(q.hi,0,h)])])].sort((a,b)=>a-b);
+    const at=(u,y,off=.0015)=>wallWorld(room,wall,u,y-wallBase(room,wall,u),off);
+    const shade=(u,y)=>Math.min(.14,.075*Math.pow(1-clamp((len/2-Math.abs(u))/pad,0,1),2)+.085*Math.pow(1-clamp((h-y)/.26,0,1),2));
+    for(let i=1;i<xs.length;i++)for(let j=1;j<ys.length;j++){
+      const a=xs[i-1],b=xs[i],lo=ys[j-1],hi=ys[j],u=(a+b)/2,y=(lo+hi)/2;
+      if(holes.some(q=>u>q.a&&u<q.b&&y>q.lo&&y<q.hi))continue;
+      const alpha=[shade(a,lo),shade(b,lo),shade(b,hi),shade(a,hi)];if(Math.max(...alpha)<1e-8)continue;
+      quad([at(a,lo),at(b,lo),at(b,hi),at(a,hi)],alpha,wall==='南'||wall==='西');
+    }
+    const depths=[.0015,.045,.11,.20];
+    for(let i=1;i<xs.length;i++)for(let j=1;j<depths.length;j++){
+      const a=xs[i-1],b=xs[i],near=depths[j-1],far=depths[j],alpha=t=>.045*Math.pow(1-clamp(t/.20,0,1),2);
+      quad([at(a,h-.0015,near),at(b,h-.0015,near),at(b,h-.0015,far),at(a,h-.0015,far)],[alpha(near),alpha(near),alpha(far),alpha(far)],wall==='南'||wall==='西');
+    }
+  }
+  const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));geometry.setAttribute('color',new THREE.Float32BufferAttribute(colors,4));return geometry;
+}
+
 function wallLen(room, wall) {
   return wall === "北" || wall === "南" ? room.w : room.d;
 }
@@ -488,6 +515,27 @@ function solar(env) {
   const altDeg = alt * 180 / Math.PI;
   const dir = new THREE.Vector3(Math.sin(b) * Math.cos(alt), Math.sin(alt), -Math.cos(b) * Math.cos(alt)).normalize();
   return { ok, altDeg, bearingDeg: (bearing * 180 / Math.PI % 360 + 360) % 360, dir, sunUp: altDeg > 0.5, day: sm(-6, 12, altDeg), atm: sm(0, 6, altDeg) * (0.55 + 0.45 * sm(0, 25, altDeg)), kelvin: 2200 + 3400 * sm(0, 35, altDeg) };
+}
+// Window direction is its outward wall normal, rotated by the room's north setting.
+function windowSunState(win, room, env, sun = solar(roomSolarEnv(room, env))) {
+  const outward=wallNormal(win.wall).negate(), facing=Math.max(0,outward.dot(sun.dir));
+  const tangent=(win.wall==='北'||win.wall==='南')?new THREE.Vector3(1,0,0):new THREE.Vector3(0,0,1);
+  const depth=windowRecess(win), dx=facing>1e-6?depth*Math.abs(tangent.dot(sun.dir))/facing:Infinity, dy=facing>1e-6?depth*Math.max(0,sun.dir.y)/facing:Infinity;
+  const clearWidth=Math.max(0,win.w-.035-dx),clearHeight=Math.max(0,win.h-.035-dy);
+  const aperture=clearWidth*clearHeight/Math.max(.0001,win.w*win.h);
+  const direct=!!env.sun&&sun.ok&&sun.sunUp&&facing>.001&&aperture>0;
+  const axis={'北':0,'東':90,'南':180,'西':270}[win.wall]||0;
+  const bearing=wrapDegrees(axis-roomNorthAngle(room,env));
+  const status=!env.sun?'太陽の光はオフ':!sun.ok?'太陽の計算を読み込み中':!sun.sunUp?'夜間・直射光なし':facing<=.001?'太陽と反対向き・直射光なし':aperture<=0?'窓の奥行きで直射光が遮られています':'直射光が入る向き';
+  return {bearing,compass:wallCompassName(win.wall,room,env),facing,aperture,direct,status,sun};
+}
+function fitGallerySunShadow(light, target, room, windows) {
+  const camera=light.shadow.camera, pad=.12, depth=Math.max(.1,...windows.map(windowRecess));
+  camera.position.copy(light.position);camera.lookAt(target.position);camera.updateMatrixWorld(true);
+  const box=new THREE.Box3();
+  for(const x of [-room.w/2-depth,room.w/2+depth])for(const y of [0,Math.max(room.h,room.stair?room.stair.steps*room.stair.riser+room.stair.clear:room.h)])for(const z of [-room.d/2-depth,room.d/2+depth])box.expandByPoint(new THREE.Vector3(x,y,z).applyMatrix4(camera.matrixWorldInverse));
+  camera.left=box.min.x-pad;camera.right=box.max.x+pad;camera.bottom=box.min.y-pad;camera.top=box.max.y+pad;
+  camera.near=Math.max(.05,-box.max.z-pad);camera.far=Math.max(camera.near+.1,-box.min.z+pad);camera.updateProjectionMatrix();
 }
 // Render-only geometry: dimensions, collision volumes and saved objects stay unchanged.
 function galleryStepGeometry(w, h, d, bevel = 0.002) {
@@ -655,6 +703,17 @@ const PORTAL_RECESS = 0.22;
 // Separate the opaque portal backing from the autofill boundary to avoid z-fighting.
 const PORTAL_FACE_GAP = 0.003;
 function entranceMode(e) { return e.transition === "pass" || e.transition === "portal" ? e.transition : e.link ? "portal" : "pass"; }
+function entranceDaylight(e){return ['outdoor','adjacent'].includes(e.daylight)?e.daylight:'none';}
+function entranceStyle(e){return ['singleGlass','doubleGlass'].includes(e.style)?e.style:'open';}
+function entranceGlassLayout(e){
+  const glass=entranceStyle(e)!=='open',side=glass&&e.sideGlass?clamp(Number.isFinite(e.sideWidth)?e.sideWidth:.25,0,Math.min(3,Math.max(0,(e.w-.7)/2))):0;
+  return {glass,side,doorWidth:Math.max(.1,e.w-2*side),leaves:entranceStyle(e)==='doubleGlass'?2:1};
+}
+function entranceAdjacentStrength(e){return {low:.45,medium:1,high:1.7}[e.adjacentStrength]||1;}
+function galleryDaylightAccess(room,windows,entrances){
+  const area=windows.reduce((sum,w)=>sum+Math.max(0,w.w*w.h),0)+entrances.reduce((sum,e)=>sum+(entranceDaylight(e)==='outdoor'?e.w*e.h:entranceDaylight(e)==='adjacent'?e.w*e.h*.25*entranceAdjacentStrength(e):0),0);
+  return clamp(area/Math.max(1,room.w*room.d*.12),0,1);
+}
 function isTransferEntrance(e) { return entranceMode(e) === "portal"; }
 function columnDoorAxis(c) { return colW(c) >= colD(c) ? "x" : "z"; }
 function columnDoorFaces(c) { return columnDoorAxis(c) === "x" ? ["南", "北"] : ["西", "東"]; }
@@ -849,7 +908,7 @@ function resolvePortalVolumes(x, z, r, columns, entrances, blocks, radius, eye, 
   return { x, z, relocated, foot };
 }
 function pushOutColumn(x, z, c, r, entrances, blocks, radius, eye, foot) {
-  for (const b of columnSolids(c, r, entrances, blocks)) {
+  for (const b of columnSolids(c, r, entrances.map(e=>({...e,w:entranceGlassLayout(e).doorWidth})), blocks)) {
     if (b.y + b.h / 2 <= foot + STEP_MAX + 1e-6 || b.y - b.h / 2 >= foot + eye + 0.1) continue;
     const hx = b.w / 2 + radius, hz = b.d / 2 + radius, dx = x - b.x, dz = z - b.z;
     if (Math.abs(dx) < hx && Math.abs(dz) < hz) {
@@ -1364,17 +1423,214 @@ function galleryReflectionTexture() {
   texture.colorSpace=THREE.LinearSRGBColorSpace;texture.needsUpdate=true;
   return texture;
 }
+// Display-only finishes. Photo surfaces and saved layout objects are never patched.
+function galleryPaint(theme,role='wall'){
+  const dark=theme==='black';
+  return {color:dark?(role==='ceiling'?0x282927:role==='skirting'?0x292a29:0x20211f):(role==='ceiling'?0xfafbf9:role==='skirting'?0xe9e6df:0xf3f0e9),roughness:role==='ceiling'?.97:role==='skirting'?.55:.9,bumpScale:role==='ceiling'?.00014:role==='skirting'?.00010:.00042,reflection:role==='ceiling'?.025:role==='skirting'?.28:.055};
+}
+function galleryChamferBox(w,h,d,bevel=.0015){
+  const b=Math.max(.00001,Math.min(bevel,w*.12,h*.12,d*.12));
+  const shape=new THREE.Shape();shape.moveTo(-w/2+b,-h/2+b);shape.lineTo(w/2-b,-h/2+b);shape.lineTo(w/2-b,h/2-b);shape.lineTo(-w/2+b,h/2-b);shape.closePath();
+  const g=new THREE.ExtrudeGeometry(shape,{depth:d-2*b,bevelEnabled:true,bevelSize:b,bevelThickness:b,bevelSegments:1,steps:1,curveSegments:1});g.translate(0,0,-d/2+b);g.computeBoundingBox();g.userData.galleryArchitecturalBevel=true;g.parameters={width:w,height:h,depth:d,bevel:b};return g;
+}
+function galleryColumnGeometry(column,solid,bevel=.0015){
+  const hx=colW(column)/2,hz=colD(column)/2,b=Math.min(bevel,hx*.12,hz*.12),x=column.x,z=column.z;
+  let polygon=[[x-hx+b,z-hz],[x+hx-b,z-hz],[x+hx,z-hz+b],[x+hx,z+hz-b],[x+hx-b,z+hz],[x-hx+b,z+hz],[x-hx,z+hz-b],[x-hx,z-hz+b]];
+  for(const [axis,bound,sign]of [[0,solid.x-solid.w/2,1],[0,solid.x+solid.w/2,-1],[1,solid.z-solid.d/2,1],[1,solid.z+solid.d/2,-1]]){
+    const out=[];for(let i=0;i<polygon.length;i++){const a=polygon[i],c=polygon[(i+1)%polygon.length],insideA=(a[axis]-bound)*sign>=-1e-9,insideC=(c[axis]-bound)*sign>=-1e-9;if(insideA)out.push(a);if(insideA!==insideC){const t=(bound-a[axis])/(c[axis]-a[axis]);out.push([a[0]+t*(c[0]-a[0]),a[1]+t*(c[1]-a[1])]);}}polygon=out;
+  }
+  const shape=new THREE.Shape();polygon.forEach((p,i)=>shape[i?'lineTo':'moveTo'](p[0]-solid.x,-(p[1]-solid.z)));shape.closePath();
+  const g=new THREE.ExtrudeGeometry(shape,{depth:solid.h,bevelEnabled:false,steps:1,curveSegments:1});g.rotateX(-Math.PI/2);g.translate(0,-solid.h/2,0);g.computeBoundingBox();g.userData={galleryArchitecturalBevel:true,bevel:b,columnCornersOnly:true};g.parameters={width:solid.w,height:solid.h,depth:solid.d};return g;
+}
+function gallerySkirtingGeometry(w,h,d){
+  const b=Math.min(.0015,h/4,w/8,d/8),rings=[[-h/2,0],[h/2-b,0],[h/2-b*.292893,b*.292893],[h/2,b]],positions=[],colors=[];
+  const points=rings.map(([y,i])=>[[-w/2+i,y,-d/2+i],[-w/2+i,y,d/2-i],[w/2-i,y,d/2-i],[w/2-i,y,-d/2+i]]),quad=(a,b,c,d)=>[a,b,d,b,c,d].forEach(p=>{positions.push(...p);colors.push(1,1,1);});
+  quad(points[0][3],points[0][2],points[0][1],points[0][0]);for(let r=1;r<points.length;r++)for(let i=0;i<4;i++){const j=(i+1)%4;quad(points[r-1][i],points[r-1][j],points[r][j],points[r][i]);}quad(...points.at(-1));
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));g.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));g.computeVertexNormals();g.computeBoundingBox();return g;
+}
+function galleryBoxSegment(a,b,box){
+  let lo=0,hi=1;for(const [axis,size]of [['x','w'],['y','h'],['z','d']]){const delta=b[axis]-a[axis],min=box[axis]-box[size]/2,max=box[axis]+box[size]/2;if(Math.abs(delta)<1e-9){if(a[axis]<min||a[axis]>max)return false;continue;}let u=(min-a[axis])/delta,v=(max-a[axis])/delta;if(u>v)[u,v]=[v,u];lo=Math.max(lo,u);hi=Math.min(hi,v);if(lo>hi)return false;}return hi>.015&&lo<.985;
+}
+function galleryIndirectOccluders(room,columns,entrances,blocks){
+  const stairBoxes=[];if(room.stair){const st=room.stair,n1=stairN1(st),start=room.d/2-st.land,end=-room.d/2+st.land,cuts=[-room.d/2,room.d/2,...Array.from({length:n1+1},(_,i)=>start-i*st.tread),...(st.type==='fold'?Array.from({length:st.steps-n1+1},(_,i)=>end+i*st.tread):[])].filter(z=>z>=-room.d/2&&z<=room.d/2),zs=[...new Set(cuts)].sort((a,b)=>a-b),xs=st.type==='fold'?[-room.w/2,0,room.w/2]:[-room.w/2,room.w/2];for(let i=1;i<xs.length;i++)for(let j=1;j<zs.length;j++){const x=(xs[i-1]+xs[i])/2,z=(zs[j-1]+zs[j])/2,h=floorBase(room,x,z);if(h>.001)stairBoxes.push({x,z,y:h/2,w:xs[i]-xs[i-1],d:zs[j]-zs[j-1],h});}}
+  return [...stairBoxes,...columns.flatMap(c=>columnSolids(c,room,entrances,blocks)),...blocks.map(b=>({x:b.x,z:b.z,y:b.ceil?ceilBot(room,b)+b.h/2:floorBase(room,b.x,b.z)+b.h/2,w:b.w,d:b.d,h:b.h})),...portalAutoFill(room,columns,entrances,blocks).boxes];
+}
+function gallerySurfaceHit(origin,dir,room,boxes,windows,entrances,columns,blocks){
+  let distance=Infinity,point=null,normal=null;
+  const candidate=(t,n)=>{if(t<.02||t>=distance)return;const p=origin.clone().addScaledVector(dir,t);if(p.x<-room.w/2-.001||p.x>room.w/2+.001||p.z<-room.d/2-.001||p.z>room.d/2+.001)return;distance=t;point=p;normal=n;};
+  if(dir.y<-.0001)candidate(-origin.y/dir.y,new THREE.Vector3(0,1,0));
+  for(const [axis,half]of [['x',room.w/2],['z',room.d/2]])if(Math.abs(dir[axis])>.0001){const edge=dir[axis]>0?half:-half,t=(edge-origin[axis])/dir[axis],p=origin.clone().addScaledVector(dir,t);if(p.y<0||p.y>room.h)continue;const wall=axis==='x'?(edge>0?'東':'西'):(edge>0?'南':'北'),along=axis==='x'?p.z:p.x;
+    const hole=windows.some(w=>w.wall===wall&&Math.abs(along-w.pos)<w.w/2&&p.y>w.sill&&p.y<w.sill+w.h)||entrances.some(e=>!e.col&&e.wall===wall&&Math.abs(along-e.pos)<e.w/2&&p.y>entranceBase(room,e,columns,blocks)&&p.y<entranceBase(room,e,columns,blocks)+e.h);if(!hole)candidate(t,wallNormal(wall));}
+  for(const box of boxes){let lo=-Infinity,hi=Infinity,n=null,valid=true;for(const [axis,size]of [['x','w'],['y','h'],['z','d']]){const min=box[axis]-box[size]/2,max=box[axis]+box[size]/2;if(Math.abs(dir[axis])<1e-9){if(origin[axis]<min||origin[axis]>max){valid=false;break;}continue;}let a=(min-origin[axis])/dir[axis],b=(max-origin[axis])/dir[axis],sign=-1;if(a>b){[a,b]=[b,a];sign=1;}if(a>lo){lo=a;n=new THREE.Vector3();n[axis]=sign;}hi=Math.min(hi,b);if(lo>hi){valid=false;break;}}if(valid&&n)candidate(lo,n);}
+  return point?{point,normal,distance}:null;
+}
+function galleryIndirectSources(room,env,lights,windows,entrances,columns,blocks,sun){
+  const boxes=galleryIndirectOccluders(room,columns,entrances,blocks),sources=[],absorption=room.theme==='black'?.35:1;
+  const emit=(id,p,color,strength,radius)=>{if(strength>.0001)sources.push({id,point:p,color:color.clone(),strength:strength*absorption,radius});};
+  if(env.lightsOn)for(const l of lights){const tilt=l.tilt*Math.PI/180,angle=l.dir*Math.PI/180,dir=new THREE.Vector3(Math.sin(angle)*Math.sin(tilt),-Math.cos(tilt),-Math.cos(angle)*Math.sin(tilt)),origin=new THREE.Vector3(l.x,ceilAt(room,l.x,l.z)-.10,l.z),hit=gallerySurfaceHit(origin,dir,room,boxes,windows,entrances,columns,blocks);if(hit)emit('lamp:'+l.id,hit.point.clone().addScaledVector(hit.normal,.065),kelvinToColor(l.kelvin),.05*clamp(l.intensity/60,0,2),2.25);}
+  if(env.sun&&sun.ok&&sun.day>0){const sky=new THREE.Color(0xecf2f5);for(const w of windows){const n=wallNormal(w.wall),p=wallWorld(room,w.wall,w.pos,w.sill+w.h*.55-wallBase(room,w.wall,w.pos),.15);emit('sky:'+w.id,p,sky,Math.min(.06,w.w*w.h*.017)*sun.day,2.8);
+      const state=windowSunState(w,room,env,sun);if(state.direct){const hit=gallerySurfaceHit(p,sun.dir.clone().negate(),room,boxes,windows,entrances,columns,blocks);if(hit)emit('sun:'+w.id,hit.point.clone().addScaledVector(hit.normal,.065),kelvinToColor(sun.kelvin),.045*state.facing*state.aperture*sun.atm,2.6);}}
+    for(const e of entrances){const mode=entranceDaylight(e);if(mode==='none')continue;const p=entrancePoint(room,e,columns,blocks,e.h*.55,.15);emit('door:'+e.id,p,sky,Math.min(.06,e.w*e.h*.014)*sun.day*(mode==='adjacent'?.4*entranceAdjacentStrength(e):1),2.6);}}
+  return {boxes,sources:sources.sort((a,b)=>b.strength-a.strength||a.id.localeCompare(b.id)).slice(0,8)};
+}
+function galleryIndirectSamples(room,sources,boxes){
+  const nx=6,ny=4,nz=6,height=Math.max(room.h,room.stair?room.stair.steps*room.stair.riser+room.stair.clear:0),data=new Uint8Array(nx*ny*nz*4),scale=.24;
+  for(let z=0;z<nz;z++)for(let y=0;y<ny;y++)for(let x=0;x<nx;x++){const point=new THREE.Vector3(((x+.5)/nx-.5)*room.w,(y+.5)/ny*height,((z+.5)/nz-.5)*room.d),i=((z*ny+y)*nx+x)*4;let r=0,g=0,b=0;
+    for(const s of sources){if(boxes.some(box=>galleryBoxSegment(point,s.point,box)))continue;const amount=s.strength/(1+point.distanceToSquared(s.point)/(s.radius*s.radius));r+=s.color.r*amount;g+=s.color.g*amount;b+=s.color.b*amount;}data[i]=Math.round(clamp(r/scale,0,1)*255);data[i+1]=Math.round(clamp(g/scale,0,1)*255);data[i+2]=Math.round(clamp(b/scale,0,1)*255);data[i+3]=255;}
+  return {data,width:nx,height:ny,depth:nz,boundsHeight:height,scale};
+}
+function gallerySpatialMaterial(material,uniforms){
+  const previous=material.onBeforeCompile,key=material.customProgramCacheKey();material.userData.gallerySpatialFill=true;
+  material.onBeforeCompile=shader=>{previous.call(material,shader);Object.assign(shader.uniforms,uniforms);shader.vertexShader='varying vec3 galleryPaintWorld;\n'+shader.vertexShader;shader.vertexShader=shader.vertexShader.replace('#include <project_vertex>','#include <project_vertex>\ngalleryPaintWorld=(modelMatrix*vec4(transformed,1.0)).xyz;');
+    shader.fragmentShader='uniform highp sampler3D galleryIndirectField; uniform vec3 galleryFieldMin; uniform vec3 galleryFieldSize; uniform float galleryFieldScale; varying vec3 galleryPaintWorld;\n'+shader.fragmentShader;
+    shader.fragmentShader=shader.fragmentShader.replace('#include <lights_fragment_end>',`#include <lights_fragment_end>
+      vec3 galleryWorldNormal=inverseTransformDirection(normal,viewMatrix);
+      vec3 galleryFieldUV=clamp((galleryPaintWorld-galleryFieldMin)/galleryFieldSize,vec3(0.0),vec3(1.0));
+      vec3 galleryReturn=texture(galleryIndirectField,galleryFieldUV).rgb*galleryFieldScale;
+      float galleryReceiver=1.0-.9*smoothstep(.15,.8,galleryWorldNormal.y);
+      reflectedLight.indirectDiffuse+=diffuseColor.rgb*galleryReturn*galleryReceiver;`);
+  };material.customProgramCacheKey=()=>key+'|spatial-painted-room-v1';return material;
+}
+
+function galleryGlazingMaterial(options) {
+  const material=new THREE.MeshStandardMaterial({...options,transparent:true,depthWrite:false,side:THREE.DoubleSide});
+  const u={galleryMirror:{value:null},galleryMirrorMatrix:{value:new THREE.Matrix4()},galleryMirrorReady:{value:0},galleryMirrorTexel:{value:new THREE.Vector2(1/384,1/384)}};
+  material.userData.galleryGlazing=u;
+  material.onBeforeCompile=shader=>{
+    Object.assign(shader.uniforms,u);
+    shader.vertexShader='uniform mat4 galleryMirrorMatrix; varying vec4 galleryMirrorUV;\n'+shader.vertexShader;
+    shader.vertexShader=shader.vertexShader.replace('#include <project_vertex>','#include <project_vertex>\ngalleryMirrorUV = galleryMirrorMatrix * modelMatrix * vec4(transformed, 1.0);');
+    shader.fragmentShader='uniform sampler2D galleryMirror; uniform float galleryMirrorReady; uniform vec2 galleryMirrorTexel; varying vec4 galleryMirrorUV;\n'+shader.fragmentShader;
+    shader.fragmentShader=shader.fragmentShader.replace('#include <opaque_fragment>',`
+      float galleryFresnel=pow(1.0-clamp(abs(dot(normal,normalize(vViewPosition))),0.0,1.0),5.0);
+      diffuseColor.a=min(.30,opacity+(.30-opacity)*galleryFresnel);
+      if(galleryMirrorReady>.5 && galleryMirrorUV.w>0.0){
+        vec2 uv=galleryMirrorUV.xy/galleryMirrorUV.w;
+        if(all(greaterThanEqual(uv,vec2(0.0)))&&all(lessThanEqual(uv,vec2(1.0)))){
+          vec3 reflected=texture2D(galleryMirror,uv).rgb*.5;
+          reflected+=(texture2D(galleryMirror,uv+galleryMirrorTexel).rgb+texture2D(galleryMirror,uv-galleryMirrorTexel).rgb+texture2D(galleryMirror,uv+vec2(galleryMirrorTexel.x,-galleryMirrorTexel.y)).rgb+texture2D(galleryMirror,uv+vec2(-galleryMirrorTexel.x,galleryMirrorTexel.y)).rgb)*.125;
+          outgoingLight=mix(outgoingLight,reflected,.92);
+        }
+      }
+      #include <opaque_fragment>`);
+  };
+  material.customProgramCacheKey=()=> 'gallery-glazing-room-v1';
+  return material;
+}
+function galleryMirrorView(surface,camera,virtualCamera,matrix){
+  const origin=new THREE.Vector3().setFromMatrixPosition(surface.matrixWorld),position=new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
+  const normal=new THREE.Vector3(0,0,1).transformDirection(surface.matrixWorld);
+  if(position.clone().sub(origin).dot(normal)<=.015)return false;
+  virtualCamera.position.copy(position.clone().sub(origin).reflect(normal).add(origin));
+  const rotation=new THREE.Matrix4().extractRotation(camera.matrixWorld),look=new THREE.Vector3(0,0,-1).applyMatrix4(rotation).add(position);
+  const target=look.sub(origin).reflect(normal).add(origin);
+  virtualCamera.up.set(0,1,0).applyMatrix4(rotation).reflect(normal);virtualCamera.lookAt(target);
+  virtualCamera.near=camera.near;virtualCamera.far=camera.far;virtualCamera.updateMatrixWorld(true);virtualCamera.projectionMatrix.copy(camera.projectionMatrix);
+  matrix.set(.5,0,0,.5,0,.5,0,.5,0,0,.5,.5,0,0,0,1).multiply(virtualCamera.projectionMatrix).multiply(virtualCamera.matrixWorldInverse);
+  const plane=new THREE.Plane().setFromNormalAndCoplanarPoint(normal,origin).applyMatrix4(virtualCamera.matrixWorldInverse),clip=new THREE.Vector4(plane.normal.x,plane.normal.y,plane.normal.z,plane.constant),p=virtualCamera.projectionMatrix.elements;
+  const q=new THREE.Vector4((Math.sign(clip.x)+p[8])/p[0],(Math.sign(clip.y)+p[9])/p[5],-1,(1+p[10])/p[14]);
+  const denominator=clip.dot(q);if(Math.abs(denominator)<1e-8)return false;clip.multiplyScalar(2/denominator);
+  p[2]=clip.x;p[6]=clip.y;p[10]=clip.z+1-.0002;p[14]=clip.w;virtualCamera.projectionMatrixInverse.copy(virtualCamera.projectionMatrix).invert();
+  return true;
+}
+function createGalleryGlazingReflection(renderer,scene,camera){
+  const surfaces=[],virtual=new THREE.PerspectiveCamera(),matrix=new THREE.Matrix4();
+  let target=null,active=null,last=-Infinity,dirty=2,failed=false,lastPose='',lastChoice=null,previousPlane=null;
+  const enabled=typeof renderer.setRenderTarget==='function'&&typeof renderer.getRenderTarget==='function';
+  const disable=()=>{for(const m of surfaces)m.material.userData.galleryGlazing.galleryMirrorReady.value=0;};
+  const bind=()=>{if(!target||!previousPlane)return;for(const m of surfaces){const n=new THREE.Vector3(0,0,1).transformDirection(m.matrixWorld),p=m.getWorldPosition(new THREE.Vector3());if(n.dot(previousPlane.normal)>.999&&Math.abs(p.sub(previousPlane.origin).dot(previousPlane.normal))<.01){const u=m.material.userData.galleryGlazing;u.galleryMirror.value=target.texture;u.galleryMirrorMatrix.value.copy(previousPlane.matrix);u.galleryMirrorReady.value=1;}}};
+  return {
+    register(mesh){surfaces.push(mesh);},
+    reset(){disable();surfaces.length=0;active=null;lastChoice=null;lastPose='';dirty=2;},
+    update(now){
+      if(!enabled||failed||!surfaces.length)return false;
+      scene.updateMatrixWorld(true);camera.updateMatrixWorld(true);
+      const frustum=new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse));
+      let choice=null,best=0;
+      for(const m of surfaces){if(!m.visible||!frustum.intersectsObject(m))continue;let visible=true;for(let p=m.parent;p;p=p.parent)if(!p.visible)visible=false;if(!visible)continue;
+        const pos=m.getWorldPosition(new THREE.Vector3()),delta=camera.position.clone().sub(pos),n=new THREE.Vector3(0,0,1).transformDirection(m.matrixWorld),facing=delta.clone().normalize().dot(n);
+        if(facing<=.02)continue;const box=m.geometry.parameters,score=(box.width||1)*(box.height||1)*facing/Math.max(1,delta.lengthSq())*(lastChoice===m?1.25:1);
+        if(score>best){choice=m;best=score;}}
+      if(!choice){disable();active=null;lastChoice=null;return false;}
+      bind();
+      const changed=choice!==active,pose=camera.matrixWorld.elements.concat(camera.projectionMatrix.elements).map(v=>v.toFixed(5)).join(',');
+      if(!changed&&pose===lastPose&&dirty<=0)return false;
+      if(target&&now-last<100)return false;
+      // The main draw must create the depth textures before the first mirrored draw.
+      let pendingShadow=false;scene.traverse(o=>{if(!o.isLight||!o.castShadow||!o.shadow||o.shadow.map||!o.layers.test(camera.layers))return;for(let p=o;p;p=p.parent)if(!p.visible)return;pendingShadow=true;});
+      if(pendingShadow)return false;
+      if(!galleryMirrorView(choice,camera,virtual,matrix))return false;
+      if(!target){try{target=new THREE.WebGLRenderTarget(384,384,{minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,generateMipmaps:false});target.texture.colorSpace=THREE.LinearSRGBColorSpace;target.texture.userData={cached:true,galleryPlanarReflection:true};}catch{failed=true;disable();return false;}}
+      const hidden=[],oldTarget=renderer.getRenderTarget(),shadowUpdate=renderer.shadowMap.needsUpdate,shadowAuto=renderer.shadowMap.autoUpdate,xr=renderer.xr?.enabled,viewport=renderer.getViewport?.(new THREE.Vector4());
+      const hide=o=>{if(o.visible){hidden.push(o);o.visible=false;}};
+      for(const m of surfaces)hide(m);
+      scene.traverse(o=>{if(o.isSprite||o.isLine||o.type==='ArrowHelper'||o.userData?.handle||o.userData?.selectionMarker||o.material?.wireframe)hide(o);});
+      let success=false;
+      try{if(renderer.xr)renderer.xr.enabled=false;renderer.shadowMap.autoUpdate=false;renderer.shadowMap.needsUpdate=false;renderer.setRenderTarget(target);renderer.state?.buffers?.depth?.setMask(true);renderer.clear?.();renderer.render(scene,virtual);success=true;}
+      catch{failed=true;disable();}
+      finally{for(const o of hidden)o.visible=true;renderer.shadowMap.needsUpdate=shadowUpdate;renderer.shadowMap.autoUpdate=shadowAuto;if(renderer.xr)renderer.xr.enabled=xr;renderer.setRenderTarget(oldTarget);if(viewport)renderer.setViewport?.(viewport);}
+      if(!success)return false;
+      disable();previousPlane={normal:new THREE.Vector3(0,0,1).transformDirection(choice.matrixWorld),origin:choice.getWorldPosition(new THREE.Vector3()),matrix:matrix.clone()};bind();
+      active=choice;lastChoice=choice;lastPose=pose;last=now;dirty=Math.max(0,dirty-1);return true;
+    },
+    dispose(){disable();target?.dispose();target=null;surfaces.length=0;}
+  };
+}
+function gallerySoftShadowMaterial(material,parameters){
+  material.userData.gallerySoftShadow=true;
+  const previous=material.onBeforeCompile;
+  material.onBeforeCompile=shader=>{
+    previous?.(shader);Object.assign(shader.uniforms,parameters);
+    const chunk=THREE.ShaderChunk.shadowmap_pars_fragment.replace('float radius = shadowRadius * texelSize.x;',`
+      float radius=shadowRadius*texelSize.x;
+      if(shadowRadius>2.9){
+        vec2 probe=shadowCoord.xy;
+        float visibility=texture(shadowMap,vec3(probe,shadowCoord.z));
+        for(int j=0;j<4;j++){
+          vec2 offset=j==0?vec2(2.0,0.0):j==1?vec2(-2.0,0.0):j==2?vec2(0.0,2.0):vec2(0.0,-2.0);
+          vec2 candidate=shadowCoord.xy+offset*texelSize;
+          float sampleVisibility=texture(shadowMap,vec3(candidate,shadowCoord.z));
+          if(sampleVisibility<visibility){visibility=sampleVisibility;probe=candidate;}
+        }
+        float spread=.7;
+        if(visibility<.99){
+          float lo=0.0,hi=shadowCoord.z;
+          for(int j=0;j<7;j++){float mid=(lo+hi)*.5;float v=texture(shadowMap,vec3(probe,mid));if(v<.5)hi=mid;else lo=mid;}
+          float separation=max(0.0,shadowCoord.z-hi)*gallerySunDepthSpan;
+          spread=clamp(.7+separation*.012/max(.0001,gallerySunTexelWorld),.7,4.5);
+        }
+        radius=spread*texelSize.x;
+      }`);
+    shader.fragmentShader='uniform float gallerySunDepthSpan; uniform float gallerySunTexelWorld;\n'+shader.fragmentShader.replace('#include <shadowmap_pars_fragment>',chunk);
+  };
+  material.customProgramCacheKey=()=> 'gallery-distance-soft-shadow-v1';return material;
+}
+function galleryWoodGeometry(source){
+  source.computeBoundingBox();const b=source.boundingBox,size=b.getSize(new THREE.Vector3()),axes=['x','y','z'].sort((a,b)=>size[b]-size[a]),long=axes[0],cross=axes[1],other=axes[2],geometry=source.clone(),p=geometry.getAttribute('position'),n=geometry.getAttribute('normal'),uv=new Float32Array(p.count*2);
+  const get=(a,i)=>a==='x'?p.getX(i):a==='y'?p.getY(i):p.getZ(i);
+  for(let i=0;i<p.count;i++){const nc=n?(cross==='x'?n.getX(i):cross==='y'?n.getY(i):n.getZ(i)):0;uv[i*2]=get(Math.abs(nc)>.7?other:cross,i)/.09;uv[i*2+1]=get(long,i)/.45;}
+  geometry.setAttribute('uv',new THREE.BufferAttribute(uv,2));geometry.userData={...geometry.userData,galleryWoodGrain:true,grainAxis:long};return geometry;
+}
+function gallerySunReturn(room,env,windows,entrances,columns,sun){
+  if(!env.sun||!sun.ok||!sun.sunUp)return 0;
+  let area=0;for(const w of windows){const v=windowSunState(w,room,env,sun);if(v.direct)area+=w.w*w.h*v.aperture*v.facing;}
+  for(const e of entrances)if(entranceDaylight(e)==='outdoor')area+=e.w*e.h*Math.max(0,entranceNormal(e,columns).negate().dot(sun.dir));
+  return .09*clamp(area/Math.max(1,room.w*room.d*.16),0,1)*sun.atm*(room.theme==='black'?.55:1);
+}
+
 function galleryReflectionStrength(fill) { return .12*fill.daylight+.2*fill.energy; }
 function galleryFurnitureRole(type,name,material) {
-  if(!["tableRound","tableRect"].includes(type)||!material?.isMeshStandardMaterial)return null;
+  if(!material?.isMeshStandardMaterial)return null;
+  if(type==="easel")return material.metalness>.2||/screw|hinge|knob|stay|fitting/i.test(name)?"metal":"woodRail";
+  if(!["tableRound","tableRect"].includes(type))return null;
   if(/tabletop/i.test(name))return "woodTop";
   if(/rim|apron/i.test(name))return "woodEdge";
   if(/cap|rubber/i.test(name))return null;
   return material.metalness>.1||/pedestal|steel|base/i.test(name)?"metal":null;
 }
 
-function galleryLightingResponse(room, env, lights, solarDay) {
-  const daylight = env.sun && Number.isFinite(solarDay) ? clamp(solarDay, 0, 1) : 0;
+function galleryLightingResponse(room, env, lights, solarDay, apertureAccess = 1) {
+  const daylight = env.sun && Number.isFinite(solarDay) ? clamp(solarDay, 0, 1) * clamp(apertureAccess,0,1) : 0;
   const area = Math.max(4, (Number(room.w) || 6) * (Number(room.d) || 4));
   const power = env.lightsOn ? (lights || []).reduce((sum, light) => sum + clamp(Number(light.intensity) || 0, 0, 150), 0) : 0;
   const energy = clamp(power / Math.max(60, area * 7.5), 0, 1);
@@ -1382,6 +1638,33 @@ function galleryLightingResponse(room, env, lights, solarDay) {
   const darkReturn=room.theme==="black"?.06*clamp(energy+daylight,0,1)*(1-daylight):0;
   return { daylight, energy, reflectance, hemisphere: 0.2 + 0.65 * daylight + (0.1 + 0.22 * (1 - daylight)) * energy * reflectance + darkReturn, bounce: (0.22 + 0.28 * daylight + 0.13 * energy) * reflectance + darkReturn*.6 };
 }
+function galleryRoundedTop(source,type){
+  source.computeBoundingBox();const b=source.boundingBox,size=b.getSize(new THREE.Vector3()),center=b.getCenter(new THREE.Vector3());
+  // Only simple, untextured horizontal table tops are eligible.
+  const w=size.x,h=size.y,d=size.z,r=Math.min(.0015,h*.15,w*.01,d*.01);
+  if(!(r>0&&h<Math.min(w,d)*.35))return null;
+  const heights=new Set();for(let i=0;i<source.getAttribute('position').count;i++)heights.add(Math.round(source.getAttribute('position').getY(i)*1e6));
+  if(heights.size>2)return null; // Retain already beveled or custom sculpted assets.
+  let g;
+  if(type==='tableRound'&&Math.abs(w-d)<Math.max(w,d)*.04){
+    const radius=Math.min(w,d)/2,points=[new THREE.Vector2(0,-h/2)];
+    points.push(new THREE.Vector2(radius-r,-h/2));
+    for(let i=0;i<=4;i++){const a=-Math.PI/2+i*Math.PI/8;points.push(new THREE.Vector2(radius-r+r*Math.cos(a),-h/2+r+r*Math.sin(a)));}
+    points.push(new THREE.Vector2(radius,h/2-r));
+    for(let i=1;i<=4;i++){const a=i*Math.PI/8;points.push(new THREE.Vector2(radius-r+r*Math.cos(a),h/2-r+r*Math.sin(a)));}
+    points.push(new THREE.Vector2(0,h/2));g=new THREE.LatheGeometry(points,64);
+  }else if(type==='tableRect'){
+    const positions=[],normals=[],uv=[],half=[w/2,h/2,d/2];
+    for(let axis=0;axis<3;axis++)for(const sign of [-1,1]){
+      const u=(axis+1)%3,v=(axis+2)%3,us=[-half[u],-half[u]+r,0,half[u]-r,half[u]],vs=[-half[v],-half[v]+r,0,half[v]-r,half[v]];
+      const vertex=(i,j)=>{const p=[0,0,0];p[axis]=half[axis]*sign;p[u]=us[i];p[v]=vs[j];const q=p.map((x,k)=>clamp(x,-half[k]+r,half[k]-r)),n=new THREE.Vector3(...p.map((x,k)=>x-q[k])).normalize();return {p:q.map((x,k)=>x+n.getComponent(k)*r),n:n.toArray(),uv:[i/4,j/4]};};
+      for(let i=0;i<4;i++)for(let j=0;j<4;j++){const a=vertex(i,j),b=vertex(i+1,j),c=vertex(i+1,j+1),d=vertex(i,j+1);for(const t of sign>0?[a,b,d,b,c,d]:[a,d,b,b,d,c]){positions.push(...t.p);normals.push(...t.n);uv.push(...t.uv);}}
+    }
+    g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));g.setAttribute('normal',new THREE.Float32BufferAttribute(normals,3));g.setAttribute('uv',new THREE.Float32BufferAttribute(uv,2));
+  }else return null;
+  g.translate(center.x,center.y,center.z);g.computeBoundingBox();g.userData.galleryRoundedFurniture={radius:r,type};return g;
+}
+
 function galleryFrameGeometry(p, depth = 0.03) {
   const width=frameW(p), height=frameH(p), inset=FRAME_W+(p.mat?MAT_W:0), scale=depth/0.03;
   const positions=[],uv=[],regions=[];
@@ -1393,7 +1676,7 @@ function galleryFrameGeometry(p, depth = 0.03) {
   }
   const loop=(offset,z)=>[new THREE.Vector3(-width/2+offset,-height/2+offset,z*scale),new THREE.Vector3(width/2-offset,-height/2+offset,z*scale),new THREE.Vector3(width/2-offset,height/2-offset,z*scale),new THREE.Vector3(-width/2+offset,height/2-offset,z*scale)];
   function bridge(a,b,kind) { for(let i=0;i<4;i++) { const j=(i+1)%4; quad(a[i],a[j],b[j],b[i],kind); } }
-  const profile=[[0,-0.015],[0,0.012],[0.0016,0.015],[FRAME_W-0.0015,0.015],[FRAME_W,0.0108],[FRAME_W,p.mat?0.010:0.009]];
+  const profile=[[0,-0.015],[0,0.012],[.00025,.0132],[.0007,.01425],[.0013,.0149],[.0016,.015],[FRAME_W-.0015,.015],[FRAME_W-.0007,.0142],[FRAME_W,.0108],[FRAME_W,p.mat?.010:.009]];
   for(let i=1;i<profile.length;i++) bridge(loop(...profile[i-1]),loop(...profile[i]),"frame");
   const photoZ=p.mat?0.008:0.009;
   if(p.mat) {
@@ -2842,7 +3125,7 @@ function App() {
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 0.9;
     renderer.shadowMap.autoUpdate = false;
@@ -2871,13 +3154,16 @@ function App() {
     sunLight.castShadow = true;
     sunLight.userData.galleryRole = "sun";
     sunLight.shadow.mapSize.set(2048, 2048);
-    sunLight.shadow.bias = -4e-4;
-    sunLight.shadow.normalBias = 0.02;
+    sunLight.shadow.bias = -0.00008;
+    sunLight.shadow.normalBias = 0.003;
+    sunLight.shadow.radius = 3;
+    const sunShadowParameters={gallerySunDepthSpan:{value:1},gallerySunTexelWorld:{value:.005}};
     sunLight.target = sunTarget;
     scene.add(sunLight, sunTarget);
     const group = new THREE.Group();
     scene.add(group);
     groupRef.current = group;
+    const glazingReflection=createGalleryGlazingReflection(renderer,scene,camera);
     let resizePending = true, renderWidth = 0, renderHeight = 0;
     // ResizeObserver runs after animation callbacks in some browsers. Resizing
     // here clears WebGL's buffer after it was drawn, exposing an empty frame.
@@ -2898,30 +3184,32 @@ function App() {
       reflectionSource.dispose();reflectionGenerator?.dispose();
     }
     function finishTexture(kind, channel) {
-      const size = 128, data = new Uint8Array(size * size * 4);
-      let seed = kind === "wall" ? 173 : 947;
-      for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
-        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-        const grain = (seed / 4294967296 - 0.5) * 2;
-        const wave = Math.sin(x * Math.PI * 2 / size) * Math.sin(y * Math.PI * 4 / size);
-        const value = channel === "color" ? 253 + wave + grain : channel === "rough" ? 239 + grain * 7 + wave * 3 : 128 + grain * (kind === "wall" ? 27 : 13);
-        const i = (y * size + x) * 4, v = Math.round(clamp(value, 0, 255));
-        data[i] = data[i + 1] = data[i + 2] = v; data[i + 3] = 255;
+      const size=128,data=new Uint8Array(size*size*4),seed=kind==='wall'?173:947;
+      const hash=(x,y,n)=>{x=(x%n+n)%n;y=(y%n+n)%n;let v=Math.imul(x+seed,374761393)^Math.imul(y+seed,668265263);v=Math.imul(v^(v>>>13),1274126177);return ((v^(v>>>16))>>>0)/4294967295*2-1;};
+      const noise=(x,y,n)=>{x=x/size*n;y=y/size*n;const ix=Math.floor(x),iy=Math.floor(y),fx=x-ix,fy=y-iy,u=fx*fx*(3-2*fx),v=fy*fy*(3-2*fy);return (hash(ix,iy,n)*(1-u)+hash(ix+1,iy,n)*u)*(1-v)+(hash(ix,iy+1,n)*(1-u)+hash(ix+1,iy+1,n)*u)*v;};
+      for(let y=0;y<size;y++)for(let x=0;x<size;x++){
+        const fine=hash(x,y,size),small=noise(x,y,32),broad=noise(x,y,4);
+        const value=channel==='color'?253.5+broad*.8+small*.3:channel==='rough'?239+broad*(kind==='floor'?8:11)+small*3+fine:128+fine*(kind==='wall'?17:6)+small*(kind==='wall'?10:8);
+        const i=(y*size+x)*4,v=Math.round(clamp(value,0,255));data[i]=data[i+1]=data[i+2]=v;data[i+3]=255;
       }
-      const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
-      texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
-      texture.magFilter = THREE.LinearFilter; texture.minFilter = THREE.LinearMipmapLinearFilter; texture.generateMipmaps = true;
-      if (channel === "color") texture.colorSpace = THREE.SRGBColorSpace;
-      texture.userData = { cached: true, surfaceFinish: kind + ":" + channel };
-      texture.needsUpdate = true; surfaceTextures.push(texture); return texture;
+      const texture=new THREE.DataTexture(data,size,size,THREE.RGBAFormat);
+      texture.wrapS=texture.wrapT=THREE.RepeatWrapping;texture.magFilter=THREE.LinearFilter;texture.minFilter=THREE.LinearMipmapLinearFilter;texture.generateMipmaps=true;
+      if(channel==='color')texture.colorSpace=THREE.SRGBColorSpace;
+      if(channel==='rough')texture.repeat.set(kind==='floor'?.125:.25,kind==='floor'?.125:.25);
+      texture.userData={cached:true,surfaceFinish:kind+':'+channel};texture.needsUpdate=true;surfaceTextures.push(texture);return texture;
     }
     const finishMaps = { wall: { bumpMap: finishTexture("wall", "bump"), roughnessMap: finishTexture("wall", "rough") }, floor: { map: finishTexture("floor", "color"), bumpMap: finishTexture("floor", "bump"), roughnessMap: finishTexture("floor", "rough") } };
-    function finishMaterial(kind, properties) {
-      const mat = new THREE.MeshStandardMaterial({ ...properties, ...finishMaps[kind], roughness:kind==="floor"?.66:properties.roughness, envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*(kind==="floor"?.55:.055), bumpScale: kind === "wall" ? 0.0003 : 0.00015 });
-      mat.userData.surfaceFinish = kind; return mat;
+    const indirectTexture=new THREE.Data3DTexture(new Uint8Array(6*4*6*4),6,4,6);indirectTexture.format=THREE.RGBAFormat;indirectTexture.minFilter=indirectTexture.magFilter=THREE.LinearFilter;indirectTexture.unpackAlignment=1;indirectTexture.userData={cached:true,galleryIndirectField:true};indirectTexture.needsUpdate=true;
+    const indirectUniforms={galleryIndirectField:{value:indirectTexture},galleryFieldMin:{value:new THREE.Vector3()},galleryFieldSize:{value:new THREE.Vector3(1,1,1)},galleryFieldScale:{value:.24}};
+    let indirectSignature='';
+    function updateIndirectField(s,sun){const key=JSON.stringify([s.room,s.env,s.lights,s.windows,s.entrances,s.columns,s.blocks]);if(key===indirectSignature)return;const field=galleryIndirectSources(s.room,s.env,s.lights,s.windows,s.entrances,s.columns,s.blocks,sun),samples=galleryIndirectSamples(s.room,field.sources,field.boxes);indirectTexture.image.data.set(samples.data);indirectTexture.needsUpdate=true;indirectUniforms.galleryFieldMin.value.set(-s.room.w/2,0,-s.room.d/2);indirectUniforms.galleryFieldSize.value.set(s.room.w,samples.boundsHeight,s.room.d);indirectSignature=key;}
+    function finishMaterial(kind, properties, role="wall") {
+      const mat = new THREE.MeshStandardMaterial({ ...properties, ...finishMaps[kind], roughness:kind==="floor"?.66:properties.roughness, envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*(kind==="floor"?.55:.055), bumpScale: kind === "wall" ? 0.00042 : 0.00015 });
+      mat.userData.surfaceFinish = kind;gallerySoftShadowMaterial(mat,sunShadowParameters);
+      if(kind==='wall'){const finish=galleryPaint(stateRef.current.room.theme,role);mat.bumpScale=finish.bumpScale;mat.envMapIntensity=reflectionLevel*finish.reflection;mat.userData.paintRole=role;gallerySpatialMaterial(mat,indirectUniforms);}return mat;
     }
     function finishUV(geometry, kind) {
-      const pos = geometry.getAttribute("position"), normal = geometry.getAttribute("normal"), uv = new Float32Array(pos.count * 2), tile = kind === "wall" ? 0.25 : 0.5;
+      const pos = geometry.getAttribute("position"), normal = geometry.getAttribute("normal"), uv = new Float32Array(pos.count * 2), tile = kind === "wall" ? 0.12 : 0.5;
       for (let i = 0; i < pos.count; i++) {
         const nx = Math.abs(normal.getX(i)), ny = Math.abs(normal.getY(i)), nz = Math.abs(normal.getZ(i));
         uv[i * 2] = (ny > nx && ny > nz ? pos.getX(i) : nx > nz ? pos.getZ(i) : pos.getX(i)) / tile;
@@ -2941,20 +3229,30 @@ function App() {
       texture.userData = { cached: true, contactMask: edge ? "edge" : round ? "round" : "soft" };
       texture.needsUpdate = true; surfaceTextures.push(texture); return texture;
     }
+    const roundedFurnitureCache=new Map(),woodGeometryCache=new Map();
+    function easelFinish(o){if(!o.isMesh)return;const mats=Array.isArray(o.material)?o.material:[o.material];if(mats.some(m=>galleryFurnitureRole("easel",o.name,m)==="woodRail")&&!mats.some(m=>m.map)){const key=o.geometry.uuid;if(!woodGeometryCache.has(key))woodGeometryCache.set(key,galleryWoodGeometry(o.geometry));o.geometry=woodGeometryCache.get(key);}o.material=Array.isArray(o.material)?mats.map(m=>furnitureFinish(m,"easel",o.name)):furnitureFinish(o.material,"easel",o.name);o.castShadow=true;o.receiveShadow=true;}
+    function finishFurnitureGeometry(o,type){
+      const materials=Array.isArray(o.material)?o.material:[o.material];
+      if(!materials.some(m=>galleryFurnitureRole(type,o.name,m)==="woodTop")||materials.some(m=>m.map)||o.geometry.groups.length>1)return;
+      const key=o.geometry.uuid+"|"+type;
+      if(!roundedFurnitureCache.has(key))roundedFurnitureCache.set(key,galleryRoundedTop(o.geometry,type));
+      const geometry=roundedFurnitureCache.get(key);if(geometry)o.geometry=geometry;
+    }
     const contactMaps = { soft: contactTexture(false), edge: contactTexture(true), round: contactTexture(false,true) };
     let exhibitShadowLight = null;
     const furnitureFinishCache=new Map(),furnitureFinishUsed=new Set();
     const woodFinish={};
-    for(const channel of ["bump","rough"]){
+    for(const channel of ["bump","rough","color"]){
       const size=64,data=new Uint8Array(size*size*4);
       for(let y=0;y<size;y++)for(let x=0;x<size;x++){
-        const grain=Math.sin((x/size*9+Math.sin(y/size*Math.PI*2)*.22)*Math.PI*2),value=Math.round(channel==="bump"?128+grain*9:239+grain*5),i=(y*size+x)*4;
+        const grain=Math.sin((x/size*9+Math.sin(y/size*Math.PI*2)*.22)*Math.PI*2),value=Math.round(channel==="bump"?128+grain*9:channel==="rough"?239+grain*5:252+grain*2),i=(y*size+x)*4;
         data[i]=data[i+1]=data[i+2]=value;data[i+3]=255;
       }
       const texture=new THREE.DataTexture(data,size,size,THREE.RGBAFormat);
       texture.wrapS=texture.wrapT=THREE.RepeatWrapping;texture.minFilter=THREE.LinearMipmapLinearFilter;texture.magFilter=THREE.LinearFilter;texture.generateMipmaps=true;
+      if(channel==="color")texture.colorSpace=THREE.SRGBColorSpace;
       texture.userData={cached:true,furnitureFinish:channel};texture.needsUpdate=true;surfaceTextures.push(texture);
-      woodFinish[channel==="bump"?"bumpMap":"roughnessMap"]=texture;
+      woodFinish[channel==="bump"?"bumpMap":channel==="rough"?"roughnessMap":"map"]=texture;
     }
     function furnitureFinish(material,type,name){
       const role=galleryFurnitureRole(type,name,material);if(!role)return material;
@@ -2962,11 +3260,12 @@ function App() {
       let mat=furnitureFinishCache.get(key);
       if(!mat){
         mat=material.clone();mat.userData={...mat.userData,galleryFurnitureFinish:role};
-        mat.roughness=role==="woodTop"?.5:role==="woodEdge"?.66:.4;
-        if(role!=="metal"){Object.assign(mat,woodFinish);mat.bumpScale=.00012;}
+        mat.roughness=role==="woodTop"?.5:role==="woodEdge"?.66:role==="woodRail"?.48:type==="easel"?.28:.4;
+        if(role!=="metal"&&!mat.map){Object.assign(mat,woodFinish);mat.bumpScale=role==="woodRail"?.00016:.00012;}
+        gallerySoftShadowMaterial(mat,sunShadowParameters);
         mat.envMap=reflectionTarget?.texture||null;furnitureFinishCache.set(key,mat);
       }
-      mat.envMapIntensity=reflectionLevel*(role==="woodTop"?.8:role==="woodEdge"?.45:.6);
+      mat.envMapIntensity=reflectionLevel*(role==="woodTop"?.8:role==="woodEdge"?.45:role==="woodRail"?.55:.9);
       return mat;
     }
     const frameFinishCache = new Map(), frameFinishUsed = new Set();
@@ -3037,10 +3336,13 @@ function App() {
       return [s.room, s.columns, s.windows, s.entrances, s.placements, s.selected, s.view, s.eyeHeight, s.mode, s.viewArt, s.personSel, s.alignH, s.alignMode, s.showLine, s.tab, s.rooms, s.lights, s.env, s.lookClean, s.blocks, s.furniture, s.modelVer, s.photoVer, s.replacement, s.artworkSwap, s.batchFocus, s.artMoveId, s.objectMoveKey, s.arrange, s.placeMode?.kind, s.placeMode?.arg?.ceil, s.plan, dragInfoRef.current, ...s.view === "orbit" ? [wr.pos.x, wr.pos.z, wr.yaw] : [0, 0, 0]];
     };
     const disposeGroup = () => {
+      glazingReflection.reset();
       group.traverse((o) => {
         if (o.userData && o.userData.keepRes) return;
-        o.geometry?.dispose();
+        if(!o.geometry?.userData.galleryRoundedFurniture&&!o.geometry?.userData.galleryWoodGrain)o.geometry?.dispose();
         if(o !== exhibitShadowLight) o.shadow?.dispose();
+        o.customDepthMaterial?.dispose();
+        o.userData?.glazingSkyMap?.dispose();
         (Array.isArray(o.material) ? o.material : o.material ? [o.material] : []).forEach((m) => {
           if(m.userData.galleryFurnitureFinish)return;
           if (m.map && !m.map.userData?.cached) m.map.dispose();
@@ -3140,11 +3442,13 @@ function App() {
       furnitureFinishUsed.clear();
       const s = stateRef.current;
       const { w, d, h, theme } = s.room;
-      const wallC = theme === "white" ? 16119282 : 0x20211f;
+      const wallC = galleryPaint(theme).color;
       const floorC = theme === "white" ? 15263457 : 2763306;
       const sol2 = solar(roomSolarEnv(s.room, s.env));
-      const sunOn = s.env.sun && sol2.sunUp;
-      const fill = galleryLightingResponse(s.room, s.env, s.lights, sol2.day);
+      updateIndirectField(s,sol2);
+      const naturalAccess=galleryDaylightAccess(s.room,s.windows,s.entrances);
+      const sunOn = s.env.sun && sol2.sunUp && (s.windows.length>0||s.entrances.some(e=>entranceDaylight(e)==='outdoor'));
+      const fill = galleryLightingResponse(s.room, s.env, s.lights, sol2.day, naturalAccess);
       reflectionLevel=galleryReflectionStrength(fill)*(theme==="black"?.65:1);
       let red = 0, green = 0, blue = 0, power = 0;
       if (s.env.lightsOn) s.lights.forEach((light) => {
@@ -3156,13 +3460,15 @@ function App() {
       const reflectedLamp = new THREE.Color(1, 1, 1);
       if (power > 0) reflectedLamp.setRGB(red / power, green / power, blue / power);
       const floorAlbedo = new THREE.Color(floorC);
+      const sunReturn=gallerySunReturn(s.room,s.env,s.windows,s.entrances,s.columns,sol2);
       // A mostly neutral floor return opens dark midtones without recoloring
       // photo textures or changing the user's lamp power, aim, or beam angle.
       hemi.intensity = fill.hemisphere;
       hemi.groundColor.set(5592405).lerp(floorAlbedo, 0.12 * fill.reflectance).lerp(reflectedLamp, 0.025 * fill.energy * fill.reflectance);
-      bounce.intensity = fill.bounce;
+      bounce.intensity = fill.bounce+sunReturn;
+      bounce.userData.sunReturn=sunReturn;
       bounce.position.set(theme==="black"?.35:0,-1,theme==="black"?.25:0);
-      bounce.color.set(16777215).lerp(floorAlbedo, 0.1).lerp(reflectedLamp, 0.06 * fill.energy * fill.reflectance);
+      bounce.color.set(16777215).lerp(floorAlbedo, 0.1).lerp(reflectedLamp, 0.06 * fill.energy * fill.reflectance).lerp(kelvinToColor(sol2.kelvin),sunReturn*.18);
       {
         const R = Math.hypot(w, d, h) / 2 + 1.5;
         sunTarget.position.set(0, h / 2, 0);
@@ -3170,14 +3476,9 @@ function App() {
         sunLight.position.set(sol2.dir.x * (R + 12), h / 2 + sol2.dir.y * (R + 12), sol2.dir.z * (R + 12));
         sunLight.intensity = sunOn ? 3.8 * sol2.atm : 0;
         sunLight.color.copy(kelvinToColor(sol2.kelvin));
-        const sc = sunLight.shadow.camera;
-        sc.left = -R;
-        sc.right = R;
-        sc.top = R;
-        sc.bottom = -R;
-        sc.near = 0.5;
-        sc.far = R * 2 + 14;
-        sc.updateProjectionMatrix();
+        fitGallerySunShadow(sunLight, sunTarget, s.room, s.windows);
+        sunShadowParameters.gallerySunDepthSpan.value=sunLight.shadow.camera.far-sunLight.shadow.camera.near;
+        sunShadowParameters.gallerySunTexelWorld.value=(sunLight.shadow.camera.right-sunLight.shadow.camera.left)/sunLight.shadow.mapSize.x;
         renderer.shadowMap.needsUpdate = true;
       }
       const pk = s.mode === "edit" ? s.placeMode?.kind : null;
@@ -3188,13 +3489,14 @@ function App() {
         if (active) { mat.color.lerp(new THREE.Color("#63d6bd"), 0.32); mat.emissive.set("#247665"); mat.emissiveIntensity = 0.2; mat.userData.placementHint = surface; }
         return mat;
       };
-      const contactBatches = { floor: { positions: [], uv: [], opacity: 0.13, map: contactMaps.soft }, round: { positions: [], uv: [], opacity: 0.11, map: contactMaps.round }, edge: { positions: [], uv: [], opacity: 0.075, map: contactMaps.edge }, artwork: { positions: [], uv: [], colors:[], opacity: 0.12, map: null } };
+      const contactBatches = { floor: { positions: [], uv: [], colors:[], opacity: 0.13, map: contactMaps.soft }, round: { positions: [], uv: [], colors:[], opacity: 0.11, map: contactMaps.round }, edge: { positions: [], uv: [], opacity: 0.055, map: contactMaps.edge }, artwork: { positions: [], uv: [], colors:[], opacity: 0.12, map: null } };
       function contactQuad(batch, a, b, c, d, u0, v0, u1, v1, flip = false) {
         (flip ? [a,d,b,b,d,c] : [a,b,d,b,c,d]).forEach((v) => batch.positions.push(v.x, v.y, v.z));
         if (flip) batch.uv.push(u0,v0, u0,v1, u1,v0, u1,v0, u0,v1, u1,v1);
         else batch.uv.push(u0,v0, u1,v0, u0,v1, u1,v0, u1,v1, u0,v1);
       }
-      function groundContact(x, z, width, depth, rotation, footY, batch = contactBatches.floor) {
+      function groundContact(x, z, width, depth, rotation, footY, batch = contactBatches.floor,strength=1) {
+        const vertexStart=batch.positions.length/3;
         const ca = Math.cos(rotation), sa = Math.sin(rotation), inside = (px, pz) => px >= -w / 2 - 0.00001 && px <= w / 2 + 0.00001 && pz >= -d / 2 - 0.00001 && pz <= d / 2 + 0.00001;
         const point = (u, v) => { const lx = (u - 0.5) * width, lz = (v - 0.5) * depth; return new THREE.Vector3(Math.fround(x + ca * lx + sa * lz), Math.fround(footY + 0.002), Math.fround(z - sa * lx + ca * lz)); };
         function cell(u0, v0, u1, v1, level) {
@@ -3207,9 +3509,10 @@ function App() {
         }
         const nx = Math.min(16, Math.max(1, Math.ceil(width / 0.25))), nz = Math.min(16, Math.max(1, Math.ceil(depth / 0.25)));
         for (let i=0;i<nx;i++) for (let j=0;j<nz;j++) cell(i/nx,j/nz,(i+1)/nx,(j+1)/nz,2);
+        if(batch.colors)for(let i=vertexStart;i<batch.positions.length/3;i++)batch.colors.push(0,0,0,strength);
       }
       function artContact(g, p, width, height) {
-        const pad = 0.055, bottom = g.position.y - height / 2 - pad - 0.008, top = g.position.y + height / 2 + pad;
+        const pad = 0.045, bottom = g.position.y - height / 2 - pad - 0.008, top = g.position.y + height / 2 + pad;
         let off = 0.04;
         if (p.col) {
           const host = mountOf(s.columns,s.blocks,p.col);
@@ -3227,7 +3530,7 @@ function App() {
         }
         g.updateMatrixWorld(true);
         // Nested rings give a narrow contact shadow plus a broad, faint outer falloff.
-        const profile=[[-.006,0,1],[.004,-.002,1],[.016,-.004,.5],[pad,-.008,0]],batch=contactBatches.artwork;
+        const profile=[[-.006,0,1],[.003,-.0015,1],[.014,-.0035,.35],[pad,-.007,0]],batch=contactBatches.artwork;
         const ring=([margin,dy])=>[[-1,-1],[1,-1],[1,1],[-1,1]].map(([x,y])=>new THREE.Vector3(x*(width/2+margin),y*(height/2+margin)+dy,-off+.0015).applyMatrix4(g.matrixWorld));
         for(let k=1;k<profile.length;k++){
           const inner=ring(profile[k-1]),outer=ring(profile[k]);
@@ -3243,7 +3546,7 @@ function App() {
       floor.position.y = -0.04;
       floor.receiveShadow = true;
       group.add(floor);
-      const ceilMat = hintMaterial(new THREE.MeshStandardMaterial({ color: theme === "white" ? 16448247 : 0x282927,roughness:.95 }), ceilingHint, "ceiling");
+      const ceilMat = hintMaterial(finishMaterial("wall",{color:galleryPaint(theme,"ceiling").color,roughness:galleryPaint(theme,"ceiling").roughness},"ceiling"), ceilingHint, "ceiling");
       if (s.room.stair) {
         const st = s.room.stair, n1 = stairN1(st), n2 = st.steps - n1, zS = d / 2 - st.land, R = st.riser, T = st.tread, tot = st.steps * R;
         const sm2 = hintMaterial(finishMaterial("floor", { color: floorC, roughness: 0.85, vertexColors:true }), floorHint, "floor");
@@ -3291,11 +3594,12 @@ function App() {
           strip(-w / 2, 0, [[zM, n1 * R + st.clear], [zM + n2 * T, tot + st.clear], [d / 2, tot + st.clear]]);
         }
       } else {
-        const ceil = new THREE.Mesh(new THREE.PlaneGeometry(w, d), ceilMat);
+        const ceil = new THREE.Mesh(finishUV(new THREE.PlaneGeometry(w, d),"wall"), ceilMat);
         ceil.userData.roomCeiling=true;
         ceil.rotation.x = Math.PI / 2;
         ceil.position.y = h;
         ceil.castShadow = true;
+        ceil.receiveShadow = true;
         group.add(ceil);
       }
       const grid = new THREE.GridHelper(Math.max(w, d), Math.max(w, d), theme === "white" ? 12170925 : 5592400, theme === "white" ? 13947337 : 3881784);
@@ -3399,15 +3703,16 @@ function App() {
         joint.position.set(l.x, jy, l.z);
         fx.add(joint);
         const body = new THREE.Group();
-        body.position.set(l.x, jy, l.z).addScaledVector(dv, 0.05);
+        body.position.set(l.x, jy, l.z).addScaledVector(dv, 0.082);
         body.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), dv);
-        body.add(new THREE.Mesh(new THREE.CylinderGeometry(0.042, 0.042, 0.15, 24), fm));
-        const ring = new THREE.Mesh(new THREE.CylinderGeometry(0.046, 0.046, 0.02, 24), fm);
-        ring.position.y = -0.075;
-        body.add(ring);
+        body.add(new THREE.Mesh(new THREE.CylinderGeometry(0.042, 0.042, 0.15, 32,1,true), fm));
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(.039,.003,8,32),fm);ring.rotation.x=Math.PI/2;ring.position.y=-.075;ring.userData.fixtureDetail='bezel';body.add(ring);
+        const baffle=new THREE.Mesh(new THREE.CylinderGeometry(.037,.034,.026,32,1,true),new THREE.MeshStandardMaterial({color:0x171816,roughness:.96,side:THREE.DoubleSide}));baffle.position.y=-.060;baffle.userData.fixtureDetail='baffle';body.add(baffle);
+        const cap=new THREE.Mesh(new THREE.CircleGeometry(.042,32),fm);cap.rotation.x=-Math.PI/2;cap.position.y=.075;cap.userData.fixtureDetail='cap';body.add(cap);
         const lens = new THREE.Mesh(new THREE.CircleGeometry(0.028, 20), new THREE.MeshStandardMaterial({ color: 2236962, emissive: col, emissiveIntensity: s.env.lightsOn ? isSel ? 1.6 : 1.1 : 0 }));
         lens.rotation.x = Math.PI / 2;
-        lens.position.y = -0.0855;
+        lens.position.y = -0.058;
+        lens.userData.fixtureDetail="lens";
         body.add(lens);
         fx.add(body);
         group.add(fx);
@@ -3427,9 +3732,9 @@ function App() {
               exhibitShadowLight.shadow.camera.near=.08;
             }
             spot=exhibitShadowLight;
-            spot.color.copy(col);spot.intensity=l.intensity;spot.distance=Math.max(12,h*2.5);spot.angle=l.angle*Math.PI/180;spot.penumbra=.8;spot.decay=1.4;
+            spot.color.copy(col);spot.intensity=l.intensity;spot.distance=Math.max(12,h*2.5);spot.angle=l.angle*Math.PI/180;spot.penumbra=.9;spot.decay=1.4;
             spot.castShadow=true;spot.shadow.needsUpdate=true;
-          }else spot=new THREE.SpotLight(col,l.intensity,Math.max(12,h*2.5),l.angle*Math.PI/180,.8,1.4);
+          }else spot=new THREE.SpotLight(col,l.intensity,Math.max(12,h*2.5),l.angle*Math.PI/180,.9,1.4);
           spot.userData = { galleryRole: "exhibit", fixtureId: l.id, localShadow:casts };
           spot.position.copy(lensPos);
           spot.target.position.set(tx, fl, tz);
@@ -3463,13 +3768,13 @@ function App() {
       const sel = s.selected;
       s.columns.forEach((c) => {
         const isSel = sel?.kind === "column" && sel.id === c.id;
-        const mat2 = finishMaterial("wall", { color: theme === "white" ? 15329248 : 3421236, roughness: 0.8, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.55 : 0 });
+        const mat2 = finishMaterial("wall", { color: wallC, roughness: .9, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.55 : 0 });
         hintMaterial(mat2, pk === "entrance", "column");
         const m = new THREE.Group();
         m.position.set(c.x, h / 2, c.z);
         m.userData = { kind: "column", id: c.id };
         columnSolids(c, s.room, s.entrances, s.blocks).forEach((b) => {
-          const part = new THREE.Mesh(finishUV(new THREE.BoxGeometry(b.w, b.h, b.d), "wall"), mat2);
+          const part = new THREE.Mesh(finishUV(galleryColumnGeometry(c,b), "wall"), mat2);
           part.position.set(b.x - c.x, b.y - h / 2, b.z - c.z);
           part.castShadow = true;
           part.receiveShadow = true;
@@ -3499,11 +3804,11 @@ function App() {
         m.userData = { kind: "column", id: b.col, autoFill: true };
         group.add(m);
       });
-      const architectureBatches = { reveal: [], threshold: [] };
+      const architectureBatches = { reveal: [], threshold: [], frameJoint: [] };
       const skirting = gallerySkirtingSegments(s.room,s.columns,s.entrances,s.windows,s.blocks);
       if(skirting.length){
-        const geometry=galleryMergeGeometry(skirting.map(v=>({...v,geometry:galleryStepGeometry(v.w,v.h,v.d,.0015)})));
-        const mesh=new THREE.Mesh(finishUV(geometry,"wall"),finishMaterial("wall",{color:theme==="white"?0xdedbd4:0x292a29,roughness:.78,vertexColors:true}));
+        const geometry=galleryMergeGeometry(skirting.map(v=>({...v,geometry:gallerySkirtingGeometry(v.w,v.h,v.d)})));
+        const mesh=new THREE.Mesh(finishUV(geometry,"wall"),finishMaterial("wall",{color:galleryPaint(theme,"skirting").color,roughness:galleryPaint(theme,"skirting").roughness,vertexColors:true},"skirting"));
         mesh.userData={architecturalDetail:"skirting"};mesh.raycast=()=>{};mesh.receiveShadow=true;group.add(mesh);
       }
       s.blocks.forEach((b) => {
@@ -3547,15 +3852,15 @@ function App() {
         const sy = supportY(s.blocks, f.x, f.z);
         g.position.set(f.x, sy, f.z);
         g.rotation.y = f.rot * Math.PI / 180;
-        g.traverse(o=>{if(o.isMesh){o.castShadow=true;o.receiveShadow=true;o.material=Array.isArray(o.material)?o.material.map(m=>furnitureFinish(m,f.type,o.name)):furnitureFinish(o.material,f.type,o.name);}});
+        g.traverse(o=>{if(o.isMesh){finishFurnitureGeometry(o,f.type);o.castShadow=true;o.receiveShadow=true;o.material=Array.isArray(o.material)?o.material.map(m=>furnitureFinish(m,f.type,o.name)):furnitureFinish(o.material,f.type,o.name);}});
         const ca=Math.cos(g.rotation.y),sa=Math.sin(g.rotation.y);
-        const foot=(x,z,width,depth=width)=>groundContact(f.x+ca*x+sa*z,f.z-sa*x+ca*z,width,depth,g.rotation.y,sy,contactBatches.round);
+        const foot=(x,z,width,depth=width)=>groundContact(f.x+ca*x+sa*z,f.z-sa*x+ca*z,width,depth,g.rotation.y,sy,contactBatches.round,1.25);
         if(f.type==="tableRound"){
           // Circular canopy occlusion plus the smaller pedestal contact; no square decal.
-          groundContact(f.x,f.z,dm.w+.18,dm.d+.18,0,sy,contactBatches.round);
+          groundContact(f.x,f.z,dm.w+.18,dm.d+.18,0,sy,contactBatches.round,.45);
           foot(0,0,.66);
         }else{
-          groundContact(f.x,f.z,dm.w+.12,dm.d+.12,g.rotation.y,sy);
+          groundContact(f.x,f.z,dm.w+.12,dm.d+.12,g.rotation.y,sy,contactBatches.floor,.5);
           const feet=f.type==="tableRect"?[[-.65,-.285],[-.65,.285],[.65,-.285],[.65,.285]]:[[-.215,-.245],[-.215,.235],[.215,-.245],[.215,.235]];
           for(const [x,z] of feet)foot(x,z,.15);
         }
@@ -3567,25 +3872,36 @@ function App() {
         }
         group.add(g);
       });
+      const junction=new THREE.Mesh(galleryRoomJunctions(s.room,s.windows,s.entrances,s.columns,s.blocks),new THREE.MeshBasicMaterial({vertexColors:true,transparent:true,opacity:1,depthWrite:false,side:THREE.FrontSide,polygonOffset:true,polygonOffsetFactor:-1,polygonOffsetUnits:-1,toneMapped:false}));
+      junction.userData.architecturalJunction=true;junction.raycast=()=>{};group.add(junction);
       const frameMat = new THREE.MeshStandardMaterial({ color: theme === "white" ? 14342353 : 1118481, roughness: 0.55 });
-      const glassC = new THREE.Color(1384492).lerp(new THREE.Color(14283007), sol2.day);
+      const glassC = new THREE.Color(0x101823).lerp(new THREE.Color(0xe4e6df), s.env.sun?sol2.day:0);
+      const skyData=new Uint8Array(4*32*4);
+      for(let y=0;y<32;y++)for(let x=0;x<4;x++){const t=y/31,i=(y*4+x)*4;skyData[i]=Math.round(235-45*t);skyData[i+1]=Math.round(233-32*t);skyData[i+2]=Math.round(225-14*t);skyData[i+3]=255;}
+      const skyMap=new THREE.DataTexture(skyData,4,32,THREE.RGBAFormat);skyMap.colorSpace=THREE.SRGBColorSpace;skyMap.magFilter=THREE.LinearFilter;skyMap.needsUpdate=true;skyMap.userData.cached=true;
+      // Owned once per build, even though multiple glazing materials share it.
+      const skyOwner=new THREE.Object3D();skyOwner.userData.glazingSkyMap=skyMap;group.add(skyOwner);
       s.windows.forEach((win) => {
         const isSel = sel?.kind === "window" && sel.id === win.id;
         const g = new THREE.Group();
-        const fw = new THREE.Mesh(new THREE.BoxGeometry(win.w + 0.12, win.h + 0.12, 0.08), new THREE.MeshStandardMaterial({ color: isSel ? 9429190 : frameMat.color, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.5 : 0, roughness: 0.55 }));
-        fw.userData = { kind: "window", id: win.id };
-        const glass = new THREE.Mesh(new THREE.PlaneGeometry(win.w, win.h), new THREE.MeshBasicMaterial({ color: isSel ? 16773312 : glassC }));
-        glass.position.z = 0.05;
-        glass.userData = { kind: "window", id: win.id };
-        const bar = new THREE.Mesh(new THREE.BoxGeometry(0.04, win.h, 0.02), frameMat);
-        bar.position.z = 0.06;
-        bar.userData = { kind: "window", id: win.id };
-        const bar2 = new THREE.Mesh(new THREE.BoxGeometry(win.w, 0.04, 0.02), frameMat);
-        bar2.position.z = 0.06;
-        bar2.userData = { kind: "window", id: win.id };
-        bar.castShadow = true;
-        bar2.castShadow = true;
-        g.add(fw, glass, bar, bar2);
+        const recess=windowRecess(win), daylight=windowSunState(win,s.room,s.env,sol2);
+        g.userData={kind:'window',id:win.id,windowRecess:recess,windowBearing:daylight.bearing,directSun:daylight.direct};
+        const trimMaterial=new THREE.MeshStandardMaterial({color:isSel?9429190:frameMat.color,emissive:isSel?SEL_C:0,emissiveIntensity:isSel?.5:0,roughness:.65});
+        const revealMaterial=finishMaterial('wall',{color:wallC,roughness:.9});
+        const box=(width,height,depth,x,y,z,material,part)=>{const m=new THREE.Mesh(finishUV(new THREE.BoxGeometry(width,height,Math.max(.001,depth)),'wall'),material);m.position.set(x,y,z);m.userData={kind:'window',id:win.id,windowPart:part};m.castShadow=true;m.receiveShadow=true;g.add(m);return m;};
+        // Local +Z faces the room; all recess depth extends toward local -Z.
+        if(recess>0){
+          box(.025,win.h,recess,-win.w/2-.0125,0,-recess/2,revealMaterial,'reveal');box(.025,win.h,recess,win.w/2+.0125,0,-recess/2,revealMaterial,'reveal');
+          box(win.w+.05,.025,recess,0,-win.h/2-.0125,-recess/2,revealMaterial,'reveal');box(win.w+.05,.025,recess,0,win.h/2+.0125,-recess/2,revealMaterial,'reveal');
+        }
+        for(const z of [.002,-recess]){
+          const front=z===.002,t=front?.055:.035,depth=front?.018:.025,part=front?'trim':'backFrame';
+          box(t,win.h+2*t,depth,-win.w/2-t/2,0,z,trimMaterial,part);box(t,win.h+2*t,depth,win.w/2+t/2,0,z,trimMaterial,part);
+          box(win.w,t,depth,0,-win.h/2-t/2,z,trimMaterial,part);box(win.w,t,depth,0,win.h/2+t/2,z,trimMaterial,part);
+        }
+        const glass=new THREE.Mesh(new THREE.PlaneGeometry(win.w,win.h),new THREE.MeshBasicMaterial({color:isSel?16773312:glassC.clone().lerp(kelvinToColor(sol2.kelvin),daylight.direct?.12*daylight.facing:0),map:skyMap,side:THREE.DoubleSide}));glass.position.z=-recess;glass.userData={kind:'window',id:win.id,windowPart:'glass'};g.add(glass);
+        const reflection=new THREE.Mesh(new THREE.PlaneGeometry(win.w,win.h),galleryGlazingMaterial({color:0xffffff,roughness:.16,metalness:.05,opacity:.045,envMap:reflectionTarget?.texture||null,envMapIntensity:reflectionLevel*2}));reflection.position.z=-recess+.002;reflection.userData={kind:'window',id:win.id,windowPart:'reflection'};g.add(reflection);glazingReflection.register(reflection);
+        box(.035,win.h,.018,0,0,-recess+.01,frameMat,'mullion');box(win.w,.035,.018,0,0,-recess+.01,frameMat,'mullion');
         if (isSel) {
           addWire(g, win.w + 0.18, win.h + 0.18, 0.14);
           addHandle(g, win.w / 2 + 0.16, 0, 0.12, "window", win.id, "width");
@@ -3593,18 +3909,18 @@ function App() {
         }
         const y = win.sill + win.h / 2;
         if (win.wall === "北") {
-          g.position.set(win.pos, y, -d / 2 + 0.02);
+          g.position.set(win.pos, y, -d / 2);
         }
         if (win.wall === "南") {
-          g.position.set(win.pos, y, d / 2 - 0.02);
+          g.position.set(win.pos, y, d / 2);
           g.rotation.y = Math.PI;
         }
         if (win.wall === "東") {
-          g.position.set(w / 2 - 0.02, y, win.pos);
+          g.position.set(w / 2, y, win.pos);
           g.rotation.y = -Math.PI / 2;
         }
         if (win.wall === "西") {
-          g.position.set(-w / 2 + 0.02, y, win.pos);
+          g.position.set(-w / 2, y, win.pos);
           g.rotation.y = Math.PI / 2;
         }
         group.add(g);
@@ -3614,19 +3930,40 @@ function App() {
           addRing(rx, rz);
         }
       });
+      function sunOnlyGate(parent,e,width,height){
+        const m=new THREE.Mesh(new THREE.PlaneGeometry(width+.008,height+.008),new THREE.MeshBasicMaterial({colorWrite:false,depthWrite:false,side:THREE.DoubleSide}));
+        m.castShadow=true;m.raycast=()=>{};m.userData={entranceSunGate:e.id};
+        m.customDepthMaterial=new THREE.MeshDepthMaterial({depthPacking:THREE.RGBADepthPacking,side:THREE.DoubleSide});
+        m.onBeforeShadow=(_renderer,_object,_camera,shadowCamera,_geometry,depth)=>{const block=shadowCamera===sunLight.shadow.camera;depth.colorWrite=block;depth.depthWrite=block;};
+        m.onAfterShadow=(_renderer,_object,_camera,_shadowCamera,_geometry,depth)=>{depth.colorWrite=true;depth.depthWrite=true;};
+        m.position.z=-.008;parent.add(m);
+      }
+      function entranceGlazing(parent,e,isSel){
+        const layout=entranceGlassLayout(e);if(!layout.glass)return;
+        const color=isSel?9429190:({white:0xecebe6,black:0x252627,metal:0x9a9b98}[e.frameTone]||0x9a9b98);
+        const frame=new THREE.MeshStandardMaterial({color,roughness:(e.frameTone==='metal'||!e.frameTone)?.35:.6,metalness:(e.frameTone==='metal'||!e.frameTone)?.65:.05});
+        const pane=galleryGlazingMaterial({color:0xe4eceb,roughness:.12,metalness:.05,opacity:.055,envMap:reflectionTarget?.texture||null,envMapIntensity:reflectionLevel*2});
+        const bar=(bw,bh,x,y,z=.045)=>{const m=new THREE.Mesh(galleryChamferBox(Math.max(.006,bw),Math.max(.006,bh),.035,.001),frame);m.position.set(x,y,z);m.castShadow=true;m.receiveShadow=true;m.userData={kind:'entrance',id:e.id,entrancePart:'frame'};parent.add(m);};
+        const panel=(width,x,part)=>{if(width<=.01)return;const m=new THREE.Mesh(new THREE.PlaneGeometry(Math.max(.01,width-.036),Math.max(.01,e.h-.07)),pane);m.position.set(x,0,.045);m.userData={kind:'entrance',id:e.id,entrancePart:part};parent.add(m);glazingReflection.register(m);bar(.03,e.h,x-width/2,0);bar(.03,e.h,x+width/2,0);bar(width,.035,x,e.h/2-.0175);bar(width,.035,x,-e.h/2+.0175);};
+        if(layout.side>0){panel(layout.side,-e.w/2+layout.side/2,'sidelight');panel(layout.side,e.w/2-layout.side/2,'sidelight');}
+        for(let i=0;i<layout.leaves;i++){const width=layout.doorWidth/layout.leaves,x=-layout.doorWidth/2+width*(i+.5);panel(width,x,'glassDoor');const handleX=layout.leaves===2?(i===0?-1:1)*Math.min(.07,width*.25):x+width/2-Math.min(.07,width*.25);bar(.018,Math.min(.28,e.h*.25),handleX,Math.min(0,.95-e.h/2),.09);}
+        parent.userData.doorWidth=layout.doorWidth;
+      }
       s.entrances.forEach((e) => {
         const isSel = sel?.kind === "entrance" && sel.id === e.id;
         const g = new THREE.Group();
         const internal = !!e.col;
-        const transfer = isTransferEntrance(e);
+        const transfer = isTransferEntrance(e), daylightMode=entranceDaylight(e);
+        g.userData={kind:'entrance',id:e.id,daylightMode,entranceStyle:entranceStyle(e)};
         const rec = internal && transfer ? portalAutoFill(s.room, s.columns, s.entrances, s.blocks).portals.find((p) => p.e.id === e.id) : null;
         const dark = new THREE.Mesh(new THREE.PlaneGeometry(e.w, e.h), new THREE.MeshBasicMaterial({ color: isSel ? 1923656 : 460551, transparent: internal && !transfer, opacity: internal && !transfer ? 0 : 1, depthWrite: !internal || transfer, side: THREE.DoubleSide }));
         dark.userData = { kind: "entrance", id: e.id };
-        const fm = new THREE.MeshStandardMaterial({ color: isSel ? 9429190 : frameMat.color, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.5 : 0 });
+        const entryFrameColor=entranceStyle(e)==='open'?frameMat.color:({white:0xecebe6,black:0x252627,metal:0x9a9b98}[e.frameTone]||0x9a9b98);
+        const fm = new THREE.MeshStandardMaterial({ color: isSel ? 9429190 : entryFrameColor, roughness:e.frameTone==='metal'?.35:.6, metalness:e.frameTone==='metal'?.65:.05, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.5 : 0 });
         if (internal) {
           const t = 0.025;
           for (const [bw, bh, x, y] of [[t, e.h, -e.w / 2 - t / 2, 0], [t, e.h, e.w / 2 + t / 2, 0], [e.w + 2 * t, t, 0, e.h / 2 + t / 2]]) {
-            const bar = new THREE.Mesh(new THREE.BoxGeometry(bw, bh, 0.035), fm);
+            const bar = new THREE.Mesh(galleryChamferBox(bw, bh, 0.035,.001), fm);
             bar.position.set(x, y, 0.015);
             bar.userData = { kind: "entrance", id: e.id };
             g.add(bar);
@@ -3634,18 +3971,30 @@ function App() {
         } else {
           // Three-sided casing leaves the opening clear, down to the actual floor.
           const fr = new THREE.Mesh(galleryMergeGeometry([
-            {geometry:new THREE.BoxGeometry(.07,e.h,.025),x:-e.w/2-.035,z:-.0105},
-            {geometry:new THREE.BoxGeometry(.07,e.h,.025),x:e.w/2+.035,z:-.0105},
-            {geometry:new THREE.BoxGeometry(e.w+.14,.04,.025),y:e.h/2+.02,z:-.0105}
+            {geometry:galleryChamferBox(.07,e.h,.025),x:-e.w/2-.035,z:-.0105},
+            {geometry:galleryChamferBox(.07,e.h,.025),x:e.w/2+.035,z:-.0105},
+            {geometry:galleryChamferBox(e.w+.14,.04,.025),y:e.h/2+.02,z:-.0105}
           ]),fm);
           fr.userData = { kind: "entrance", id: e.id };
+          fr.castShadow=true;fr.receiveShadow=true;
           g.add(fr);
         }
+        if(daylightMode==='outdoor'){dark.material.color.copy(glassC);dark.material.map=skyMap;}
+        else if(daylightMode==='adjacent'){dark.material.color.set(0x8c8a80).multiplyScalar(.3+(s.env.sun?sol2.day:0)*.5*entranceAdjacentStrength(e));}
+        dark.userData.entrancePart='backing';
         g.add(dark);
+        if(daylightMode!=='outdoor')sunOnlyGate(g,e,e.w,e.h);
+        entranceGlazing(g,e,isSel);
         dark.position.z = internal ? (rec ? -rec.depth - 0.025 + PORTAL_FACE_GAP : 0.04) : -.112;
         const normal = entranceNormal(e, s.columns);
         g.rotation.y = Math.atan2(normal.x, normal.z);
         g.position.copy(entrancePoint(s.room, e, s.columns, s.blocks, e.h / 2, 0.025));
+        if(daylightMode==='adjacent'&&s.env.sun&&sol2.day>.001){
+          const soft=new THREE.SpotLight(0xfff2dc,5*entranceAdjacentStrength(e)*sol2.day,3.8,Math.PI*.37,1,2);
+          soft.position.copy(entrancePoint(s.room,e,s.columns,s.blocks,Math.min(e.h*.65,1.5),.12));
+          const target=new THREE.Object3D();target.position.copy(entrancePoint(s.room,e,s.columns,s.blocks,.25,1.25));soft.target=target;
+          soft.castShadow=true;soft.shadow.mapSize.set(512,512);soft.shadow.bias=-.0001;soft.shadow.normalBias=.006;soft.shadow.camera.near=.04;soft.userData={adjacentEntranceLight:e.id};target.userData.adjacentEntranceTarget=e.id;group.add(soft,target);
+        }
         if(!internal){
           const x=e.w/2,y=e.h/2,front=-.023,back=-.115;
           const geometry=(quads)=>{
@@ -3653,6 +4002,7 @@ function App() {
             const geo=new THREE.BufferGeometry();geo.setAttribute("position",new THREE.Float32BufferAttribute(points,3));return geo;
           };
           const at={x:g.position.x,y:g.position.y,z:g.position.z,rotation:g.rotation.y};
+          architectureBatches.frameJoint.push({...at,geometry:galleryMergeGeometry([{geometry:new THREE.BoxGeometry(.003,e.h+.04,.002),x:-e.w/2-.0715,z:-.0235},{geometry:new THREE.BoxGeometry(.003,e.h+.04,.002),x:e.w/2+.0715,z:-.0235},{geometry:new THREE.BoxGeometry(e.w+.146,.003,.002),y:e.h/2+.0415,z:-.0235}])});
           architectureBatches.reveal.push({...at,geometry:geometry([
             [[-x,-y,front],[-x,y,front],[-x,y,back],[-x,-y,back]],
             [[x,-y,back],[x,y,back],[x,y,front],[x,-y,front]],
@@ -3700,6 +4050,7 @@ function App() {
           const g = new THREE.Group();
           g.userData = { kind: "placement", id: p.id };
           const em = getModel("easel").clone(true);
+          em.traverse(easelFinish);
           g.add(em);
           const lean = -4.8 * Math.PI / 180, sinL = Math.sin(4.8 * Math.PI / 180), cosL = Math.cos(lean), bh = ph;
           const frameC = p.frame === "白" || p.frame === "パネル" ? 16250351 : p.frame === "黒" ? 1513239 : 9067061;
@@ -3799,7 +4150,7 @@ function App() {
           }
         } else {
           const g = new THREE.Group();
-          const wood = new THREE.MeshStandardMaterial({ color: isSel ? 10508848 : 7160870, roughness: 0.8, emissive: 0, emissiveIntensity: isSel ? 0.4 : 0 });
+          const wood = furnitureFinish(new THREE.MeshStandardMaterial({ color: isSel ? 10508848 : 7160870, roughness: 0.8, emissive: 0, emissiveIntensity: isSel ? 0.4 : 0 }),"easel","rail");
           const legBetween = (a, b) => {
             const dir = new THREE.Vector3().subVectors(b, a);
             const len = dir.length();
@@ -3853,6 +4204,7 @@ function App() {
       });
       Object.entries(architectureBatches).forEach(([kind,parts])=>{
         if(!parts.length)return;
+        if(kind==='frameJoint'){const mesh=new THREE.Mesh(galleryMergeGeometry(parts),new THREE.MeshBasicMaterial({color:0x3f403b,transparent:true,opacity:.16,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-1,polygonOffsetUnits:-1}));mesh.userData={architecturalDetail:kind};mesh.raycast=()=>{};group.add(mesh);return;}
         const surface=kind==="threshold"?"floor":"wall";
         const mesh=new THREE.Mesh(finishUV(galleryMergeGeometry(parts),surface),finishMaterial(surface,{color:surface==="floor"?floorC:wallC,roughness:.85}));
         mesh.userData={architecturalDetail:kind};mesh.raycast=()=>{};mesh.receiveShadow=true;group.add(mesh);
@@ -4396,6 +4748,7 @@ function App() {
       updateEntranceNames(camera,group);
       updateSelectionHoldFeedback();
       drawPositionGuides(scene);
+      glazingReflection.update(now);
       renderer.render(scene, camera);
       if (diagRef.current && now - lastDiag > 250) {
         lastDiag = now;
@@ -4441,10 +4794,14 @@ function App() {
       exhibitShadowLight?.shadow.dispose();
       sunLight.shadow.dispose();
       furnitureFinishCache.forEach(mat=>mat.dispose());furnitureFinishCache.clear();
+      glazingReflection.dispose();
+      woodGeometryCache.forEach(g=>g.dispose());woodGeometryCache.clear();
+      indirectTexture.dispose();
       reflectionTarget?.dispose();
       surfaceTextures.forEach((texture) => texture.dispose());
       frameFinishCache.forEach(disposeFrameFinish); frameFinishCache.clear();
       disposePositionGuides();
+      roundedFurnitureCache.forEach(g=>g?.dispose());roundedFurnitureCache.clear();
       renderer.dispose();
       el.removeChild(renderer.domElement);
     };
@@ -7101,17 +7458,32 @@ function App() {
     const status = entranceAssessment(e);
     return React.createElement("section", { "aria-label": "入口の設定状態", style: { borderRadius: 10, padding: "9px 10px", fontSize: 12, lineHeight: 1.65, background: status.tone === "warning" ? "#fff2cc" : "#e9f5ef", color: status.tone === "warning" ? "#713509" : "#205d43" } }, React.createElement("b", { role: "status" }, status.title), React.createElement("p", null, status.portal ? status.linked ? "入口に近づくと移動ボタンが出ます。通路や階段をここに作る必要はありません。" : "「つながり先」で、別の部屋の入口を選びます。" : status.host ? "この開口は同じ部屋の壁の表裏を歩いて通ります。" : "別の部屋へ移動する場合は「別フロアへ移動」と接続先を設定します。"), React.createElement("p", null, "正面：", status.front), React.createElement("p", null, "空洞：", status.fill), ...status.issues.map((text) => React.createElement("p", { key: text, style: { fontWeight: 800 } }, "⚠ ", text)), React.createElement("div", { className: "flex flex-wrap gap-2 mt-1" }, status.portal && React.createElement("button", { type: "button", className: "chip text-xs font-bold", disabled: !status.linked, onClick: () => testEntranceLink(e.id) }, "接続先への移動を試す"), status.host && React.createElement("button", { type: "button", className: "chip text-xs", onClick: () => { const faces = columnDoorFaces(status.host); const face = faces.find((f) => f !== (e.face || faces[0])); updateEntrances(dataRef.current.entrances.map((x) => x.id === e.id ? { ...x, face, wall: face } : x)); } }, "正面を反転")));
   }
+  function entranceAppearanceControls(e){
+    const E=React.createElement,style=entranceStyle(e),light=entranceDaylight(e),layout=entranceGlassLayout(e);
+    const patch=(value,discrete=true)=>{if(stateRef.current.mode==='view')return;const next=dataRef.current.entrances.map(x=>x.id===e.id?{...x,...value}:x);if(discrete){pushHistoryRaw(snapStr());updateEntrances(next,false);saveAll();}else updateEntrances(next);};
+    const tiles=(label,options,value,field)=>E('div',{role:'group','aria-label':label,className:'grid grid-cols-3 gap-2'},...options.map(([key,title,sub])=>E('button',{type:'button',key,'aria-pressed':value===key,className:'soft-key rounded-xl p-2 text-xs '+(value===key?'tab-active':''),onClick:()=>patch({[field]:key})},E('b',{className:'block'},title),sub&&E('span',{className:'block small'},sub))));
+    return E('section',{'aria-label':'入口の見た目と採光',className:'space-y-2 rounded-xl border border-[var(--line)] p-3'},
+      E('h3',{className:'text-sm font-bold'},'入口の形'),tiles('入口の形',[['open','開口のみ'],['singleGlass','片開きガラス'],['doubleGlass','両開きガラス']],style,'style'),
+      layout.glass&&E(React.Fragment,null,E('p',{className:'text-xs font-bold'},'枠の色'),tiles('入口の枠色',[['white','白'],['black','黒'],['metal','金属色']],e.frameTone||'metal','frameTone'),
+        E('button',{type:'button',className:'soft-key rounded-xl px-3 py-2 text-xs','aria-pressed':!!e.sideGlass,onClick:()=>patch({sideGlass:!e.sideGlass})},'横ガラス：'+(e.sideGlass?'あり':'なし')),
+        e.sideGlass&&E('label',{className:'block text-xs'},'横ガラスの幅（左右それぞれ・cm）',E(RangeNum,{'aria-label':'横ガラスの幅',min:0,max:Math.round(Math.min(3,Math.max(0,(e.w-.7)/2))*100),rstep:1,value:Math.round(layout.side*100),onChange:ev=>patch({sideWidth:clamp(Number(ev.target.value)/100,0,3)},false)})),
+        E('p',{className:'small'},'横ガラスは全体幅の内側に付き、扉幅を0.70m以上残す範囲で調整します。扉部分 '+layout.doorWidth.toFixed(2)+' m。扉は閉じた見た目でも移動できます。')),
+      E('h3',{className:'text-sm font-bold'},'入口からの光'),tiles('入口からの光',[['none','光を入れない','室内・暗い廊下'],['outdoor','外の日差し','屋外に直接つながる'],['adjacent','隣の明かり','明るい廊下・階段']],light,'daylight'),
+      light==='adjacent'&&tiles('隣の明かりの強さ',[['low','弱'],['medium','中'],['high','強']],e.adjacentStrength||'medium','adjacentStrength'),
+      E('p',{className:'small'},light==='outdoor'?'部屋の北・日付・時刻に連動します。ほかの壁で太陽が遮られる入口には「隣の明かり」を使います。':light==='adjacent'?'隣の空間から届く柔らかい昼光の近似です。夜間と「窓・入口の自然光」オフ時は入りません。':'入口からの直射日光を遮ります。室内照明や、同じ部屋の通り抜けは維持します。'),
+      E('p',{className:'small'},'ガラス扉の有無と採光は独立しています。未設定の入口は「光を入れない」になります。'));
+  }
   function entranceMountControls(e) {
     const c = e.col && columns.find((c) => c.id === e.col);
     const transfer = isTransferEntrance(e);
     return React.createElement("div", { className: "col-span-2 space-y-1" },
-      entranceStatusCard(e), React.createElement("div", { className: "flex gap-1", role: "group", "aria-label": "入口の種類" }, ...[["pass", "通り抜け"], ["portal", "別フロアへ移動"]].map(([mode, label]) => React.createElement("button", { key: mode, type: "button", className: "chip text-xs " + (entranceMode(e) === mode ? "tab-active" : ""), "aria-pressed": entranceMode(e) === mode, onClick: () => setEntranceMode(e.id, mode) }, label))),
+      entranceStatusCard(e), React.createElement("h3",{className:"text-sm font-bold"},"移動先"), React.createElement("div", { className: "flex gap-1", role: "group", "aria-label": "入口の種類" }, ...[["pass", "通り抜け"], ["portal", "別フロアへ移動"]].map(([mode, label]) => React.createElement("button", { key: mode, type: "button", className: "chip text-xs " + (entranceMode(e) === mode ? "tab-active" : ""), "aria-pressed": entranceMode(e) === mode, onClick: () => setEntranceMode(e.id, mode) }, label))),
       React.createElement("label", { className: "block text-xs" }, "入口を付ける壁", React.createElement("select", { className: "field", value: e.col || "outer:" + e.wall, onChange: (ev) => changeEntranceHost(e.id, ev.target.value) },
         ...["北", "南", "東", "西"].map((wall) => React.createElement("option", { key: "outer:" + wall, value: "outer:" + wall }, wallName(wall) + "の外壁")),
         ...columns.map((c, i) => React.createElement("option", { key: c.id, value: c.id }, c.name || `壁・柱 ${i + 1}`)))),
       c && React.createElement("label", { className: "block text-xs" }, "入口の正面", React.createElement("select", { className: "field", value: e.face || columnDoorFaces(c)[0], onChange: (ev) => updateEntrances(dataRef.current.entrances.map((x) => x.id === e.id ? { ...x, wall: ev.target.value, face: ev.target.value } : x)) }, ...columnDoorFaces(c).map((f) => React.createElement("option", { key: f, value: f }, wallName(f) + "面")))),
       c && React.createElement("label", { className: "block text-xs" }, "開口の下端（床の基準から m）", React.createElement("input", { className: "field", type: "number", min: "0", max: Math.max(0, room.h - e.h), step: ".01", value: entranceBase(room, e, columns, blocks), onChange: (ev) => updateEntrances(dataRef.current.entrances.map((x) => x.id === e.id ? { ...x, base: Math.max(0, Number(ev.target.value)) } : x)) })),
-      c && !transfer && React.createElement("p", { className: "small" }, "壁の表裏を貫通する開口です。同じ部屋の中を歩いて通れます。"));
+      c && !transfer && React.createElement("p", { className: "small" }, "壁の表裏を貫通する開口です。同じ部屋の中を歩いて通れます。"), entranceAppearanceControls(e));
   }
   function setEntranceLink(entId, target) {
     if (stateRef.current.mode === "view") return;
@@ -7332,11 +7704,11 @@ function App() {
     deleteObject("block", b.id);
   } }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "台・天井を削除"))), blocks.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small mt-2" }, "まだありません。上のボタンで追加します。")), /* @__PURE__ */ React.createElement("section", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "家具"), /* @__PURE__ */ React.createElement("span", { className: "small" }, "複製・等間隔の対象外")), furniture.map((f) => /* @__PURE__ */ React.createElement("div", { key: f.id, className: `border rounded-xl p-3 mt-2 space-y-2 ${selected?.kind === "furniture" && selected.id === f.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("button", { className: "text-left text-xs font-bold", onClick: () => selectObj("furniture", f.id) }, FURN_NAMES[f.type], "を選択して3Dで動かす（回転 ", f.rot, "°）"), /* @__PURE__ */ React.createElement("button", { className: "text-xs text-red-600 flex gap-1 items-center", onClick: () => {
     deleteObject("furniture", f.id);
-  } }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "家具を削除"))), furniture.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small mt-2" }, "椅子・テーブルを置けます。"))), tab === "光" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex rounded-xl p-0.5 bg-[var(--surface2)] text-sm font-bold" }, [["light", "照明"], ["sun", "窓の光と時間帯"]].map(([k, lb]) => /* @__PURE__ */ React.createElement("button", { key: k, type: "button", "aria-pressed": lightSub === k, onClick: () => setLightSub(k), className: `flex-1 h-9 rounded-[10px] ${lightSub === k ? "bg-[var(--surface)] shadow" : ""}` }, lb))), lightSub === "light" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: "space-y-1" }, addHead("押してから、置く場所を3Dでタップ"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-4 gap-1.5" }, addTile("light", "照明", /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("rect", { x: "3", y: "2", width: "9", height: "2.4", rx: "1", fill: "currentColor" }), /* @__PURE__ */ React.createElement("rect", { x: "6.5", y: "4.4", width: "2", height: "3", fill: "currentColor" }), /* @__PURE__ */ React.createElement("g", { transform: "rotate(-30 7.5 11)" }, /* @__PURE__ */ React.createElement("rect", { x: "4", y: "7.5", width: "7", height: "10", rx: "2", fill: "currentColor" })), /* @__PURE__ */ React.createElement("path", { d: "M11 16 L23 20 L18 25 L9.5 18.5 Z", fill: "rgba(255,196,40,.65)" })), () => startPlace("light", "照明")))), /* @__PURE__ */ React.createElement("section", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "照明（天井スポット）"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, /* @__PURE__ */ React.createElement("button", { className: "chip text-xs", onClick: () => distributeGroup({ t: "light" }) }, "↔ 等間隔"))), lights.length > 0 && bulkPanel(), lights.map((l, i) => /* @__PURE__ */ React.createElement("div", { key: l.id, className: `border rounded-xl p-3 mt-2 grid grid-cols-2 gap-2 ${selected?.kind === "light" && selected.id === l.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("div", { className: "col-span-2 flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "照明 ", i + 1), /* @__PURE__ */ React.createElement("button", { type: "button", "aria-label": `照明${i + 1}の一括／個別`, onClick: () => l.solo ? rejoinBulk(l) : toggleBulk(l.id), className: `chip text-xs ${l.solo ? "" : "tab-active"}` }, l.solo ? "個別（押すと一括に戻す）" : "一括 ✓")), /* @__PURE__ */ React.createElement("button", { className: "col-span-2 text-left text-xs font-bold", onClick: () => selectObj("light", l.id) }, "照明 ", i + 1, " を選択して3Dで動かす（強度 ", l.intensity, " ・ ", l.kelvin, " K ・ ", l.angle, "°）"), /* @__PURE__ */ React.createElement("button", { className: "col-span-2 text-xs text-red-600 flex gap-1 items-center", onClick: () => {
+  } }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "家具を削除"))), furniture.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small mt-2" }, "椅子・テーブルを置けます。"))), tab === "光" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex rounded-xl p-0.5 bg-[var(--surface2)] text-sm font-bold" }, [["light", "照明"], ["sun", "窓・入口の自然光と時間帯"]].map(([k, lb]) => /* @__PURE__ */ React.createElement("button", { key: k, type: "button", "aria-pressed": lightSub === k, onClick: () => setLightSub(k), className: `flex-1 h-9 rounded-[10px] ${lightSub === k ? "bg-[var(--surface)] shadow" : ""}` }, lb))), lightSub === "light" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: "space-y-1" }, addHead("押してから、置く場所を3Dでタップ"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-4 gap-1.5" }, addTile("light", "照明", /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("rect", { x: "3", y: "2", width: "9", height: "2.4", rx: "1", fill: "currentColor" }), /* @__PURE__ */ React.createElement("rect", { x: "6.5", y: "4.4", width: "2", height: "3", fill: "currentColor" }), /* @__PURE__ */ React.createElement("g", { transform: "rotate(-30 7.5 11)" }, /* @__PURE__ */ React.createElement("rect", { x: "4", y: "7.5", width: "7", height: "10", rx: "2", fill: "currentColor" })), /* @__PURE__ */ React.createElement("path", { d: "M11 16 L23 20 L18 25 L9.5 18.5 Z", fill: "rgba(255,196,40,.65)" })), () => startPlace("light", "照明")))), /* @__PURE__ */ React.createElement("section", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between items-center" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "照明（天井スポット）"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, /* @__PURE__ */ React.createElement("button", { className: "chip text-xs", onClick: () => distributeGroup({ t: "light" }) }, "↔ 等間隔"))), lights.length > 0 && bulkPanel(), lights.map((l, i) => /* @__PURE__ */ React.createElement("div", { key: l.id, className: `border rounded-xl p-3 mt-2 grid grid-cols-2 gap-2 ${selected?.kind === "light" && selected.id === l.id ? "border-[var(--accent)] bg-[var(--surface2)]" : "border-[var(--line)]"}` }, /* @__PURE__ */ React.createElement("div", { className: "col-span-2 flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold" }, "照明 ", i + 1), /* @__PURE__ */ React.createElement("button", { type: "button", "aria-label": `照明${i + 1}の一括／個別`, onClick: () => l.solo ? rejoinBulk(l) : toggleBulk(l.id), className: `chip text-xs ${l.solo ? "" : "tab-active"}` }, l.solo ? "個別（押すと一括に戻す）" : "一括 ✓")), /* @__PURE__ */ React.createElement("button", { className: "col-span-2 text-left text-xs font-bold", onClick: () => selectObj("light", l.id) }, "照明 ", i + 1, " を選択して3Dで動かす（強度 ", l.intensity, " ・ ", l.kelvin, " K ・ ", l.angle, "°）"), /* @__PURE__ */ React.createElement("button", { className: "col-span-2 text-xs text-red-600 flex gap-1 items-center", onClick: () => {
     deleteObject("light", l.id);
-  } }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "照明を削除"))), lights.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small mt-2" }, "照明がありません。「追加」で天井に設置します。"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "窓の光と時間帯"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, /* @__PURE__ */ React.createElement("button", { onClick: () => updateEnv({ sun: !env.sun }), className: `chip text-sm ${env.sun ? "tab-active" : ""}` }, "窓の光（太陽）", env.sun ? "あり" : "なし"), /* @__PURE__ */ React.createElement("button", { onClick: () => updateEnv({ lightsOn: !env.lightsOn }), className: `chip text-sm ${env.lightsOn ? "tab-active" : ""}` }, "照明 ", env.lightsOn ? "点灯" : "消灯")), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "日付（東京）", /* @__PURE__ */ React.createElement("input", { className: "field", type: "date", value: env.date, onChange: (e) => {
+  } }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), "照明を削除"))), lights.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "small mt-2" }, "照明がありません。「追加」で天井に設置します。"))) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("section", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold" }, "窓・入口の自然光と時間帯"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, /* @__PURE__ */ React.createElement("button", { onClick: () => updateEnv({ sun: !env.sun }), className: `chip text-sm ${env.sun ? "tab-active" : ""}` }, "窓・入口の自然光", env.sun ? "あり" : "なし"), /* @__PURE__ */ React.createElement("button", { onClick: () => updateEnv({ lightsOn: !env.lightsOn }), className: `chip text-sm ${env.lightsOn ? "tab-active" : ""}` }, "照明 ", env.lightsOn ? "点灯" : "消灯")), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "日付（東京）", /* @__PURE__ */ React.createElement("input", { className: "field", type: "date", value: env.date, onChange: (e) => {
     if (e.target.value) updateEnv({ date: e.target.value });
-  } })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "時刻"), /* @__PURE__ */ React.createElement("b", null, fmtHour(env.hour))), /* @__PURE__ */ React.createElement("input", { "aria-label": "時刻", className: "w-full", type: "range", min: "0", max: "24", step: ".25", value: env.hour, onChange: (e) => updateEnv({ hour: Number(e.target.value) }) })), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, [["朝", 7], ["昼", 12], ["夕", 17], ["夜", 21]].map(([n, v]) => /* @__PURE__ */ React.createElement("button", { key: n, onClick: () => updateEnv({ hour: v }), className: "chip text-sm" }, n, " ", v, ":00"))), northControls(), /* @__PURE__ */ React.createElement("p", { className: "small" }, !sol.ok ? "太陽の計算ライブラリを読み込めませんでした（オンライン接続が必要です）。" : sol.sunUp ? `太陽高度 ${sol.altDeg.toFixed(0)}° ・ 方位 ${sol.bearingDeg.toFixed(0)}°（真北から時計回り）・ ${Math.round(sol.kelvin)} K` : "太陽は地平線の下です。窓からは空の光だけが入ります。"), /* @__PURE__ */ React.createElement("p", { className: "small" }, "太陽の光は、この部屋に設定した北の向きに合わせて計算します。")))), tab === "写真" && /* @__PURE__ */ React.createElement("div", { className: "space-y-4", onDragOver: (e) => e.preventDefault(), onDrop: (e) => {
+  } })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "時刻"), /* @__PURE__ */ React.createElement("b", null, fmtHour(env.hour))), /* @__PURE__ */ React.createElement("input", { "aria-label": "時刻", className: "w-full", type: "range", min: "0", max: "24", step: ".25", value: env.hour, onChange: (e) => updateEnv({ hour: Number(e.target.value) }) })), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, [["朝", 7], ["昼", 12], ["夕", 17], ["夜", 21]].map(([n, v]) => /* @__PURE__ */ React.createElement("button", { key: n, onClick: () => updateEnv({ hour: v }), className: "chip text-sm" }, n, " ", v, ":00"))), northControls(), /* @__PURE__ */ React.createElement("p", { className: "small" }, !sol.ok ? "太陽の計算ライブラリを読み込めませんでした（オンライン接続が必要です）。" : sol.sunUp ? `太陽高度 ${sol.altDeg.toFixed(0)}° ・ 方位 ${sol.bearingDeg.toFixed(0)}°（真北から時計回り）・ ${Math.round(sol.kelvin)} K` : "太陽は地平線の下です。窓からは空の光だけが入ります。"), /* @__PURE__ */ React.createElement("p", { className: "small" }, galleryDaylightAccess(room,windows,entrances)===0?"採光する窓・入口がないため、時刻による明るさの変化はありません。":"太陽の光は、この部屋に設定した北の向きに合わせて計算します。")))), tab === "写真" && /* @__PURE__ */ React.createElement("div", { className: "space-y-4", onDragOver: (e) => e.preventDefault(), onDrop: (e) => {
     e.preventDefault();
     addFiles(e.dataTransfer.files);
   } }, /* @__PURE__ */ React.createElement("p", { className: "small rounded-lg bg-[var(--surface2)] px-3 py-2" }, "① 取り込む → ② 飾る写真を選ぶ → ③「選んだ写真を飾る」を押す。額・飾り方は下で設定できます。"), photoImportPanel, /* @__PURE__ */ React.createElement("section", { className: "space-y-3 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold text-sm" }, "額・サイズ（これから飾る作品）"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, SIZE_LIST.map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => setSize(x), className: `chip text-sm ${size === x ? "tab-active" : ""}` }, x === "スクエア" ? "スクエア（正方形）" : `${x} ${SIZE_MM[x][0]}×${SIZE_MM[x][1]} mm`))), size === "スクエア" && /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "スクエアの一辺"), /* @__PURE__ */ React.createElement("b", null, sqMM, " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "スクエアの一辺（これから飾る写真）", className: "w-full", type: "range", min: "100", max: "1000", rstep: "10", value: sqMM, onChange: (e) => setSqMM(clamp(Math.round(Number(e.target.value)), 100, 1e3)) })), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1 flex-wrap" }, ["自動", "縦", "横"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => setOrient(x), className: `chip text-sm ${orient === x ? "tab-active" : ""}` }, x === "自動" ? "向き 自動" : `${x}向き`)), ["白", "黒", "木目", "パネル"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => setFrame(x), className: `chip text-sm ${frame === x ? "tab-active" : ""}` }, x === "パネル" ? "パネル（縁なし）" : `額 ${x}`)), frame !== "パネル" && /* @__PURE__ */ React.createElement("button", { onClick: () => setMat(!mat), className: `chip text-sm ${mat ? "tab-active" : ""}` }, "マット ", mat ? "あり" : "なし")), frame === "パネル" && /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "パネルの厚さ"), /* @__PURE__ */ React.createElement("b", null, panelMM, " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "パネルの厚さ（これから飾る写真）", className: "w-full", type: "range", min: "2", max: "20", rstep: "1", value: panelMM, onChange: (e) => setPanelMM(clamp(Math.round(Number(e.target.value)), 2, 20)) })), orient === "自動" && /* @__PURE__ */ React.createElement("p", { className: "small" }, "向きは写真の縦横比に合わせます。")), /* @__PURE__ */ React.createElement("section", { className: "space-y-3 rounded-xl border border-[var(--line)] p-3" }, /* @__PURE__ */ React.createElement("h3", { className: "font-bold text-sm" }, "飾る場所・方法"), /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, ["壁掛け", "イーゼル"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => setMethod(x), className: `chip text-sm ${method === x ? "tab-active" : ""}` }, x))), method === "壁掛け" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex gap-1" }, ["北", "南", "東", "西"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, onClick: () => {
@@ -7439,14 +7811,29 @@ function App() {
     setNotice("この部屋の物をすべて削除しました。写真は残っています。「元に戻す」で戻せます");
   }
   const footerRow = React.createElement("div", { className: "p-3 border-t border-[var(--line)] flex gap-2" }, React.createElement("button", { disabled: mode === "view", onClick: resetExhibits, className: "chip text-xs flex-1 disabled:opacity-50" }, "この部屋の展示を外す"), React.createElement("button", { disabled: mode === "view", onClick: clearRoomObjects, className: "chip text-xs flex-1 text-red-600 disabled:opacity-50" }, "この部屋を空にする"));
-  const objectEditBody = artworkSwap ? artworkSwapPanel() : replacement ? replacementPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, !isFullscreen&&selectionPanelHeader(), selCol && resizeReviewPanel(), selPlace && artworkActionSettings(selPlace), microPositionPanel(), (selWin || selEnt && !selEnt.col) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "設置する壁"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1", role: "group", "aria-label": "設置する壁" }, ["北", "南", "東", "西"].map((wallOpt) => {
+  function windowSunPanel(win){
+    const state=windowSunState(win,room,env), E=React.createElement;
+    return E('section',{'aria-label':'窓の方角と日差し',className:'space-y-2 rounded-xl border border-[var(--line)] p-3'},
+      E('div',{className:'flex justify-between items-center gap-2'},E('b',null,'窓の向き：'+state.compass),E('span',{className:'small'},Math.round(state.bearing)+'°（北から時計回り）')),
+      E('p',{role:'status',className:'text-xs font-bold'},fmtHour(env.hour)+' ｜ '+state.status),
+      E('button',{type:'button',className:'chip text-xs '+(env.sun?'tab-active':''),'aria-pressed':!!env.sun,onClick:()=>updateEnv({sun:!env.sun})},'窓からの太陽光：'+(env.sun?'オン':'オフ')),
+      E('label',{className:'block text-xs'},'日付（東京・日本時間）',E('input',{type:'date',className:'field',value:env.date,'aria-label':'窓の日差しの日付',onChange:e=>{if(e.target.value)updateEnv({date:e.target.value});}})),
+      E('label',{className:'block text-xs font-bold'},'時刻：'+fmtHour(env.hour),E('input',{type:'range',className:'w-full',min:0,max:23.75,step:.25,value:env.hour,'aria-label':'窓の日差しの時刻',onChange:e=>updateEnv({hour:Number(e.target.value)})})),
+      E('div',{className:'grid grid-cols-4 gap-1'},...[[7,'朝'],[12,'昼'],[17,'夕'],[21,'夜']].map(([hour,label])=>{const v=windowSunState(win,room,{...env,hour});return E('button',{type:'button',key:hour,className:'soft-key rounded-xl p-2 text-xs','aria-pressed':env.hour===hour,onClick:()=>updateEnv({hour})},E('b',{className:'block'},label+' '+hour+':00'),E('span',{className:'block small'},!env.sun?'光オフ':!v.sun.ok?'計算待ち':v.direct?'直射光あり':'直射光なし'));})),
+      E('details',null,E('summary',{className:'text-xs cursor-pointer'},'窓の方角を合わせる'),northControls()),
+      E('p',{className:'small'},'方角は設置する壁と部屋の北に連動します。日時は全ての窓で共通。朝夕は長く暖かな光、昼は短い光と窓枠の影に変わります。周囲の建物・天候は含まない目安です。'));
+  }
+  function windowRecessPanel(win){
+    return React.createElement('label',{'aria-label':'窓の奥行き設定',className:'block'},React.createElement('span',{className:'flex justify-between text-sm font-bold'},React.createElement('span',null,'窓の奥行き（外側へ）'),React.createElement('b',null,(windowRecess(win)*100).toFixed(1)+' cm')),React.createElement(RangeNum,{'aria-label':'窓の外側への奥行き',className:'w-full',min:0,max:60,rstep:1,value:windowRecess(win)*100,onChange:e=>updateWindows(dataRef.current.windows.map(w=>w.id===win.id?{...w,recess:clamp((Number(e.target.value)||0)/100,0,.6)}:w))}),React.createElement('p',{className:'small'},'0cmで壁面に合わせ、数値を増やすとガラスが外側へ下がります。'));
+  }
+  const objectEditBody = artworkSwap ? artworkSwapPanel() : replacement ? replacementPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, !isFullscreen&&selectionPanelHeader(), selCol && resizeReviewPanel(), selPlace && artworkActionSettings(selPlace), microPositionPanel(), selWin&&windowSunPanel(selWin), selWin&&windowRecessPanel(selWin), (selWin || selEnt && !selEnt.col) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "設置する壁"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1", role: "group", "aria-label": "設置する壁" }, ["北", "南", "東", "西"].map((wallOpt) => {
     const cur = selWin ? selWin.wall : selEnt?.wall;
     const active = cur === wallOpt;
     return /* @__PURE__ */ React.createElement("button", { key: wallOpt, type: "button", "aria-pressed": active, onClick: () => {
       if (selWin) changeWall("window", selWin.id, wallOpt);
       else if (selEnt) changeWall("entrance", selEnt.id, wallOpt);
     }, className: "rounded-lg border px-2 py-2.5 text-sm font-black", style: active ? { background: "#ea580c", color: "#fff", borderColor: "#ea580c" } : { background: "var(--surface2)", color: "var(--ink)", borderColor: "var(--line)" } }, wallName(wallOpt), "壁");
-  })), /* @__PURE__ */ React.createElement("p", { className: "small mt-1" }, "表示する方角は「部屋」の北の向きに連動します。壁を変えても幅・高さ・床からの高さは維持されます。")), selCol && /* @__PURE__ */ React.createElement(React.Fragment, null, React.createElement("button", { type: "button", className: "chip text-sm w-full", onClick: () => addEntranceOnColumn(selCol.id) }, "＋ この壁に入口を追加"), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(colW(selCol)), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "柱の幅", className: "w-full", type: "range", min: "0.1", max: String(Math.min(15, room.w)), step: "0.1", value: colW(selCol), onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "奥行き"), /* @__PURE__ */ React.createElement("b", null, fmt(colD(selCol)), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "柱の奥行き", className: "w-full", type: "range", min: "0.1", max: String(Math.min(15, room.d)), step: "0.1", value: colD(selCol), onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, d: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ（部屋の高さ）"), /* @__PURE__ */ React.createElement("b", null, fmt(room.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "部屋の高さ", className: "w-full", type: "range", min: "2.4", max: "5", step: "0.1", value: room.h, onEditStart: beginRoomResize, onEditEnd: finishRoomResize, onChange: (e) => updateRoom({ h: Number(e.target.value) }) })), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selCol.x, onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selCol.z, onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, z: Number(e.target.value) } : x)) })))), selWin && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.w), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の幅", className: "w-full", type: "range", min: "0.6", max: "3", step: "0.1", value: selWin.w, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の高さ", className: "w-full", type: "range", min: "0.6", max: "2", step: "0.1", value: selWin.h, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, h: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "床からの高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.sill), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の床からの高さ", className: "w-full", type: "range", min: "0", max: "2", step: "0.1", value: selWin.sill, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, sill: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "壁沿い位置 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selWin.pos, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, pos: Number(e.target.value) } : x)) }))), selEnt && rooms.length > 1 && /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "font-bold" }, "つながり先（別の部屋の入口）"), /* @__PURE__ */ React.createElement("select", { className: "field mt-1", value: selEnt.link ? `${selEnt.link.room}|${selEnt.link.ent}` : "", onChange: (e) => setEntranceLink(selEnt.id, e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "つながりなし"), rooms.filter((r) => r.id !== curRoomId).map((r) => entrancesOf(r.id).map((en, i) => /* @__PURE__ */ React.createElement("option", { key: r.id + en.id, value: `${r.id}|${en.id}` }, r.floor, " ", r.name, "・入口", i + 1, "（", en.wall, "壁）")))), /* @__PURE__ */ React.createElement("span", { className: "small block mt-1" }, "鑑賞モードでこの入口に近づくと、つながり先の部屋へ移るボタンが出ます。")), selEnt && rooms.length <= 1 && /* @__PURE__ */ React.createElement("p", { className: "small" }, "「部屋」タブで部屋を追加すると、別の部屋の入口とつなげられます。"), selEnt && /* @__PURE__ */ React.createElement(React.Fragment, null, entranceMountControls(selEnt), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(selEnt.w), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "入口の幅", className: "w-full", type: "range", min: "0.3", max: String(Math.max(0.3, Math.min(3, entranceLength(room, selEnt, columns) - 0.04))), step: "0.01", value: selEnt.w, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selEnt.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "入口の高さ", className: "w-full", type: "range", min: "0.3", max: String(Math.max(0.3, room.h - entranceBase(room, selEnt, columns, blocks))), step: "0.01", value: selEnt.h, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, h: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "壁沿い位置 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selEnt.pos, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, pos: Number(e.target.value) } : x)) }))), selFurn && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, furnSliders(selFurn)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selFurn.x, onChange: (e) => updateFurniture(furniture.map((x) => x.id === selFurn.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selFurn.z, onChange: (e) => updateFurniture(furniture.map((x) => x.id === selFurn.id ? { ...x, z: Number(e.target.value) } : x)) })))), selBlock && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, blockSliders(selBlock)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selBlock.x, onChange: (e) => updateBlocks(blocks.map((x) => x.id === selBlock.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selBlock.z, onChange: (e) => updateBlocks(blocks.map((x) => x.id === selBlock.id ? { ...x, z: Number(e.target.value) } : x)) })))), selLight && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("b", { className: "text-sm" }, "この照明だけ調整（照明", lights.findIndex((l) => l.id === selLight.id) + 1, "）", selLight.solo ? /* @__PURE__ */ React.createElement("span", { className: "ml-1 rounded-full border border-[var(--line)] px-2 py-0.5 text-[11px]" }, "個別") : null), selLight.solo ? /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs shrink-0", onClick: () => rejoinBulk(selLight) }, "一括に戻す") : /* @__PURE__ */ React.createElement("span", { className: "small text-right" }, "動かすと一括の対象から外れます")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, lightSliders(selLight)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selLight.x, onChange: (e) => updateLights(lights.map((x) => x.id === selLight.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selLight.z, onChange: (e) => updateLights(lights.map((x) => x.id === selLight.id ? { ...x, z: Number(e.target.value) } : x)) })))),  selPlace && selPlace.col && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "柱の面"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1" }, ["北", "南", "東", "西"].map((fc) => /* @__PURE__ */ React.createElement("button", { key: fc, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, face: fc, pos: 0 } : p)), className: `chip text-sm ${(selPlace.face || "南") === fc ? "tab-active" : ""}` }, wallName(fc), "面")))), selPlace && selPlace.method === "壁掛け" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "額装サイズ"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex flex-wrap gap-1" }, SIZE_LIST.map((x) => /* @__PURE__ */ React.createElement("button", { key: x, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, size: x, ...x === "スクエア" ? { sq: p.sq || 300 } : {} } : p)), className: `chip text-sm ${selPlace.size === x ? "tab-active" : ""}` }, x))), selPlace.size === "スクエア" && /* @__PURE__ */ React.createElement("label", { className: "mt-2 block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "スクエアの一辺"), /* @__PURE__ */ React.createElement("b", null, mmOf("スクエア", selPlace.sq)[0], " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "スクエアの一辺", className: "w-full", type: "range", min: "100", max: "1000", rstep: "10", value: mmOf("スクエア", selPlace.sq)[0], onChange: (e) => {
+  })), /* @__PURE__ */ React.createElement("p", { className: "small mt-1" }, "表示する方角は「部屋」の北の向きに連動します。壁を変えても幅・高さ・床からの高さは維持されます。")), selCol && /* @__PURE__ */ React.createElement(React.Fragment, null, React.createElement("button", { type: "button", className: "chip text-sm w-full", onClick: () => addEntranceOnColumn(selCol.id) }, "＋ この壁に入口を追加"), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(colW(selCol)), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "柱の幅", className: "w-full", type: "range", min: "0.1", max: String(Math.min(15, room.w)), step: "0.1", value: colW(selCol), onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "奥行き"), /* @__PURE__ */ React.createElement("b", null, fmt(colD(selCol)), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "柱の奥行き", className: "w-full", type: "range", min: "0.1", max: String(Math.min(15, room.d)), step: "0.1", value: colD(selCol), onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, d: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ（部屋の高さ）"), /* @__PURE__ */ React.createElement("b", null, fmt(room.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "部屋の高さ", className: "w-full", type: "range", min: "2.4", max: "5", step: "0.1", value: room.h, onEditStart: beginRoomResize, onEditEnd: finishRoomResize, onChange: (e) => updateRoom({ h: Number(e.target.value) }) })), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selCol.x, onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selCol.z, onChange: (e) => updateColumns(columns.map((x) => x.id === selCol.id ? { ...x, z: Number(e.target.value) } : x)) })))), selWin && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "幅"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.w), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の幅", className: "w-full", type: "range", min: "0.6", max: "3", step: "0.1", value: selWin.w, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の高さ", className: "w-full", type: "range", min: "0.6", max: "2", step: "0.1", value: selWin.h, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, h: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "床からの高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selWin.sill), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "窓の床からの高さ", className: "w-full", type: "range", min: "0", max: "2", step: "0.1", value: selWin.sill, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, sill: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "壁沿い位置 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selWin.pos, onChange: (e) => updateWindows(windows.map((x) => x.id === selWin.id ? { ...x, pos: Number(e.target.value) } : x)) }))), selEnt && rooms.length > 1 && /* @__PURE__ */ React.createElement("label", { className: "block text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "font-bold" }, "つながり先（別の部屋の入口）"), /* @__PURE__ */ React.createElement("select", { className: "field mt-1", value: selEnt.link ? `${selEnt.link.room}|${selEnt.link.ent}` : "", onChange: (e) => setEntranceLink(selEnt.id, e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "つながりなし"), rooms.filter((r) => r.id !== curRoomId).map((r) => entrancesOf(r.id).map((en, i) => /* @__PURE__ */ React.createElement("option", { key: r.id + en.id, value: `${r.id}|${en.id}` }, r.floor, " ", r.name, "・入口", i + 1, "（", en.wall, "壁）")))), /* @__PURE__ */ React.createElement("span", { className: "small block mt-1" }, "鑑賞モードでこの入口に近づくと、つながり先の部屋へ移るボタンが出ます。")), selEnt && rooms.length <= 1 && /* @__PURE__ */ React.createElement("p", { className: "small" }, "「部屋」タブで部屋を追加すると、別の部屋の入口とつなげられます。"), selEnt && /* @__PURE__ */ React.createElement(React.Fragment, null, entranceMountControls(selEnt), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "入口全体の幅"), /* @__PURE__ */ React.createElement("b", null, fmt(selEnt.w), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "入口の幅", className: "w-full", type: "range", min: "0.3", max: String(Math.max(0.3, Math.min(3, entranceLength(room, selEnt, columns) - 0.04))), step: "0.01", value: selEnt.w, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, w: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "高さ"), /* @__PURE__ */ React.createElement("b", null, fmt(selEnt.h), " m")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "入口の高さ", className: "w-full", type: "range", min: "0.3", max: String(Math.max(0.3, room.h - entranceBase(room, selEnt, columns, blocks))), step: "0.01", value: selEnt.h, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, h: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "block text-xs" }, "壁沿い位置 (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selEnt.pos, onChange: (e) => updateEntrances(entrances.map((x) => x.id === selEnt.id ? { ...x, pos: Number(e.target.value) } : x)) }))), selFurn && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, furnSliders(selFurn)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selFurn.x, onChange: (e) => updateFurniture(furniture.map((x) => x.id === selFurn.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selFurn.z, onChange: (e) => updateFurniture(furniture.map((x) => x.id === selFurn.id ? { ...x, z: Number(e.target.value) } : x)) })))), selBlock && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, blockSliders(selBlock)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selBlock.x, onChange: (e) => updateBlocks(blocks.map((x) => x.id === selBlock.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selBlock.z, onChange: (e) => updateBlocks(blocks.map((x) => x.id === selBlock.id ? { ...x, z: Number(e.target.value) } : x)) })))), selLight && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2" }, /* @__PURE__ */ React.createElement("b", { className: "text-sm" }, "この照明だけ調整（照明", lights.findIndex((l) => l.id === selLight.id) + 1, "）", selLight.solo ? /* @__PURE__ */ React.createElement("span", { className: "ml-1 rounded-full border border-[var(--line)] px-2 py-0.5 text-[11px]" }, "個別") : null), selLight.solo ? /* @__PURE__ */ React.createElement("button", { type: "button", className: "chip text-xs shrink-0", onClick: () => rejoinBulk(selLight) }, "一括に戻す") : /* @__PURE__ */ React.createElement("span", { className: "small text-right" }, "動かすと一括の対象から外れます")), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, lightSliders(selLight)), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 X (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selLight.x, onChange: (e) => updateLights(lights.map((x) => x.id === selLight.id ? { ...x, x: Number(e.target.value) } : x)) })), /* @__PURE__ */ React.createElement("label", { className: "text-xs" }, "位置 Z (m)", /* @__PURE__ */ React.createElement("input", { className: "field", type: "number", step: "0.1", value: selLight.z, onChange: (e) => updateLights(lights.map((x) => x.id === selLight.id ? { ...x, z: Number(e.target.value) } : x)) })))),  selPlace && selPlace.col && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "柱の面"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1" }, ["北", "南", "東", "西"].map((fc) => /* @__PURE__ */ React.createElement("button", { key: fc, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, face: fc, pos: 0 } : p)), className: `chip text-sm ${(selPlace.face || "南") === fc ? "tab-active" : ""}` }, wallName(fc), "面")))), selPlace && selPlace.method === "壁掛け" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "額装サイズ"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex flex-wrap gap-1" }, SIZE_LIST.map((x) => /* @__PURE__ */ React.createElement("button", { key: x, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, size: x, ...x === "スクエア" ? { sq: p.sq || 300 } : {} } : p)), className: `chip text-sm ${selPlace.size === x ? "tab-active" : ""}` }, x))), selPlace.size === "スクエア" && /* @__PURE__ */ React.createElement("label", { className: "mt-2 block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "スクエアの一辺"), /* @__PURE__ */ React.createElement("b", null, mmOf("スクエア", selPlace.sq)[0], " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "スクエアの一辺", className: "w-full", type: "range", min: "100", max: "1000", rstep: "10", value: mmOf("スクエア", selPlace.sq)[0], onChange: (e) => {
     const v = clamp(Math.round(Number(e.target.value)), 100, 1e3);
     updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, sq: v } : p));
   } }))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "縦横向き"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex gap-1" }, ["縦", "横"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, orient: x } : p)), className: `chip ${selPlace.orient === x ? "tab-active" : ""}` }, x, "向き")))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "額縁色・パネル"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex flex-wrap gap-1" }, ["白", "黒", "木目", "パネル"].map((x) => /* @__PURE__ */ React.createElement("button", { key: x, type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, frame: x } : p)), className: `chip ${selPlace.frame === x ? "tab-active" : ""}` }, x === "パネル" ? "パネル（縁なし）" : `額 ${x}`)))), selPlace.frame !== "パネル" && /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => updatePlacements(placements.map((p) => p.id === selPlace.id ? { ...p, mat: !p.mat } : p)), className: `chip ${selPlace.mat ? "tab-active" : ""}` }, "マット ", selPlace.mat ? "あり" : "なし"), selPlace.frame === "パネル" && /* @__PURE__ */ React.createElement("label", { className: "block" }, /* @__PURE__ */ React.createElement("span", { className: "flex justify-between text-sm font-bold" }, /* @__PURE__ */ React.createElement("span", null, "パネルの厚さ"), /* @__PURE__ */ React.createElement("b", null, Math.round((selPlace.thick ?? PANEL_T) * 1e3), " mm")), /* @__PURE__ */ React.createElement(RangeNum, { "aria-label": "パネルの厚さ", className: "w-full", type: "range", min: "2", max: "20", rstep: "1", value: Math.round((selPlace.thick ?? PANEL_T) * 1e3), onChange: (e) => {
