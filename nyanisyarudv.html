@@ -15207,9 +15207,9 @@ let steeredLineMode='', steeredLineVelocity=0, steeredLineOffset=0;
 let steeredCommandRate=0,steeredCommandLimit=4,steeredHandoff=0,steeredHandoffRate=0,steeredHandoffLimit=3.3;
 let slideNeutralTime=0, slideExitActive=false, slideExitTime=0, slideLastKTech=1;
 // Tire-limited trajectory in the road frame; body slip/animations keep their own pose.
-const pathHandling={ready:false,curve:null,heading:0,lateralVelocity:0,lateralAcceleration:0,load:0,limit:55,alignment:1,travel:0,lastLateral:0,understeer:0};
+const pathHandling={ready:false,curve:null,heading:0,lateralVelocity:0,lateralAcceleration:0,load:0,limit:55,alignment:1,travel:0,lastLateral:0,understeer:0,turnRate:0,tireScale:1};
 function resetPathHandling(){
-  Object.assign(pathHandling,{ready:false,curve:null,heading:0,lateralVelocity:0,lateralAcceleration:0,load:0,limit:55,alignment:1,travel:0,lastLateral:lateral,understeer:0});
+  Object.assign(pathHandling,{ready:false,curve:null,heading:0,lateralVelocity:0,lateralAcceleration:0,load:0,limit:55,alignment:1,travel:0,lastLateral:lateral,understeer:0,turnRate:0,tireScale:1});
 }
 function pathAngle(a,b){return Math.atan2(Math.sin(b-a),Math.cos(b-a));}
 function pathHandlingExcluded(){
@@ -15254,6 +15254,7 @@ function stepPathSteering(dt,requested,oldLateral,braking,tireScale=1){
   const tires=20*gripSpeedScale()**2*tireScale*Math.sqrt(1-brakeUse*brakeUse)*frontLoad*kitsuneGripScale()*(dragonOrdinary()?1+.6*dragonRun.gold.brake:1);
   const maxTurn=tires*.62/Math.max(speed,3)*dt;
   const turn=pathAngle(state.heading,desired),actual=THREE.MathUtils.clamp(turn,-maxTurn,maxTurn);
+  state.turnRate=actual/Math.max(dt,1e-5);state.tireScale=tireScale;
   state.heading+=actual;
   assistWallGuide=0;
   if(globalIsAssist&&!(isHarunaMapKey(currentKey)&&(isSliding||isBrakingDrift))&&!(currentKey==='irohaLocal'&&typeof branchS!=='undefined'&&Math.abs(s-branchS)<60)){
@@ -15519,6 +15520,27 @@ function manualCornerExit(c=findDriveCorner()){
   const ready=phase*Math.min(direction,space);
   Object.assign(manualExitCache,{curve,key,value:ready});return ready;
 }
+// Gachi ordinary cats: use the tire capacity left after turning for exit
+// acceleration. No lane/outer-position reward and no change to drift awards.
+const EXIT_GRIP={revision:'exit-grip-1',loadFree:.65,loadFull:1.03,underFree:.035,underFull:.14};
+function exitGripAllowance(load,under){
+  return (1-THREE.MathUtils.smoothstep(load,EXIT_GRIP.loadFree,EXIT_GRIP.loadFull))*(1-THREE.MathUtils.smoothstep(under,EXIT_GRIP.underFree,EXIT_GRIP.underFull));
+}
+function manualExitAccelerationRoom(){
+  const unchanged={active:false,room:1,load:0,under:0,corner:null,why:'通常の加速'};
+  if(globalIsAssist||!normalCatSpeed()||gutterRun.active||pathHandlingExcluded()||TRACKS[currentKey]?.dragon||TRACKS[currentKey]?.skySlide||windcutActive())return unchanged;
+  const c=findDriveCorner();
+  if(!c||!pathHandling.ready||pathHandling.curve!==curve||s<=getCornerDriveProfile(c).apex||s>c.end+18)return unchanged;
+  // Exclude the artificial exit tire boost from the capacity available for
+  // acceleration, while leaving its actual steering effect unchanged.
+  const base=20*gripSpeedScale()**2*kitsuneGripScale();
+  const turning=Math.abs(pathHandling.turnRate)*Math.max(speed,0)/Math.max(.01,base*.62);
+  const requested=pathHandling.load*pathHandling.tireScale;
+  const load=Math.max(turning,requested),under=pathHandling.understeer;
+  const room=exitGripAllowance(load,under);
+  return {active:true,room,load,under,corner:c,why:room>.999?'旋回に余裕あり':under>EXIT_GRIP.underFree?'向きが追いつくまで加速を制限':'旋回負担に応じて加速を制限'};
+}
+
 function manualExitLimit(launch,limit){
   const ready=manualCornerExit(),c=findDriveCorner();
   if(!c||ready<=0)return limit;
@@ -15701,11 +15723,12 @@ function featherUnravel(){
 }
 // きれいの時は、羽根が猫に届いてから(hold.clean 秒後)猫の羽・金色の肉球・光の粒を出す
 let featherCelebrateAt=-1;
+let featherCelebrateCorner=null;
 function updateFeather(){
   featherDiag?.frame();
   // 予定より hold.clean 秒以上先なら時刻が戻った(やり直し)とみて取り消す。予定を入れたコマでは差がちょうど hold.clean になり、小数の誤差で上回ることがある(半分ほどの回で羽が出なかった)ので0.05秒の余裕を持たせる
   if(featherCelebrateAt>=0&&(gameState!=='racing'||simulationElapsed>=featherCelebrateAt||featherCelebrateAt-simulationElapsed>FEATHER.hold.clean+.05)){
-    const go=gameState==='racing'&&simulationElapsed>=featherCelebrateAt;featherCelebrateAt=-1;if(go)celebrateCleanExit();}
+    const go=gameState==='racing'&&simulationElapsed>=featherCelebrateAt,sourceCorner=featherCelebrateCorner;featherCelebrateAt=-1;featherCelebrateCorner=null;if(go)celebrateCleanExit(sourceCorner);}
   const F=featherMark;if(!F.state)return;
   if(gameState!=='racing'){featherHide();return;}
   const m=featherEl();
@@ -15723,7 +15746,7 @@ function updateFeather(){
 }
 // きれいに抜けた時のご褒美(ブレーキ解説のON・OFFに関係なく出す。ぎりぎり・壁に当たった時は出さない)：
 // 次の4歩を金色の肉球にし(GOLD_PAW)、猫の後ろへ光の粒を流す(EXIT_SPARKS)。猫の羽は広げて羽ばたく(unfoldExitWings)
-function celebrateCleanExit(){startGoldPawSteps();startExitSparks();unfoldExitWings();}
+function celebrateCleanExit(sourceCorner=linkExitWatch.corner){startGoldPawSteps();startExitSparks();unfoldExitWings(sourceCorner);}
 // ゴール後の結果：連携してきれいに抜けた回数を、翼を開いた肉球の印と ×N で出す。0回は出さない
 // 印は連携の羽根の絵を複製し、羽根3枚と粒を除く。元の絵は普段隠れていて、隠れた絵の色(グラデーション)を参照すると Safari で色が出ないことがあるので、id を付け替えて色の指定も複製側に持たせる
 function renderGoalCleanLinks(){
@@ -15780,12 +15803,12 @@ function updateExitSparks(dt){
 // 結果は2つ：一番近づいた距離が NIKUKYU_BULGE.near 未満なら「ぎりぎり」、それ以上なら「きれいに抜けた」(壁に当たった時は stopWallDrive)
 function confirmLinkSuccess(minGap=Infinity){
   const near=Number.isFinite(minGap)&&minGap<NIKUKYU_BULGE.near;
-  speedLab?.wing('出口の確認：'+(near?'ぎりぎり':'きれい')+'(外の壁まで最短 '+(Number.isFinite(minGap)?minGap.toFixed(2)+'m':'-')+')');
+  speedLab?.wing('出口の確認：'+(near?'ぎりぎり':'きれい')+'(外の壁まで最短 '+(Number.isFinite(minGap)?minGap.toFixed(2)+'m':'-')+')',linkExitWatch.corner);
   if(near)dismissFoldedWings();
   // 連携していた時は、羽根の結果(きれい：猫の背中へ飛ぶ・ぎりぎり：オレンジ)と連携の音。きれいの猫の羽などは羽根が届いてから(updateFeather)
   // 連携していないドリフトは、きれいならすぐ猫の羽など、ぎりぎりの時だけ短い知らせ
-  if(featherResult(near?'near':'clean')){if(!near){cleanLinkCount++;featherCelebrateAt=simulationElapsed+FEATHER.hold.clean;}return;}
-  if(!near&&gameState==='racing')celebrateCleanExit();
+  if(featherResult(near?'near':'clean')){if(!near){cleanLinkCount++;featherCelebrateAt=simulationElapsed+FEATHER.hold.clean;featherCelebrateCorner=linkExitWatch.corner;}return;}
+  if(!near&&gameState==='racing')celebrateCleanExit(linkExitWatch.corner);
   if(near&&gameState==='racing')showDriveNotice('ぎりぎり！',`外の壁まで${Math.max(0,minGap).toFixed(1)}m`);
 }
 function recordExitAcceleration(){
@@ -16048,6 +16071,7 @@ const speedLab=(()=>{
     const inward=p.lateral*r.sign,where=Math.abs(inward)<.35?'中央':inward>0?'イン側':'アウト側';
     return `${label}：${k(p.speed)}km/h ${where}${Math.abs(inward).toFixed(2)}m (道の中心から)・走行${p.t.toFixed(3)}秒`;
   };
+  const accelerationText=(label,a)=>a?`${label}：走行${a.t.toFixed(3)}秒・${k(a.speed)}km/h・${a.inward>=0?'イン':'アウト'}側${Math.abs(a.inward).toFixed(2)}m\n  旋回負担${a.load.toFixed(2)}倍・向きの遅れ${(a.under*180/Math.PI).toFixed(1)}°・加速許可${Math.round(a.room*100)}%\n  加速要求${a.requested.toFixed(2)}→許可${a.allowed.toFixed(2)}m/s²・速度目標${k(a.target)}km/h・${a.why}`:`${label}：まだありません`;
   const cornerText=r=>{
     const p=r.points,through=p.entry&&p.exit?p.exit.t-p.entry.t:null;
     const full=p.approach&&p.after?p.after.t-p.approach.t:null;
@@ -16067,10 +16091,11 @@ const speedLab=(()=>{
       `出口の旋回力上乗せ 最大${((r.tireMax-1)*100).toFixed(1)}% (${r.tireN}コマ)\n`+
       `コーナー内で外へ${r.out.toFixed(2)}m・内へ${r.inn.toFixed(2)}m(移動の累計)\n`+
       `インの壁まで最短 ${Number.isFinite(r.inside)?r.inside.toFixed(2)+'m':'未計測'}\n`+
+      [accelerationText('出口加速の最初の要求',r.accelAttempt),accelerationText('出口加速の開始',r.accelStart),accelerationText('旋回負担で最も加速を抑えた瞬間',r.accelRestricted)].join('\n')+'\n'+
       `速度処理の割合と状態割合は別集計。曲がれる速さの目安には出口の旋回力上乗せを含めない。`;
   };
-  const wing=msg=>{
-    const e={t:simulationElapsed,corner:owner(),msg};wingEvents.push(e);
+  const wing=(msg,sourceCorner=owner())=>{
+    const e={t:simulationElapsed,corner:sourceCorner,msg};wingEvents.push(e);
     wingInfo.textContent='猫の羽(直近)\n'+context(e.corner)+'\n'+msg;
   };
   const observeSlide=()=>{
@@ -16150,6 +16175,11 @@ const speedLab=(()=>{
     for(const r of activeRows){
       if(s<r.c.start||s>r.c.end)continue;
       r.controlTime+=o.dt;r.by[o.branch]=(r.by[o.branch]||0)+o.dt;
+      if(o.budget?.active&&o.budget.corner===r.c&&o.requestedAccel>0){
+        const a={t:simulationElapsed,speed:o.before,inward:lateral*r.sign,load:o.budget.load,under:o.budget.under,room:o.budget.room,requested:o.requestedAccel,allowed:o.allowedAccel,target:o.target,why:o.budget.why};
+        r.accelAttempt??=a;if(o.allowedAccel>.05)r.accelStart??=a;
+        if(o.requestedAccel-o.allowedAccel>.01&&(!r.accelRestricted||o.requestedAccel-o.allowedAccel>r.accelRestricted.requested-r.accelRestricted.allowed))r.accelRestricted=a;
+      }
       r.targetMin=Math.min(r.targetMin,o.target);r.targetMax=Math.max(r.targetMax,o.target);
       if(o.dt>0){const a=(o.after-o.before)/o.dt;r.accelMin=Math.min(r.accelMin,a);r.accelMax=Math.max(r.accelMax,a);}
     }
@@ -16183,7 +16213,7 @@ const speedLab=(()=>{
   };
   const report=()=>{
     const m=runMeta;
-    const header=`ドリフト全コーナー記録 ${m?.version||APP_VERSION}\nコース ${m?.title||COURSES[currentKey]?.title||currentKey} (${m?.course||currentKey})・猫 ${m?.cat||catModel}\n全${records.length}コーナー・滑り終わり${exitRecords.length}件・羽の記録${wingEvents.length}件\n計測の境界は前後のコマから補間。物理値・走行挙動は変更なし。\n開始時の設定 ${JSON.stringify(m?.settings||NORMAL_SPEED)}\n現在の設定 ${JSON.stringify({...NORMAL_SPEED,bands:undefined})}`;
+    const header=`ドリフト全コーナー記録 ${m?.version||APP_VERSION}\nコース ${m?.title||COURSES[currentKey]?.title||currentKey} (${m?.course||currentKey})・猫 ${m?.cat||catModel}\n全${records.length}コーナー・滑り終わり${exitRecords.length}件・羽の記録${wingEvents.length}件\n計測の境界は前後のコマから補間。出口加速調整 exit-grip-1：ガチ峠の通常猫のみ、旋回の余裕に応じて加速。旋回力上乗せの設定は維持。\n開始時の設定 ${JSON.stringify(m?.settings||NORMAL_SPEED)}\n現在の設定 ${JSON.stringify({...NORMAL_SPEED,bands:undefined})}\n出口加速の設定 ${JSON.stringify(EXIT_GRIP)}`;
     const rows=records.map((r,i)=>`【${i+1}】${cornerText(r)}`);
     const events=[...exitRecords.map((e,i)=>({t:e.t0,text:`【滑り終わり${i+1}】${exitText(e)}`})),...wingEvents.map(e=>({t:e.t,text:`【猫の羽】${nameOf(e.corner)}・走行${e.t.toFixed(2)}秒 ${e.msg}`}))].sort((a,b)=>a.t-b.t);
     return [header,...rows,...events.map(e=>e.text)].join('\n\n');
@@ -18382,7 +18412,7 @@ function updateReadyCourse(){
   setCourseWarmUi(courseWarm.ready);
 }
 function resetRace(){
-  speedLab?.resetRun();
+  speedLab?.resetRun();featherCelebrateCorner=null;
   resetCatMotion();
   resetDragon();
   resetSkySlide();
@@ -19417,7 +19447,7 @@ function exitWingBlockReason(receipt,running=false){
     running&&(input.brake||input.brakePressed)?'ブレーキ中':shortcutOwnsFeedback()?'抜け道の表示中':!pawTrailGrounded()?'足が地面にない':running&&exitBonusVisual.curve!==curve?'道が切り替わった':'';
 }
 function startExitBonusVisual(receipt){
-  if(speedLab&&receipt&&exitBonusVisual.receipt!==receipt){const why=exitWingBlockReason(receipt);speedLab.wing(why?'たたんだ羽を出さない：'+why:isWeakCornerBonus(receipt)?'たたんだ羽：弱いボーナスなので羽は見せない('+(receipt.lowGain?'加速が普段の'+EXIT_LAUNCH.wingGain+'倍未満':'ドリフトで曲がった割合が小さい '+(receipt.cover??0).toFixed(2))+')':'たたんだ羽を出した');}
+  if(speedLab&&receipt&&exitBonusVisual.receipt!==receipt){const why=exitWingBlockReason(receipt);speedLab.wing(why?'たたんだ羽を出さない：'+why:isWeakCornerBonus(receipt)?'たたんだ羽：弱いボーナスなので羽は見せない('+(receipt.lowGain?'加速が普段の'+EXIT_LAUNCH.wingGain+'倍未満':'ドリフトで曲がった割合が小さい '+(receipt.cover??0).toFixed(2))+')':'たたんだ羽を出した',receipt.corner);}
   if(assistDiag&&receipt&&exitBonusVisual.receipt!==receipt)assistDiag.wing(exitWingBlockReason(receipt)||(isWeakCornerBonus(receipt)?'弱いボーナス(風だけ)':'出た'));
   if(!appAnimationsEnabled||!receipt||exitBonusVisual.receipt===receipt||gameState!=='racing'||receipt.blocked||assistBonusBlocked(receipt.corner)||wallHitCooldown>0||shortcutOwnsFeedback()||!pawTrailGrounded())return;
   const weak=isWeakCornerBonus(receipt);
@@ -19426,8 +19456,8 @@ function startExitBonusVisual(receipt){
 }
 // たたんだ羽：大きさ scale 倍・濃さ opacity。ぎりぎりの時は dismiss 秒で消す。max 秒たっても確定しなければ消す
 const EXIT_WING_FOLD={scale:.75,opacity:.75,dismiss:.25,max:5};
-function unfoldExitWings(){
-  const st=exitBonusVisual;speedLab?.wing(!st.active?'羽を開く時に羽がなかった(先に消えていた・出していない)':!st.folded?'羽を開く時にはもう開いていた':st.weak?'羽を開く(弱いボーナスなので見せない)':'羽を開いた');if(!st.active||!st.folded)return;
+function unfoldExitWings(sourceCorner=null){
+  const st=exitBonusVisual;speedLab?.wing(!st.active?'羽を開く時に羽がなかった(先に消えていた・出していない)':!st.folded?'羽を開く時にはもう開いていた':st.weak?'羽を開く(弱いボーナスなので見せない)':'羽を開いた',sourceCorner||st.receipt?.corner||linkExitWatch.corner);if(!st.active||!st.folded)return;
   st.folded=false;st.time=0;st.airStarted=false;st.dismiss=null;
   if(!st.weak)playSfx('wingTwinkle');
 }
@@ -19435,14 +19465,14 @@ function dismissFoldedWings(){const st=exitBonusVisual;if(st.active&&st.folded&&
 function updateExitBonusVisual(dt){
   const state=exitBonusVisual;if(!state.active)return;
   if(!appAnimationsEnabled||gameState!=='racing'||state.curve!==curve||state.receipt.blocked||assistBonusBlocked(state.receipt.corner)||wallHitCooldown>0||input.brake||input.brakePressed||shortcutOwnsFeedback()||!pawTrailGrounded()){
-    speedLab?.wing('たたんだ羽が途中で消えた：'+(exitWingBlockReason(state.receipt,true)||'?'));
+    speedLab?.wing('たたんだ羽が途中で消えた：'+(exitWingBlockReason(state.receipt,true)||'?'),state.receipt?.corner);
     assistDiag?.wing('途中で消えた：'+(exitWingBlockReason(state.receipt,true)||'?')+' '+state.time.toFixed(2)+'秒');
     resetExitBonusVisual();return;
   }
   const folded=state.folded;
   if(folded){
-    state.foldTime+=dt;if(state.foldTime>EXIT_WING_FOLD.max){speedLab?.wing('たたんだまま'+EXIT_WING_FOLD.max+'秒たって消えた');resetExitBonusVisual();return;}
-    if(state.dismiss!==null){state.dismiss-=dt;if(state.dismiss<=0){speedLab?.wing('ぎりぎりなので羽を消した');resetExitBonusVisual();return;}}
+    state.foldTime+=dt;if(state.foldTime>EXIT_WING_FOLD.max){speedLab?.wing('たたんだまま'+EXIT_WING_FOLD.max+'秒たって消えた',state.receipt?.corner);resetExitBonusVisual();return;}
+    if(state.dismiss!==null){state.dismiss-=dt;if(state.dismiss<=0){speedLab?.wing('ぎりぎりなので羽を消した',state.receipt?.corner);resetExitBonusVisual();return;}}
   }else{state.time+=dt;if(state.time>=state.duration){resetExitBonusVisual();return;}}
   // たたんでいる間は羽の時間を0に止める(開く前の形)。風の線だけは離した時からの時間で一度流す
   const time=folded?0:state.time,airTime=folded?state.foldTime:state.time,open=THREE.MathUtils.smoothstep(time,0,.18),charge=THREE.MathUtils.smoothstep(time,.18,.40),stroke=THREE.MathUtils.smoothstep(time,.40,.60),settle=THREE.MathUtils.smoothstep(time,.60,.82),stream=THREE.MathUtils.smoothstep(time,.60,.90);
@@ -21252,7 +21282,9 @@ function tick(dt,renderDt=dt){
     if(!yokaiRun.fired){yokaiRun.fired=true;speed=Math.max(speed,TOP_SPEED);if(navigator.vibrate)navigator.vibrate([30,30,60]);}
     if(!isBraking)tSpd=Math.max(tSpd,TOP_SPEED);
   }
+  const exitGrip=manualExitAccelerationRoom();
   const beforeControllerSpeed=speed;
+  let exitAccelBefore=0,exitAccelAfter=0,exitLaunchEligible=false;
   let speedLabBranch='';
   // ?assistdiag用：このコマの速さがどの枝で決まったか(加速ボーナスは「通常の加速」の枝でしか始まらない)
   accelPath=gutterRun.active&&!isBraking?'溝':rescueDecel>0&&!isBraking?'救済':manualGripOverspeed?'外へ流れ':speed<tSpd?(cornerLaunch?'通常(ボーナス弱)':'通常(ボーナスなし)'):isBraking?'ブレーキ':'目標超え';
@@ -21322,7 +21354,7 @@ function tick(dt,renderDt=dt){
           cornerDrive.lowGain=fullGain<EXIT_LAUNCH.wingGain;
           fishLab?.exit(speed*3.6,fullGain,nowGain,isWeakCornerBonus(cornerDrive));
         }
-        recordExitAcceleration();
+        exitLaunchEligible=true;
       }
       accel=THREE.MathUtils.lerp(accel,launchAccel,authority);
       if(authority>.02)speedLabBranch='通常加速＋出口ボーナス合成';
@@ -21358,6 +21390,11 @@ function tick(dt,renderDt=dt){
     // 雪・氷の上は足が空回りして加速が鈍い
     accel*=snowAccelScale();
     if(speed*3.6<45)lowSpeedTrace.final=accel;
+    exitAccelBefore=accel;
+    accel*=exitGrip.room;
+    exitAccelAfter=accel;
+    if(exitGrip.active&&exitGrip.room<.999)speedLabBranch+='(旋回負担で出口加速を制限)';
+    if(exitLaunchEligible&&accel>.01)recordExitAcceleration();
     speed=Math.min(tSpd,speed+accel*dt);
   } else {
     speedLabBranch=isBraking?'手動ブレーキ':'目標超えの減速処理';
@@ -21437,7 +21474,7 @@ function tick(dt,renderDt=dt){
   // V222 最終クランプ 45→55で180km/h到達可能に。のちに210km/hへ
   speed=THREE.MathUtils.clamp(speed,0,raceSpeedLimit());
   if(!isFinite(speed)) speed=0;
-  speedLab?.controller({dt,before:beforeControllerSpeed,after:speed,target:tSpd,branch:speedLabBranch,success:Boolean(success)});
+  speedLab?.controller({dt,before:beforeControllerSpeed,after:speed,target:tSpd,branch:speedLabBranch,success:Boolean(success),budget:exitGrip,requestedAccel:exitAccelBefore,allowedAccel:exitAccelAfter,launchEligible:exitLaunchEligible});
 
   updateSoloSlideFeedback(dt);
 
