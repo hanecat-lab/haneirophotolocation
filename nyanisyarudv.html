@@ -15207,9 +15207,9 @@ let steeredLineMode='', steeredLineVelocity=0, steeredLineOffset=0;
 let steeredCommandRate=0,steeredCommandLimit=4,steeredHandoff=0,steeredHandoffRate=0,steeredHandoffLimit=3.3;
 let slideNeutralTime=0, slideExitActive=false, slideExitTime=0, slideLastKTech=1;
 // Tire-limited trajectory in the road frame; body slip/animations keep their own pose.
-const pathHandling={ready:false,curve:null,heading:0,lateralVelocity:0,lateralAcceleration:0,load:0,limit:55,alignment:1,travel:0,lastLateral:0,understeer:0,turnRate:0,tireScale:1};
+const pathHandling={ready:false,curve:null,heading:0,lateralVelocity:0,lateralAcceleration:0,load:0,limit:55,alignment:1,travel:0,lastLateral:0,understeer:0,turnRate:0,tireScale:1,exitTurnLoad:0};
 function resetPathHandling(){
-  Object.assign(pathHandling,{ready:false,curve:null,heading:0,lateralVelocity:0,lateralAcceleration:0,load:0,limit:55,alignment:1,travel:0,lastLateral:lateral,understeer:0,turnRate:0,tireScale:1});
+  Object.assign(pathHandling,{ready:false,curve:null,heading:0,lateralVelocity:0,lateralAcceleration:0,load:0,limit:55,alignment:1,travel:0,lastLateral:lateral,understeer:0,turnRate:0,tireScale:1,exitTurnLoad:0});
 }
 function pathAngle(a,b){return Math.atan2(Math.sin(b-a),Math.cos(b-a));}
 function pathHandlingExcluded(){
@@ -15243,7 +15243,7 @@ function stepPathSteering(dt,requested,oldLateral,braking,tireScale=1){
     resetPathHandling();return requested;
   }
   const tr=getTrackAtDist(s),roadHeading=Math.atan2(tr.t.z,tr.t.x),v=Math.max(0,speed*.62);
-  if(!state.ready||state.curve!==curve){state.ready=true;state.curve=curve;state.heading=roadHeading;state.lastLateral=oldLateral;state.lateralVelocity=0;state.lateralAcceleration=0;}
+  if(!state.ready||state.curve!==curve){state.ready=true;state.curve=curve;state.heading=roadHeading;state.lastLateral=oldLateral;state.lateralVelocity=0;state.lateralAcceleration=0;state.exitTurnLoad=0;}
   const k=roadBendAt(s),q=THREE.MathUtils.clamp(1-k*oldLateral,.3,1.8);
   const mid=getTrackAtDist(s+v*dt/(2*q)),midHeading=Math.atan2(mid.t.z,mid.t.x);
   const requestedVelocity=THREE.MathUtils.clamp((requested-oldLateral)/Math.max(dt,.00001),-v*.82,v*.82);
@@ -15255,6 +15255,11 @@ function stepPathSteering(dt,requested,oldLateral,braking,tireScale=1){
   const maxTurn=tires*.62/Math.max(speed,3)*dt;
   const turn=pathAngle(state.heading,desired),actual=THREE.MathUtils.clamp(turn,-maxTurn,maxTurn);
   state.turnRate=actual/Math.max(dt,1e-5);state.tireScale=tireScale;
+  // Measure used tire force, not desired-heading error. The latter can grow
+  // to 3x while the actual turn is still capped, especially during handoffs.
+  const normalTires=20*gripSpeedScale()**2*kitsuneGripScale();
+  const usedLoad=Math.abs(state.turnRate)*Math.max(speed,0)/Math.max(.01,normalTires*.62);
+  state.exitTurnLoad+=(usedLoad-state.exitTurnLoad)*(1-Math.exp(-dt/EXIT_GRIP.loadResponse));
   state.heading+=actual;
   assistWallGuide=0;
   if(globalIsAssist&&!(isHarunaMapKey(currentKey)&&(isSliding||isBrakingDrift))&&!(currentKey==='irohaLocal'&&typeof branchS!=='undefined'&&Math.abs(s-branchS)<60)){
@@ -15522,12 +15527,12 @@ function manualCornerExit(c=findDriveCorner()){
 }
 // Gachi ordinary cats: use the tire capacity left after turning for exit
 // acceleration. No lane/outer-position reward and no change to drift awards.
-const EXIT_GRIP={revision:'exit-grip-1',loadFree:.65,loadFull:1.03,underFree:.035,underFull:.14};
+const EXIT_GRIP={revision:'exit-grip-2',loadFree:.65,loadFull:1.03,underFree:.035,underFull:.14,loadResponse:.10};
 function exitGripAllowance(load,under){
   return (1-THREE.MathUtils.smoothstep(load,EXIT_GRIP.loadFree,EXIT_GRIP.loadFull))*(1-THREE.MathUtils.smoothstep(under,EXIT_GRIP.underFree,EXIT_GRIP.underFull));
 }
 function manualExitAccelerationRoom(){
-  const unchanged={active:false,room:1,load:0,under:0,corner:null,why:'通常の加速'};
+  const unchanged={active:false,room:1,load:0,instantLoad:0,requestedLoad:0,under:0,corner:null,why:'通常の加速'};
   if(globalIsAssist||!normalCatSpeed()||gutterRun.active||pathHandlingExcluded()||TRACKS[currentKey]?.dragon||TRACKS[currentKey]?.skySlide||windcutActive())return unchanged;
   const c=findDriveCorner();
   if(!c||!pathHandling.ready||pathHandling.curve!==curve||s<=getCornerDriveProfile(c).apex||s>c.end+18)return unchanged;
@@ -15536,9 +15541,12 @@ function manualExitAccelerationRoom(){
   const base=20*gripSpeedScale()**2*kitsuneGripScale();
   const turning=Math.abs(pathHandling.turnRate)*Math.max(speed,0)/Math.max(.01,base*.62);
   const requested=pathHandling.load*pathHandling.tireScale;
-  const load=Math.max(turning,requested),under=pathHandling.understeer;
+  // Acceleration uses the smoothed magnitude of actual tire force. Keep
+  // requested-heading pressure for diagnostics only; it must not gate speed.
+  const load=pathHandling.exitTurnLoad,under=pathHandling.understeer;
   const room=exitGripAllowance(load,under);
-  return {active:true,room,load,under,corner:c,why:room>.999?'旋回に余裕あり':under>EXIT_GRIP.underFree?'向きが追いつくまで加速を制限':'旋回負担に応じて加速を制限'};
+  const turnRoom=1-THREE.MathUtils.smoothstep(load,EXIT_GRIP.loadFree,EXIT_GRIP.loadFull),directionRoom=1-THREE.MathUtils.smoothstep(under,EXIT_GRIP.underFree,EXIT_GRIP.underFull);
+  return {active:true,room,load,instantLoad:turning,requestedLoad:requested,under,corner:c,why:room>.999?'実旋回に余裕あり':directionRoom<turnRoom?'向きが追いつくまで加速を制限':'実際に使った旋回力に応じて加速を制限'};
 }
 
 function manualExitLimit(launch,limit){
@@ -16071,7 +16079,7 @@ const speedLab=(()=>{
     const inward=p.lateral*r.sign,where=Math.abs(inward)<.35?'中央':inward>0?'イン側':'アウト側';
     return `${label}：${k(p.speed)}km/h ${where}${Math.abs(inward).toFixed(2)}m (道の中心から)・走行${p.t.toFixed(3)}秒`;
   };
-  const accelerationText=(label,a)=>a?`${label}：走行${a.t.toFixed(3)}秒・${k(a.speed)}km/h・${a.inward>=0?'イン':'アウト'}側${Math.abs(a.inward).toFixed(2)}m\n  旋回負担${a.load.toFixed(2)}倍・向きの遅れ${(a.under*180/Math.PI).toFixed(1)}°・加速許可${Math.round(a.room*100)}%\n  加速要求${a.requested.toFixed(2)}→許可${a.allowed.toFixed(2)}m/s²・速度目標${k(a.target)}km/h・${a.why}`:`${label}：まだありません`;
+  const accelerationText=(label,a)=>a?`${label}：走行${a.t.toFixed(3)}秒・${k(a.speed)}km/h・${a.inward>=0?'イン':'アウト'}側${Math.abs(a.inward).toFixed(2)}m\n  実旋回の負担${a.load.toFixed(2)}倍(瞬間${a.instantLoad.toFixed(2)}倍)・操作追従の要求${a.requestedLoad.toFixed(2)}倍(加速制限には不使用)・向きの遅れ${(a.under*180/Math.PI).toFixed(1)}°・加速許可${Math.round(a.room*100)}%\n  加速要求${a.requested.toFixed(2)}→許可${a.allowed.toFixed(2)}m/s²・速度目標${k(a.target)}km/h・${a.why}`:`${label}：まだありません`;
   const cornerText=r=>{
     const p=r.points,through=p.entry&&p.exit?p.exit.t-p.entry.t:null;
     const full=p.approach&&p.after?p.after.t-p.approach.t:null;
@@ -16176,7 +16184,7 @@ const speedLab=(()=>{
       if(s<r.c.start||s>r.c.end)continue;
       r.controlTime+=o.dt;r.by[o.branch]=(r.by[o.branch]||0)+o.dt;
       if(o.budget?.active&&o.budget.corner===r.c&&o.requestedAccel>0){
-        const a={t:simulationElapsed,speed:o.before,inward:lateral*r.sign,load:o.budget.load,under:o.budget.under,room:o.budget.room,requested:o.requestedAccel,allowed:o.allowedAccel,target:o.target,why:o.budget.why};
+        const a={t:simulationElapsed,speed:o.before,inward:lateral*r.sign,load:o.budget.load,instantLoad:o.budget.instantLoad??o.budget.load,requestedLoad:o.budget.requestedLoad??0,under:o.budget.under,room:o.budget.room,requested:o.requestedAccel,allowed:o.allowedAccel,target:o.target,why:o.budget.why};
         r.accelAttempt??=a;if(o.allowedAccel>.05)r.accelStart??=a;
         if(o.requestedAccel-o.allowedAccel>.01&&(!r.accelRestricted||o.requestedAccel-o.allowedAccel>r.accelRestricted.requested-r.accelRestricted.allowed))r.accelRestricted=a;
       }
@@ -16213,7 +16221,7 @@ const speedLab=(()=>{
   };
   const report=()=>{
     const m=runMeta;
-    const header=`ドリフト全コーナー記録 ${m?.version||APP_VERSION}\nコース ${m?.title||COURSES[currentKey]?.title||currentKey} (${m?.course||currentKey})・猫 ${m?.cat||catModel}\n全${records.length}コーナー・滑り終わり${exitRecords.length}件・羽の記録${wingEvents.length}件\n計測の境界は前後のコマから補間。出口加速調整 exit-grip-1：ガチ峠の通常猫のみ、旋回の余裕に応じて加速。旋回力上乗せの設定は維持。\n開始時の設定 ${JSON.stringify(m?.settings||NORMAL_SPEED)}\n現在の設定 ${JSON.stringify({...NORMAL_SPEED,bands:undefined})}\n出口加速の設定 ${JSON.stringify(EXIT_GRIP)}`;
+    const header=`ドリフト全コーナー記録 ${m?.version||APP_VERSION}\nコース ${m?.title||COURSES[currentKey]?.title||currentKey} (${m?.course||currentKey})・猫 ${m?.cat||catModel}\n全${records.length}コーナー・滑り終わり${exitRecords.length}件・羽の記録${wingEvents.length}件\n計測の境界は前後のコマから補間。出口加速調整 exit-grip-2：ガチ峠の通常猫のみ、実際に使った旋回力の余裕に応じて加速。操作追従の要求は加速制限に使わない。旋回力上乗せの設定は維持。\n開始時の設定 ${JSON.stringify(m?.settings||NORMAL_SPEED)}\n現在の設定 ${JSON.stringify({...NORMAL_SPEED,bands:undefined})}\n出口加速の設定 ${JSON.stringify(EXIT_GRIP)}`;
     const rows=records.map((r,i)=>`【${i+1}】${cornerText(r)}`);
     const events=[...exitRecords.map((e,i)=>({t:e.t0,text:`【滑り終わり${i+1}】${exitText(e)}`})),...wingEvents.map(e=>({t:e.t,text:`【猫の羽】${nameOf(e.corner)}・走行${e.t.toFixed(2)}秒 ${e.msg}`}))].sort((a,b)=>a.t-b.t);
     return [header,...rows,...events.map(e=>e.text)].join('\n\n');
