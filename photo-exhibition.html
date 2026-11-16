@@ -1378,7 +1378,7 @@ function galleryShadowFixture(room,env,lights,furniture,placements,blocks,column
     if(!(l.intensity>0))continue;
     const {origin,aim}=galleryLampPose(room,l),edge=Math.cos(l.angle*Math.PI/180),inner=Math.cos(l.angle*.2*Math.PI/180);
     let score=0;
-    for(const p of receivers){const delta=new THREE.Vector3(p.x,p.y,p.z).sub(origin),distance=delta.length(),cone=sm(edge,inner,delta.normalize().dot(aim));score+=l.intensity*cone/Math.max(1,distance**1.4);}
+    for(const p of receivers){const delta=new THREE.Vector3(p.x,p.y,p.z).sub(origin),distance=delta.length(),cone=gallerySpotFalloff(edge,delta.normalize().dot(aim));score+=l.intensity*cone/Math.max(1,distance**1.4);}
     if(score>best){best=score;chosen=l.id;}
   }
   return chosen;
@@ -1386,6 +1386,27 @@ function galleryShadowFixture(room,env,lights,furniture,placements,blocks,column
 
 // A tiny neutral room reflection, filtered once per renderer. It contains no
 // photos or external imagery, and is assigned only to architectural/furniture finishes.
+// A continuous lens profile, shared by every receiving material. The exhibit
+// fixtures use decay 1.4; daylight fill spots retain their original distribution.
+function gallerySpotFalloff(coneCos,angleCos){
+  const r2=clamp((1-angleCos)/Math.max(.00001,1-coneCos),0,1);
+  return Math.exp(-2.4*r2)*(1-sm(.70,1,r2));
+}
+function gallerySpotProfile(material){
+  if(!material?.isMeshStandardMaterial||material.userData.gallerySpotProfile)return material;
+  const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
+  material.userData.gallerySpotProfile=true;
+  material.onBeforeCompile=shader=>{previous.call(material,shader);
+    const chunk=THREE.ShaderChunk.lights_pars_begin.replace('float spotAttenuation = getSpotAttenuation( spotLight.coneCos, spotLight.penumbraCos, angleCos );',`float spotAttenuation = getSpotAttenuation( spotLight.coneCos, spotLight.penumbraCos, angleCos );
+      if(abs(spotLight.decay-1.4)<.0001){
+        float galleryConeRadius2=clamp((1.0-angleCos)/max(.00001,1.0-spotLight.coneCos),0.0,1.0);
+        spotAttenuation=exp(-2.4*galleryConeRadius2)*(1.0-smoothstep(.70,1.0,galleryConeRadius2));
+      }`);
+    shader.fragmentShader=shader.fragmentShader.replace('#include <lights_pars_begin>',chunk);
+  };
+  material.customProgramCacheKey=()=>key+'|gallery-lens-profile-v1';return material;
+}
+
 function galleryReflectionTexture() {
   const width=128,height=64,data=new Uint8Array(width*height*4);
   for(let y=0;y<height;y++)for(let x=0;x<width;x++){
@@ -1504,9 +1525,46 @@ function galleryGlazingMaterial(options) {
   material.customProgramCacheKey=()=> 'gallery-glazing-room-v1';
   return material;
 }
+// Reflection is composited into the opaque floor itself: no coplanar overlay.
+function galleryFloorFinish(material,strength){
+  const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
+  const u={galleryMirror:{value:null},galleryMirrorMatrix:{value:new THREE.Matrix4()},galleryMirrorReady:{value:0},galleryMirrorTexel:{value:new THREE.Vector2(1/384,1/384)},galleryFloorMirrorStrength:{value:clamp(strength*3,0,1)}};
+  material.userData.galleryGlazing=u;material.userData.galleryFloorFinish=true;
+  material.onBeforeCompile=shader=>{previous.call(material,shader);Object.assign(shader.uniforms,u);
+    shader.vertexShader='uniform mat4 galleryMirrorMatrix; varying vec4 galleryFloorMirrorUV; varying vec3 galleryFloorWorld;\n'+shader.vertexShader;
+    shader.vertexShader=shader.vertexShader.replace('#include <project_vertex>','#include <project_vertex>\ngalleryFloorWorld=(modelMatrix*vec4(transformed,1.0)).xyz; galleryFloorMirrorUV=galleryMirrorMatrix*vec4(galleryFloorWorld,1.0);');
+    shader.fragmentShader='uniform sampler2D galleryMirror; uniform vec2 galleryMirrorTexel; uniform float galleryMirrorReady; uniform float galleryFloorMirrorStrength; varying vec4 galleryFloorMirrorUV; varying vec3 galleryFloorWorld;\n'+shader.fragmentShader;
+    shader.fragmentShader=shader.fragmentShader.replace('#include <roughnessmap_fragment>',`#include <roughnessmap_fragment>
+      vec2 galleryTile=floor((galleryFloorWorld.xz+.00001)/.5);
+      float galleryTileFinish=fract(sin(dot(galleryTile,vec2(127.1,311.7)))*43758.5453);
+      roughnessFactor=clamp(roughnessFactor+(galleryTileFinish-.5)*.035,.48,.75);`);
+    shader.fragmentShader=shader.fragmentShader.replace('#include <opaque_fragment>',`
+      vec3 galleryFloorNormal=inverseTransformDirection(normal,viewMatrix);
+      if(galleryMirrorReady>.5 && galleryFloorMirrorUV.w>0.0 && galleryFloorNormal.y>.9){
+        vec2 uv=galleryFloorMirrorUV.xy/galleryFloorMirrorUV.w;
+        if(all(greaterThanEqual(uv,vec2(0.0)))&&all(lessThanEqual(uv,vec2(1.0)))){
+          float blur=clamp(3.0+roughnessFactor*4.0+length(vViewPosition)*.5,3.0,10.0);
+          vec2 stepUV=galleryMirrorTexel*blur;
+          vec3 reflected=texture2D(galleryMirror,clamp(uv,stepUV,vec2(1.0)-stepUV)).rgb*.20;
+          for(int j=0;j<8;j++){
+            vec2 offset=j==0?vec2(1.0,0.0):j==1?vec2(-1.0,0.0):j==2?vec2(0.0,1.0):j==3?vec2(0.0,-1.0):j==4?vec2(1.0,1.0):j==5?vec2(-1.0,1.0):j==6?vec2(1.0,-1.0):vec2(-1.0,-1.0);
+            reflected+=texture2D(galleryMirror,clamp(uv+offset*stepUV,stepUV,vec2(1.0)-stepUV)).rgb*(j<4?.12:.08);
+          }
+          float fresnel=pow(1.0-clamp(abs(dot(normal,normalize(vViewPosition))),0.0,1.0),5.0);
+          float border=smoothstep(0.0,.035,min(min(uv.x,uv.y),min(1.0-uv.x,1.0-uv.y)));
+          outgoingLight=mix(outgoingLight,reflected*diffuseColor.rgb,(.012+.07*fresnel)*galleryFloorMirrorStrength*border);
+        }
+      }
+      #include <opaque_fragment>`);
+  };
+  material.customProgramCacheKey=()=>key+'|gallery-satin-floor-v1';return material;
+}
+
+function galleryMirrorPlane(surface){
+  return {origin:(surface.userData.galleryMirrorPoint||new THREE.Vector3()).clone().applyMatrix4(surface.matrixWorld),normal:(surface.userData.galleryMirrorNormal||new THREE.Vector3(0,0,1)).clone().transformDirection(surface.matrixWorld)};
+}
 function galleryMirrorView(surface,camera,virtualCamera,matrix){
-  const origin=new THREE.Vector3().setFromMatrixPosition(surface.matrixWorld),position=new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
-  const normal=new THREE.Vector3(0,0,1).transformDirection(surface.matrixWorld);
+  const {origin,normal}=galleryMirrorPlane(surface),position=new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
   if(position.clone().sub(origin).dot(normal)<=.015)return false;
   virtualCamera.position.copy(position.clone().sub(origin).reflect(normal).add(origin));
   const rotation=new THREE.Matrix4().extractRotation(camera.matrixWorld),look=new THREE.Vector3(0,0,-1).applyMatrix4(rotation).add(position);
@@ -1525,7 +1583,7 @@ function createGalleryGlazingReflection(renderer,scene,camera){
   let target=null,active=null,last=-Infinity,dirty=2,failed=false,lastPose='',lastChoice=null,previousPlane=null;
   const enabled=typeof renderer.setRenderTarget==='function'&&typeof renderer.getRenderTarget==='function';
   const disable=()=>{for(const m of surfaces)m.material.userData.galleryGlazing.galleryMirrorReady.value=0;};
-  const bind=()=>{if(!target||!previousPlane)return;for(const m of surfaces){const n=new THREE.Vector3(0,0,1).transformDirection(m.matrixWorld),p=m.getWorldPosition(new THREE.Vector3());if(n.dot(previousPlane.normal)>.999&&Math.abs(p.sub(previousPlane.origin).dot(previousPlane.normal))<.01){const u=m.material.userData.galleryGlazing;u.galleryMirror.value=target.texture;u.galleryMirrorMatrix.value.copy(previousPlane.matrix);u.galleryMirrorReady.value=1;}}};
+  const bind=()=>{if(!target||!previousPlane)return;for(const m of surfaces){const plane=galleryMirrorPlane(m),n=plane.normal,p=plane.origin;if(n.dot(previousPlane.normal)>.999&&Math.abs(p.sub(previousPlane.origin).dot(previousPlane.normal))<.01){const u=m.material.userData.galleryGlazing;u.galleryMirror.value=target.texture;u.galleryMirrorMatrix.value.copy(previousPlane.matrix);u.galleryMirrorReady.value=1;}}};
   return {
     register(mesh){surfaces.push(mesh);},
     reset(){disable();surfaces.length=0;active=null;lastChoice=null;lastPose='';dirty=2;},
@@ -1535,8 +1593,8 @@ function createGalleryGlazingReflection(renderer,scene,camera){
       const frustum=new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse));
       let choice=null,best=0;
       for(const m of surfaces){if(!m.visible||!frustum.intersectsObject(m))continue;let visible=true;for(let p=m.parent;p;p=p.parent)if(!p.visible)visible=false;if(!visible)continue;
-        const pos=m.getWorldPosition(new THREE.Vector3()),delta=camera.position.clone().sub(pos),n=new THREE.Vector3(0,0,1).transformDirection(m.matrixWorld),facing=delta.clone().normalize().dot(n);
-        if(facing<=.02)continue;const box=m.geometry.parameters,score=(box.width||1)*(box.height||1)*facing/Math.max(1,delta.lengthSq())*(lastChoice===m?1.25:1);
+        const plane=galleryMirrorPlane(m),pos=plane.origin,delta=camera.position.clone().sub(pos),n=plane.normal,facing=delta.clone().normalize().dot(n);
+        if(facing<=.02)continue;const box=m.geometry.parameters||{},area=m.userData.galleryMirrorArea||((box.width||1)*(box.height||1)),weight=m.userData.galleryMirrorWeight??1,score=area*weight*facing/Math.max(1,delta.lengthSq())*(lastChoice===m?1.25:1);
         if(score>best){choice=m;best=score;}}
       if(!choice){disable();active=null;lastChoice=null;return false;}
       bind();
@@ -1551,13 +1609,13 @@ function createGalleryGlazingReflection(renderer,scene,camera){
       const hidden=[],oldTarget=renderer.getRenderTarget(),shadowUpdate=renderer.shadowMap.needsUpdate,shadowAuto=renderer.shadowMap.autoUpdate,xr=renderer.xr?.enabled,viewport=renderer.getViewport?.(new THREE.Vector4());
       const hide=o=>{if(o.visible){hidden.push(o);o.visible=false;}};
       for(const m of surfaces)hide(m);
-      scene.traverse(o=>{if(o.isSprite||o.isLine||o.type==='ArrowHelper'||o.userData?.handle||o.userData?.selectionMarker||o.material?.wireframe)hide(o);});
+      scene.traverse(o=>{if(o.isSprite||o.isLine||o.type==='ArrowHelper'||o.userData?.handle||o.userData?.selectionMarker||o.userData?.floorTileLines||o.material?.wireframe)hide(o);});
       let success=false;
       try{if(renderer.xr)renderer.xr.enabled=false;renderer.shadowMap.autoUpdate=false;renderer.shadowMap.needsUpdate=false;renderer.setRenderTarget(target);renderer.state?.buffers?.depth?.setMask(true);renderer.clear?.();renderer.render(scene,virtual);success=true;}
       catch{failed=true;disable();}
       finally{for(const o of hidden)o.visible=true;renderer.shadowMap.needsUpdate=shadowUpdate;renderer.shadowMap.autoUpdate=shadowAuto;if(renderer.xr)renderer.xr.enabled=xr;renderer.setRenderTarget(oldTarget);if(viewport)renderer.setViewport?.(viewport);}
       if(!success)return false;
-      disable();previousPlane={normal:new THREE.Vector3(0,0,1).transformDirection(choice.matrixWorld),origin:choice.getWorldPosition(new THREE.Vector3()),matrix:matrix.clone()};bind();
+      disable();previousPlane={...galleryMirrorPlane(choice),matrix:matrix.clone()};bind();
       active=choice;lastChoice=choice;lastPose=pose;last=now;dirty=Math.max(0,dirty-1);return true;
     },
     dispose(){disable();target?.dispose();target=null;surfaces.length=0;}
@@ -1570,7 +1628,7 @@ function galleryCentroidShadowChunk(source){
 }
 function gallerySoftShadowMaterial(material,parameters){
   material.userData.gallerySoftShadow=true;
-  const previous=material.onBeforeCompile;
+  const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
   material.onBeforeCompile=shader=>{
     previous?.(shader);Object.assign(shader.uniforms,parameters);
     shader.vertexShader=shader.vertexShader.replace('#include <shadowmap_pars_vertex>',galleryCentroidShadowChunk(THREE.ShaderChunk.shadowmap_pars_vertex));
@@ -1593,10 +1651,38 @@ function gallerySoftShadowMaterial(material,parameters){
           spread=clamp(.7+separation*.012/max(.0001,gallerySunTexelWorld),.7,4.5);
         }
         radius=spread*texelSize.x;
+      }else if(shadowRadius>1.9){
+        float galleryNear=galleryLampShadowNearFar.x,galleryFar=galleryLampShadowNearFar.y;
+        float galleryBlocker=0.0,galleryVisibility=1.0;
+        vec2 galleryProbe=shadowCoord.xy;
+        // Five depth probes, then nine filtered comparisons. Only one exhibit
+        // light owns a shadow map, independently of the number of fixtures.
+        for(int j=0;j<5;j++){
+          vec2 offset=j==0?vec2(0.0):j==1?vec2(2.5,0.0):j==2?vec2(-2.5,0.0):j==3?vec2(0.0,2.5):vec2(0.0,-2.5);
+          vec2 probe=clamp(shadowCoord.xy+offset*texelSize,texelSize,vec2(1.0)-texelSize);
+          float visibility=texture(shadowMap,vec3(probe,shadowCoord.z));
+          if(visibility<galleryVisibility){galleryVisibility=visibility;galleryProbe=probe;}
+        }
+        float gallerySpread=.8;
+        if(galleryVisibility<.5){
+          float lo=0.0,hi=shadowCoord.z;
+          for(int k=0;k<10;k++){float mid=(lo+hi)*.5;if(texture(shadowMap,vec3(galleryProbe,mid))<.5)hi=mid;else lo=mid;}
+          galleryBlocker=galleryNear*galleryFar/max(.00001,galleryFar-hi*(galleryFar-galleryNear));
+          float galleryReceiver=galleryNear*galleryFar/max(.00001,galleryFar-shadowCoord.z*(galleryFar-galleryNear));
+          float gallerySeparation=max(0.0,galleryReceiver-galleryBlocker);
+          float galleryTexelWorld=2.0*galleryLampShadowTan*galleryReceiver*texelSize.x;
+          gallerySpread=clamp(.8+.022*gallerySeparation/max(.01,galleryBlocker)/max(.00001,galleryTexelWorld),.8,6.0);
+        }
+        radius=gallerySpread*texelSize.x;
       }`);
-    shader.fragmentShader='uniform float gallerySunDepthSpan; uniform float gallerySunTexelWorld;\n'+shader.fragmentShader.replace('#include <shadowmap_pars_fragment>',chunk);
+    const filtered=chunk.replace(/vogelDiskSample\( ([0-4]), 5, phi \)/g,'vogelDiskSample( $1, 9, phi )').replace(') * 0.2;',`+
+          texture(shadowMap,vec3(shadowCoord.xy+vogelDiskSample(5,9,phi)*radius,shadowCoord.z))+
+          texture(shadowMap,vec3(shadowCoord.xy+vogelDiskSample(6,9,phi)*radius,shadowCoord.z))+
+          texture(shadowMap,vec3(shadowCoord.xy+vogelDiskSample(7,9,phi)*radius,shadowCoord.z))+
+          texture(shadowMap,vec3(shadowCoord.xy+vogelDiskSample(8,9,phi)*radius,shadowCoord.z))) / 9.0;`);
+    shader.fragmentShader='uniform float gallerySunDepthSpan; uniform float gallerySunTexelWorld; uniform vec2 galleryLampShadowNearFar; uniform float galleryLampShadowTan;\n'+shader.fragmentShader.replace('#include <shadowmap_pars_fragment>',filtered);
   };
-  material.customProgramCacheKey=()=> 'gallery-distance-soft-shadow-v2-centroid';return material;
+  material.customProgramCacheKey=()=>key+'|gallery-distance-soft-shadow-v3-perspective-centroid';return material;
 }
 function galleryWoodGeometry(source){
   source.computeBoundingBox();const b=source.boundingBox,size=b.getSize(new THREE.Vector3()),axes=['x','y','z'].sort((a,b)=>size[b]-size[a]),long=axes[0],cross=axes[1],other=axes[2],geometry=source.clone(),p=geometry.getAttribute('position'),n=geometry.getAttribute('normal'),uv=new Float32Array(p.count*2);
@@ -1660,12 +1746,12 @@ function galleryRoundedTop(source,type){
 
 function galleryFrameGeometry(p, depth = 0.03) {
   const width=frameW(p), height=frameH(p), inset=FRAME_W+(p.mat?MAT_W:0), scale=depth/0.03;
-  const positions=[],uv=[],regions=[];
+  const positions=[],uv=[],regions=[],finishRegions=[];
   const project=(v)=>[v.x/width+0.5,v.y/height+0.5];
   function quad(a,b,c,d,kind,back=false) {
     const start=positions.length/3;
     for (const v of [a,b,d,b,c,d]) { positions.push(v.x,v.y,v.z); uv.push(...(back?[FRAME_W/width/4,0.5]:project(v))); }
-    regions.push({kind,start,count:6});
+    regions.push({kind,start,count:6});for(let i=0;i<6;i++)finishRegions.push(kind==='photo'?2:kind.startsWith('mat')?1:0);
   }
   const loop=(offset,z)=>[new THREE.Vector3(-width/2+offset,-height/2+offset,z*scale),new THREE.Vector3(width/2-offset,-height/2+offset,z*scale),new THREE.Vector3(width/2-offset,height/2-offset,z*scale),new THREE.Vector3(-width/2+offset,height/2-offset,z*scale)];
   function bridge(a,b,kind) { for(let i=0;i<4;i++) { const j=(i+1)%4; quad(a[i],a[j],b[j],b[i],kind); } }
@@ -1685,7 +1771,22 @@ function galleryFrameGeometry(p, depth = 0.03) {
   geometry.userData.frameProfile={inset,photoWidth:width-2*inset,photoHeight:height-2*inset,photoZ:photoZ*scale,matZ:p.mat?0.010*scale:null,frontZ:depth/2,regions};
   geometry.setAttribute("position",new THREE.Float32BufferAttribute(positions,3));
   geometry.setAttribute("uv",new THREE.Float32BufferAttribute(uv,2));
+  geometry.setAttribute("galleryFinishRegion",new THREE.Float32BufferAttribute(finishRegions,1));
   geometry.computeVertexNormals(); geometry.computeBoundingBox(); return geometry;
+}
+function galleryFrameSurface(material){
+  const previous=material.onBeforeCompile,key=material.customProgramCacheKey();material.userData.galleryFrameSurface=true;
+  material.onBeforeCompile=shader=>{previous.call(material,shader);
+    shader.vertexShader='attribute float galleryFinishRegion; varying float gallerySurfaceRegion;\n'+shader.vertexShader;
+    shader.vertexShader=shader.vertexShader.replace('#include <begin_vertex>','#include <begin_vertex>\ngallerySurfaceRegion=galleryFinishRegion;');
+    shader.fragmentShader='varying float gallerySurfaceRegion;\n'+shader.fragmentShader;
+    shader.fragmentShader=shader.fragmentShader.replace('#include <roughnessmap_fragment>',`#include <roughnessmap_fragment>
+      if(gallerySurfaceRegion>.5)roughnessFactor=gallerySurfaceRegion>1.5?.84:.97;`);
+    shader.fragmentShader=shader.fragmentShader.replace('#include <lights_fragment_end>',`#include <lights_fragment_end>
+      float gallerySurfaceSpecular=gallerySurfaceRegion>1.5?.55:gallerySurfaceRegion>.5?.22:1.0;
+      reflectedLight.directSpecular*=gallerySurfaceSpecular; reflectedLight.indirectSpecular*=gallerySurfaceSpecular;`);
+  };
+  material.customProgramCacheKey=()=>key+'|gallery-frame-paper-photo-v1';return material;
 }
 function App() {
   const [tab, setTab] = useState("部屋");
@@ -3154,7 +3255,7 @@ function App() {
     sunLight.shadow.bias = -0.00008;
     sunLight.shadow.normalBias = 0.003;
     sunLight.shadow.radius = 3;
-    const sunShadowParameters={gallerySunDepthSpan:{value:1},gallerySunTexelWorld:{value:.005}};
+    const sunShadowParameters={gallerySunDepthSpan:{value:1},gallerySunTexelWorld:{value:.005},galleryLampShadowNearFar:{value:new THREE.Vector2(.08,12)},galleryLampShadowTan:{value:Math.tan(Math.PI/6)}};
     sunLight.target = sunTarget;
     scene.add(sunLight, sunTarget);
     const group = new THREE.Group();
@@ -3201,9 +3302,9 @@ function App() {
     let indirectSignature='';
     function updateIndirectField(s,sun){const key=JSON.stringify([s.room,s.env,s.lights,s.windows,s.entrances,s.columns,s.blocks]);if(key===indirectSignature)return;const field=galleryIndirectSources(s.room,s.env,s.lights,s.windows,s.entrances,s.columns,s.blocks,sun),samples=galleryIndirectSamples(s.room,field.sources,field.boxes);indirectTexture.image.data.set(samples.data);indirectTexture.needsUpdate=true;indirectUniforms.galleryFieldMin.value.set(-s.room.w/2,0,-s.room.d/2);indirectUniforms.galleryFieldSize.value.set(s.room.w,samples.boundsHeight,s.room.d);indirectSignature=key;}
     function finishMaterial(kind, properties, role="wall") {
-      const mat = new THREE.MeshStandardMaterial({ ...properties, ...finishMaps[kind], roughness:kind==="floor"?.66:properties.roughness, envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*(kind==="floor"?.55:.055), bumpScale: kind === "wall" ? 0.00042 : 0.00015 });
+      const mat = new THREE.MeshStandardMaterial({ ...properties, ...finishMaps[kind], roughness:kind==="floor"?.60:properties.roughness, envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*(kind==="floor"?.55:.055), bumpScale: kind === "wall" ? 0.00042 : 0.00015 });
       mat.userData.surfaceFinish = kind;gallerySoftShadowMaterial(mat,sunShadowParameters);
-      if(kind==='wall'){const finish=galleryPaint(stateRef.current.room.theme,role);mat.bumpScale=finish.bumpScale;mat.envMapIntensity=reflectionLevel*finish.reflection;mat.userData.paintRole=role;gallerySpatialMaterial(mat,indirectUniforms);}return mat;
+      if(kind==='wall'){const finish=galleryPaint(stateRef.current.room.theme,role);mat.bumpScale=finish.bumpScale;mat.envMapIntensity=reflectionLevel*finish.reflection;mat.userData.paintRole=role;gallerySpatialMaterial(mat,indirectUniforms);}else if(kind==='floor')galleryFloorFinish(mat,reflectionLevel);return mat;
     }
     function finishUV(geometry, kind) {
       const pos = geometry.getAttribute("position"), normal = geometry.getAttribute("normal"), uv = new Float32Array(pos.count * 2), tile = kind === "wall" ? 0.12 : 0.5;
@@ -3542,7 +3643,9 @@ function App() {
       const floor = new THREE.Mesh(floorGeometry(w,.08,d,0,-.04,0), hintMaterial(finishMaterial("floor", { color: floorC, roughness: 0.85, vertexColors:true }), floorHint, "floor"));
       floor.position.y = -0.04;
       floor.receiveShadow = true;
+      floor.userData={...floor.userData,galleryMirrorNormal:new THREE.Vector3(0,1,0),galleryMirrorPoint:new THREE.Vector3(0,.04,0),galleryMirrorArea:w*d,galleryMirrorWeight:.10};
       group.add(floor);
+      if(!s.room.stair&&!floorHint)glazingReflection.register(floor);
       const ceilMat = hintMaterial(finishMaterial("wall",{color:galleryPaint(theme,"ceiling").color,roughness:galleryPaint(theme,"ceiling").roughness},"ceiling"), ceilingHint, "ceiling");
       if (s.room.stair) {
         const st = s.room.stair, n1 = stairN1(st), n2 = st.steps - n1, zS = d / 2 - st.land, R = st.riser, T = st.tread, tot = st.steps * R;
@@ -3690,7 +3793,9 @@ function App() {
         const tx = l.x + Math.sin(dr) * Math.tan(tl) * lr, tz = l.z - Math.cos(dr) * Math.tan(tl) * lr;
         const cy = ceilAt(s.room, l.x, l.z), jy = cy - 0.09;
         const dv = new THREE.Vector3(Math.sin(dr) * Math.sin(tl), -Math.cos(tl), -Math.cos(dr) * Math.sin(tl)).normalize();
-        const fm = new THREE.MeshStandardMaterial({ color: 1776411, roughness: 0.45, metalness: 0.3, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.4 : 0 });
+        const fm = new THREE.MeshStandardMaterial({ color: 0x30312f, roughness: .42, metalness: .55, envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*1.8, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.4 : 0 });
+        fm.userData.fixtureFinish='housing';
+        const bezel=fm.clone();bezel.color.set(0x41423f);bezel.roughness=.32;bezel.userData.fixtureFinish='bezel';
         const fx = new THREE.Group();
         fx.userData = { kind: "light", id: l.id };
         const base = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.055, 0.025, 24), fm);
@@ -3706,7 +3811,7 @@ function App() {
         body.position.set(l.x, jy, l.z).addScaledVector(dv, 0.082);
         body.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), dv);
         body.add(new THREE.Mesh(new THREE.CylinderGeometry(0.042, 0.042, 0.15, 32,1,true), fm));
-        const ring = new THREE.Mesh(new THREE.TorusGeometry(.039,.003,8,32),fm);ring.rotation.x=Math.PI/2;ring.position.y=-.075;ring.userData.fixtureDetail='bezel';body.add(ring);
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(.039,.003,8,32),bezel);ring.rotation.x=Math.PI/2;ring.position.y=-.075;ring.userData.fixtureDetail='bezel';body.add(ring);
         const baffle=new THREE.Mesh(new THREE.CylinderGeometry(.037,.034,.026,32,1,true),new THREE.MeshStandardMaterial({color:0x171816,roughness:.96,side:THREE.DoubleSide}));baffle.position.y=-.060;baffle.userData.fixtureDetail='baffle';body.add(baffle);
         const cap=new THREE.Mesh(new THREE.CircleGeometry(.042,32),fm);cap.rotation.x=-Math.PI/2;cap.position.y=.075;cap.userData.fixtureDetail='cap';body.add(cap);
         const lens = new THREE.Mesh(new THREE.CircleGeometry(0.028, 20), new THREE.MeshStandardMaterial({ color: 2236962, emissive: col, emissiveIntensity: s.env.lightsOn ? isSel ? 1.6 : 1.1 : 0 }));
@@ -3734,6 +3839,8 @@ function App() {
             spot=exhibitShadowLight;
             spot.color.copy(col);spot.intensity=l.intensity;spot.distance=Math.max(12,h*2.5);spot.angle=l.angle*Math.PI/180;spot.penumbra=.9;spot.decay=1.4;
             spot.castShadow=true;spot.shadow.needsUpdate=true;
+            sunShadowParameters.galleryLampShadowNearFar.value.set(spot.shadow.camera.near,spot.distance);
+            sunShadowParameters.galleryLampShadowTan.value=Math.tan(spot.angle);
           }else spot=new THREE.SpotLight(col,l.intensity,Math.max(12,h*2.5),l.angle*Math.PI/180,.9,1.4);
           spot.userData = { galleryRole: "exhibit", fixtureId: l.id, localShadow:casts };
           spot.position.copy(lensPos);
@@ -4036,6 +4143,7 @@ function App() {
         const isSel = sel?.kind === "placement" && sel.id === p.id;
         const mat2 = new THREE.MeshStandardMaterial({ map: frameTexture(photo, p.size, p.orient, p.frame, p.mat, p.sq), roughness: 0.7, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0, ...frameFinish(p) });
         const isPanel = p.frame === "パネル";
+        if(!isPanel){mat2.envMap=reflectionTarget?.texture||null;mat2.envMapIntensity=reflectionLevel*.55;galleryFrameSurface(mat2);}
         const edge = isPanel && p.method === "壁掛け" ? new THREE.MeshStandardMaterial({ color: 15921386, roughness: 0.8, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0 }) : null;
         const pt = clamp(p.thick ?? PANEL_T, 2e-3, 0.02);
         const board = p.method === "壁掛け" ? new THREE.Mesh(isPanel ? new THREE.BoxGeometry(pw, ph, pt) : galleryFrameGeometry(p), isPanel ? [edge, edge, edge, edge, mat2, edge] : mat2) : null;
@@ -4501,6 +4609,7 @@ function App() {
         group.add(dragRing);
         spriteLabel(di.text, new THREE.Vector3(di.pos.x, di.pos.y + 1.05, di.pos.z), 1.45);
       }
+      group.traverse(o=>{if(!o.isMesh)return;for(const mat of Array.isArray(o.material)?o.material:[o.material]){if(!mat?.isMeshStandardMaterial)continue;if(!mat.userData.gallerySoftShadow)gallerySoftShadowMaterial(mat,sunShadowParameters);gallerySpotProfile(mat);}});
       pruneFrameTex();
       frameFinishCache.forEach((maps,key)=>{if(!frameFinishUsed.has(key)){disposeFrameFinish(maps);frameFinishCache.delete(key);}});
       furnitureFinishCache.forEach((mat,key)=>{if(!furnitureFinishUsed.has(key)){mat.dispose();furnitureFinishCache.delete(key);}});
