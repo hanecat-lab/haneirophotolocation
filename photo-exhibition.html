@@ -1803,32 +1803,59 @@ function galleryFloorFinish(material,strength,theme){
   // frames or paintings. No screen-space mirror, Gaussian compositing, light
   // blobs or tile-dependent variations are applied to this finish.
   if(polishedMarble){
+    // v17: separate base diffuse irradiance from environment-specular response.
+    // In Three.js r185 the environment map contributes to iblIrradiance AND
+    // radiance/clearcoatRadiance. Earlier tests changed envMapIntensity for all
+    // three, so switching off reflections also removed the floor's base light.
+    // Keep the known-stable RoomEnvironment solely for specular highlights.
     const previous=material.onBeforeCompile;
     const key=material.customProgramCacheKey();
     material.userData.galleryFloorFinish=true;
-    material.userData.galleryWarmSoftMirror=false;
     material.userData.galleryWarmUniformSheen=true;
-    // Independent, uniform floor-only diffuse lighting diagnostic. It does
-    // not alter the RoomEnvironment PMREM, clearcoat, walls or real lamps.
-    const floorFillUniform={value:Number.isFinite(window.__galleryWarmFloorFill)?window.__galleryWarmFloorFill:0};
-    material.userData.galleryWarmFloorFillUniform=floorFillUniform;
+    material.userData.galleryWarmSoftMirror=false;
+    // Both live controls are uniforms: no shader recompile on iOS/WebKit.
+    const diffuse={value:Number.isFinite(window.__galleryWarmFloorFill)?window.__galleryWarmFloorFill:1.15};
+    const specular={value:Number.isFinite(window.__galleryFloorEnvFactor)?window.__galleryFloorEnvFactor:1};
+    material.userData.galleryWarmFloorFillUniform=diffuse;
+    material.userData.galleryWarmFloorSpecularUniform=specular;
     material.onBeforeCompile=shader=>{
       previous?.(shader);
-      shader.uniforms.galleryWarmFloorFill=floorFillUniform;
-      shader.fragmentShader='uniform float galleryWarmFloorFill;\n'+shader.fragmentShader;
+      shader.uniforms.galleryWarmBaseDiffuse=diffuse;
+      shader.uniforms.galleryWarmSpecularFactor=specular;
+      shader.fragmentShader='uniform float galleryWarmBaseDiffuse; uniform float galleryWarmSpecularFactor;\n'+shader.fragmentShader;
       shader.fragmentShader=shader.fragmentShader.replace(
         '#include <roughnessmap_fragment>',
         '#include <roughnessmap_fragment>\nroughnessFactor=clamp(roughnessFactor,.27,.40);'
       );
-      shader.fragmentShader=shader.fragmentShader.replace('#include <lights_fragment_end>',
-        `#include <lights_fragment_end>
-         // Add only smooth, angle-independent diffuse energy on upward floor
-         // faces. Preserve specular/clearcoat and all contact shadows.
-         vec3 warmFloorWorldNormal=inverseTransformDirection(normal,viewMatrix);
-         float warmFloorUp=smoothstep(.6,.98,warmFloorWorldNormal.y);
-         reflectedLight.indirectDiffuse += diffuseColor.rgb * vec3(1.0,.94,.86) * galleryWarmFloorFill * warmFloorUp;`);
+      // lights_fragment_maps samples the PMREM into the separate diffuse and
+      // specular irradiance variables. Change only the appropriate component.
+      // Do this BEFORE lights_fragment_end consumes those variables.
+      const mapsKey='#include <lights_fragment_maps>';
+      if(!shader.fragmentShader.includes(mapsKey)){
+        console.warn('Warm-floor lighting hook unavailable; using stock lighting');
+        return;
+      }
+      shader.fragmentShader=shader.fragmentShader.replace(mapsKey,`#include <lights_fragment_maps>
+        #ifdef RE_IndirectDiffuse
+          vec3 warmFloorWorldNormal=inverseTransformDirection(geometryNormal,viewMatrix);
+          float warmFloorUp=smoothstep(.60,.96,warmFloorWorldNormal.y);
+          // Preserve wall/edge shading; remove ONLY the upward floor surface's
+          // IBL diffuse component, keeping direct lights, shadows and sky fill.
+          iblIrradiance *= (1.0-warmFloorUp);
+          // Floor-only uniform broad bounce. Unlike reflected image projection,
+          // this cannot produce banding, frame silhouettes or local light blobs.
+          irradiance += vec3(1.0,.93,.84)*galleryWarmBaseDiffuse*warmFloorUp;
+        #else
+          float warmFloorUp=1.0;
+        #endif
+        #ifdef RE_IndirectSpecular
+          radiance *= mix(1.0,galleryWarmSpecularFactor,warmFloorUp);
+          #ifdef USE_CLEARCOAT
+            clearcoatRadiance *= mix(1.0,galleryWarmSpecularFactor,warmFloorUp);
+          #endif
+        #endif`);
     };
-    material.customProgramCacheKey=()=>key+'|gallery-warm-floor-fill-comparison-v16';
+    material.customProgramCacheKey=()=>key+'|warm-floor-separate-diffuse-specular-r185-v17';
     return material;
   }
   const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
@@ -3970,18 +3997,15 @@ function App() {
     // Toggle only the intensity of the existing warm-floor RoomEnvironment.
     // Nothing here changes the spotlights, shadows, floor color, camera or layout.
     const applyGalleryFloorEnvDiagnostic=()=>{
-      const factor=Number.isFinite(window.__galleryFloorEnvFactor)?window.__galleryFloorEnvFactor:1;
+      const factor=clamp(Number(window.__galleryFloorEnvFactor ?? 1),0,1.5);
       let count=0,hasEnvironment=false;
       group.traverse(obj=>{
         if(!obj.isMesh)return;
-        const mats=Array.isArray(obj.material)?obj.material:[obj.material];
-        for(const mat of mats){
-          if(!mat?.userData?.galleryWarmUniformSheen)continue;
-          count++;
+        for(const mat of Array.isArray(obj.material)?obj.material:[obj.material]){
+          const u=mat?.userData?.galleryWarmFloorSpecularUniform;
+          if(!u)continue;
+          u.value=factor;count++;
           hasEnvironment ||= !!mat.envMap;
-          mat.envMapIntensity=(mat.userData.galleryFloorEnvBase??1.18)*factor;
-          // Force a uniform refresh on Safari/WebKit when material is unchanged.
-          mat.needsUpdate=true;
         }
       });
       window.dispatchEvent(new CustomEvent('gallery-floor-env-status',{
@@ -3990,8 +4014,7 @@ function App() {
     };
     window.addEventListener('gallery-floor-env-compare',applyGalleryFloorEnvDiagnostic);
     const applyWarmFloorFillDiagnostic=()=>{
-      const raw=Number(window.__galleryWarmFloorFill);
-      const level=Number.isFinite(raw)?clamp(raw,0,.3):0;
+      const level=clamp(Number(window.__galleryWarmFloorFill ?? 1.15),0,2.5);
       let count=0;
       group.traverse(obj=>{
         if(!obj.isMesh)return;
@@ -4132,13 +4155,8 @@ function App() {
         envMapIntensity:isMarble?1.18:reflectionLevel*(kind==='floor'?.55:.055),
         bumpScale:isMarble?.000025:kind==='wall'?.00025:.00015
       });
-      if(isMarble){
-        // Diagnostic only. 0%, 50%, 100% share the same materials and camera.
-        // Set before compilation so freshly reconstructed rooms inherit the setting.
-        mat.userData.galleryFloorEnvBase=mat.envMapIntensity;
-        const factor=Number.isFinite(window.__galleryFloorEnvFactor)?window.__galleryFloorEnvFactor:1;
-        mat.envMapIntensity*=factor;
-      }
+      // v17: Warm floor PMREM intensity remains fixed. The shader scales
+      // specular and adds base diffuse independently through live uniforms.
       mat.userData.surfaceFinish = kind;gallerySoftShadowMaterial(mat,sunShadowParameters);
       if(kind==='wall'){const finish=galleryPaint(stateRef.current.room.theme,role);mat.bumpScale=finish.bumpScale;mat.envMapIntensity=reflectionLevel*finish.reflection;mat.userData.paintRole=role;gallerySpatialMaterial(mat,indirectUniforms);}else if(kind==='floor')galleryFloorFinish(mat,reflectionLevel,finishTheme);return mat;
     }
@@ -9600,19 +9618,19 @@ function artworkActionSettings(p,part='all') {
 // on ordinary launches; switches act live, without resetting the camera.
 if(new URLSearchParams(location.search).get('floorEnvTest')==='1'){
   window.__galleryFloorEnvFactor=1;
-  window.__galleryWarmFloorFill=0;
+  window.__galleryWarmFloorFill=1.15;
   const panel=document.createElement('div');
   panel.style.cssText='position:fixed;z-index:2147483646;left:12px;right:12px;bottom:calc(env(safe-area-inset-bottom,0px) + 12px);border:1px solid #bdb8ae;background:rgba(255,252,245,.97);border-radius:14px;padding:9px 10px;box-shadow:0 3px 15px #0003;font:13px system-ui,sans-serif;color:#222;';
   const title=document.createElement('div');
   title.style.cssText='margin-bottom:5px;font-weight:700;';
-  title.textContent='ウォーム床：反射と拡散光を個別に比較';
+  title.textContent='ウォーム床：鏡面反射と基礎照明を分離';
   panel.appendChild(title);
   const buttons=document.createElement('div');
   buttons.style.cssText='display:flex;gap:7px;flex-wrap:wrap;margin-top:5px;';
   panel.appendChild(buttons);
   const status=document.createElement('div');
   status.style.cssText='font-size:11px;color:#595752;margin-top:4px;';
-  status.textContent='ウォームギャラリーのみ対象。ほかの設定は固定';
+  status.textContent='床の鏡面反射のみを調整。基礎照明は固定';
   panel.appendChild(status);
   const buttonMap=[];
   const updateButtons=(active)=>{
@@ -9637,11 +9655,11 @@ if(new URLSearchParams(location.search).get('floorEnvTest')==='1'){
     const {count,hasEnvironment,factor,theme}=event.detail||{};
     status.textContent=theme!=='warm'?'ウォームギャラリーを選ぶと比較できます':
       count===0?'床材の準備中です':hasEnvironment?
-        `環境反射 ${Math.round(factor*100)}%（対象 ${count} 面）`:
+        `鏡面反射 ${Math.round(factor*100)}%（対象 ${count} 面）`:
         '環境マップが取得できません（反射切替の差は出ません）';
   });
   const fillTitle=document.createElement('div');
-  fillTitle.textContent='床だけの補助光（拡散光）';
+  fillTitle.textContent='床だけの基礎照明（拡散光）';
   fillTitle.style.cssText='margin-top:9px;font-weight:700;';panel.appendChild(fillTitle);
   const fillButtons=document.createElement('div');
   fillButtons.style.cssText='display:flex;gap:7px;flex-wrap:wrap;margin-top:5px;';
@@ -9651,7 +9669,7 @@ if(new URLSearchParams(location.search).get('floorEnvTest')==='1'){
     b.style.background=value===active?'#a6dfcf':'#fff';
     b.setAttribute('aria-pressed',value===active?'true':'false');
   });
-  for(const [level,label] of [[0,'OFF'],[.12,'弱'],[.24,'中']]){
+  for(const [level,label] of [[0,'OFF'],[.60,'弱'],[1.15,'基準']]){
     const b=document.createElement('button');b.type='button';b.textContent=label;
     b.style.cssText='flex:1;min-width:78px;border:1px solid #a6a39d;border-radius:10px;padding:9px 5px;color:#202020;font-size:13px;font-weight:700;';
     b.addEventListener('click',()=>{
@@ -9661,15 +9679,15 @@ if(new URLSearchParams(location.search).get('floorEnvTest')==='1'){
     });
     fillPairs.push([level,b]);fillButtons.appendChild(b);
   }
-  styleFill(0);
+  styleFill(1.15);
   const fillStatus=document.createElement('div');
   fillStatus.style.cssText='font-size:11px;color:#595752;margin-top:5px;';
-  fillStatus.textContent='補助光OFF＝従来表示。影やクリアコートは固定';
+  fillStatus.textContent='基礎光は環境反射と独立。影・光沢材は固定';
   panel.appendChild(fillStatus);
   window.addEventListener('gallery-floor-fill-status',event=>{
     const {count,level,theme}=event.detail||{};
     fillStatus.textContent=theme!=='warm'?'ウォームギャラリーのみ対象':
-      count===0?'床材の準備中です':`床面 ${count} 面・補助光 ${level===0?'OFF':level===.12?'弱':'中'}・影と反射は固定`;
+      count===0?'床材の準備中です':`床面 ${count} 面・基礎光 ${level===0?'OFF':level===.60?'弱':'基準'}・鏡面反射と独立`;
   });
   document.body.appendChild(panel);
 }
