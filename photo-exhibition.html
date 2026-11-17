@@ -1855,7 +1855,7 @@ function galleryFloorFinish(material,strength,theme){
           #endif
         #endif`);
     };
-    material.customProgramCacheKey=()=>key+'|warm-floor-separate-diffuse-specular-r185-v17';
+    material.customProgramCacheKey=()=>key+'|warm-floor-adaptive-illumination-v18';
     return material;
   }
   const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
@@ -2140,6 +2140,18 @@ function galleryFurnitureRole(type,name,material) {
   return material.metalness>.1||/pedestal|steel|base/i.test(name)?"metal":null;
 }
 
+// Keep warm-floor diffuse illumination and PMREM specular reflection separate.
+// These both adapt to the room's available light. The environment map itself,
+// artwork lighting, geometry and other interior themes remain untouched.
+function galleryWarmFloorRoomExposure(fill) {
+  const lamp=clamp(fill.energy/.42,0,1);
+  const daylight=clamp(fill.daylight/.85,0,1);
+  const combined=1-(1-lamp)*(1-daylight);
+  const smooth=combined*combined*(3-2*combined);
+  // A weak ambient floor remains visible with all lights off, but must not
+  // look self-illuminated while the walls are unlit.
+  return .08+.92*smooth;
+}
 function galleryLightingResponse(room, env, lights, solarDay, apertureAccess = 1) {
   const daylight = env.sun && Number.isFinite(solarDay) ? clamp(solarDay, 0, 1) * clamp(apertureAccess,0,1) : 0;
   const area = Math.max(4, (Number(room.w) || 6) * (Number(room.d) || 4));
@@ -3994,6 +4006,10 @@ function App() {
     const group = new THREE.Group();
     scene.add(group);
     groupRef.current = group;
+    // Small live set: no scene traversal or shader recompilation per frame.
+    const warmFloorMaterials=new Set();
+    let warmRoomExposureTarget=1;
+    let warmRoomExposureCurrent=null;
     // Toggle only the intensity of the existing warm-floor RoomEnvironment.
     // Nothing here changes the spotlights, shadows, floor color, camera or layout.
     const applyGalleryFloorEnvDiagnostic=()=>{
@@ -4021,11 +4037,11 @@ function App() {
         for(const mat of Array.isArray(obj.material)?obj.material:[obj.material]){
           const u=mat?.userData?.galleryWarmFloorFillUniform;
           if(!u)continue;
-          u.value=level;count++;
+          u.value=level*(warmRoomExposureCurrent??warmRoomExposureTarget);count++;
         }
       });
       window.dispatchEvent(new CustomEvent('gallery-floor-fill-status',{
-        detail:{count,level,theme:stateRef.current.room?.theme}
+        detail:{count,level,effective:level*(warmRoomExposureCurrent??warmRoomExposureTarget),roomExposure:warmRoomExposureCurrent??warmRoomExposureTarget,theme:stateRef.current.room?.theme}
       }));
     };
     window.addEventListener('gallery-floor-fill-compare',applyWarmFloorFillDiagnostic);
@@ -4155,9 +4171,11 @@ function App() {
         envMapIntensity:isMarble?1.18:reflectionLevel*(kind==='floor'?.55:.055),
         bumpScale:isMarble?.000025:kind==='wall'?.00025:.00015
       });
-      // v17: Warm floor PMREM intensity remains fixed. The shader scales
-      // specular and adds base diffuse independently through live uniforms.
-      mat.userData.surfaceFinish = kind;gallerySoftShadowMaterial(mat,sunShadowParameters);
+      // v18: Warm floor PMREM stays stable and the shader separates its
+      // specular response from adaptive ambient diffuse, with no light blobs.
+      mat.userData.surfaceFinish = kind;
+      if(isMarble)warmFloorMaterials.add(mat);
+      gallerySoftShadowMaterial(mat,sunShadowParameters);
       if(kind==='wall'){const finish=galleryPaint(stateRef.current.room.theme,role);mat.bumpScale=finish.bumpScale;mat.envMapIntensity=reflectionLevel*finish.reflection;mat.userData.paintRole=role;gallerySpatialMaterial(mat,indirectUniforms);}else if(kind==='floor')galleryFloorFinish(mat,reflectionLevel,finishTheme);return mat;
     }
     function finishUV(geometry, kind) {
@@ -4401,6 +4419,7 @@ function App() {
       entranceLabelsRef.current=[];
       personObj = null;
       disposeGroup();
+      warmFloorMaterials.clear();
       frameTexUsed.clear();
       frameFinishUsed.clear();
       furnitureFinishUsed.clear();
@@ -4413,6 +4432,9 @@ function App() {
       const naturalAccess=galleryDaylightAccess(s.room,s.windows,s.entrances);
       const sunOn = s.env.sun && sol2.sunUp && (s.windows.length>0||s.entrances.some(e=>entranceDaylight(e)==='outdoor'));
       const fill = galleryLightingResponse(s.room, s.env, s.lights, sol2.day, naturalAccess);
+      // Light switches, dimming and daylight alter the floor's apparent
+      // illumination; roughness, color, and PMREM remain invariant.
+      warmRoomExposureTarget=theme==='warm'?galleryWarmFloorRoomExposure(fill):1;
       reflectionLevel=galleryReflectionStrength(fill)*(theme==="black"?.65:theme==="white"?1.04:1);
       let red = 0, green = 0, blue = 0, power = 0;
       if (s.env.lightsOn) s.lights.forEach((light) => {
@@ -5865,6 +5887,23 @@ function App() {
       drawLightBindingGuides(scene);
       drawArrangeEndGuides(scene);
       drawWallLightingGuides(scene);
+      // Smooth the lighting transition (~0.3 s) to avoid an abrupt bright-floor
+      // flash when the gallery's lights are switched on or off. The diagnostic
+      // diffuse/specular controls still work independently through uniforms.
+      if(warmRoomExposureCurrent===null)warmRoomExposureCurrent=warmRoomExposureTarget;
+      else warmRoomExposureCurrent+=(warmRoomExposureTarget-warmRoomExposureCurrent)*(1-Math.exp(-dt/.30));
+      if(warmFloorMaterials.size){
+        const base=clamp(Number(window.__galleryWarmFloorFill??1.15),0,2.5);
+        const gloss=clamp(Number(window.__galleryFloorEnvFactor??1),0,1.5);
+        const diffuseLevel=base*warmRoomExposureCurrent;
+        const specularLevel=gloss*(.12+.88*warmRoomExposureCurrent);
+        for(const mat of warmFloorMaterials){
+          const diffuse=mat.userData.galleryWarmFloorFillUniform;
+          const specular=mat.userData.galleryWarmFloorSpecularUniform;
+          if(diffuse)diffuse.value=diffuseLevel;
+          if(specular)specular.value=specularLevel;
+        }
+      }
       glazingReflection.update(now);
       renderer.render(scene, camera);
       if(now-cameraLastSavedAtRef.current>1400){
@@ -9682,12 +9721,12 @@ if(new URLSearchParams(location.search).get('floorEnvTest')==='1'){
   styleFill(1.15);
   const fillStatus=document.createElement('div');
   fillStatus.style.cssText='font-size:11px;color:#595752;margin-top:5px;';
-  fillStatus.textContent='基礎光は環境反射と独立。影・光沢材は固定';
+  fillStatus.textContent='拡散光と鏡面反射は個別調整。どちらも室内の明るさに追従';
   panel.appendChild(fillStatus);
   window.addEventListener('gallery-floor-fill-status',event=>{
-    const {count,level,theme}=event.detail||{};
+    const {count,level,effective,roomExposure,theme}=event.detail||{};
     fillStatus.textContent=theme!=='warm'?'ウォームギャラリーのみ対象':
-      count===0?'床材の準備中です':`床面 ${count} 面・基礎光 ${level===0?'OFF':level===.60?'弱':'基準'}・鏡面反射と独立`;
+      count===0?'床材の準備中です':`床面 ${count} 面・基礎光 ${level===0?'OFF':level===.60?'弱':'基準'}・室内連動 ${Math.round((roomExposure??1)*100)}%（実効 ${Number(effective??level).toFixed(2)}）`;
   });
   document.body.appendChild(panel);
 }
