@@ -1624,7 +1624,7 @@ function galleryShadowFixture(room,env,lights,furniture,placements,blocks,column
 // fixtures use decay 1.4; daylight fill spots retain their original distribution.
 function gallerySpotFalloff(coneCos,angleCos){
   const r2=clamp((1-angleCos)/Math.max(.00001,1-coneCos),0,1);
-  return Math.exp(-1.55*r2)*(1-sm(.52,1,r2));
+  return Math.exp(-1.82*r2)*(1-sm(.46,.98,r2));
 }
 function gallerySpotProfile(material){
   if(!material?.isMeshStandardMaterial||material.userData.gallerySpotProfile)return material;
@@ -1634,11 +1634,11 @@ function gallerySpotProfile(material){
     const chunk=THREE.ShaderChunk.lights_pars_begin.replace('float spotAttenuation = getSpotAttenuation( spotLight.coneCos, spotLight.penumbraCos, angleCos );',`float spotAttenuation = getSpotAttenuation( spotLight.coneCos, spotLight.penumbraCos, angleCos );
       if(abs(spotLight.decay-1.4)<.0001){
         float galleryConeRadius2=clamp((1.0-angleCos)/max(.00001,1.0-spotLight.coneCos),0.0,1.0);
-        spotAttenuation=exp(-1.55*galleryConeRadius2)*(1.0-smoothstep(.52,1.0,galleryConeRadius2));
+        spotAttenuation=exp(-1.82*galleryConeRadius2)*(1.0-smoothstep(.46,.98,galleryConeRadius2));
       }`);
     shader.fragmentShader=shader.fragmentShader.replace('#include <lights_pars_begin>',chunk);
   };
-  material.customProgramCacheKey=()=>key+'|gallery-lens-profile-v2-softbox';return material;
+  material.customProgramCacheKey=()=>key+'|gallery-lens-profile-v3-soft-edge';return material;
 }
 
 function galleryReflectionTexture() {
@@ -1980,15 +1980,15 @@ function galleryRoundedTop(source,type){
 
 function galleryFrameGeometry(p, depth = 0.038) {
   const width=frameW(p), height=frameH(p), inset=FRAME_W+(p.mat?MAT_W:0), scale=depth/0.03;
-  const positions=[],uv=[],regions=[],finishRegions=[];
+  const positions=[],uv=[],regions=[],finishRegions=[],sideRegions=[];
   const project=(v)=>[v.x/width+0.5,v.y/height+0.5];
-  function quad(a,b,c,d,kind,back=false) {
+  function quad(a,b,c,d,kind,back=false,side=false) {
     const start=positions.length/3;
     for (const v of [a,b,d,b,c,d]) { positions.push(v.x,v.y,v.z); uv.push(...(back?[FRAME_W/width/4,0.5]:project(v))); }
-    regions.push({kind,start,count:6});for(let i=0;i<6;i++)finishRegions.push(kind==='photo'?2:kind.startsWith('mat')?1:0);
+    regions.push({kind,start,count:6});for(let i=0;i<6;i++){finishRegions.push(kind==='photo'?2:kind.startsWith('mat')?1:0);sideRegions.push(side?1:0);}
   }
   const loop=(offset,z)=>[new THREE.Vector3(-width/2+offset,-height/2+offset,z*scale),new THREE.Vector3(width/2-offset,-height/2+offset,z*scale),new THREE.Vector3(width/2-offset,height/2-offset,z*scale),new THREE.Vector3(-width/2+offset,height/2-offset,z*scale)];
-  function bridge(a,b,kind) { for(let i=0;i<4;i++) { const j=(i+1)%4; quad(a[i],a[j],b[j],b[i],kind); } }
+  function bridge(a,b,kind) { const side=kind==='frame'&&Math.abs(a[0].z-b[0].z)>.01;for(let i=0;i<4;i++) { const j=(i+1)%4; quad(a[i],a[j],b[j],b[i],kind,false,side); } }
   const profile=[[0,-0.015],[0,0.012],[.00025,.0132],[.0007,.01425],[.0013,.0149],[.0016,.015],[FRAME_W-.0015,.015],[FRAME_W-.0007,.0142],[FRAME_W,.0108],[FRAME_W,p.mat?.010:.009]];
   for(let i=1;i<profile.length;i++) bridge(loop(...profile[i-1]),loop(...profile[i]),"frame");
   const photoZ=p.mat?0.008:0.009;
@@ -2006,21 +2006,24 @@ function galleryFrameGeometry(p, depth = 0.038) {
   geometry.setAttribute("position",new THREE.Float32BufferAttribute(positions,3));
   geometry.setAttribute("uv",new THREE.Float32BufferAttribute(uv,2));
   geometry.setAttribute("galleryFinishRegion",new THREE.Float32BufferAttribute(finishRegions,1));
+  geometry.setAttribute("galleryFrameSide",new THREE.Float32BufferAttribute(sideRegions,1));
   geometry.computeVertexNormals(); geometry.computeBoundingBox(); return geometry;
 }
 function galleryFrameSurface(material){
   const previous=material.onBeforeCompile,key=material.customProgramCacheKey();material.userData.galleryFrameSurface=true;
   material.onBeforeCompile=shader=>{previous.call(material,shader);
-    shader.vertexShader='attribute float galleryFinishRegion; varying float gallerySurfaceRegion;\n'+shader.vertexShader;
-    shader.vertexShader=shader.vertexShader.replace('#include <begin_vertex>','#include <begin_vertex>\ngallerySurfaceRegion=galleryFinishRegion;');
-    shader.fragmentShader='varying float gallerySurfaceRegion;\n'+shader.fragmentShader;
+    shader.vertexShader='attribute float galleryFinishRegion; attribute float galleryFrameSide; varying float gallerySurfaceRegion; varying float gallerySide;\n'+shader.vertexShader;
+    shader.vertexShader=shader.vertexShader.replace('#include <begin_vertex>','#include <begin_vertex>\ngallerySurfaceRegion=galleryFinishRegion; gallerySide=galleryFrameSide;');
+    shader.fragmentShader='varying float gallerySurfaceRegion; varying float gallerySide;\n'+shader.fragmentShader;
+    shader.fragmentShader=shader.fragmentShader.replace('#include <color_fragment>','#include <color_fragment>\n diffuseColor.rgb*=mix(1.0,.91,gallerySide);');
     shader.fragmentShader=shader.fragmentShader.replace('#include <roughnessmap_fragment>',`#include <roughnessmap_fragment>
-      if(gallerySurfaceRegion>.5)roughnessFactor=gallerySurfaceRegion>1.5?.84:.97;`);
+      if(gallerySurfaceRegion>.5)roughnessFactor=gallerySurfaceRegion>1.5?.84:.97;
+      if(gallerySide>.5)roughnessFactor=.43;`);
     shader.fragmentShader=shader.fragmentShader.replace('#include <lights_fragment_end>',`#include <lights_fragment_end>
-      float gallerySurfaceSpecular=gallerySurfaceRegion>1.5?.55:gallerySurfaceRegion>.5?.22:1.08;
+      float gallerySurfaceSpecular=gallerySurfaceRegion>1.5?.55:gallerySurfaceRegion>.5?.22:gallerySide>.5?1.22:1.08;
       reflectedLight.directSpecular*=gallerySurfaceSpecular; reflectedLight.indirectSpecular*=gallerySurfaceSpecular;`);
   };
-  material.customProgramCacheKey=()=>key+'|gallery-frame-paper-photo-v2-edge';return material;
+  material.customProgramCacheKey=()=>key+'|gallery-frame-paper-photo-v3-satin-side';return material;
 }
 function App() {
   const [tab, setTab] = useState("部屋");
@@ -4110,7 +4113,7 @@ function App() {
         if (active) { mat.color.lerp(new THREE.Color("#63d6bd"), 0.32); mat.emissive.set("#247665"); mat.emissiveIntensity = 0.2; mat.userData.placementHint = surface; }
         return mat;
       };
-      const contactBatches = { floor: { positions: [], uv: [], colors:[], opacity: 0.155, map: contactMaps.soft }, round: { positions: [], uv: [], colors:[], opacity: 0.13, map: contactMaps.round }, edge: { positions: [], uv: [], opacity: 0.065, map: contactMaps.edge }, artwork: { positions: [], uv: [], colors:[], opacity: 0.18, map: null } };
+      const contactBatches = { floor: { positions: [], uv: [], colors:[], opacity: 0.155, map: contactMaps.soft }, round: { positions: [], uv: [], colors:[], opacity: 0.13, map: contactMaps.round }, edge: { positions: [], uv: [], opacity: 0.065, map: contactMaps.edge }, artwork: { positions: [], uv: [], colors:[], opacity: 0.16, map: null } };
       function contactQuad(batch, a, b, c, d, u0, v0, u1, v1, flip = false) {
         (flip ? [a,d,b,b,d,c] : [a,b,d,b,c,d]).forEach((v) => batch.positions.push(v.x, v.y, v.z));
         if (flip) batch.uv.push(u0,v0, u0,v1, u1,v0, u1,v0, u0,v1, u1,v1);
@@ -4133,8 +4136,11 @@ function App() {
         if(batch.colors)for(let i=vertexStart;i<batch.positions.length/3;i++)batch.colors.push(0,0,0,strength);
       }
       function artContact(g, p, width, height) {
-        const pad = 0.052, bottom = g.position.y - height / 2 - pad - 0.008, top = g.position.y + height / 2 + pad;
-        let off = 0.04;
+        const pad = 0.028, bottom = g.position.y - height / 2 - pad - 0.008, top = g.position.y + height / 2 + pad;
+        // Wall-mounted frames have a 38mm profile (19mm behind the local origin).
+        // At 22mm from the wall their back has a realistic ~3mm clearance.
+        // The contact shadow must be projected onto the wall, not into that gap.
+        let off = 0.022;
         if (p.col) {
           const host = mountOf(s.columns,s.blocks,p.col);
           if (!host || s.entrances.some((e) => e.col === p.col)) return;
@@ -4150,8 +4156,10 @@ function App() {
           if (holes.some((q) => lo < q.pos+q.w/2 && hi > q.pos-q.w/2 && bottom < q.hi && top > q.lo)) return;
         }
         g.updateMatrixWorld(true);
-        // Nested rings give a narrow contact shadow plus a broad, faint outer falloff.
-        const profile=[[-.005,0,.90],[.003,-.001,1],[.016,-.0035,.44],[pad,-.009,0]],batch=contactBatches.artwork;
+        // Tight, dark wall contact instead of a broad grey/white-looking band.
+        // The profile is physically attached to the rear of the frame and fades
+        // out within 28mm of the edge, without introducing a luminous halo.
+        const profile=[[-.003,0,.88],[.001,-.0005,.92],[.008,-.002,.38],[pad,-.004,0]],batch=contactBatches.artwork;
         const ring=([margin,dy])=>[[-1,-1],[1,-1],[1,1],[-1,1]].map(([x,y])=>new THREE.Vector3(x*(width/2+margin),y*(height/2+margin)+dy,-off+.0015).applyMatrix4(g.matrixWorld));
         for(let k=1;k<profile.length;k++){
           const inner=ring(profile[k-1]),outer=ring(profile[k]);
@@ -4316,9 +4324,9 @@ function App() {
         const tx = l.x + Math.sin(dr) * Math.tan(tl) * lr, tz = l.z - Math.cos(dr) * Math.tan(tl) * lr;
         const cy = ceilAt(s.room, l.x, l.z), jy = cy - 0.09;
         const dv = new THREE.Vector3(Math.sin(dr) * Math.sin(tl), -Math.cos(tl), -Math.cos(dr) * Math.sin(tl)).normalize();
-        const fm = new THREE.MeshStandardMaterial({ color: 0x30312f, roughness: .42, metalness: .55, envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*1.8, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.4 : 0 });
+        const fm = new THREE.MeshStandardMaterial({ color: 0x383a37, roughness: .37, metalness: .48, envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*2.05, emissive: isSel ? SEL_C : 0, emissiveIntensity: isSel ? 0.4 : 0 });
         fm.userData.fixtureFinish='housing';
-        const bezel=fm.clone();bezel.color.set(0x41423f);bezel.roughness=.32;bezel.userData.fixtureFinish='bezel';
+        const bezel=fm.clone();bezel.color.set(0x484a46);bezel.roughness=.30;bezel.metalness=.58;bezel.userData.fixtureFinish='bezel';
         const fx = new THREE.Group();
         fx.userData = { kind: "light", id: l.id };
         const base = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.055, 0.025, 24), fm);
@@ -4347,6 +4355,9 @@ function App() {
         body.position.set(l.x, jy, l.z).addScaledVector(dv, 0.082);
         body.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), dv);
         body.add(new THREE.Mesh(new THREE.CylinderGeometry(0.042, 0.042, 0.15, 32,1,true), fm));
+        // A fine satin-metal joint at the shell seam picks up ambient reflections.
+        const seam=new THREE.Mesh(new THREE.CylinderGeometry(.0425,.0425,.003,32,1,true),bezel);
+        seam.position.y=-.008;seam.userData.fixtureDetail='satinHousingSeam';body.add(seam);
         const housingBand=new THREE.Mesh(new THREE.CylinderGeometry(.0435,.0435,.006,32,1,true),bezel);
         housingBand.position.y=.045;housingBand.userData.fixtureDetail='housingBand';body.add(housingBand);
         const ring = new THREE.Mesh(new THREE.TorusGeometry(.039,.003,8,32),bezel);ring.rotation.x=Math.PI/2;ring.position.y=-.075;ring.userData.fixtureDetail='bezel';body.add(ring);
@@ -4705,7 +4716,7 @@ function App() {
         const mat2 = new THREE.MeshStandardMaterial({ map: frameTexture(photo, p.size, p.orient, p.frame, p.mat, p.sq), roughness: 0.7, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0, ...frameFinish(p) });
         const isPanel = p.frame === "パネル";
         if(!isPanel){mat2.envMap=reflectionTarget?.texture||null;mat2.envMapIntensity=reflectionLevel*.55;galleryFrameSurface(mat2);}
-        const edge = isPanel && p.method === "壁掛け" ? new THREE.MeshStandardMaterial({ color: 15921386, roughness: 0.8, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0 }) : null;
+        const edge = isPanel && p.method === "壁掛け" ? new THREE.MeshStandardMaterial({ color: 0xe7e7e3, roughness: .56, metalness:.04, envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*.18, emissive: 0, emissiveIntensity: isSel ? 0.38 : 0 }) : null;
         const pt = clamp(p.thick ?? PANEL_T, 2e-3, 0.02);
         const board = p.method === "壁掛け" ? new THREE.Mesh(isPanel ? new THREE.BoxGeometry(pw, ph, pt) : galleryFrameGeometry(p), isPanel ? [edge, edge, edge, edge, mat2, edge] : mat2) : null;
         if (board) {
@@ -4794,18 +4805,18 @@ function App() {
           }
           const y = p.center + wallBase(s.room, p.wall, p.pos);
           if (p.wall === "北") {
-            g.position.set(p.pos, y, -d / 2 + 0.04);
+            g.position.set(p.pos, y, -d / 2 + 0.022);
           }
           if (p.wall === "南") {
-            g.position.set(p.pos, y, d / 2 - 0.04);
+            g.position.set(p.pos, y, d / 2 - 0.022);
             g.rotation.y = Math.PI;
           }
           if (p.wall === "東") {
-            g.position.set(w / 2 - 0.04, y, p.pos);
+            g.position.set(w / 2 - 0.022, y, p.pos);
             g.rotation.y = -Math.PI / 2;
           }
           if (p.wall === "西") {
-            g.position.set(-w / 2 + 0.04, y, p.pos);
+            g.position.set(-w / 2 + 0.022, y, p.pos);
             g.rotation.y = Math.PI / 2;
           }
           group.add(g);
