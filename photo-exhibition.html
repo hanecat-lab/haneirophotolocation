@@ -871,7 +871,7 @@ function galleryThemeRoom(room){
 }
 const GALLERY_THEMES=[['white','白ホリ'],['warm','ウォーム'],['black','ブラック']];
 function galleryThemeSample(theme,part){
-  if(part==='floor')return theme==='black'?'#2a2a2a':theme==='warm'?'#eae2d5':'#ffffff';
+  if(part==='floor')return theme==='black'?'#2a2a2a':theme==='warm'?'#e8d9c7':'#ffffff';
   return theme==='black'?'#20211f':theme==='warm'?'#c8beb4':'#ffffff';
 }
 function roomDataOf(d) {
@@ -1792,12 +1792,15 @@ function galleryGlazingMaterial(options) {
   return material;
 }
 // Reflection is composited into the opaque floor itself: no coplanar overlay.
-// Warm-gallery v2: reduced mirror energy and wider reflection filtering; white/black are unchanged.
+// Warm only: use a separately prefiltered reflection texture. The previous
+// nine offset samples created multiple recognizable outlines (ghosting).
+// White and black floors retain their existing reflection treatment.
 function galleryFloorFinish(material,strength,theme){
   const polishedMarble=theme==='warm';
   const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
-  const u={galleryMirror:{value:null},galleryMirrorMatrix:{value:new THREE.Matrix4()},galleryMirrorReady:{value:0},galleryMirrorTexel:{value:new THREE.Vector2(1/384,1/384)},galleryFloorMirrorStrength:{value:polishedMarble?clamp(.59+strength*.85,.59,.78):clamp(strength*3,0,1)}};
+  const u={galleryMirror:{value:null},galleryMirrorMatrix:{value:new THREE.Matrix4()},galleryMirrorReady:{value:0},galleryMirrorTexel:{value:new THREE.Vector2(1/384,1/384)},galleryFloorMirrorStrength:{value:polishedMarble?clamp(.54+strength*.55,.54,.69):clamp(strength*3,0,1)}};
   material.userData.galleryGlazing=u;material.userData.galleryFloorFinish=true;
+  material.userData.galleryWarmSoftMirror=polishedMarble;
   material.onBeforeCompile=shader=>{previous.call(material,shader);Object.assign(shader.uniforms,u);
     shader.vertexShader='uniform mat4 galleryMirrorMatrix; varying vec4 galleryFloorMirrorUV; varying vec3 galleryFloorWorld;\n'+shader.vertexShader;
     shader.vertexShader=shader.vertexShader.replace('#include <project_vertex>','#include <project_vertex>\ngalleryFloorWorld=(modelMatrix*vec4(transformed,1.0)).xyz; galleryFloorMirrorUV=galleryMirrorMatrix*vec4(galleryFloorWorld,1.0);');
@@ -1805,27 +1808,32 @@ function galleryFloorFinish(material,strength,theme){
     shader.fragmentShader=shader.fragmentShader.replace('#include <roughnessmap_fragment>',`#include <roughnessmap_fragment>
       vec2 galleryTile=floor((galleryFloorWorld.xz+.00001)/.5);
       float galleryTileFinish=fract(sin(dot(galleryTile,vec2(127.1,311.7)))*43758.5453);
-      roughnessFactor=${polishedMarble?'clamp(roughnessFactor+(galleryTileFinish-.5)*.016,.22,.39)':'clamp(roughnessFactor+(galleryTileFinish-.5)*.035,.48,.75)'};`);
+      roughnessFactor=${polishedMarble?'clamp(roughnessFactor+(galleryTileFinish-.5)*.016,.26,.42)':'clamp(roughnessFactor+(galleryTileFinish-.5)*.035,.48,.75)'};`);
     shader.fragmentShader=shader.fragmentShader.replace('#include <opaque_fragment>',`
       vec3 galleryFloorNormal=inverseTransformDirection(normal,viewMatrix);
       if(galleryMirrorReady>.5 && galleryFloorMirrorUV.w>0.0 && galleryFloorNormal.y>.9){
         vec2 uv=galleryFloorMirrorUV.xy/galleryFloorMirrorUV.w;
         if(all(greaterThanEqual(uv,vec2(0.0)))&&all(lessThanEqual(uv,vec2(1.0)))){
-          float blur=${polishedMarble?'clamp(3.3+roughnessFactor*5.0+length(vViewPosition)*.36,3.3,8.8)':'clamp(3.0+roughnessFactor*4.0+length(vViewPosition)*.5,3.0,10.0)'};
+          ${polishedMarble?`// The two-pass Gaussian texture has one smooth, continuous silhouette.
+          // Sample it once: no shifted copies of frames or photographs.
+          vec3 reflected=texture2D(galleryMirror,clamp(uv,vec2(.003),vec2(.997))).rgb;`:`float blur=clamp(3.0+roughnessFactor*4.0+length(vViewPosition)*.5,3.0,10.0);
           vec2 stepUV=galleryMirrorTexel*blur;
           vec3 reflected=texture2D(galleryMirror,clamp(uv,stepUV,vec2(1.0)-stepUV)).rgb*.20;
           for(int j=0;j<8;j++){
-            vec2 offset=j==0?vec2(1.0,0.0):j==1?vec2(-1.0,0.0):j==2?vec2(0.0,1.0):j==3?vec2(0.0,-1.0):j==4?vec2(1.0,1.0):j==5?vec2(-1.0,1.0):j==6?vec2(1.0,-1.0):vec2(-1.0,-1.0);
+            vec2 offset=j==0?vec2(1.0,0.0):j==1?vec2(-1.0,0.0):j==2?vec2(0.0,1.0):j==3?vec2(0.0,-1.0):j==4?vec2(1.0,1.0):j==5?vec2(-1.0,1.0):vec2(1.0,-1.0):vec2(-1.0,-1.0);
             reflected+=texture2D(galleryMirror,clamp(uv+offset*stepUV,stepUV,vec2(1.0)-stepUV)).rgb*(j<4?.12:.08);
-          }
+          }`}
           float fresnel=pow(1.0-clamp(abs(dot(normal,normalize(vViewPosition))),0.0,1.0),5.0);
           float border=smoothstep(0.0,.035,min(min(uv.x,uv.y),min(1.0-uv.x,1.0-uv.y)));
-          outgoingLight=mix(outgoingLight,reflected*diffuseColor.rgb,${polishedMarble?'(.17+.19*fresnel)':'(.012+.07*fresnel)'}*galleryFloorMirrorStrength*border);
+          ${polishedMarble?`// Keep the champagne-ivory floor dominant, with soft colour bleeding.
+          // Dark frame silhouettes must not turn into distinct grey replicas.
+          vec3 reflectionWash=mix(diffuseColor.rgb,reflected*diffuseColor.rgb,.63);
+          outgoingLight=mix(outgoingLight,reflectionWash,(.17+.11*fresnel)*galleryFloorMirrorStrength*border);`:`outgoingLight=mix(outgoingLight,reflected*diffuseColor.rgb,(.012+.07*fresnel)*galleryFloorMirrorStrength*border);`}
         }
       }
       #include <opaque_fragment>`);
   };
-  material.customProgramCacheKey=()=>key+(polishedMarble?'|gallery-polished-marble-v2-soft-reflection':'|gallery-satin-floor-v1');return material;
+  material.customProgramCacheKey=()=>key+(polishedMarble?'|gallery-polished-marble-v3-gaussian':'|gallery-satin-floor-v1');return material;
 }
 
 function galleryMirrorPlane(surface){
@@ -1848,10 +1856,45 @@ function galleryMirrorView(surface,camera,virtualCamera,matrix){
 }
 function createGalleryGlazingReflection(renderer,scene,camera){
   const surfaces=[],virtual=new THREE.PerspectiveCamera(),matrix=new THREE.Matrix4();
-  let target=null,active=null,last=-Infinity,dirty=2,failed=false,lastPose='',lastChoice=null,previousPlane=null;
+  let target=null,softA=null,softB=null,blurScene=null,blurCamera=null,blurMaterial=null;
+  let active=null,last=-Infinity,dirty=2,failed=false,lastPose='',lastChoice=null,previousPlane=null;
+  // Render at half resolution, then perform two separable Gaussian passes.
+  // This is inexpensive on phones and removes the discrete echo contours.
+  function softenWarmFloor(source){
+    if(!surfaces.some(m=>m.material?.userData?.galleryWarmSoftMirror))return null;
+    if(!softA){
+      const opts={minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,generateMipmaps:false};
+      softA=new THREE.WebGLRenderTarget(192,192,opts);
+      softB=new THREE.WebGLRenderTarget(192,192,opts);
+      softA.texture.colorSpace=softB.texture.colorSpace=THREE.LinearSRGBColorSpace;
+      blurMaterial=new THREE.ShaderMaterial({depthTest:false,depthWrite:false,
+        uniforms:{tInput:{value:source},uDirection:{value:new THREE.Vector2(1/192,0)}},
+        vertexShader:'varying vec2 vUv; void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}',
+        fragmentShader:`uniform sampler2D tInput;uniform vec2 uDirection;varying vec2 vUv;
+          void main(){
+            vec3 sum=vec3(0.0);float weights=0.0;
+            for(int i=-6;i<=6;i++){
+              float d=float(i);
+              float w=exp(-.5*d*d/5.76);
+              sum+=texture2D(tInput,clamp(vUv+uDirection*d*2.1,vec2(0.001),vec2(.999))).rgb*w;
+              weights+=w;
+            }
+            gl_FragColor=vec4(sum/weights,1.0);
+          }`});
+      blurScene=new THREE.Scene();blurCamera=new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+      blurScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2),blurMaterial));
+    }
+    blurMaterial.uniforms.tInput.value=source;
+    blurMaterial.uniforms.uDirection.value.set(2.1/384,0);
+    renderer.setRenderTarget(softA);renderer.render(blurScene,blurCamera);
+    blurMaterial.uniforms.tInput.value=softA.texture;
+    blurMaterial.uniforms.uDirection.value.set(0,2.1/192);
+    renderer.setRenderTarget(softB);renderer.render(blurScene,blurCamera);
+    return softB.texture;
+  }
   const enabled=typeof renderer.setRenderTarget==='function'&&typeof renderer.getRenderTarget==='function';
   const disable=()=>{for(const m of surfaces)m.material.userData.galleryGlazing.galleryMirrorReady.value=0;};
-  const bind=()=>{if(!target||!previousPlane)return;for(const m of surfaces){const plane=galleryMirrorPlane(m),n=plane.normal,p=plane.origin;if(n.dot(previousPlane.normal)>.999&&Math.abs(p.sub(previousPlane.origin).dot(previousPlane.normal))<.01){const u=m.material.userData.galleryGlazing;u.galleryMirror.value=target.texture;u.galleryMirrorMatrix.value.copy(previousPlane.matrix);u.galleryMirrorReady.value=1;}}};
+  const bind=()=>{if(!target||!previousPlane)return;for(const m of surfaces){const plane=galleryMirrorPlane(m),n=plane.normal,p=plane.origin;if(n.dot(previousPlane.normal)>.999&&Math.abs(p.sub(previousPlane.origin).dot(previousPlane.normal))<.01){const u=m.material.userData.galleryGlazing;const soft=m.material.userData.galleryWarmSoftMirror&&softB;u.galleryMirror.value=soft?softB.texture:target.texture;u.galleryMirrorTexel?.value.set(1/(soft?192:384),1/(soft?192:384));u.galleryMirrorMatrix.value.copy(previousPlane.matrix);u.galleryMirrorReady.value=1;}}};
   return {
     register(mesh){surfaces.push(mesh);},
     reset(){disable();surfaces.length=0;active=null;lastChoice=null;lastPose='';dirty=2;},
@@ -1879,14 +1922,19 @@ function createGalleryGlazingReflection(renderer,scene,camera){
       for(const m of surfaces)hide(m);
       scene.traverse(o=>{if(o.isSprite||o.isLine||o.type==='ArrowHelper'||o.userData?.handle||o.userData?.selectionMarker||o.userData?.floorTileLines||o.userData?.positionGuide||o.userData?.lightBindingGuide||o.userData?.arrangeEndGuide||o.material?.wireframe)hide(o);});
       let success=false;
-      try{if(renderer.xr)renderer.xr.enabled=false;renderer.shadowMap.autoUpdate=false;renderer.shadowMap.needsUpdate=false;renderer.setRenderTarget(target);renderer.state?.buffers?.depth?.setMask(true);renderer.clear?.();renderer.render(scene,virtual);success=true;}
+      try{if(renderer.xr)renderer.xr.enabled=false;renderer.shadowMap.autoUpdate=false;renderer.shadowMap.needsUpdate=false;renderer.setRenderTarget(target);renderer.state?.buffers?.depth?.setMask(true);renderer.clear?.();renderer.render(scene,virtual);
+        // Only warm-gallery floor receives the blurred texture. Other finishes
+        // continue using the original planar texture without any change.
+        softenWarmFloor(target.texture);success=true;}
       catch{failed=true;disable();}
       finally{for(const o of hidden)o.visible=true;renderer.shadowMap.needsUpdate=shadowUpdate;renderer.shadowMap.autoUpdate=shadowAuto;if(renderer.xr)renderer.xr.enabled=xr;renderer.setRenderTarget(oldTarget);if(viewport)renderer.setViewport?.(viewport);}
       if(!success)return false;
       disable();previousPlane={...galleryMirrorPlane(choice),matrix:matrix.clone()};bind();
       active=choice;lastChoice=choice;lastPose=pose;last=now;dirty=Math.max(0,dirty-1);return true;
     },
-    dispose(){disable();target?.dispose();target=null;surfaces.length=0;}
+    dispose(){disable();target?.dispose();softA?.dispose();softB?.dispose();
+      blurScene?.traverse(o=>o.geometry?.dispose?.());blurMaterial?.dispose();
+      target=null;softA=null;softB=null;surfaces.length=0;}
   };
 }
 // With MSAA, pixel centers can lie outside a covered silhouette. Keep shadow
@@ -3865,7 +3913,7 @@ function App() {
         let r,g,b;
         if(channel==='color'){
           const variation=fine*.8+grain*.35;
-          r=253.7+variation;g=252.8+variation;b=250.8+variation;
+          r=253.4+variation;g=251.9+variation;b=249.2+variation;
         }else if(channel==='rough'){
           const value=239+fine*1.4+grain*.6;
           r=g=b=value;
@@ -3898,7 +3946,7 @@ function App() {
       const finishTheme=stateRef.current.room.theme;
       const isMarble=kind==='floor'&&finishTheme==='warm';
       const maps=isMarble?polishedMarbleMaps:finishMaps[finishKind];
-      const mat = new THREE.MeshStandardMaterial({ ...properties, ...maps, roughness:kind==='floor'?(isMarble?.30:finishTheme==='white'?.66:.60):properties.roughness, metalness:isMarble?.025:(properties.metalness||0), envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*(kind==='floor'?(isMarble?1.15:.55):.055), bumpScale: isMarble?.000035:kind === 'wall' ? 0.00025 : 0.00015 });
+      const mat = new THREE.MeshStandardMaterial({ ...properties, ...maps, roughness:kind==='floor'?(isMarble?.37:finishTheme==='white'?.66:.60):properties.roughness, metalness:isMarble?.025:(properties.metalness||0), envMap:reflectionTarget?.texture||null, envMapIntensity:reflectionLevel*(kind==='floor'?(isMarble?.92:.55):.055), bumpScale: isMarble?.000035:kind === 'wall' ? 0.00025 : 0.00015 });
       mat.userData.surfaceFinish = kind;gallerySoftShadowMaterial(mat,sunShadowParameters);
       if(kind==='wall'){const finish=galleryPaint(stateRef.current.room.theme,role);mat.bumpScale=finish.bumpScale;mat.envMapIntensity=reflectionLevel*finish.reflection;mat.userData.paintRole=role;gallerySpatialMaterial(mat,indirectUniforms);}else if(kind==='floor')galleryFloorFinish(mat,reflectionLevel,finishTheme);return mat;
     }
@@ -4149,7 +4197,7 @@ function App() {
       const s = stateRef.current;
       const { w, d, h, theme } = s.room;
       const wallC = galleryPaint(theme).color;
-      const floorC = theme === "black" ? 0x2a2a2a : theme === "warm" ? 0xeae2d5 : 0xffffff;
+      const floorC = theme === "black" ? 0x2a2a2a : theme === "warm" ? 0xe8d9c7 : 0xffffff;
       const sol2 = solar(roomSolarEnv(s.room, s.env));
       updateIndirectField(s,sol2);
       const naturalAccess=galleryDaylightAccess(s.room,s.windows,s.entrances);
