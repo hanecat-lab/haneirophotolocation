@@ -206,7 +206,7 @@ function validateExhibitionFile(j) {
         if (!o || !idOK(o.id) || ids.has(o.id)) fail();
         ids.add(o.id);
         if (["columns", "lights", "blocks", "furniture"].includes(k) && !finite(o, ["x", "z"])) fail();
-        if(k==='lights'&&(o.targetPlacement!==undefined&&!idOK(o.targetPlacement)||o.followTarget!==undefined&&typeof o.followTarget!=='boolean'||o.aimMode!==undefined&&!['light','center'].includes(o.aimMode)))fail();
+        if(k==='lights'&&(o.targetPlacement!==undefined&&!idOK(o.targetPlacement)||o.followTarget!==undefined&&typeof o.followTarget!=='boolean'||o.aimMode!==undefined&&!['light','center'].includes(o.aimMode)||o.lightPosition!==undefined&&!['center','slightlyUp','upper'].includes(o.lightPosition)))fail();
         if (k === "columns" && !((o.w || o.size) > 0 && (o.d || o.size) > 0)) fail();
         if (["windows", "entrances"].includes(k) && (!walls.includes(o.wall) || !finite(o, ["pos", "w", "h"]) || o.w <= 0 || o.h <= 0 || k === "windows" && !Number.isFinite(o.sill))) fail();
         if (k === "entrances" && (o.daylight!==undefined&&!['none','outdoor','adjacent'].includes(o.daylight)||o.style!==undefined&&!['open','singleGlass','doubleGlass'].includes(o.style)||o.frameTone!==undefined&&!['white','black','metal'].includes(o.frameTone)||o.adjacentStrength!==undefined&&!['low','medium','high'].includes(o.adjacentStrength)||o.sideGlass!==undefined&&typeof o.sideGlass!=='boolean'||o.sideWidth!==undefined&&(!Number.isFinite(o.sideWidth)||o.sideWidth<0||o.sideWidth>3))) fail();
@@ -668,6 +668,16 @@ function galleryArtworkTarget(data,p){
 // the wall*, not the ray. This matters for oblique spots: their footprint is
 // asymmetric even when the central ray intersects the photograph's center.
 function galleryLightAimMode(light){return light?.aimMode==='center'?'center':'light';}
+// Easel-only vertical placement of the light's brightness centroid on the photograph.
+// Missing values from existing layouts intentionally default to 'slightly up'.
+function galleryEaselLightPosition(light){
+  return ['center','slightlyUp','upper'].includes(light?.lightPosition)?light.lightPosition:'slightlyUp';
+}
+function galleryEaselLightOffset(light,plane){
+  if(plane?.kind!=='easel')return 0;
+  const factor={center:0,slightlyUp:.12,upper:.22}[galleryEaselLightPosition(light)];
+  return factor*(plane.photoHeight||0);
+}
 function galleryCenterRayAim(data,light,target){
   const dx=target.x-light.x,dz=target.z-light.z,dy=ceilAt(data.room,light.x,light.z)-.09-target.y,hd=Math.hypot(dx,dz),raw=Math.atan2(hd,Math.max(.005,dy))*180/Math.PI;
   return {tilt:Number(clamp(raw,0,60).toFixed(3)),dir:hd<.0001?light.dir:Number((Math.atan2(dx,-dz)*180/Math.PI).toFixed(3)),limited:dy<=0||raw>60.5,target};
@@ -752,8 +762,9 @@ function galleryLightAim(data,light,p){
   if(galleryLightAimMode(light)==='center'||base.limited)return base;
   const plane=galleryArtworkLightingPlane(data,p,target);
   if(!plane)return base;
-  const key=JSON.stringify([light.x,light.z,light.angle,p.id,p.method,p.wall,p.col,p.face,p.pos,p.center,p.x,p.z,p.rot,p.size,p.orient,p.sq,p.frame,p.mat,target.x,target.y,target.z,plane.kind,plane.horizontal,plane.lo,plane.hi,plane.minY,plane.maxY,plane.normal.x,plane.normal.y,plane.normal.z,plane.tangentU?.x,plane.tangentU?.z,plane.tangentV?.x,plane.tangentV?.y,plane.tangentV?.z,plane.surfaceOffset,plane.photoWidth,plane.photoHeight,ceilAt(data.room,light.x,light.z)]);
+  const key=JSON.stringify([light.x,light.z,light.angle,light.lightPosition,p.id,p.photo,p.method,p.wall,p.col,p.face,p.pos,p.center,p.x,p.z,p.rot,p.size,p.orient,p.sq,p.frame,p.mat,target.x,target.y,target.z,plane.kind,plane.horizontal,plane.lo,plane.hi,plane.minY,plane.maxY,plane.normal.x,plane.normal.y,plane.normal.z,plane.tangentU?.x,plane.tangentU?.z,plane.tangentV?.x,plane.tangentV?.y,plane.tangentV?.z,plane.surfaceOffset,plane.photoWidth,plane.photoHeight,ceilAt(data.room,light.x,light.z)]);
   const cached=galleryAimCache.get(key);if(cached)return {...cached,target};
+  const desiredV=galleryEaselLightOffset(light,plane);
   let offsetU=0,offsetV=0,aim=base;
   for(let iter=0;iter<5;iter++){
     const shifted=target.clone();
@@ -764,10 +775,11 @@ function galleryLightAim(data,light,p){
     const centroid=galleryWallIlluminanceCentroid(data,light,plane,target,candidate.tilt,candidate.dir);
     if(!centroid)break;
     aim=candidate;
-    const error=Math.hypot(centroid.u,centroid.v);
+    const errorV=centroid.v-desiredV;
+    const error=Math.hypot(centroid.u,errorV);
     if(error<.006)break;
     offsetU=clamp(offsetU-centroid.u*.78,-.45,.45);
-    offsetV=clamp(offsetV-centroid.v*.78,-.45,.45);
+    offsetV=clamp(offsetV-errorV*.78,-.45,.45);
   }
   // Prevent a grazing wall or an edge from causing extreme correction.
   const deltaTilt=Math.abs(aim.tilt-base.tilt);
@@ -1831,14 +1843,14 @@ function gallerySoftShadowMaterial(material,parameters){
           float galleryTexelWorld=2.0*galleryLampShadowTan*galleryReceiver*texelSize.x;
           gallerySpread=clamp(.8+.022*gallerySeparation/max(.01,galleryBlocker)/max(.00001,galleryTexelWorld),.8,6.0);
         }
-        radius=gallerySpread*texelSize.x;
+        radius=gallerySpread*galleryLampShadowSoftness*texelSize.x;
       }`);
     const filtered=chunk.replace(/vogelDiskSample\( ([0-4]), 5, phi \)/g,'vogelDiskSample( $1, 9, phi )').replace(') * 0.2;',`+
           texture(shadowMap,vec3(shadowCoord.xy+vogelDiskSample(5,9,phi)*radius,shadowCoord.z))+
           texture(shadowMap,vec3(shadowCoord.xy+vogelDiskSample(6,9,phi)*radius,shadowCoord.z))+
           texture(shadowMap,vec3(shadowCoord.xy+vogelDiskSample(7,9,phi)*radius,shadowCoord.z))+
           texture(shadowMap,vec3(shadowCoord.xy+vogelDiskSample(8,9,phi)*radius,shadowCoord.z))) / 9.0;`);
-    shader.fragmentShader='uniform float gallerySunDepthSpan; uniform float gallerySunTexelWorld; uniform vec2 galleryLampShadowNearFar; uniform float galleryLampShadowTan;\n'+shader.fragmentShader.replace('#include <shadowmap_pars_fragment>',filtered);
+    shader.fragmentShader='uniform float gallerySunDepthSpan; uniform float gallerySunTexelWorld; uniform vec2 galleryLampShadowNearFar; uniform float galleryLampShadowTan; uniform float galleryLampShadowSoftness;\n'+shader.fragmentShader.replace('#include <shadowmap_pars_fragment>',filtered);
   };
   material.customProgramCacheKey=()=>key+'|gallery-distance-soft-shadow-v3-perspective-centroid';return material;
 }
@@ -2931,13 +2943,34 @@ function App() {
     const next=d.lights.map(x=>x.id===lid?{...x,aimMode:mode==='manual'?galleryLightAimMode(x):mode,followTarget:mode!=='manual'}:x);
     commitBindingLights(next,mode==='manual'?'手動調整に切り替えました。担当作品は維持します':mode==='light'?'作品面の光の中心を作品に合わせて自動追従します':'照明の中心軸を作品の中心へ向けて自動追従します');
   }
+  function setLightPosition(lid,position){
+    if(!bindingAllowed()||!['center','slightlyUp','upper'].includes(position))return;
+    const d=dataRef.current,l=d.lights.find(x=>x.id===lid);
+    const p=l&&d.placements.find(x=>x.id===l.targetPlacement);
+    if(!p||p.method!=='イーゼル')return;
+    commitBindingLights(d.lights.map(x=>x.id===lid?{...x,lightPosition:position}:x),
+      'イーゼルの光の位置を'+({center:'中央',slightlyUp:'やや上',upper:'上寄り'}[position])+'に設定しました');
+  }
   function lightAimModeButtons(l){
     if(!l?.targetPlacement)return null;
     const active=l.followTarget===false?'manual':galleryLightAimMode(l);
+    const assigned=dataRef.current.placements.find(p=>p.id===l.targetPlacement);
+    const isEasel=assigned?.method==='イーゼル';
+    const position=galleryEaselLightPosition(l);
     const opts=[['light','光の中心'],['center','作品の中心'],['manual','手動']];
     return React.createElement('div',{'aria-label':'自動追従の照準方式',style:{display:'grid',gap:5}},
       React.createElement('b',{style:{fontSize:11}},'照準方式'),
       React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(3,minmax(0,1fr))',gap:5}},...opts.map(([key,label])=>React.createElement('button',{key,type:'button','aria-pressed':active===key,disabled:!bindingAllowed(),onClick:()=>setLightAimMode(l.id,key),style:{minHeight:37,padding:'5px 3px',fontSize:11,fontWeight:active===key?800:600,borderRadius:9,...artworkButtonSurface(active===key?'primary':'neutral',active===key,!bindingAllowed())}},label))),
+      isEasel&&React.createElement('div',{'aria-label':'イーゼルの光の位置',style:{display:'grid',gap:5,marginTop:5}},
+        React.createElement('b',{style:{fontSize:11}},'光の位置'),
+        React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(3,minmax(0,1fr))',gap:5}},
+          ...[['center','中央'],['slightlyUp','やや上'],['upper','上寄り']].map(([key,label])=>React.createElement('button',{
+            key,type:'button','aria-pressed':position===key,
+            disabled:!bindingAllowed(),onClick:()=>setLightPosition(l.id,key),
+            style:{minHeight:37,padding:'5px 3px',fontSize:11,fontWeight:position===key?800:600,borderRadius:9,...artworkButtonSurface(position===key?'primary':'neutral',position===key,!bindingAllowed())}
+          },label))),
+        React.createElement('span',{className:'small',style:{fontSize:10}},
+          active==='light'?'写真の表示範囲を基準に、明るさの重心を'+({center:'中央',slightlyUp:'少し上',upper:'上側'}[position])+'へ調整します。':'「光の中心」に切り替えるとこの位置設定が反映されます。')),
       React.createElement('span',{className:'small',style:{fontSize:10}},active==='light'?'光の重心を作品に合わせます。イーゼルは写真の表示範囲のみ計算し、額・台は含めません。':active==='center'?'照明の中心軸を作品中心に向けます。':'角度を固定し、担当作品との紐づけは維持します。'));
   }
   function addAssignedLight(pid){
@@ -3594,7 +3627,7 @@ function App() {
     sunLight.shadow.bias = -0.00008;
     sunLight.shadow.normalBias = 0.003;
     sunLight.shadow.radius = 3;
-    const sunShadowParameters={gallerySunDepthSpan:{value:1},gallerySunTexelWorld:{value:.005},galleryLampShadowNearFar:{value:new THREE.Vector2(.08,12)},galleryLampShadowTan:{value:Math.tan(Math.PI/6)}};
+    const sunShadowParameters={gallerySunDepthSpan:{value:1},gallerySunTexelWorld:{value:.005},galleryLampShadowNearFar:{value:new THREE.Vector2(.08,12)},galleryLampShadowTan:{value:Math.tan(Math.PI/6)},galleryLampShadowSoftness:{value:1}};
     sunLight.target = sunTarget;
     scene.add(sunLight, sunTarget);
     const group = new THREE.Group();
@@ -4177,6 +4210,11 @@ function App() {
             }
             spot=exhibitShadowLight;
             spot.color.copy(col);spot.intensity=l.intensity;spot.distance=Math.max(12,h*2.5);spot.angle=l.angle*Math.PI/180;spot.penumbra=.9;spot.decay=1.4;
+            const easelTarget=s.placements.find(p=>p.id===l.targetPlacement&&p.method==='イーゼル');
+            // A softer penumbra and lower occlusion for the single exhibit
+            // shadow-casting fixture when it illuminates an easel photograph.
+            spot.shadow.intensity=easelTarget?.48:.65;
+            sunShadowParameters.galleryLampShadowSoftness.value=easelTarget?1.65:1;
             spot.castShadow=true;spot.shadow.needsUpdate=true;
             sunShadowParameters.galleryLampShadowNearFar.value.set(spot.shadow.camera.near,spot.distance);
             sunShadowParameters.galleryLampShadowTan.value=Math.tan(spot.angle);
