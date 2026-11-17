@@ -673,7 +673,16 @@ function galleryCenterRayAim(data,light,target){
   return {tilt:Number(clamp(raw,0,60).toFixed(3)),dir:hd<.0001?light.dir:Number((Math.atan2(dx,-dz)*180/Math.PI).toFixed(3)),limited:dy<=0||raw>60.5,target};
 }
 function galleryArtworkLightingPlane(data,p,target){
-  if(p.method==='イーゼル')return null; // tilted freestanding work: use center ray
+  if(p.method==='イーゼル'){
+    // An easel is a freestanding, slightly tilted illuminated surface, not a wall.
+    // Match the board's actual Y- and X-rotation in the 3D renderer, including
+    // its fallback model. The light footprint is measured on this picture plane.
+    const a=(getModel('easel')?4.8:10)*Math.PI/180,rot=(p.rot||0)*Math.PI/180;
+    const ca=Math.cos(a),sa=Math.sin(a),cr=Math.cos(rot),sr=Math.sin(rot);
+    return {kind:'easel',normal:new THREE.Vector3(sr*ca,sa,cr*ca),
+      tangentU:new THREE.Vector3(cr,0,-sr),tangentV:new THREE.Vector3(-sr*sa,ca,-cr*sa),
+      surfaceOffset:0,photoWidth:frameW(p),photoHeight:frameH(p)};
+  }
   const r=data.room;
   if(p.col){
     const host=mountOf(data.columns||[],data.blocks||[],p.col);if(!host)return null;
@@ -688,24 +697,26 @@ function galleryWallIlluminanceCentroid(data,light,plane,target,tilt,dir){
   // as the exhibited SpotLight and the gallery's material shader.
   const pose=galleryLampPose(data.room,{...light,tilt,dir});
   const lens=pose.origin,axis=pose.aim,edge=Math.cos(clamp(light.angle,15,60)*Math.PI/180);
-  const surface=target.clone().addScaledVector(plane.normal,-plane.surfaceOffset);
+  const easel=plane.kind==='easel';
+  const surface=easel?target:target.clone().addScaledVector(plane.normal,-plane.surfaceOffset);
   const distance=lens.distanceTo(surface);
   const radius=clamp(distance*Math.tan(clamp(light.angle,15,60)*Math.PI/180)*2.4,.65,2.35);
-  const n=21,step=2*radius/(n-1),axis0=plane.horizontal==='x'?surface.x:surface.z;
+  const n=21,step=2*radius/(n-1),axis0=easel?0:plane.horizontal==='x'?surface.x:surface.z;
   let sum=0,along=0,up=0;
   for(let i=0;i<n;i++){
     const u=(i-(n-1)/2)*step,coord=axis0+u;
-    if(coord<plane.lo+.005||coord>plane.hi-.005)continue;
+    if(!easel&&(coord<plane.lo+.005||coord>plane.hi-.005))continue;
     for(let j=0;j<n;j++){
-      const v=(j-(n-1)/2)*step,y=target.y+v;
-      if(y<plane.minY||y>plane.maxY)continue;
-      const x=plane.horizontal==='x'?surface.x+u:surface.x;
-      const z=plane.horizontal==='z'?surface.z+u:surface.z;
+      const v=(j-(n-1)/2)*step;
+      const x=easel?surface.x+plane.tangentU.x*u+plane.tangentV.x*v:plane.horizontal==='x'?surface.x+u:surface.x;
+      const y=easel?surface.y+plane.tangentU.y*u+plane.tangentV.y*v:target.y+v;
+      const z=easel?surface.z+plane.tangentU.z*u+plane.tangentV.z*v:plane.horizontal==='z'?surface.z+u:surface.z;
+      if(!easel&&(y<plane.minY||y>plane.maxY))continue;
       const dx=x-lens.x,dy=y-lens.y,dz=z-lens.z;
       const dist=Math.hypot(dx,dy,dz);if(dist<.0001)continue;
       const angleCos=(dx*axis.x+dy*axis.y+dz*axis.z)/dist;
       if(angleCos<=edge)continue;
-      const incidence=-(dx*plane.normal.x+dz*plane.normal.z)/dist;
+      const incidence=-(dx*plane.normal.x+dy*plane.normal.y+dz*plane.normal.z)/dist;
       if(incidence<=.01)continue;
       const weight=gallerySpotFalloff(edge,angleCos)*incidence/Math.pow(Math.max(1,dist),1.4);
       sum+=weight;along+=u*weight;up+=v*weight;
@@ -721,11 +732,13 @@ function galleryLightAim(data,light,p){
   if(galleryLightAimMode(light)==='center'||base.limited)return base;
   const plane=galleryArtworkLightingPlane(data,p,target);
   if(!plane)return base;
-  const key=JSON.stringify([light.x,light.z,light.angle,p.id,p.method,p.wall,p.col,p.face,p.pos,p.center,p.x,p.z,p.rot,p.size,p.orient,p.sq,p.frame,p.mat,target.x,target.y,target.z,plane.horizontal,plane.lo,plane.hi,plane.minY,plane.maxY,plane.normal.x,plane.normal.z,plane.surfaceOffset,ceilAt(data.room,light.x,light.z)]);
+  const key=JSON.stringify([light.x,light.z,light.angle,p.id,p.method,p.wall,p.col,p.face,p.pos,p.center,p.x,p.z,p.rot,p.size,p.orient,p.sq,p.frame,p.mat,target.x,target.y,target.z,plane.kind,plane.horizontal,plane.lo,plane.hi,plane.minY,plane.maxY,plane.normal.x,plane.normal.y,plane.normal.z,plane.tangentU?.x,plane.tangentU?.z,plane.tangentV?.x,plane.tangentV?.y,plane.tangentV?.z,plane.surfaceOffset,ceilAt(data.room,light.x,light.z)]);
   const cached=galleryAimCache.get(key);if(cached)return {...cached,target};
   let offsetU=0,offsetV=0,aim=base;
   for(let iter=0;iter<5;iter++){
-    const shifted=target.clone();shifted[plane.horizontal]+=offsetU;shifted.y+=offsetV;
+    const shifted=target.clone();
+    if(plane.kind==='easel')shifted.addScaledVector(plane.tangentU,offsetU).addScaledVector(plane.tangentV,offsetV);
+    else{shifted[plane.horizontal]+=offsetU;shifted.y+=offsetV;}
     const candidate=galleryCenterRayAim(data,light,shifted);
     if(candidate.limited)break;
     const centroid=galleryWallIlluminanceCentroid(data,light,plane,target,candidate.tilt,candidate.dir);
@@ -2896,7 +2909,7 @@ function App() {
     const d=dataRef.current,l=d.lights.find(x=>x.id===lid);
     if(!l?.targetPlacement)return;
     const next=d.lights.map(x=>x.id===lid?{...x,aimMode:mode==='manual'?galleryLightAimMode(x):mode,followTarget:mode!=='manual'}:x);
-    commitBindingLights(next,mode==='manual'?'手動調整に切り替えました。担当作品は維持します':mode==='light'?'壁面の光の中心を作品に合わせて自動追従します':'照明の中心軸を作品の中心へ向けて自動追従します');
+    commitBindingLights(next,mode==='manual'?'手動調整に切り替えました。担当作品は維持します':mode==='light'?'作品面の光の中心を作品に合わせて自動追従します':'照明の中心軸を作品の中心へ向けて自動追従します');
   }
   function lightAimModeButtons(l){
     if(!l?.targetPlacement)return null;
@@ -2905,7 +2918,7 @@ function App() {
     return React.createElement('div',{'aria-label':'自動追従の照準方式',style:{display:'grid',gap:5}},
       React.createElement('b',{style:{fontSize:11}},'照準方式'),
       React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(3,minmax(0,1fr))',gap:5}},...opts.map(([key,label])=>React.createElement('button',{key,type:'button','aria-pressed':active===key,disabled:!bindingAllowed(),onClick:()=>setLightAimMode(l.id,key),style:{minHeight:37,padding:'5px 3px',fontSize:11,fontWeight:active===key?800:600,borderRadius:9,...artworkButtonSurface(active===key?'primary':'neutral',active===key,!bindingAllowed())}},label))),
-      React.createElement('span',{className:'small',style:{fontSize:10}},active==='light'?'壁面にできる明るさの重心を作品に合わせます。':active==='center'?'照明の中心軸を作品中心に向けます。':'角度を固定し、担当作品との紐づけは維持します。'));
+      React.createElement('span',{className:'small',style:{fontSize:10}},active==='light'?'作品の面にできる明るさの重心を作品に合わせます（イーゼルにも対応）。':active==='center'?'照明の中心軸を作品中心に向けます。':'角度を固定し、担当作品との紐づけは維持します。'));
   }
   function addAssignedLight(pid){
     if(!bindingAllowed())return;const d=dataRef.current,p=d.placements.find(p=>p.id===pid),target=p&&galleryArtworkTarget(d,p);if(!target)return;
@@ -6929,7 +6942,7 @@ function App() {
       ar.phase==='mid'&&React.createElement('p',{role:'status',style:{fontSize:11,fontWeight:700,color:'#865009',margin:0}},'仮表示・未確定'),
       ar.warning&&React.createElement('p',{role:'alert',style:{margin:0,padding:'7px 8px',borderRadius:8,background:'#fff2d6',color:'#8d4810',fontSize:11,lineHeight:1.5}},ar.warning),
       ar.phase!=='mid'&&React.createElement('p',{style:{fontSize:12,fontWeight:700,lineHeight:1.5,margin:0}},arrangeInstruction(ar)),
-      ar.phase==='end'&&React.createElement(React.Fragment,null,React.createElement('p',{className:'small',style:{margin:0}},'青の○＝選べる終点 ／ 灰色の×＝選択不可'),React.createElement('div',{'aria-label':'終点候補の一覧',style:{display:'grid',gap:5}},...candidates.map(({o,assessment:a})=>React.createElement('div',{key:o.id,style:{display:'flex',alignItems:'center',justifyContent:'space-between',gap:6,padding:6,borderRadius:8,border:'1px solid var(--line)'}},React.createElement('span',{style:{fontSize:11,lineHeight:1.4}},arrangeObjectLabel(ar.cls,o.id),React.createElement('small',{style:{display:'block',color:a.ok?'#166b9e':'#716e65'}},(a.ok?'○ ':'× ')+a.label)),React.createElement('button',{type:'button',disabled:!a.ok,title:a.reason,'aria-label':arrangeObjectLabel(ar.cls,o.id)+'を終点に選ぶ',onClick:()=>arrangeTap(ar.cls==='light'?'light':'placement',o.id),style:{minHeight:34,padding:'4px 8px',fontSize:11,borderRadius:8,flexShrink:0,...artworkButtonSurface('neutral',false,!a.ok)}},a.ok?'選ぶ':'選べません'))))),
+      ar.phase==='end'&&React.createElement(React.Fragment,null,React.createElement('p',{className:'small',style:{margin:0}},'青い番号＝選べる終点 ／ 灰色の番号＝選択不可'),React.createElement('div',{'aria-label':'終点候補の一覧',style:{display:'grid',gap:5}},...candidates.map(({o,assessment:a})=>React.createElement('div',{key:o.id,style:{display:'flex',alignItems:'center',justifyContent:'space-between',gap:6,padding:6,borderRadius:8,border:'1px solid var(--line)'}},React.createElement('span',{style:{fontSize:11,lineHeight:1.4}},arrangeObjectLabel(ar.cls,o.id),React.createElement('small',{style:{display:'block',color:a.ok?'#166b9e':'#716e65'}},(a.ok?'○ ':'× ')+a.label)),React.createElement('button',{type:'button',disabled:!a.ok,title:a.reason,'aria-label':arrangeObjectLabel(ar.cls,o.id)+'を終点に選ぶ',onClick:()=>arrangeTap(ar.cls==='light'?'light':'placement',o.id),style:{minHeight:34,padding:'4px 8px',fontSize:11,borderRadius:8,flexShrink:0,...artworkButtonSurface('neutral',false,!a.ok)}},a.ok?'選ぶ':'選べません'))))),
       ar.phase==='mid'&&React.createElement(React.Fragment,null,React.createElement('p',{style:{fontSize:12,fontWeight:800,lineHeight:1.5,margin:0}},'両端：'+arrangeObjectLabel(ar.cls,ar.start)+'・'+arrangeObjectLabel(ar.cls,ar.end)+'（固定）'),React.createElement('p',{style:{fontSize:12,fontWeight:700,margin:0}},'動かす'+noun+'：'+mids.length+unit),mids.length>0&&React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:4}},...mids.map(o=>React.createElement('span',{key:o.id,style:{background:'#fff0c0',color:'#694c0d',borderRadius:6,padding:'3px 6px',fontSize:11}},arrangeObjectLabel(ar.cls,o.id)))),
         plan&&React.createElement('b',{style:{fontSize:12,color:plan.bad?'#b03524':'#246e64'}},plan.bad?'重なり '+plan.bad+'か所。対象を減らすか、終点を選び直してください。':plan.text),
         ar.cls==='wall'&&React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:5}},btn('中心を等間隔',()=>setArrange({...ar,spacing:'center',warning:''})),btn('隙間を均等',()=>setArrange({...ar,spacing:'gap',warning:''})),btn('窓を避ける：'+(ar.avoid?'ON':'OFF'),()=>setArrange({...ar,avoid:!ar.avoid,warning:''}))),
@@ -6940,12 +6953,12 @@ function App() {
     return React.createElement('section',{'aria-label':'等間隔の操作パネル',className:'absolute left-2 right-2 bottom-2 z-40 bg-white text-black rounded-2xl shadow-xl',style:{display:'flex',flexDirection:'column',maxHeight:'55%',overflow:'hidden'}},header,!sheetMin&&React.createElement('div',{style:{overflowY:'auto',minHeight:0,flex:1}},body),arrangeFooter());
   }
   function disposeArrangeEndGuides(){const old=arrangeEndGuidesRef.current;if(!old)return;old.group.traverse(o=>{o.geometry?.dispose();const ms=Array.isArray(o.material)?o.material:[o.material];ms.filter(Boolean).forEach(m=>{m.map?.dispose();m.dispose();});});old.group.removeFromParent();arrangeEndGuidesRef.current=null;}
-  function scaleArrangeEndGuides(){const info=arrangeEndGuidesRef.current,camera=cameraRef.current;if(!info||!camera)return;const height=mountRef.current?.clientHeight||500,crop=camera.view?.enabled?camera.view.height/camera.view.fullHeight:1;camera.updateMatrixWorld(true);for(const m of info.markers){const distance=camera.getWorldPosition(new THREE.Vector3()).distanceTo(m.point),pixel=2*Math.tan(camera.fov*Math.PI/360)*Math.max(.05,distance)*crop/Math.max(1,height);m.ring.scale.setScalar(pixel*10);m.ring.quaternion.copy(camera.quaternion);m.label.scale.set(pixel*132,pixel*24,1);m.label.position.copy(m.point).addScaledVector(camera.up.clone().applyQuaternion(camera.quaternion),pixel*27);}info.group.updateMatrixWorld(true);}
+  function scaleArrangeEndGuides(){const info=arrangeEndGuidesRef.current,camera=cameraRef.current;if(!info||!camera)return;const height=mountRef.current?.clientHeight||500,crop=camera.view?.enabled?camera.view.height/camera.view.fullHeight:1;camera.updateMatrixWorld(true);for(const m of info.markers){const distance=camera.getWorldPosition(new THREE.Vector3()).distanceTo(m.point),pixel=2*Math.tan(camera.fov*Math.PI/360)*Math.max(.05,distance)*crop/Math.max(1,height);m.ring.scale.setScalar(pixel*10);m.ring.quaternion.copy(camera.quaternion);m.label.scale.set(pixel*28,pixel*28,1);m.label.position.copy(m.point).addScaledVector(camera.up.clone().applyQuaternion(camera.quaternion),pixel*27);}info.group.updateMatrixWorld(true);}
   function drawArrangeEndGuides(scene){
     const ar=arrangeRef.current,s=stateRef.current,active=s.mode==='edit'&&ar?.phase==='end',sig=JSON.stringify([active,curRoomRef.current,ar?.start,ar?.cls,ar?.targetMode,s.lights,s.placements,s.room,s.columns,s.blocks,!!getModel('easel')]);
     if(arrangeEndGuidesRef.current?.scene===scene&&arrangeEndGuidesRef.current.sig===sig){scaleArrangeEndGuides();return;}
     disposeArrangeEndGuides();if(!active)return;const group=new THREE.Group();group.userData.arrangeEndGuide=true;scene.add(group);const info={group,scene,sig,markers:[],labels:[],room:curRoomRef.current,start:ar.start};arrangeEndGuidesRef.current=info;
-    for(const o of arrangeEndAPIRef.current.targets(ar.cls).filter(o=>o.id!==ar.start)){const assessment=arrangeEndAPIRef.current.assess(ar,o.id),point=ar.cls==='light'?galleryLampPose(s.room,o).origin:galleryArtworkTarget(dataRef.current,o);if(!point)continue;const color=assessment.ok?'#176f9f':'#686963',ring=new THREE.Mesh(new THREE.TorusGeometry(1,.14,6,24),new THREE.MeshBasicMaterial({color,depthTest:false,depthWrite:false,toneMapped:false}));ring.position.copy(point);ring.renderOrder=41;ring.raycast=()=>{};group.add(ring);const canvas=document.createElement('canvas');canvas.width=396;canvas.height=72;const ctx=canvas.getContext('2d');ctx.fillStyle=color;ctx.fillRect(0,0,396,72);ctx.fillStyle='#fff';ctx.font='bold 30px sans-serif';ctx.textAlign='center';ctx.fillText((assessment.ok?'○ ':'× ')+(ar.cls==='light'?arrangeEndAPIRef.current.label(ar.cls,o.id):'#'+(dataRef.current.placements.findIndex(p=>p.id===o.id)+1))+' '+assessment.label,198,47);const texture=new THREE.CanvasTexture(canvas);texture.colorSpace=THREE.SRGBColorSpace;const label=new THREE.Sprite(new THREE.SpriteMaterial({map:texture,depthTest:false,depthWrite:false,toneMapped:false}));label.renderOrder=42;label.userData={kind:ar.cls==='light'?'light':'placement',id:o.id,arrangeEndCandidate:true,selectable:assessment.ok};group.add(label);info.markers.push({point,ring,label});info.labels.push(label);}
+    for(const o of arrangeEndAPIRef.current.targets(ar.cls).filter(o=>o.id!==ar.start)){const assessment=arrangeEndAPIRef.current.assess(ar,o.id),point=ar.cls==='light'?galleryLampPose(s.room,o).origin:galleryArtworkTarget(dataRef.current,o);if(!point)continue;const color=assessment.ok?'#176f9f':'#686963',ring=new THREE.Mesh(new THREE.TorusGeometry(1,.14,6,24),new THREE.MeshBasicMaterial({color,depthTest:false,depthWrite:false,toneMapped:false}));ring.position.copy(point);ring.renderOrder=41;ring.raycast=()=>{};group.add(ring);const canvas=document.createElement('canvas');canvas.width=96;canvas.height=96;const ctx=canvas.getContext('2d');const number=ar.cls==='light'?dataRef.current.lights.findIndex(l=>l.id===o.id)+1:dataRef.current.placements.findIndex(p=>p.id===o.id)+1;ctx.beginPath();ctx.arc(48,48,42,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();ctx.lineWidth=5;ctx.strokeStyle='#fff';ctx.stroke();ctx.fillStyle='#fff';ctx.font='bold 45px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(String(number),48,50);const texture=new THREE.CanvasTexture(canvas);texture.colorSpace=THREE.SRGBColorSpace;const label=new THREE.Sprite(new THREE.SpriteMaterial({map:texture,depthTest:false,depthWrite:false,toneMapped:false}));label.renderOrder=42;label.userData={kind:ar.cls==='light'?'light':'placement',id:o.id,arrangeEndCandidate:true,selectable:assessment.ok};group.add(label);info.markers.push({point,ring,label});info.labels.push(label);}
     scaleArrangeEndGuides();
   }
 
