@@ -20575,6 +20575,7 @@ function c32Command(d,lat,lv,kmh,c,line,p,wasBraking){
   const brake=v>safe+(wasBraking?-.35:.35);
   return {steer,brake,target,targetSpeed:safe*3.6,roadK:roadBendAt(d),error,projected,wallRisk,saturated,desiredLV,controller:'C32'};
 }
+const C33_CONTROL=(()=>{try{return new URLSearchParams(location.search).get('c33control')==='1'&&C32_CONTROL;}catch(_){return false;}})();
 function c26Prepare(){
   if(!C26_TRIAL_MODE)return {ok:false,error:'c26trial is not enabled'};
   if(gameState!=='ready')return {ok:false,error:'Start from READY state'};
@@ -20593,7 +20594,7 @@ function c26Prepare(){
   Object.assign(c26TrialState,{active:true,finished:false,corner:c,frames:[],events:[],steps:0,
     lastBrake:false,lastPaw:false,brakeStart:null,brakeRelease:null,pawDone:false,pawStart:null,spawnS:s,finishS:c.end+35,
     entry:null,exit:null,finish:null,wallHits:0,brakeSeconds:0,pawSeconds:0,maxLoad:0,startedAt:0,lastS:s,firstWallS:null,
-    boostFrames:0,slideFrames:0,linkFrames:0,brakeTransitions:0,brakePhase:0,brakeHold:0,releaseCandidate:0,waterStart:waterLevel,notes:['Local spawn, not full lap',C32_CONTROL?'C32 predictive controller':C31_CONTROL?'C31 predictive controller':'C25 controller applied to REAL 3D','No physics changes']});
+    boostFrames:0,slideFrames:0,linkFrames:0,brakeTransitions:0,brakePhase:0,brakeHold:0,releaseCandidate:0,c33BrakeAge:0,c33ReleaseAge:0,c33RawTransitions:0,c33PrevRaw:false,waterStart:waterLevel,notes:['Local spawn, not full lap',C33_CONTROL?'C33 brake stabilizer':C32_CONTROL?'C32 predictive controller':C31_CONTROL?'C31 predictive controller':'C25 controller applied to REAL 3D','No physics changes']});
   return {ok:true,mode:C26_TRIAL_MODE,corner:{start:c.start,end:c.end,dir:c.dir},spawnS:s,spawnKmh:110,lateral,finishS:c26TrialState.finishS,paw:C26_PAW_REQUEST};
 }
 function c26TrialStep(dt){
@@ -20616,7 +20617,17 @@ function c26TrialStep(dt){
   }
   }else{
     // Safety braking is continuous and hysteretic. No artificial acceleration.
-    braking=cmd.brake;
+    if(C33_CONTROL){
+      // C33: controller-only brake latch. Require sustained release, except
+      // when the car is well below the speed envelope. No physics modifications.
+      const raw=cmd.brake;
+      if(raw!==st.c33PrevRaw)st.c33RawTransitions++;
+      st.c33PrevRaw=raw;
+      st.c33BrakeAge=st.lastBrake?st.c33BrakeAge+dt:0;
+      st.c33ReleaseAge=raw?0:st.c33ReleaseAge+dt;
+      const below=(speed*3.6)<cmd.targetSpeed-3.5;
+      braking=st.lastBrake?(raw||(!below&&(st.c33BrakeAge<.20||st.c33ReleaseAge<.14))):raw;
+    }else braking=cmd.brake;
     if(braking&&!st.lastBrake){st.brakeTransitions++;if(!st.brakeStart)st.brakeStart={s,t:simulationElapsed,kmh:speed*3.6};}
     if(!braking&&st.lastBrake){st.brakeTransitions++;st.brakeRelease={s,t:simulationElapsed,kmh:speed*3.6};}
   }
@@ -20649,6 +20660,10 @@ function c26TrialAfterStep(){
     targetSpeed:+(st.command?.targetSpeed??0).toFixed(2),lateralVelocity:+(pathHandling.lateralVelocity||0).toFixed(3),
     projected:+(st.command?.projected??0).toFixed(3),desiredLV:+(st.command?.desiredLV??0).toFixed(3),error:+(st.command?.error??0).toFixed(3),
     ceiling:Number.isFinite(cornerPace.speedCeiling)?+(cornerPace.speedCeiling*3.6).toFixed(2):null,
+    brakeRaw:!!st.command?.brake,brakeAge:+(st.c33BrakeAge||0).toFixed(3),
+    gripKmh:Number.isFinite(activeGripLimit)?+(activeGripLimit*3.6).toFixed(2):null,
+    previewGripKmh:Number.isFinite(previewGripLimit)?+(previewGripLimit*3.6).toFixed(2):null,
+    throttleScale:+(cornerPace.scale||0).toFixed(3),
     boost:!!(boostTimer>0||exitBoostTimer>0),sliding:!!isSliding};
   if(st.steps%3===0)st.frames.push(snap);
   if(!st.entry&&s>=st.corner.start)st.entry=snap;
@@ -20663,7 +20678,7 @@ if(C26_TRIAL_MODE)window.__c26Trial={prepare:c26Prepare,step:(dt=1/60)=>advanceG
   status:()=>({mode:C26_TRIAL_MODE,paw:C26_PAW_REQUEST,active:c26TrialState.active,finished:c26TrialState.finished,
     steps:c26TrialState.steps,spawnS:c26TrialState.spawnS,finishS:c26TrialState.finishS,entry:c26TrialState.entry,
     exit:c26TrialState.exit,finish:c26TrialState.finish,wallHits:c26TrialState.wallHits,firstWallS:c26TrialState.firstWallS,
-    brakeSeconds:c26TrialState.brakeSeconds,brakeTransitions:c26TrialState.brakeTransitions,
+    brakeSeconds:c26TrialState.brakeSeconds,brakeTransitions:c26TrialState.brakeTransitions,rawBrakeTransitions:c26TrialState.c33RawTransitions,
     pawSeconds:c26TrialState.pawSeconds,pawDone:c26TrialState.pawDone,slideFrames:c26TrialState.slideFrames,
     boostFrames:c26TrialState.boostFrames,linkFrames:c26TrialState.linkFrames,
     waterLoss:c26TrialState.waterStart-waterLevel,
@@ -20672,7 +20687,7 @@ if(C26_TRIAL_MODE)window.__c26Trial={prepare:c26Prepare,step:(dt=1/60)=>advanceG
     linkAwards:(c10State.active?.events||[]).filter(e=>e.event==='linkAward'&&e.to>e.from).length,
     bonusStarts:(c10State.active?.events||[]).filter(e=>e.event==='bonus'&&e.to===true).length,
     meatQualityFrames:(c10State.active?.frames||[]).filter(f=>f.meatQuality==='GOOD'||f.meatQuality==='PERFECT').length,
-    controller:C31_CONTROL?'C31':'C26',notes:c26TrialState.notes}),
+    controller:C33_CONTROL?'C33':C32_CONTROL?'C32':C31_CONTROL?'C31':'C26',notes:c26TrialState.notes}),
   get:()=>({status:window.__c26Trial.status(),frames:c26TrialState.frames}),
   run:()=>{const init=c26Prepare();if(!init.ok)return Promise.resolve(init);
     // The existing animate() loop advances the real game. Never inject a second tick loop.
@@ -20905,7 +20920,7 @@ if(C10_DIAG_ENABLED){
   if(!enabled)return;
   const modes=['10-iii','10-oio','2-iii','2-oio'];
   let root,select,start,save,status,busy=false,result=null;
-  function urlFor(mode){const u=new URL(location.href);u.searchParams.set('linephysics','F');u.searchParams.set('c11diag','1');u.searchParams.set('c30compare','1');u.searchParams.set('c26trial',mode);u.searchParams.set('c31control','1');u.searchParams.set('c32control','1');u.searchParams.delete('c26paw');return u.href;}
+  function urlFor(mode){const u=new URL(location.href);u.searchParams.set('linephysics','F');u.searchParams.set('c11diag','1');u.searchParams.set('c30compare','1');u.searchParams.set('c26trial',mode);u.searchParams.set('c31control','1');u.searchParams.set('c32control','1');u.searchParams.set('c33control','1');u.searchParams.delete('c26paw');return u.href;}
   function label(mode){return ({'10-iii':'83° インインイン','10-oio':'83° アウトインアウト','2-iii':'162° インインイン','2-oio':'162° アウトインアウト'})[mode]||mode;}
   function message(s){if(status)status.textContent=s;}
   function refresh(){
@@ -20927,7 +20942,7 @@ if(C10_DIAG_ENABLED){
     try{
       if(gameState!=='ready')resetRace();
       const out=await api.run();
-      result={version:C32_CONTROL?'C32-prebrake-local-trial':C31_CONTROL?'C31-predictive-local-trial':'C30-mobile-local-trial',mode:new URLSearchParams(location.search).get('c26trial'),
+      result={version:C33_CONTROL?'C33-brake-stability-local-trial':C32_CONTROL?'C32-prebrake-local-trial':C31_CONTROL?'C31-predictive-local-trial':'C30-mobile-local-trial',mode:new URLSearchParams(location.search).get('c26trial'),
         trial:api.get(),telemetry:window.__c11Diagnostics?.getCompact?.()||null,
         caveat:'Actual-game local corner trial; no virtual 400m straight; do not treat as complete-lap time.'};
       if(out?.ok===false)message('走行停止: '+(out.error||'準備条件を確認してください'));
@@ -20938,7 +20953,7 @@ if(C10_DIAG_ENABLED){
   }
   async function exportResult(){
     if(!result)return;
-    const filename='nyanisyarud-'+(C32_CONTROL?'C32':C31_CONTROL?'C31':'C30')+'-'+result.mode+'-'+Date.now()+'.json';
+    const filename='nyanisyarud-'+(C33_CONTROL?'C33':C32_CONTROL?'C32':C31_CONTROL?'C31':'C30')+'-'+result.mode+'-'+Date.now()+'.json';
     const file=new File([JSON.stringify(result)],filename,{type:'application/json'});
     try{
       if(navigator.canShare?.({files:[file]})&&navigator.share){await navigator.share({files:[file],title:'ニャニシャル C30 自動比較'});return;}
@@ -20951,7 +20966,7 @@ if(C10_DIAG_ENABLED){
     if(!document.body||root)return;
     root=document.createElement('section');root.setAttribute('aria-label','C30 自動比較診断');
     root.style.cssText='position:fixed;z-index:2147483100;top:max(10px,env(safe-area-inset-top));right:10px;width:min(310px,calc(100vw - 20px));padding:12px;border-radius:13px;background:#152c40ee;color:white;font:13px system-ui,sans-serif;box-shadow:0 3px 16px #0009;';
-    const heading=document.createElement('div');heading.textContent=C32_CONTROL?'C32｜事前減速・実3D比較':C31_CONTROL?'C31｜予測操舵・実3D比較':'C30｜実3Dコーナー自動比較';heading.style.cssText='font-weight:700;margin-bottom:7px';
+    const heading=document.createElement('div');heading.textContent=C33_CONTROL?'C33｜ブレーキ安定化・原因診断':C32_CONTROL?'C32｜事前減速・実3D比較':C31_CONTROL?'C31｜予測操舵・実3D比較':'C30｜実3Dコーナー自動比較';heading.style.cssText='font-weight:700;margin-bottom:7px';
     select=document.createElement('select');select.setAttribute('aria-label','比較するコーナーとライン');select.style.cssText='width:100%;font:15px system-ui;padding:8px;border-radius:7px;color:#111;background:white;';
     for(const m of modes){const o=document.createElement('option');o.value=m;o.textContent=label(m);select.append(o);}
     const current=new URLSearchParams(location.search).get('c26trial');select.value=modes.includes(current)?current:modes[0];
@@ -20961,7 +20976,7 @@ if(C10_DIAG_ENABLED){
     save=document.createElement('button');save.textContent='JSON保存・共有';save.style.cssText='flex:1;min-height:44px;border-radius:8px;background:#ccecd6;color:#142b40;font-weight:bold';save.addEventListener('click',exportResult);
     row.append(start,save);
     status=document.createElement('div');status.setAttribute('role','status');status.style.cssText='margin-top:7px;font-size:12px;line-height:1.4';
-    const hint=document.createElement('div');hint.textContent='C32は事前減速・横滑り追従を検証。4条件のJSONを保存。NIKUKYUなし。';hint.style.cssText='margin-top:5px;opacity:.85;font-size:11px';
+    const hint=document.createElement('div');hint.textContent='C33はブレーキの細かなON/OFFを抑制し、速度制限の原因を記録。まず83° OIOを1回。';hint.style.cssText='margin-top:5px;opacity:.85;font-size:11px';
     root.append(heading,select,row,status,hint);document.body.append(root);refresh();
   }
   window.__c30MobileComparison={run,exportResult,get:()=>result};
