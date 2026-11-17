@@ -1825,15 +1825,18 @@ function galleryFloorFinish(material,strength,theme){
           }`}
           float fresnel=pow(1.0-clamp(abs(dot(normal,normalize(vViewPosition))),0.0,1.0),5.0);
           float border=smoothstep(0.0,.035,min(min(uv.x,uv.y),min(1.0-uv.x,1.0-uv.y)));
-          ${polishedMarble?`// Keep the champagne-ivory floor dominant, with soft colour bleeding.
-          // Dark frame silhouettes must not turn into distinct grey replicas.
-          vec3 reflectionWash=mix(diffuseColor.rgb,reflected*diffuseColor.rgb,.86);
-          outgoingLight=mix(outgoingLight,reflectionWash,(.36+.10*fresnel)*galleryFloorMirrorStrength*border);`:`outgoingLight=mix(outgoingLight,reflected*diffuseColor.rgb,(.012+.07*fresnel)*galleryFloorMirrorStrength*border);`}
+          ${polishedMarble?`// Rough polished stone: light-only bounce, not a translucent copy
+          // of the mirrored scene. Dark picture frames can no longer cast
+          // vertical grey bars into the floor reflection.
+          float reflectedGlow=dot(reflected,vec3(.2126,.7152,.0722));
+          vec3 warmBounce=mix(reflected,vec3(reflectedGlow)*vec3(1.0,.94,.86),.48);
+          float grazing=1.0+.22*fresnel;
+          outgoingLight+=warmBounce*(.84*galleryFloorMirrorStrength)*border*grazing;`:`outgoingLight=mix(outgoingLight,reflected*diffuseColor.rgb,(.012+.07*fresnel)*galleryFloorMirrorStrength*border);`}
         }
       }
       #include <opaque_fragment>`);
   };
-  material.customProgramCacheKey=()=>key+(polishedMarble?'|gallery-polished-marble-v5-broad-soft-reflection':'|gallery-satin-floor-v1');return material;
+  material.customProgramCacheKey=()=>key+(polishedMarble?'|gallery-polished-marble-v6-light-only-bounce':'|gallery-satin-floor-v1');return material;
 }
 
 function galleryMirrorPlane(surface){
@@ -1858,8 +1861,8 @@ function createGalleryGlazingReflection(renderer,scene,camera){
   const surfaces=[],virtual=new THREE.PerspectiveCamera(),matrix=new THREE.Matrix4();
   let target=null,softA=null,softB=null,blurScene=null,blurCamera=null,blurMaterial=null;
   let active=null,last=-Infinity,dirty=2,failed=false,lastPose='',lastChoice=null,previousPlane=null;
-  // Warm floor: use a low-frequency, separable Gaussian reflection.
-  // Equal-axis blur in texel space suppresses narrow reflected stripes without ghost copies.
+  // Warm floor: extract bright light before applying a separable Gaussian blur.
+  // Dark frame silhouettes no longer form vertical bands in the reflection.
   function softenWarmFloor(source){
     if(!surfaces.some(m=>m.material?.userData?.galleryWarmSoftMirror))return null;
     if(!softA){
@@ -1868,15 +1871,23 @@ function createGalleryGlazingReflection(renderer,scene,camera){
       softB=new THREE.WebGLRenderTarget(96,96,opts);
       softA.texture.colorSpace=softB.texture.colorSpace=THREE.LinearSRGBColorSpace;
       blurMaterial=new THREE.ShaderMaterial({depthTest:false,depthWrite:false,
-        uniforms:{tInput:{value:source},uDirection:{value:new THREE.Vector2(1/96,0)}},
+        uniforms:{tInput:{value:source},uDirection:{value:new THREE.Vector2(1/96,0)},uExtractHighlights:{value:1}},
         vertexShader:'varying vec2 vUv; void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}',
-        fragmentShader:`uniform sampler2D tInput;uniform vec2 uDirection;varying vec2 vUv;
+        fragmentShader:`uniform sampler2D tInput;uniform vec2 uDirection;uniform float uExtractHighlights;varying vec2 vUv;
           void main(){
             vec3 sum=vec3(0.0);float weights=0.0;
             for(int i=-6;i<=6;i++){
               float d=float(i);
               float w=exp(-.5*d*d/5.76);
-              sum+=texture2D(tInput,clamp(vUv+uDirection*d*2.1,vec2(0.001),vec2(.999))).rgb*w;
+              vec3 sampleColor=texture2D(tInput,clamp(vUv+uDirection*d*1.45,vec2(.001),vec2(.999))).rgb;
+              if(uExtractHighlights>.5){
+                // Filter BEFORE blurring. A black frame contributes zero
+                // instead of leaving a long, dark vertical stripe.
+                float lum=dot(sampleColor,vec3(.2126,.7152,.0722));
+                float keep=smoothstep(.32,.78,lum);
+                sampleColor=max(sampleColor-vec3(.30),vec3(0.0))*keep;
+              }
+              sum+=sampleColor*w;
               weights+=w;
             }
             gl_FragColor=vec4(sum/weights,1.0);
@@ -1885,10 +1896,12 @@ function createGalleryGlazingReflection(renderer,scene,camera){
       blurScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2),blurMaterial));
     }
     blurMaterial.uniforms.tInput.value=source;
-    blurMaterial.uniforms.uDirection.value.set(3.0/96,0);
+    blurMaterial.uniforms.uExtractHighlights.value=1;
+    blurMaterial.uniforms.uDirection.value.set(2.2/96,0);
     renderer.setRenderTarget(softA);renderer.render(blurScene,blurCamera);
     blurMaterial.uniforms.tInput.value=softA.texture;
-    blurMaterial.uniforms.uDirection.value.set(0,2.5/96);
+    blurMaterial.uniforms.uExtractHighlights.value=0;
+    blurMaterial.uniforms.uDirection.value.set(0,2.2/96);
     renderer.setRenderTarget(softB);renderer.render(blurScene,blurCamera);
     return softB.texture;
   }
