@@ -1808,14 +1808,27 @@ function galleryFloorFinish(material,strength,theme){
     material.userData.galleryFloorFinish=true;
     material.userData.galleryWarmSoftMirror=false;
     material.userData.galleryWarmUniformSheen=true;
+    // Independent, uniform floor-only diffuse lighting diagnostic. It does
+    // not alter the RoomEnvironment PMREM, clearcoat, walls or real lamps.
+    const floorFillUniform={value:Number.isFinite(window.__galleryWarmFloorFill)?window.__galleryWarmFloorFill:0};
+    material.userData.galleryWarmFloorFillUniform=floorFillUniform;
     material.onBeforeCompile=shader=>{
       previous?.(shader);
+      shader.uniforms.galleryWarmFloorFill=floorFillUniform;
+      shader.fragmentShader='uniform float galleryWarmFloorFill;\n'+shader.fragmentShader;
       shader.fragmentShader=shader.fragmentShader.replace(
         '#include <roughnessmap_fragment>',
         '#include <roughnessmap_fragment>\nroughnessFactor=clamp(roughnessFactor,.27,.40);'
       );
+      shader.fragmentShader=shader.fragmentShader.replace('#include <lights_fragment_end>',
+        `#include <lights_fragment_end>
+         // Add only smooth, angle-independent diffuse energy on upward floor
+         // faces. Preserve specular/clearcoat and all contact shadows.
+         vec3 warmFloorWorldNormal=inverseTransformDirection(normal,viewMatrix);
+         float warmFloorUp=smoothstep(.6,.98,warmFloorWorldNormal.y);
+         reflectedLight.indirectDiffuse += diffuseColor.rgb * vec3(1.0,.94,.86) * galleryWarmFloorFill * warmFloorUp;`);
     };
-    material.customProgramCacheKey=()=>key+'|gallery-warm-room-env-polish-v13';
+    material.customProgramCacheKey=()=>key+'|gallery-warm-floor-fill-comparison-v16';
     return material;
   }
   const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
@@ -3954,6 +3967,45 @@ function App() {
     const group = new THREE.Group();
     scene.add(group);
     groupRef.current = group;
+    // Toggle only the intensity of the existing warm-floor RoomEnvironment.
+    // Nothing here changes the spotlights, shadows, floor color, camera or layout.
+    const applyGalleryFloorEnvDiagnostic=()=>{
+      const factor=Number.isFinite(window.__galleryFloorEnvFactor)?window.__galleryFloorEnvFactor:1;
+      let count=0,hasEnvironment=false;
+      group.traverse(obj=>{
+        if(!obj.isMesh)return;
+        const mats=Array.isArray(obj.material)?obj.material:[obj.material];
+        for(const mat of mats){
+          if(!mat?.userData?.galleryWarmUniformSheen)continue;
+          count++;
+          hasEnvironment ||= !!mat.envMap;
+          mat.envMapIntensity=(mat.userData.galleryFloorEnvBase??1.18)*factor;
+          // Force a uniform refresh on Safari/WebKit when material is unchanged.
+          mat.needsUpdate=true;
+        }
+      });
+      window.dispatchEvent(new CustomEvent('gallery-floor-env-status',{
+        detail:{count,hasEnvironment,factor,theme:stateRef.current.room?.theme}
+      }));
+    };
+    window.addEventListener('gallery-floor-env-compare',applyGalleryFloorEnvDiagnostic);
+    const applyWarmFloorFillDiagnostic=()=>{
+      const raw=Number(window.__galleryWarmFloorFill);
+      const level=Number.isFinite(raw)?clamp(raw,0,.3):0;
+      let count=0;
+      group.traverse(obj=>{
+        if(!obj.isMesh)return;
+        for(const mat of Array.isArray(obj.material)?obj.material:[obj.material]){
+          const u=mat?.userData?.galleryWarmFloorFillUniform;
+          if(!u)continue;
+          u.value=level;count++;
+        }
+      });
+      window.dispatchEvent(new CustomEvent('gallery-floor-fill-status',{
+        detail:{count,level,theme:stateRef.current.room?.theme}
+      }));
+    };
+    window.addEventListener('gallery-floor-fill-compare',applyWarmFloorFillDiagnostic);
     const glazingReflection=createGalleryGlazingReflection(renderer,scene,camera);
     let resizePending = true, renderWidth = 0, renderHeight = 0;
     // ResizeObserver runs after animation callbacks in some browsers. Resizing
@@ -4080,6 +4132,13 @@ function App() {
         envMapIntensity:isMarble?1.18:reflectionLevel*(kind==='floor'?.55:.055),
         bumpScale:isMarble?.000025:kind==='wall'?.00025:.00015
       });
+      if(isMarble){
+        // Diagnostic only. 0%, 50%, 100% share the same materials and camera.
+        // Set before compilation so freshly reconstructed rooms inherit the setting.
+        mat.userData.galleryFloorEnvBase=mat.envMapIntensity;
+        const factor=Number.isFinite(window.__galleryFloorEnvFactor)?window.__galleryFloorEnvFactor:1;
+        mat.envMapIntensity*=factor;
+      }
       mat.userData.surfaceFinish = kind;gallerySoftShadowMaterial(mat,sunShadowParameters);
       if(kind==='wall'){const finish=galleryPaint(stateRef.current.room.theme,role);mat.bumpScale=finish.bumpScale;mat.envMapIntensity=reflectionLevel*finish.reflection;mat.userData.paintRole=role;gallerySpatialMaterial(mat,indirectUniforms);}else if(kind==='floor')galleryFloorFinish(mat,reflectionLevel,finishTheme);return mat;
     }
@@ -4437,16 +4496,6 @@ function App() {
       const floor = new THREE.Mesh(floorGeometry(w,.08,d,0,-.04,0), hintMaterial(finishMaterial("floor", { color: floorC, roughness: 0.85, vertexColors:true }), floorHint, "floor"));
       floor.position.y = -0.04;
       floor.receiveShadow = true;
-      if (window.__galleryFloorReflectionTest) {
-        window.__galleryFloorDiagnosticMaterials ??= new Set();
-        window.__galleryFloorDiagnosticMaterials.add(floor.material);
-        window.__galleryApplyFloorReflectionTest?.();
-        floor.addEventListener('removed', () => window.__galleryFloorDiagnosticMaterials?.delete(floor.material));
-      }
-      // Diagnostic-only live floor shadow toggle; rebuilt floors register again.
-      window.__galleryFloorMeshes = window.__galleryFloorMeshes || new Set();
-      window.__galleryFloorMeshes.add(floor);
-      floor.addEventListener('removed', () => window.__galleryFloorMeshes?.delete(floor));
       floor.userData={...floor.userData,galleryMirrorNormal:new THREE.Vector3(0,1,0),galleryMirrorPoint:new THREE.Vector3(0,.04,0),galleryMirrorArea:w*d,galleryMirrorWeight:theme==='warm'?.42:.10};
       group.add(floor);
       if(theme!=='warm'&&!s.room.stair&&!floorHint)glazingReflection.register(floor);
@@ -5841,6 +5890,8 @@ function App() {
     }
     animate();
     return () => {
+      window.removeEventListener('gallery-floor-env-compare',applyGalleryFloorEnvDiagnostic);
+      window.removeEventListener('gallery-floor-fill-compare',applyWarmFloorFillDiagnostic);
       cancelAnimationFrame(raf);
       ro.disconnect();
       el.removeEventListener("wheel", onWheelNative);
@@ -9545,34 +9596,82 @@ function artworkActionSettings(p,part='all') {
     else openRoomPanel();
   }, style: { right: panelActive && !isPortrait ? 328 : 8, top: "58%" }, className: `${previewOnly || arrange || isPhone ? "hidden " : ""}fixed z-[60] flex flex-col items-center justify-center gap-1 rounded-l-2xl border border-r-0 border-[var(--line)] bg-[var(--surface)] text-[var(--ink)] shadow-xl py-3 px-2` }, /* @__PURE__ */ React.createElement("span", { className: "w-[56px] min-h-[100px] flex flex-col items-center justify-center gap-1.5" }, roomPanelOpen ? /* @__PURE__ */ React.createElement(X, { size: 22, "aria-hidden": true }) : /* @__PURE__ */ React.createElement(LayoutGrid, { size: 22, "aria-hidden": true }), /* @__PURE__ */ React.createElement("span", { className: "vertical-label text-[13px] font-black leading-tight tracking-wide" }, roomPanelOpen ? "パネルを閉じる" : "部屋を調整"), /* @__PURE__ */ React.createElement("span", { className: "vertical-label text-[11px] font-bold leading-tight opacity-90 max-h-[72px] overflow-hidden" }, fmt(room.w), " × ", fmt(room.d), " m"), /* @__PURE__ */ React.createElement("span", { className: "text-[10px] font-bold opacity-80" }, "部屋"))));
 }
-// Floor-only environment-reflection diagnostic. Camera is not changed by toggling.
-if (new URLSearchParams(location.search).get('floorEnvTest') === '1') {
-  window.__galleryFloorReflectionTest = true;
-  window.__galleryFloorDiagnosticMaterials = new Set();
+// Opt-in, temporary environment-reflection diagnosis. Nothing is displayed
+// on ordinary launches; switches act live, without resetting the camera.
+if(new URLSearchParams(location.search).get('floorEnvTest')==='1'){
+  window.__galleryFloorEnvFactor=1;
+  window.__galleryWarmFloorFill=0;
   const panel=document.createElement('div');
-  panel.style.cssText='position:fixed;z-index:2147483646;bottom:calc(env(safe-area-inset-bottom,0px) + 12px);left:12px;right:12px;background:rgba(255,252,246,.97);border:1px solid #aaa;border-radius:13px;padding:9px;display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:7px;font:13px system-ui;box-shadow:0 3px 12px #0003;';
-  const label=document.createElement('span');label.textContent='床の環境反射：';panel.appendChild(label);
-  let active='normal';
-  const buttons=[];
-  const modes=[['normal','通常'],['off','反射OFF'],['half','反射50%'],['double','反射150%']];
-  function update(){
-    for(const mat of window.__galleryFloorDiagnosticMaterials){
-      if(!mat?.userData?.galleryFloorFinish)continue;
-      if(mat.userData.galleryOriginalEnvIntensity===undefined)mat.userData.galleryOriginalEnvIntensity=mat.envMapIntensity;
-      const base=mat.userData.galleryOriginalEnvIntensity;
-      mat.envMapIntensity=active==='off'?0:active==='half'?base*.5:active==='double'?base*1.5:base;
+  panel.style.cssText='position:fixed;z-index:2147483646;left:12px;right:12px;bottom:calc(env(safe-area-inset-bottom,0px) + 12px);border:1px solid #bdb8ae;background:rgba(255,252,245,.97);border-radius:14px;padding:9px 10px;box-shadow:0 3px 15px #0003;font:13px system-ui,sans-serif;color:#222;';
+  const title=document.createElement('div');
+  title.style.cssText='margin-bottom:5px;font-weight:700;';
+  title.textContent='ウォーム床：反射と拡散光を個別に比較';
+  panel.appendChild(title);
+  const buttons=document.createElement('div');
+  buttons.style.cssText='display:flex;gap:7px;flex-wrap:wrap;margin-top:5px;';
+  panel.appendChild(buttons);
+  const status=document.createElement('div');
+  status.style.cssText='font-size:11px;color:#595752;margin-top:4px;';
+  status.textContent='ウォームギャラリーのみ対象。ほかの設定は固定';
+  panel.appendChild(status);
+  const buttonMap=[];
+  const updateButtons=(active)=>{
+    for(const [factor,b] of buttonMap){
+      b.style.background=factor===active?'#a6dfcf':'#fff';
+      b.setAttribute('aria-pressed',factor===active?'true':'false');
     }
-    for(const [key,btn] of buttons)btn.style.background=key===active?'#a8dfcf':'white';
+  };
+  for(const [factor,label] of [[0,'OFF 0%'],[.5,'半分 50%'],[1,'通常 100%']]){
+    const b=document.createElement('button');
+    b.type='button';b.textContent=label;
+    b.style.cssText='flex:1;min-width:78px;border:1px solid #a6a39d;border-radius:10px;padding:9px 5px;color:#202020;font-size:13px;font-weight:700;';
+    b.addEventListener('click',()=>{
+      window.__galleryFloorEnvFactor=factor;
+      updateButtons(factor);
+      window.dispatchEvent(new Event('gallery-floor-env-compare'));
+    });
+    buttonMap.push([factor,b]);buttons.appendChild(b);
   }
-  for(const [key,title] of modes){
-    const btn=document.createElement('button');btn.textContent=title;
-    btn.style.cssText='padding:9px 10px;border:1px solid #999;border-radius:9px;background:white;color:#222;font-weight:600;';
-    btn.onclick=()=>{active=key;update();};panel.appendChild(btn);buttons.push([key,btn]);
+  updateButtons(1);
+  window.addEventListener('gallery-floor-env-status',event=>{
+    const {count,hasEnvironment,factor,theme}=event.detail||{};
+    status.textContent=theme!=='warm'?'ウォームギャラリーを選ぶと比較できます':
+      count===0?'床材の準備中です':hasEnvironment?
+        `環境反射 ${Math.round(factor*100)}%（対象 ${count} 面）`:
+        '環境マップが取得できません（反射切替の差は出ません）';
+  });
+  const fillTitle=document.createElement('div');
+  fillTitle.textContent='床だけの補助光（拡散光）';
+  fillTitle.style.cssText='margin-top:9px;font-weight:700;';panel.appendChild(fillTitle);
+  const fillButtons=document.createElement('div');
+  fillButtons.style.cssText='display:flex;gap:7px;flex-wrap:wrap;margin-top:5px;';
+  panel.appendChild(fillButtons);
+  const fillPairs=[];
+  const styleFill=(active)=>fillPairs.forEach(([value,b])=>{
+    b.style.background=value===active?'#a6dfcf':'#fff';
+    b.setAttribute('aria-pressed',value===active?'true':'false');
+  });
+  for(const [level,label] of [[0,'OFF'],[.12,'弱'],[.24,'中']]){
+    const b=document.createElement('button');b.type='button';b.textContent=label;
+    b.style.cssText='flex:1;min-width:78px;border:1px solid #a6a39d;border-radius:10px;padding:9px 5px;color:#202020;font-size:13px;font-weight:700;';
+    b.addEventListener('click',()=>{
+      window.__galleryWarmFloorFill=level;
+      styleFill(level);
+      window.dispatchEvent(new Event('gallery-floor-fill-compare'));
+    });
+    fillPairs.push([level,b]);fillButtons.appendChild(b);
   }
-  const hint=document.createElement('small');hint.textContent='同じ視点で切り替えて撮影';hint.style.width='100%';hint.style.textAlign='center';panel.appendChild(hint);
-  document.body.appendChild(panel);update();
-  // Floor meshes are rebuilt when the scene changes; apply current test mode at creation.
-  window.__galleryApplyFloorReflectionTest=()=>update();
+  styleFill(0);
+  const fillStatus=document.createElement('div');
+  fillStatus.style.cssText='font-size:11px;color:#595752;margin-top:5px;';
+  fillStatus.textContent='補助光OFF＝従来表示。影やクリアコートは固定';
+  panel.appendChild(fillStatus);
+  window.addEventListener('gallery-floor-fill-status',event=>{
+    const {count,level,theme}=event.detail||{};
+    fillStatus.textContent=theme!=='warm'?'ウォームギャラリーのみ対象':
+      count===0?'床材の準備中です':`床面 ${count} 面・補助光 ${level===0?'OFF':level===.12?'弱':'中'}・影と反射は固定`;
+  });
+  document.body.appendChild(panel);
 }
 ReactDOM.createRoot(document.getElementById("root")).render(/* @__PURE__ */ React.createElement(App, null));
 </script>
