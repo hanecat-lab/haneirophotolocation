@@ -20265,9 +20265,12 @@ const C15_REPLAY_REFERENCE=[[0.0013,0.0124,70.57],[0.0045,0.0398,71.07],[0.0103,
 const C15_REPLAY_ASSIST=(()=>{try{return new URLSearchParams(location.search).get('c15replayassist')!=='0';}catch(_){return true;}})();
 const c15ReplayState={active:false,index:0,lastS:-Infinity,lastBrake:false,lastPaw:false,autoSaved:false,steps:0,
   stallTime:0,stallS:0,rescue:false,rescueCount:0,correctionFrames:0,brakeReleaseFrames:0,
+  brakeHoldActive:false,brakeHoldCount:0,brakeHoldStartS:0,brakeHoldStartT:0,
   lastOverride:false,finished:false};
 function c15ReplayReset(){Object.assign(c15ReplayState,{active:false,index:0,lastS:-Infinity,lastBrake:false,lastPaw:false,autoSaved:false,steps:0,
-  stallTime:0,stallS:0,rescue:false,rescueCount:0,correctionFrames:0,brakeReleaseFrames:0,lastOverride:false,finished:false});}
+  stallTime:0,stallS:0,rescue:false,rescueCount:0,correctionFrames:0,brakeReleaseFrames:0,
+  brakeHoldActive:false,brakeHoldCount:0,brakeHoldStartS:0,brakeHoldStartT:0,
+  lastOverride:false,finished:false});}
 function c15ReplayStep(dt){
   if(!C15_REPLAY_MODE)return;
   // Keep the saved flag after finishing; resetting here caused repeated JSON downloads.
@@ -20299,14 +20302,42 @@ function c15ReplayStep(dt){
     const targetLv=ra[1]+(rb[1]-ra[1])*alpha;
     const latError=targetLat-lateral;
     const lvError=targetLv-(pathHandling.ready?pathHandling.lateralVelocity:0);
-    if(Math.abs(latError)>.35){
-      correction=Math.max(-.48,Math.min(.48,latError*.26+lvError*.08));
-      steer=Math.max(-1,Math.min(1,steer+correction));
-      if(Math.abs(correction)>.005)state.correctionFrames++;
+    // C15.3: quiet deadband for small lateral errors, progressive tracking for large ones.
+    // Preserve the original emergency steering authority for large trajectory errors.
+    const absLat=Math.abs(latError);
+    const trackWeight=Math.max(0,Math.min(1,(absLat-.65)/.6));
+    const velocityGuard=absLat>.35&&Math.abs(lvError)>2.5?
+      Math.min(.65,(Math.abs(lvError)-2.5)*.2):0;
+    const correctionWeight=Math.max(trackWeight,velocityGuard);
+    if(correctionWeight>0){
+      correction=Math.max(-.48,Math.min(.48,(latError*.26+lvError*.08)*correctionWeight));
+      if(Math.abs(correction)>.005){
+        steer=Math.max(-1,Math.min(1,steer+correction));
+        state.correctionFrames++;
+      }
     }
-    // Guard against distance-index deadlock: at zero speed the recorded brake-release
-    // distance can never be reached. Original run's minimum corner speed is much higher.
-    if(braking&&speed*3.6<25){braking=false;brakeOverride=true;state.brakeReleaseFrames++;}
+    // C15.3: brake release is latched for the *whole recorded braking segment*.
+    // Once low speed triggers it, 25km/h threshold chatter cannot repeatedly reapply
+    // the brake until the original input trace reaches its OFF position.
+    // This is assisted diagnostic replay only; strict replay remains unchanged.
+    if(!braking&&state.brakeHoldActive){
+      state.brakeHoldActive=false;
+      if(typeof c10State!=='undefined'&&c10State.active)c10State.active.events.push({
+        event:'replayBrakeHoldEnd',t:simulationElapsed,s,kmh:speed*3.6});
+    }
+    if(braking&&speed*3.6<27&&!state.brakeHoldActive){
+      state.brakeHoldActive=true;
+      state.brakeHoldCount++;
+      state.brakeHoldStartS=s;
+      state.brakeHoldStartT=simulationElapsed;
+      if(typeof c10State!=='undefined'&&c10State.active)c10State.active.events.push({
+        event:'replayBrakeHoldStart',t:simulationElapsed,s,kmh:speed*3.6});
+    }
+    if(braking&&state.brakeHoldActive){
+      braking=false; // do not reapply until the recorded brake OFF edge
+      brakeOverride=true;
+      state.brakeReleaseFrames++;
+    }
     if(speed*3.6<7&&ds<.04)state.stallTime+=Math.max(0,Math.min(dt,.1));
     else state.stallTime=0;
     if(state.stallTime>.65&&!state.rescue){
@@ -20324,7 +20355,8 @@ function c15ReplayStep(dt){
   steerLeftPressed=false;steerRightPressed=false;joyActive=false;
   input.brake=braking;input.brakePressed=false;
   input.brakeJustPressed=braking&&!state.lastBrake;
-  if(state.lastBrake&&!braking)lastBrakeReleaseTime=Date.now();
+  // Emergency release is NOT a valid manual brake-release edge for NIKUKYU timing.
+  if(state.lastBrake&&!braking&&!brakeOverride)lastBrakeReleaseTime=Date.now();
   input.drift=paw;input.driftPressed=false;
   input.driftJustPressed=paw&&!state.lastPaw;
   state.lastBrake=braking;state.lastPaw=paw;
@@ -20335,13 +20367,16 @@ function c15ReplayStep(dt){
     run.replayRecoveryCount=state.rescueCount;
     run.replayCorrectionFrames=state.correctionFrames;
     run.replayBrakeReleaseFrames=state.brakeReleaseFrames;
+    run.replayBrakeHoldCount=state.brakeHoldCount;
   }
 }
 if(C15_REPLAY_MODE)window.__c15Replay={status:()=>({source:C15_REPLAY_MODE,axis:C15_REPLAY_AXIS,assist:C15_REPLAY_ASSIST,
   active:c15ReplayState.active,finished:c15ReplayState.finished,sample:c15ReplayState.index,steps:c15ReplayState.steps,
   s,kmh:speed*3.6,stallTime:c15ReplayState.stallTime,rescue:c15ReplayState.rescue,
   rescueCount:c15ReplayState.rescueCount,correctionFrames:c15ReplayState.correctionFrames,
-  brakeReleaseFrames:c15ReplayState.brakeReleaseFrames,mode:LINE_PHYSICS_MODE||'original'}),reset:c15ReplayReset};
+  brakeReleaseFrames:c15ReplayState.brakeReleaseFrames,
+  brakeHoldActive:c15ReplayState.brakeHoldActive,brakeHoldCount:c15ReplayState.brakeHoldCount,
+  mode:LINE_PHYSICS_MODE||'original'}),reset:c15ReplayReset};
 // C11: opt-in, PASSIVE real-game B/D telemetry with scope and clean exit measurement. No UI or physics changes.
 // URL: ?linephysics=B&c10diag=1 or ?linephysics=D&c10diag=1.
 // Ctrl+Shift+L downloads JSON; console: __c11Diagnostics.get()/download()/clear()/mark().
@@ -20357,7 +20392,7 @@ function c10CourseCorners(track){
 }
 function c10NewRun(){
   const r={id:c10State.nextId++,track:currentKey,mode:LINE_PHYSICS_MODE||'original',cat:catModel,driveMode,
-    corners:c10CourseCorners(currentKey),frames:[],events:[],label:c14RequestedLabel(),controller:C15_REPLAY_MODE?(C15_REPLAY_ASSIST?'C15.2-assisted-input-replay':'C15.2-strict-input-replay'):(C15_BOT_MODE?'C15-auto-steer':'human'),botPaw:C15_BOT_PAW,replaySource:C15_REPLAY_MODE||null,replayAxis:C15_REPLAY_MODE?C15_REPLAY_AXIS:null,replayAssist:C15_REPLAY_MODE?C15_REPLAY_ASSIST:null,startedAt:new Date().toISOString(),telemetryVersion:2};
+    corners:c10CourseCorners(currentKey),frames:[],events:[],label:c14RequestedLabel(),controller:C15_REPLAY_MODE?(C15_REPLAY_ASSIST?'C15.3-assisted-input-replay':'C15.3-strict-input-replay'):(C15_BOT_MODE?'C15-auto-steer':'human'),botPaw:C15_BOT_PAW,replaySource:C15_REPLAY_MODE||null,replayAxis:C15_REPLAY_MODE?C15_REPLAY_AXIS:null,replayAssist:C15_REPLAY_MODE?C15_REPLAY_ASSIST:null,startedAt:new Date().toISOString(),telemetryVersion:2};
   c10State.runs.push(r);if(c10State.runs.length>8)c10State.runs.shift();c10State.active=r;
   r.events.push({event:'raceStart',t:simulationElapsed,s});return r;
 }
