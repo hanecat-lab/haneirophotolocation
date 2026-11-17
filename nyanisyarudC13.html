@@ -15210,8 +15210,8 @@ let slideNeutralTime=0, slideExitActive=false, slideExitTime=0, slideLastKTech=1
 // The turn budget and the path speed estimate use the same lateral-force model.
 // No line classification, fixed line bonus, wall change or UI adjustment.
 const LINE_PHYSICS_MODE=(()=>{try{return new URLSearchParams(location.search).get('linephysics')||'';}catch(_){return '';}})();
-const LINE_PHYSICS_A_REQUESTED=LINE_PHYSICS_MODE==='A'||LINE_PHYSICS_MODE==='B'||LINE_PHYSICS_MODE==='C'||LINE_PHYSICS_MODE==='D';
-const LINE_PHYSICS_B_REQUESTED=LINE_PHYSICS_MODE==='B'||LINE_PHYSICS_MODE==='C'||LINE_PHYSICS_MODE==='D';
+const LINE_PHYSICS_A_REQUESTED=LINE_PHYSICS_MODE==='A'||LINE_PHYSICS_MODE==='B'||LINE_PHYSICS_MODE==='C'||LINE_PHYSICS_MODE==='D'||LINE_PHYSICS_MODE==='F';
+const LINE_PHYSICS_B_REQUESTED=LINE_PHYSICS_MODE==='B'||LINE_PHYSICS_MODE==='C'||LINE_PHYSICS_MODE==='D'||LINE_PHYSICS_MODE==='F';
 function linePhysicsAEnabled(){
   return LINE_PHYSICS_A_REQUESTED&&currentKey==='irohaLocal'&&!globalIsAssist&&normalCatSpeed()&&!pathHandlingExcluded();
 }
@@ -15229,7 +15229,7 @@ function linePhysicsBThrottleDemand(){
   // C7 test: normalize tire-usage demand to the same speed unit used by the steering/grip cap.
   // The original B formula is retained unchanged unless ?linephysics=C is selected.
   // D: 30% transition toward consistent tire-demand units; B and C are untouched.
-  const velocity=Math.max(0,speed*(LINE_PHYSICS_MODE==='C'?1:LINE_PHYSICS_MODE==='D'?.734:.62));
+  const velocity=Math.max(0,speed*(LINE_PHYSICS_MODE==='C'?1:(LINE_PHYSICS_MODE==='D'||LINE_PHYSICS_MODE==='F')?.734:.62));
   const lateralForce=velocity*velocity*pathK;
   const capacity=Math.max(1,linePhysicsATireForce(false));
   const used=THREE.MathUtils.clamp(lateralForce/capacity,0,1);
@@ -15591,9 +15591,13 @@ function cornerThrottleScale(dt,braking){
       // D only: release the fixed corner ceiling progressively when the actual
       // tire-grip limit, alignment and corner progress permit acceleration.
       // No line classification or time bonus; A/B/C retain their exact behavior.
-      if(LINE_PHYSICS_MODE==='D'){
+      if(LINE_PHYSICS_MODE==='D'||LINE_PHYSICS_MODE==='F'){
         const actualLimit=pathGripSpeed();
-        const radiusRoom=THREE.MathUtils.smoothstep(actualLimit/Math.max(1,limit),1.02,1.45);
+        // C15 F: slightly earlier opening only where the actual path grip allows it.
+        // D and all previous modes remain bit-for-bit equivalent.
+        const radiusRoom=LINE_PHYSICS_MODE==='F'
+          ?THREE.MathUtils.smoothstep(actualLimit/Math.max(1,limit),.90,1.25)
+          :THREE.MathUtils.smoothstep(actualLimit/Math.max(1,limit),1.02,1.45);
         const aligned=pathHandling.ready?pathHandling.alignment:0;
         const phase=THREE.MathUtils.smoothstep(s,profile.apex-10,c.end);
         const openingRoom=radiusRoom*aligned*phase;
@@ -20183,17 +20187,84 @@ if(C6_DIAG_ENABLED){
   };
 }
 
+// C15 diagnostic-only real-tick steering controller. NOT an AI driver, not a ghost,
+// not an optimized human trajectory, and never enabled during normal play.
+// Example: ?linephysics=F&c11diag=1&c15bot=OIO (or III)
+const C15_BOT_MODE=(()=>{try{
+  if(new URLSearchParams(location.search).get('c11diag')!=='1')return '';
+  const v=new URLSearchParams(location.search).get('c15bot');
+  return v==='III'||v==='OIO'?v:'';
+}catch(_){return '';}})();
+const C15_BOT_PAW=(()=>{try{return new URLSearchParams(location.search).get('c15paw')==='1';}catch(_){return false;}})();
+const c15BotState={corner:null,brakeDone:false,brakeStarted:false,releaseAge:Infinity,pawAge:Infinity,lastBrake:false,steps:0,active:false};
+function c15BotReset(){Object.assign(c15BotState,{corner:null,brakeDone:false,brakeStarted:false,releaseAge:Infinity,pawAge:Infinity,lastBrake:false,steps:0,active:false});}
+function c15BotStep(dt){
+  if(!C15_BOT_MODE||gameState!=='racing'||currentKey!=='irohaLocal'||globalIsAssist||!normalCatSpeed()){
+    if(C15_BOT_MODE&&c15BotState.active){input.steer=0;input.brake=false;input.drift=false;c15BotReset();}
+    return;
+  }
+  c15BotState.active=true;c15BotState.steps++;
+  const corners=DRIVING_GUIDE_DATA.tracks[currentKey]?.corners||[];
+  const c=corners.find(x=>s<=x.end+25&&s>=x.start-110);
+  if(c!==c15BotState.corner){c15BotState.corner=c||null;c15BotState.brakeDone=false;c15BotState.brakeStarted=false;c15BotState.releaseAge=Infinity;c15BotState.pawAge=Infinity;c15BotState.lastBrake=false;}
+  const ease=(x,a,b)=>THREE.MathUtils.smoothstep(x,a,b);
+  const clamp=(v,a,b)=>THREE.MathUtils.clamp(v,a,b);
+  let target=0,braking=false;
+  if(c){
+    const turn=c.dir||1,inner=turn*2.45,outer=-turn*2.45,span=Math.max(1,c.end-c.start);
+    if(C15_BOT_MODE==='III'){
+      target=inner*ease(s,c.start-105,c.start-50);
+      if(s>=c.start-50)target=inner;
+      if(s>c.end+8)target=inner*(1-ease(s,c.end+8,c.end+25));
+    }else{
+      target=outer*ease(s,c.start-105,c.start-55);
+      const turnIn=c.start-12,apex=c.start+span*.65,exit=c.end+22;
+      if(s>=turnIn&&s<apex)target=outer+(inner-outer)*ease(s,turnIn,apex);
+      else if(s>=apex)target=inner+(outer-inner)*ease(s,apex,exit);
+    }
+    // One controlled brake phase per corner, with a deadband to prevent pulsing.
+    const lead=c.degrees>=145?55:c.degrees>=115?48:40;
+    const targetKmh=c.degrees>=145?64:c.degrees>=115?72:87;
+    if(!c15BotState.brakeDone&&s>=c.start-lead&&s<c.end){
+      braking=speed*3.6>targetKmh;
+      if(braking)c15BotState.brakeStarted=true;
+      else if(c15BotState.brakeStarted)c15BotState.brakeDone=true;
+    }
+  }
+  const lv=pathHandling.ready?pathHandling.lateralVelocity:0;
+  input.steer=clamp((target-lateral)*1.55-lv*.22,-1,1);
+  // Clear manual inputs only while diagnostic bot owns the car.
+  steerLeftPressed=false;steerRightPressed=false;joyActive=false;
+  input.brake=braking;input.brakePressed=false;
+  input.brakeJustPressed=braking&&!c15BotState.lastBrake;
+  if(c15BotState.lastBrake&&!braking)c15BotState.releaseAge=0;
+  else if(Number.isFinite(c15BotState.releaseAge))c15BotState.releaseAge+=dt;
+  c15BotState.lastBrake=braking;
+  // Optional paw trial. Off by default to isolate the line physics.
+  const paw=C15_BOT_PAW&&c&&c15BotState.releaseAge>=.20&&c15BotState.releaseAge<.32&&s<c.end;
+  input.drift=Boolean(paw);input.driftPressed=false;
+  input.driftJustPressed=Boolean(paw&&c15BotState.pawAge===Infinity);
+  if(paw)c15BotState.pawAge=0;
+  else if(Number.isFinite(c15BotState.pawAge))c15BotState.pawAge+=dt;
+}
+if(C15_BOT_MODE)window.__c15Bot={status:()=>({mode:C15_BOT_MODE,paw:C15_BOT_PAW,active:c15BotState.active,corner:c15BotState.corner?.number||null,steps:c15BotState.steps,s,lateral,kmh:speed*3.6,brakeDone:c15BotState.brakeDone}),reset:c15BotReset};
+
 // C11: opt-in, PASSIVE real-game B/D telemetry with scope and clean exit measurement. No UI or physics changes.
 // URL: ?linephysics=B&c10diag=1 or ?linephysics=D&c10diag=1.
 // Ctrl+Shift+L downloads JSON; console: __c11Diagnostics.get()/download()/clear()/mark().
 const C10_DIAG_ENABLED=(()=>{try{return new URLSearchParams(location.search).get('c11diag')==='1'||new URLSearchParams(location.search).get('c10diag')==='1';}catch(_){return false;}})();
 const c10State={runs:[],active:null,nextId:1};
+// C14: optional explicit intention per URL. No inference from lateral positions.
+function c14RequestedLabel(){
+  try{const v=new URLSearchParams(location.search).get('c14label');return v==='III'||v==='OIO'?v:C15_BOT_MODE||'';}catch(_){return C15_BOT_MODE||'';}
+}
+
 function c10CourseCorners(track){
   return (DRIVING_GUIDE_DATA.tracks[track]?.corners||[]).map(c=>({number:c.number,start:c.start,end:c.end,degrees:c.degrees,dir:c.dir}));
 }
 function c10NewRun(){
   const r={id:c10State.nextId++,track:currentKey,mode:LINE_PHYSICS_MODE||'original',cat:catModel,driveMode,
-    corners:c10CourseCorners(currentKey),frames:[],events:[],label:'',startedAt:new Date().toISOString(),telemetryVersion:2};
+    corners:c10CourseCorners(currentKey),frames:[],events:[],label:c14RequestedLabel(),controller:C15_BOT_MODE?'C15-auto-steer':'human',botPaw:C15_BOT_PAW,startedAt:new Date().toISOString(),telemetryVersion:2};
   c10State.runs.push(r);if(c10State.runs.length>8)c10State.runs.shift();c10State.active=r;
   r.events.push({event:'raceStart',t:simulationElapsed,s});return r;
 }
@@ -20269,9 +20340,35 @@ function c10RecordFrame(dt,target,throttle,launch,gripLimit,previewLimit){
 if(C10_DIAG_ENABLED){
   window.__c11Diagnostics={
     get:()=>JSON.parse(JSON.stringify({version:'C11-real-driving-v2',
-      note:'Actual game simulation ticks. Requested B/D may be inactive; check physicsEffective. III/OIO labels are manual. 400m may contain other corners. pathPlanarMeters is approximate planar geometry, not full 3D travel.',
+      note:'Actual game simulation ticks. Check physicsEffective. III/OIO labels are intended lines; controller field distinguishes human and C15 diagnostic auto-steer. 400m may contain other corners. pathPlanarMeters is approximate planar geometry, not full 3D travel.',
       runs:c10State.runs})),
     mark:(label)=>{if(c10State.active){c10State.active.label=String(label||'');return true;}return false;},
+    summary:()=>c10State.runs.map(r=>{
+      const f=r.frames,last=f[f.length-1];
+      return {id:r.id,track:r.track,mode:r.mode,label:r.label,seconds:last?.t||0,
+        distance:last?.s||0,frames:f.length,controller:r.controller||'human',
+        wallHits:r.events.filter(e=>e.event==='wallHit').length,
+        effectivePercent:f.length?100*f.filter(x=>x.physicsEffective===r.mode).length/f.length:0,
+        completedCorners:r.corners.filter(c=>r.events.some(e=>e.event==='cornerExit'&&e.corner===c.number)).length,
+        truncated:Boolean(r.truncated)};
+    }),
+    // C14: compact export is opt-in and leaves the existing full download intact.
+    // Events remain full-resolution; kept frame dt spans the discarded frames.
+    getCompact:()=>{
+      const full=window.__c11Diagnostics.get();
+      full.note+=' C14 compact: every other frame kept; dt recalculated from t; all event transitions retained.';
+      full.runs=full.runs.map(r=>{
+        const frames=r.frames,kept=frames.filter((f,i)=>i===0||i===frames.length-1||i%2===0);
+        r.frames=kept.map((f,i)=>({...f,dt:i?Math.max(0,f.t-kept[i-1].t):f.dt}));
+        r.compact=true;return r;
+      });return full;
+    },
+    downloadCompact:()=>{
+      const blob=new Blob([JSON.stringify(window.__c11Diagnostics.getCompact())],{type:'application/json'});
+      const url=URL.createObjectURL(blob),a=document.createElement('a');
+      a.href=url;a.download='nyanisyarud-C14-compact-'+(LINE_PHYSICS_MODE||'original')+'-'+Date.now()+'.json';a.click();
+      setTimeout(()=>URL.revokeObjectURL(url),1500);
+    },
     clear:()=>{c10State.runs.length=0;c10State.active=null;c10State.nextId=1;},
     download:()=>{
       const blob=new Blob([JSON.stringify(window.__c11Diagnostics.get(),null,2)],{type:'application/json'});
@@ -20283,6 +20380,7 @@ if(C10_DIAG_ENABLED){
   window.addEventListener('keydown',e=>{
     if(e.ctrlKey&&e.shiftKey&&!e.repeat){
       if(e.code==='KeyL'){e.preventDefault();window.__c11Diagnostics.download();}
+      if(e.code==='KeyK'){e.preventDefault();window.__c11Diagnostics.downloadCompact();}
       if(e.code==='Digit1'){e.preventDefault();window.__c11Diagnostics.mark('III');console.info('[C13] 走行ラベル: III');}
       if(e.code==='Digit2'){e.preventDefault();window.__c11Diagnostics.mark('OIO');console.info('[C13] 走行ラベル: OIO');}
     }
@@ -25014,6 +25112,7 @@ function advanceGameFrame(realDelta){
   if(gameState==='racing'&&(document.getElementById('app').dataset.raceMenu==='on'||document.getElementById('rankingModal').classList.contains('on')||document.getElementById('courseDropdownMenu').style.display!=='none'))return;
   const dt=THREE.MathUtils.clamp(realDelta,0,.1);
   pollKeys(dt);
+  if(C15_BOT_MODE)c15BotStep(dt);
   // カウントはメニューやランキングを開いている間は止める
   if(countdown.active&&document.getElementById('courseDropdownMenu').style.display==='none'&&!document.getElementById('rankingModal').classList.contains('on'))stepCountdown(dt);
   stepRocketWindow();
@@ -25023,6 +25122,9 @@ function advanceGameFrame(realDelta){
   for(let i=0;i<steps;i++){
     input.driftJustPressed=i===0&&driftEdge;input.brakeJustPressed=i===0&&brakeEdge;
     bridgeBeforeTick(step);tick(step,redcatDrivingActive()?(i===steps-1?dt:0):step);bridgeAfterTick(step);
+  }
+  if(C15_BOT_MODE&&gameState==='goal'&&!c15BotState.autoSaved&&window.__c11Diagnostics?.downloadCompact){
+    c15BotState.autoSaved=true;window.__c11Diagnostics.downloadCompact();
   }
 }
 function animate(){requestAnimationFrame(animate);const frameDelta0=clock.getDelta();advanceGameFrame(frameDelta0);
