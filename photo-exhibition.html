@@ -672,16 +672,33 @@ function galleryCenterRayAim(data,light,target){
   const dx=target.x-light.x,dz=target.z-light.z,dy=ceilAt(data.room,light.x,light.z)-.09-target.y,hd=Math.hypot(dx,dz),raw=Math.atan2(hd,Math.max(.005,dy))*180/Math.PI;
   return {tilt:Number(clamp(raw,0,60).toFixed(3)),dir:hd<.0001?light.dir:Number((Math.atan2(dx,-dz)*180/Math.PI).toFixed(3)),limited:dy<=0||raw>60.5,target};
 }
+// The light optimizer must use the *printed photograph*, not the frame,
+// mat, easel stand, or an imaginary infinite plane behind the picture.
+// frameTexture uses contain for framed prints and cover for panels; mirror
+// that same aperture here so the illuminated pixels and aiming target agree.
+function galleryPhotoAperture(p){
+  const [a,b]=mmOf(p.size,p.sq);
+  let width=(p.orient==='縦'?a:b)/1000,height=(p.orient==='縦'?b:a)/1000;
+  if(p.frame!=='パネル'){
+    const uploaded=photoCanvasMap.get(p.photo),photo=photoOf(p.photo);
+    const ratio=uploaded?.width&&uploaded?.height?uploaded.width/uploaded.height:photo?.ratio;
+    if(Number.isFinite(ratio)&&ratio>0){
+      if(ratio>width/height)height=width/ratio;
+      else width=height*ratio;
+    }
+  }
+  return {width,height};
+}
 function galleryArtworkLightingPlane(data,p,target){
   if(p.method==='イーゼル'){
-    // An easel is a freestanding, slightly tilted illuminated surface, not a wall.
-    // Match the board's actual Y- and X-rotation in the 3D renderer, including
-    // its fallback model. The light footprint is measured on this picture plane.
+    // The easel only supplies the photograph's pose. Light measurements are
+    // clipped to the actual visible photo aperture, excluding its furniture.
     const a=(getModel('easel')?4.8:10)*Math.PI/180,rot=(p.rot||0)*Math.PI/180;
     const ca=Math.cos(a),sa=Math.sin(a),cr=Math.cos(rot),sr=Math.sin(rot);
+    const aperture=galleryPhotoAperture(p);
     return {kind:'easel',normal:new THREE.Vector3(sr*ca,sa,cr*ca),
       tangentU:new THREE.Vector3(cr,0,-sr),tangentV:new THREE.Vector3(-sr*sa,ca,-cr*sa),
-      surfaceOffset:0,photoWidth:frameW(p),photoHeight:frameH(p)};
+      surfaceOffset:0,photoWidth:aperture.width,photoHeight:aperture.height};
   }
   const r=data.room;
   if(p.col){
@@ -701,13 +718,16 @@ function galleryWallIlluminanceCentroid(data,light,plane,target,tilt,dir){
   const surface=easel?target:target.clone().addScaledVector(plane.normal,-plane.surfaceOffset);
   const distance=lens.distanceTo(surface);
   const radius=clamp(distance*Math.tan(clamp(light.angle,15,60)*Math.PI/180)*2.4,.65,2.35);
-  const n=21,step=2*radius/(n-1),axis0=easel?0:plane.horizontal==='x'?surface.x:surface.z;
+  // For an easel, integrate ONLY the visible photograph's finite rectangle.
+  // The frame/mat/stand and surrounding wall/floor contribute no samples.
+  const n=easel?25:21,stepU=(easel?plane.photoWidth:2*radius)/(n-1),stepV=(easel?plane.photoHeight:2*radius)/(n-1);
+  const axis0=easel?0:plane.horizontal==='x'?surface.x:surface.z;
   let sum=0,along=0,up=0;
   for(let i=0;i<n;i++){
-    const u=(i-(n-1)/2)*step,coord=axis0+u;
+    const u=(i-(n-1)/2)*stepU,coord=axis0+u;
     if(!easel&&(coord<plane.lo+.005||coord>plane.hi-.005))continue;
     for(let j=0;j<n;j++){
-      const v=(j-(n-1)/2)*step;
+      const v=(j-(n-1)/2)*stepV;
       const x=easel?surface.x+plane.tangentU.x*u+plane.tangentV.x*v:plane.horizontal==='x'?surface.x+u:surface.x;
       const y=easel?surface.y+plane.tangentU.y*u+plane.tangentV.y*v:target.y+v;
       const z=easel?surface.z+plane.tangentU.z*u+plane.tangentV.z*v:plane.horizontal==='z'?surface.z+u:surface.z;
@@ -732,7 +752,7 @@ function galleryLightAim(data,light,p){
   if(galleryLightAimMode(light)==='center'||base.limited)return base;
   const plane=galleryArtworkLightingPlane(data,p,target);
   if(!plane)return base;
-  const key=JSON.stringify([light.x,light.z,light.angle,p.id,p.method,p.wall,p.col,p.face,p.pos,p.center,p.x,p.z,p.rot,p.size,p.orient,p.sq,p.frame,p.mat,target.x,target.y,target.z,plane.kind,plane.horizontal,plane.lo,plane.hi,plane.minY,plane.maxY,plane.normal.x,plane.normal.y,plane.normal.z,plane.tangentU?.x,plane.tangentU?.z,plane.tangentV?.x,plane.tangentV?.y,plane.tangentV?.z,plane.surfaceOffset,ceilAt(data.room,light.x,light.z)]);
+  const key=JSON.stringify([light.x,light.z,light.angle,p.id,p.method,p.wall,p.col,p.face,p.pos,p.center,p.x,p.z,p.rot,p.size,p.orient,p.sq,p.frame,p.mat,target.x,target.y,target.z,plane.kind,plane.horizontal,plane.lo,plane.hi,plane.minY,plane.maxY,plane.normal.x,plane.normal.y,plane.normal.z,plane.tangentU?.x,plane.tangentU?.z,plane.tangentV?.x,plane.tangentV?.y,plane.tangentV?.z,plane.surfaceOffset,plane.photoWidth,plane.photoHeight,ceilAt(data.room,light.x,light.z)]);
   const cached=galleryAimCache.get(key);if(cached)return {...cached,target};
   let offsetU=0,offsetV=0,aim=base;
   for(let iter=0;iter<5;iter++){
@@ -2918,7 +2938,7 @@ function App() {
     return React.createElement('div',{'aria-label':'自動追従の照準方式',style:{display:'grid',gap:5}},
       React.createElement('b',{style:{fontSize:11}},'照準方式'),
       React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(3,minmax(0,1fr))',gap:5}},...opts.map(([key,label])=>React.createElement('button',{key,type:'button','aria-pressed':active===key,disabled:!bindingAllowed(),onClick:()=>setLightAimMode(l.id,key),style:{minHeight:37,padding:'5px 3px',fontSize:11,fontWeight:active===key?800:600,borderRadius:9,...artworkButtonSurface(active===key?'primary':'neutral',active===key,!bindingAllowed())}},label))),
-      React.createElement('span',{className:'small',style:{fontSize:10}},active==='light'?'作品の面にできる明るさの重心を作品に合わせます（イーゼルにも対応）。':active==='center'?'照明の中心軸を作品中心に向けます。':'角度を固定し、担当作品との紐づけは維持します。'));
+      React.createElement('span',{className:'small',style:{fontSize:10}},active==='light'?'光の重心を作品に合わせます。イーゼルは写真の表示範囲のみ計算し、額・台は含めません。':active==='center'?'照明の中心軸を作品中心に向けます。':'角度を固定し、担当作品との紐づけは維持します。'));
   }
   function addAssignedLight(pid){
     if(!bindingAllowed())return;const d=dataRef.current,p=d.placements.find(p=>p.id===pid),target=p&&galleryArtworkTarget(d,p);if(!target)return;
