@@ -1798,13 +1798,13 @@ function galleryGlazingMaterial(options) {
 function galleryFloorFinish(material,strength,theme){
   const polishedMarble=theme==='warm';
   const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
-  const u={galleryMirror:{value:null},galleryMirrorMatrix:{value:new THREE.Matrix4()},galleryMirrorReady:{value:0},galleryMirrorTexel:{value:new THREE.Vector2(1/384,1/384)},galleryFloorMirrorStrength:{value:polishedMarble?clamp(.80+strength*.55,.80,.92):clamp(strength*3,0,1)}};
+  const u={galleryMirror:{value:null},galleryMirrorMatrix:{value:new THREE.Matrix4()},galleryMirrorReady:{value:0},galleryMirrorTexel:{value:new THREE.Vector2(1/384,1/384)},galleryFloorMirrorStrength:{value:polishedMarble?clamp(.80+strength*.55,.80,.92):clamp(strength*3,0,1)},galleryWarmLightCount:{value:0},galleryWarmLightData:{value:Array.from({length:16},()=>new THREE.Vector4())},galleryWarmLightDir:{value:Array.from({length:16},()=>new THREE.Vector2(0,1))},galleryWarmLightColor:{value:Array.from({length:16},()=>new THREE.Vector3(1,.88,.73))}};
   material.userData.galleryGlazing=u;material.userData.galleryFloorFinish=true;
   material.userData.galleryWarmSoftMirror=polishedMarble;
   material.onBeforeCompile=shader=>{previous.call(material,shader);Object.assign(shader.uniforms,u);
     shader.vertexShader='uniform mat4 galleryMirrorMatrix; varying vec4 galleryFloorMirrorUV; varying vec3 galleryFloorWorld;\n'+shader.vertexShader;
     shader.vertexShader=shader.vertexShader.replace('#include <project_vertex>','#include <project_vertex>\ngalleryFloorWorld=(modelMatrix*vec4(transformed,1.0)).xyz; galleryFloorMirrorUV=galleryMirrorMatrix*vec4(galleryFloorWorld,1.0);');
-    shader.fragmentShader='uniform sampler2D galleryMirror; uniform vec2 galleryMirrorTexel; uniform float galleryMirrorReady; uniform float galleryFloorMirrorStrength; varying vec4 galleryFloorMirrorUV; varying vec3 galleryFloorWorld;\n'+shader.fragmentShader;
+    shader.fragmentShader='uniform sampler2D galleryMirror; uniform vec2 galleryMirrorTexel; uniform float galleryMirrorReady; uniform float galleryFloorMirrorStrength; uniform int galleryWarmLightCount; uniform vec4 galleryWarmLightData[16]; uniform vec2 galleryWarmLightDir[16]; uniform vec3 galleryWarmLightColor[16]; varying vec4 galleryFloorMirrorUV; varying vec3 galleryFloorWorld;\n'+shader.fragmentShader;
     shader.fragmentShader=shader.fragmentShader.replace('#include <roughnessmap_fragment>',`#include <roughnessmap_fragment>
       vec2 galleryTile=floor((galleryFloorWorld.xz+.00001)/.5);
       float galleryTileFinish=fract(sin(dot(galleryTile,vec2(127.1,311.7)))*43758.5453);
@@ -1828,15 +1828,29 @@ function galleryFloorFinish(material,strength,theme){
           ${polishedMarble?`// Rough polished stone: light-only bounce, not a translucent copy
           // of the mirrored scene. Dark picture frames can no longer cast
           // vertical grey bars into the floor reflection.
-          float reflectedGlow=dot(reflected,vec3(.2126,.7152,.0722));
-          vec3 warmBounce=mix(reflected,vec3(reflectedGlow)*vec3(1.0,.94,.86),.48);
-          float grazing=1.0+.22*fresnel;
-          outgoingLight+=warmBounce*(.84*galleryFloorMirrorStrength)*border*grazing;`:`outgoingLight=mix(outgoingLight,reflected*diffuseColor.rgb,(.012+.07*fresnel)*galleryFloorMirrorStrength*border);`}
+          // Warm floor never uses a mirrored image: no photo/frame silhouettes.`:`outgoingLight=mix(outgoingLight,reflected*diffuseColor.rgb,(.012+.07*fresnel)*galleryFloorMirrorStrength*border);`}
         }
       }
+      ${polishedMarble?`// Stable soft reflection of the actual exhibit spotlights.
+      // Light positions are projected into the room; no rasterized artwork,
+      // frame edges, tiled mirror UVs or low-resolution blur are sampled.
+      if(galleryFloorNormal.y>.90){
+        vec3 galleryBounce=vec3(0.0);
+        for(int k=0;k<16;k++){
+          if(k>=galleryWarmLightCount)break;
+          vec4 lamp=galleryWarmLightData[k];
+          vec2 toward=galleryWarmLightDir[k];
+          vec2 delta=galleryFloorWorld.xz-lamp.xy;
+          float along=dot(delta,toward);
+          float across=dot(delta,vec2(-toward.y,toward.x));
+          float falloff=exp(-1.35*(along*along/(1.05*1.05)+across*across/(.58*.58)));
+          galleryBounce+=galleryWarmLightColor[k]*lamp.z*falloff;
+        }
+        outgoingLight+=galleryBounce*.095*galleryFloorMirrorStrength;
+      }`:``}
       #include <opaque_fragment>`);
   };
-  material.customProgramCacheKey=()=>key+(polishedMarble?'|gallery-polished-marble-v6-light-only-bounce':'|gallery-satin-floor-v1');return material;
+  material.customProgramCacheKey=()=>key+(polishedMarble?'|gallery-polished-marble-v7-analytic-soft-light':'|gallery-satin-floor-v1');return material;
 }
 
 function galleryMirrorPlane(surface){
@@ -1914,9 +1928,37 @@ function createGalleryGlazingReflection(renderer,scene,camera){
     update(now){
       if(!enabled||failed||!surfaces.length)return false;
       scene.updateMatrixWorld(true);camera.updateMatrixWorld(true);
+      // Warm marble: derive continuous soft light lobes from spotlight positions.
+      // This intentionally does NOT reflect the rendered picture frames: their
+      // repeated vertical edges caused the moire/stripe artifact in v3.
+      const warmSurfaces=surfaces.filter(m=>m.material?.userData?.galleryWarmSoftMirror);
+      if(warmSurfaces.length){
+        const lamps=[];
+        scene.traverse(o=>{
+          if(lamps.length>=16||!o.isSpotLight||o.userData?.galleryRole!=='exhibit'||!o.visible||o.intensity<=0)return;
+          const target=o.target.getWorldPosition(new THREE.Vector3());
+          const origin=o.getWorldPosition(new THREE.Vector3());
+          const inward=new THREE.Vector2(origin.x-target.x,origin.z-target.z);
+          if(inward.lengthSq()<.0001)return;
+          inward.normalize();
+          const center=new THREE.Vector2(target.x,target.z).addScaledVector(inward,.42);
+          const intensity=Math.min(1.3,Math.sqrt(o.intensity)/6);
+          lamps.push({center,inward,intensity,color:o.color});
+        });
+        for(const floor of warmSurfaces){
+          const u=floor.material.userData.galleryGlazing;
+          u.galleryWarmLightCount.value=lamps.length;
+          lamps.forEach((l,i)=>{
+            u.galleryWarmLightData.value[i].set(l.center.x,l.center.y,l.intensity,0);
+            u.galleryWarmLightDir.value[i].copy(l.inward);
+            u.galleryWarmLightColor.value[i].set(l.color.r,l.color.g,l.color.b);
+          });
+          u.galleryMirrorReady.value=0;
+        }
+      }
       const frustum=new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse));
       let choice=null,best=0;
-      for(const m of surfaces){if(!m.visible||!frustum.intersectsObject(m))continue;let visible=true;for(let p=m.parent;p;p=p.parent)if(!p.visible)visible=false;if(!visible)continue;
+      for(const m of surfaces){if(m.material?.userData?.galleryWarmSoftMirror)continue;if(!m.visible||!frustum.intersectsObject(m))continue;let visible=true;for(let p=m.parent;p;p=p.parent)if(!p.visible)visible=false;if(!visible)continue;
         const plane=galleryMirrorPlane(m),pos=plane.origin,delta=camera.position.clone().sub(pos),n=plane.normal,facing=delta.clone().normalize().dot(n);
         if(facing<=.02)continue;const box=m.geometry.parameters||{},area=m.userData.galleryMirrorArea||((box.width||1)*(box.height||1)),weight=m.userData.galleryMirrorWeight??1,score=area*weight*facing/Math.max(1,delta.lengthSq())*(lastChoice===m?1.25:1);
         if(score>best){choice=m;best=score;}}
@@ -3120,7 +3162,26 @@ function App() {
     } catch {
     }
   }
+  const CAMERA_POSE_KEY='photo_exhibition_camera_pose_v1';
+  const cameraStartupPoseRef=useRef((()=>{try{const p=JSON.parse(localStorage.getItem(CAMERA_POSE_KEY)||'null');return p&&p.version===1?p:null;}catch{return null;}})());
+  const cameraStartupPendingRef=useRef(true),cameraStartupApplyRef=useRef(null),cameraLastSavedAtRef=useRef(0);
   const orbitRef = useRef({ theta: Math.PI / 4, phi: 1, dist: 3, target: new THREE.Vector3(0, 1, 0) });
+  function persistCameraPose(){
+    if(cameraStartupPendingRef.current||cameraStartupApplyRef.current)return;
+    const s=stateRef.current,rc=roomCamRef.current,wr=walkRef.current,ob=orbitRef.current;
+    const pose={version:1,roomId:s.roomId,view:s.view,mode:s.mode,camStyle:s.camStyle,
+      room:{x:rc.x,y:rc.y,z:rc.z,yaw:rc.yaw,shift:rc.shift},
+      orbit:{theta:ob.theta,phi:ob.phi,dist:ob.dist,target:ob.target.toArray()},
+      walk:{pos:wr.pos.toArray(),yaw:wr.yaw,pitch:wr.pitch}};
+    try{localStorage.setItem(CAMERA_POSE_KEY,JSON.stringify(pose));}catch{}
+  }
+  useEffect(()=>{
+    const flush=()=>persistCameraPose();
+    const hidden=()=>{if(document.visibilityState==='hidden')flush();};
+    window.addEventListener('pagehide',flush);
+    document.addEventListener('visibilitychange',hidden);
+    return()=>{window.removeEventListener('pagehide',flush);document.removeEventListener('visibilitychange',hidden);};
+  },[]);
   const sceneRef = useRef(null);
   const cameraRef = useRef(null);
   const groupRef = useRef(null);
@@ -3311,6 +3372,17 @@ function App() {
       walkInitRef.current = false;
       walkAnimRef.current = null;
     } else applyLayout(v);
+    if(cameraStartupPendingRef.current){
+      cameraStartupPendingRef.current=false;
+      const pose=cameraStartupPoseRef.current;
+      if(pose&&pose.roomId===curRoomRef.current){
+        cameraStartupApplyRef.current=pose;
+        setCamStyleS(pose.camStyle==='full'?'full':'room');
+        if(pose.view==='walk'&&pose.mode==='view'){
+          setMode('view');setView('walk');
+        }else{setView('orbit');}
+      }
+    }
   }
   function commitPhotos(list) {
     photosRef.current = list;
@@ -5438,6 +5510,22 @@ function App() {
           }
         }
       }
+      // Apply a saved camera only after room data and the render size are ready.
+      // Camera mode, distance, orbit target and look direction are preserved.
+      const startupPose=cameraStartupApplyRef.current;
+      if(startupPose&&startupPose.roomId===s.roomId&&renderWidth>0&&renderHeight>0){
+        if(startupPose.room&&[startupPose.room.x,startupPose.room.y,startupPose.room.z,startupPose.room.yaw,startupPose.room.shift].every(Number.isFinite)){
+          Object.assign(roomCamRef.current,startupPose.room,{init:true});
+        }
+        if(startupPose.walk&&Array.isArray(startupPose.walk.pos)&&startupPose.walk.pos.length===3){
+          const p=startupPose.walk;
+          if([...p.pos,p.yaw,p.pitch].every(Number.isFinite)){
+            wr.pos.set(...p.pos);wr.yaw=p.yaw;wr.pitch=p.pitch;walkInitRef.current=true;
+          }
+        }
+        // Orbit restoration occurs after auto-fit below, so it cannot be reset.
+        if(s.view!=='orbit'||s.camStyle!=='full')cameraStartupApplyRef.current=null;
+      }
       const useRoomCam = s.view === "orbit" && s.camStyle === "room";
       {
         const pk = panKeyRef.current;
@@ -5485,6 +5573,16 @@ function App() {
           o.theta=fit.theta;o.phi=fit.phi;o.dist=fit.dist;o.target.copy(fit.target);o.maxDist=fit.maxDist;
           overviewRequestRef.current=false;overviewAutoFitRef.current=true;overviewRoomKeyRef.current=roomKey;overviewFitKeyRef.current=fitKey;
           camera.fov=58;camera.updateProjectionMatrix();
+        }
+        const saved=cameraStartupApplyRef.current;
+        if(saved&&saved.roomId===s.roomId&&saved.camStyle==='full'&&saved.orbit&&Array.isArray(saved.orbit.target)){
+          const p=saved.orbit;
+          if([p.theta,p.phi,p.dist,...p.target].every(Number.isFinite)){
+            o.theta=p.theta;o.phi=clamp(p.phi,.12,1.45);
+            o.dist=clamp(p.dist,.7,o.maxDist||50);o.target.set(...p.target);
+            overviewAutoFitRef.current=false;overviewRequestRef.current=false;
+          }
+          cameraStartupApplyRef.current=null;
         }
         const t = o.target;
         camera.position.set(t.x + o.dist * Math.sin(o.theta) * Math.cos(o.phi), t.y + o.dist * Math.sin(o.phi), t.z + o.dist * Math.cos(o.theta) * Math.cos(o.phi));
@@ -5644,6 +5742,10 @@ function App() {
       drawWallLightingGuides(scene);
       glazingReflection.update(now);
       renderer.render(scene, camera);
+      if(now-cameraLastSavedAtRef.current>1400){
+        cameraLastSavedAtRef.current=now;
+        persistCameraPose();
+      }
       if (diagRef.current && now - lastDiag > 250) {
         lastDiag = now;
         const cw = renderer.domElement.clientWidth, ch = renderer.domElement.clientHeight, pr = renderer.getPixelRatio();
