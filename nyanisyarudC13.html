@@ -20498,12 +20498,16 @@ const C31_CONTROL=(()=>{try{return new URLSearchParams(location.search).get('c31
 function c31Target(d,c,line,p){
   const dir=c.dir||1;
   if(line==='iii')return dir*2.0;
+  // C41: enter wide, clip the apex, then unwind to the CENTER of the exit
+  // straight. Returning to the outside lane at c.end+14 created an extra
+  // aggressive lateral manoeuvre and unnecessarily prolonged corner braking.
   const outer=dir*(p.outer??-2.15),inner=dir*(p.inner??1.1);
-  const begin=c.start-20,apex=c.start+(c.end-c.start)*Math.max(.40,p.apex),exit=c.end+14;
+  const begin=c.start-20,apex=c.start+(c.end-c.start)*Math.max(.40,p.apex);
+  const exit=c.end+Math.max(22,Math.min(38,(c.end-c.start)*.30));
   if(d<=begin)return outer;
   if(d<apex)return outer+(inner-outer)*c26Smooth(d,begin,apex);
-  if(d<exit)return inner+(outer-inner)*c26Smooth(d,apex,exit);
-  return outer;
+  if(d<exit)return inner+(0-inner)*c26Smooth(d,apex,exit);
+  return 0;
 }
 function c31Command(d,lat,lv,kmh,c,line,p,wasBraking){
   const v=kmh/3.6,dir=c.dir||1;
@@ -20559,11 +20563,18 @@ function c32Command(d,lat,lv,kmh,c,line,p,wasBraking){
   for(let aheadD=0;aheadD<=175;aheadD+=3){
     const at=d+aheadD;
     if(at>c.end+20)break;
-    const bend=Math.max(Math.abs(roadBendAt(at)),Math.abs(roadBendAt(at+3)));
     const laneSlope=(c31Target(at+3,c,line,p)-c31Target(at-3,c,line,p))/6;
-    const laneCurvature=Math.abs(c31Target(at+3,c,line,p)-2*c31Target(at,c,line,p)+c31Target(at-3,c,line,p))/9;
-    const combined=bend+laneCurvature+Math.abs(laneSlope)*bend*.35;
-    const cap=THREE.MathUtils.clamp(Math.sqrt(8.2/(combined+.0015)),10,31);
+    // C36: lane-transition curvature is a conservative *estimate*, not the
+    // actual driven path curvature. Do not count it at full strength.
+    // Keep a reserve for lateral manoeuvres without automatically punishing OIO.
+    // C41: estimate curvature of the actual offset trajectory rather than
+    // adding road curvature and lane-transition curvature as two penalties.
+    // Signed road curvature and signed lane second derivative can cancel.
+    const signedRoad=roadBendAt(at);
+    const signedLaneSecond=(c31Target(at+3,c,line,p)-2*c31Target(at,c,line,p)+c31Target(at-3,c,line,p))/9;
+    const targetOffset=c31Target(at,c,line,p);
+    const pathCurvature=Math.abs(signedRoad/(1-signedRoad*targetOffset)+signedLaneSecond/Math.pow(1+laneSlope*laneSlope,1.5));
+    const cap=THREE.MathUtils.clamp(Math.sqrt(8.2/(pathCurvature+.0015)),10,31);
     const reachable=Math.sqrt(cap*cap+2*decel*Math.max(0,aheadD-margin));
     safe=Math.min(safe,reachable);
   }
@@ -20572,7 +20583,7 @@ function c32Command(d,lat,lv,kmh,c,line,p,wasBraking){
   const saturated=Math.abs(steer)>.94&&Math.abs(error)>1.0;
   if(wallRisk)safe=Math.min(safe,Math.max(9,v-2));
   if(saturated&&Math.sign(error)===Math.sign(lv))safe=Math.min(safe,Math.max(10,v-1.5));
-  const brake=v>safe+(wasBraking?-.35:.35);
+  const brake=v>safe+(wasBraking?-.45:.65);
   return {steer,brake,target,targetSpeed:safe*3.6,roadK:roadBendAt(d),error,projected,wallRisk,saturated,desiredLV,controller:'C32'};
 }
 const C33_CONTROL=(()=>{try{return new URLSearchParams(location.search).get('c33control')==='1'&&C32_CONTROL;}catch(_){return false;}})();
@@ -20603,7 +20614,7 @@ function c26Prepare(){
   Object.assign(c26TrialState,{active:true,finished:false,corner:c,frames:[],events:[],steps:0,
     lastBrake:false,lastPaw:false,brakeStart:null,brakeRelease:null,pawDone:false,pawStart:null,spawnS:s,finishS:c.end+35,
     entry:null,exit:null,finish:null,wallHits:0,brakeSeconds:0,pawSeconds:0,maxLoad:0,startedAt:0,lastS:s,firstWallS:null,
-    boostFrames:0,slideFrames:0,linkFrames:0,brakeTransitions:0,brakePhase:0,brakeHold:0,releaseCandidate:0,c33BrakeAge:0,c33ReleaseAge:0,c33RawTransitions:0,c33PrevRaw:false,waterStart:waterLevel,notes:['Local spawn, not full lap',C33_CONTROL?'C33 brake stabilizer':C32_CONTROL?'C32 predictive controller':C31_CONTROL?'C31 predictive controller':'C25 controller applied to REAL 3D','No physics changes']});
+    boostFrames:0,slideFrames:0,linkFrames:0,brakeTransitions:0,brakePhase:0,brakeHold:0,releaseCandidate:0,c33BrakeAge:0,c33ReleaseAge:0,c33RawTransitions:0,c33PrevRaw:false,c36OffAge:1,c36BrakeDelta:0,waterStart:waterLevel,notes:['Local spawn, not full lap',C33_CONTROL?'C33 brake stabilizer':C32_CONTROL?'C32 predictive controller':C31_CONTROL?'C31 predictive controller':'C25 controller applied to REAL 3D','No physics changes','C35: previewGripLimit snapshot scope fixed','C41: geometric path curvature, centered exit, sustained brake release']});
   return {ok:true,mode:C26_TRIAL_MODE,corner:{start:c.start,end:c.end,dir:c.dir},spawnS:s,spawnKmh:110,lateral,finishS:c26TrialState.finishS,paw:C26_PAW_REQUEST};
 }
 function c26TrialStep(dt){
@@ -20633,9 +20644,22 @@ function c26TrialStep(dt){
       if(raw!==st.c33PrevRaw)st.c33RawTransitions++;
       st.c33PrevRaw=raw;
       st.c33BrakeAge=st.lastBrake?st.c33BrakeAge+dt:0;
-      st.c33ReleaseAge=raw?0:st.c33ReleaseAge+dt;
-      const below=(speed*3.6)<cmd.targetSpeed-3.5;
-      braking=st.lastBrake?(raw||(!below&&(st.c33BrakeAge<.20||st.c33ReleaseAge<.14))):raw;
+      // C41: release permission is based on a sustained *speed margin*.
+      // The raw controller's own hysteresis must not indefinitely hold the brake.
+      const releaseMargin=speed*3.6-cmd.targetSpeed < -3.5;
+      st.c33ReleaseAge=releaseMargin?st.c33ReleaseAge+dt:0;
+      st.c36OffAge=st.lastBrake?0:(st.c36OffAge||0)+dt;
+      const deltaKmh=speed*3.6-cmd.targetSpeed;
+      // C36: stateful two-threshold control. Release only after a genuine
+      // speed margin, and prevent immediate reapplication unless dangerous.
+      const urgent=deltaKmh>7.0||cmd.wallRisk;
+      if(st.lastBrake){
+        const releaseAllowed=deltaKmh< -3.5 && st.c33BrakeAge>=.22;
+        braking=!(releaseAllowed&&st.c33ReleaseAge>=.14);
+      }else{
+        braking=urgent||(deltaKmh>2.0&&st.c36OffAge>=.18);
+      }
+      st.c36BrakeDelta=deltaKmh;
     }else braking=cmd.brake;
     if(braking&&!st.lastBrake){st.brakeTransitions++;if(!st.brakeStart)st.brakeStart={s,t:simulationElapsed,kmh:speed*3.6};}
     if(!braking&&st.lastBrake){st.brakeTransitions++;st.brakeRelease={s,t:simulationElapsed,kmh:speed*3.6};}
@@ -20669,10 +20693,11 @@ function c26TrialAfterStep(){
     targetSpeed:+(st.command?.targetSpeed??0).toFixed(2),lateralVelocity:+(pathHandling.lateralVelocity||0).toFixed(3),
     projected:+(st.command?.projected??0).toFixed(3),desiredLV:+(st.command?.desiredLV??0).toFixed(3),error:+(st.command?.error??0).toFixed(3),
     ceiling:Number.isFinite(cornerPace.speedCeiling)?+(cornerPace.speedCeiling*3.6).toFixed(2):null,
-    brakeRaw:!!st.command?.brake,brakeAge:+(st.c33BrakeAge||0).toFixed(3),
+    brakeRaw:!!st.command?.brake,brakeDeltaKmh:+(st.c36BrakeDelta||0).toFixed(2),brakeAge:+(st.c33BrakeAge||0).toFixed(3),
     gripKmh:Number.isFinite(activeGripLimit)?+(activeGripLimit*3.6).toFixed(2):null,
-    previewGripKmh:Number.isFinite(previewGripLimit)?+(previewGripLimit*3.6).toFixed(2):null,
+    previewGripKmh:(()=>{const f=c10State.active?.frames?.at(-1);return Number.isFinite(f?.previewKmh)?+f.previewKmh.toFixed(2):null;})(),
     throttleScale:+(cornerPace.scale||0).toFixed(3),
+    accelBranch:c10State.active?.frames?.at(-1)?.accelBranch||null,
     boost:!!(boostTimer>0||exitBoostTimer>0),sliding:!!isSliding};
   if(st.steps%3===0)st.frames.push(snap);
   if(!st.entry&&s>=st.corner.start)st.entry=snap;
@@ -20965,14 +20990,14 @@ if(C10_DIAG_ENABLED){
     try{
       if(gameState!=='ready')resetRace();
       const out=await api.run();
-      result={version:C33_CONTROL?'C34-stall-watchdog-local-trial':C32_CONTROL?'C32-prebrake-local-trial':C31_CONTROL?'C31-predictive-local-trial':'C30-mobile-local-trial',mode:new URLSearchParams(location.search).get('c26trial'),
+      result={version:C33_CONTROL?'C36-offline-tuned-local-trial':C32_CONTROL?'C32-prebrake-local-trial':C31_CONTROL?'C31-predictive-local-trial':'C30-mobile-local-trial',mode:new URLSearchParams(location.search).get('c26trial'),
         trial:api.get(),telemetry:window.__c11Diagnostics?.getCompact?.()||null,
         caveat:'Actual-game local corner trial; no virtual 400m straight; do not treat as complete-lap time.'};
-      if(out?.ok===false)message('走行停止: '+(out.error||'準備条件を確認してください')+'。診断JSONを保存してください。');
+      if(out?.ok===false||out?.notes?.some(x=>x.startsWith('Diagnostic snapshot error:')))message('診断エラー。JSONを保存して原因を確認してください。');
       else if(out?.finished){
         message('計測終了。壁接触 '+out.wallHits+'回。JSONを自動保存します。保存されない場合は「JSON保存・共有」を押してください。');
         // Some iOS contexts block automatic downloads; retain the manual share button.
-        const filename='nyanisyarud-C34-'+result.mode+'-'+Date.now()+'.json';
+        const filename='nyanisyarud-C36-'+result.mode+'-'+Date.now()+'.json';
         const blob=new Blob([JSON.stringify(result)],{type:'application/json'});
         const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=filename;
         document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),30000);
@@ -20983,7 +21008,7 @@ if(C10_DIAG_ENABLED){
   }
   async function exportResult(){
     if(!result)return;
-    const filename='nyanisyarud-'+(C33_CONTROL?'C34':C32_CONTROL?'C32':C31_CONTROL?'C31':'C30')+'-'+result.mode+'-'+Date.now()+'.json';
+    const filename='nyanisyarud-'+(C33_CONTROL?'C36':C32_CONTROL?'C32':C31_CONTROL?'C31':'C30')+'-'+result.mode+'-'+Date.now()+'.json';
     const file=new File([JSON.stringify(result)],filename,{type:'application/json'});
     try{
       if(navigator.canShare?.({files:[file]})&&navigator.share){await navigator.share({files:[file],title:'ニャニシャル C30 自動比較'});return;}
@@ -20996,7 +21021,7 @@ if(C10_DIAG_ENABLED){
     if(!document.body||root)return;
     root=document.createElement('section');root.setAttribute('aria-label','C30 自動比較診断');
     root.style.cssText='position:fixed;z-index:2147483100;top:max(10px,env(safe-area-inset-top));right:10px;width:min(310px,calc(100vw - 20px));padding:12px;border-radius:13px;background:#152c40ee;color:white;font:13px system-ui,sans-serif;box-shadow:0 3px 16px #0009;';
-    const heading=document.createElement('div');heading.textContent=C33_CONTROL?'C34｜停止監視・自動保存':C32_CONTROL?'C32｜事前減速・実3D比較':C31_CONTROL?'C31｜予測操舵・実3D比較':'C30｜実3Dコーナー自動比較';heading.style.cssText='font-weight:700;margin-bottom:7px';
+    const heading=document.createElement('div');heading.textContent=C33_CONTROL?'C36｜減速最適化・ブレーキ安定化':C32_CONTROL?'C32｜事前減速・実3D比較':C31_CONTROL?'C31｜予測操舵・実3D比較':'C30｜実3Dコーナー自動比較';heading.style.cssText='font-weight:700;margin-bottom:7px';
     select=document.createElement('select');select.setAttribute('aria-label','比較するコーナーとライン');select.style.cssText='width:100%;font:15px system-ui;padding:8px;border-radius:7px;color:#111;background:white;';
     for(const m of modes){const o=document.createElement('option');o.value=m;o.textContent=label(m);select.append(o);}
     const current=new URLSearchParams(location.search).get('c26trial');select.value=modes.includes(current)?current:modes[0];
@@ -21006,7 +21031,7 @@ if(C10_DIAG_ENABLED){
     save=document.createElement('button');save.textContent='JSON保存・共有';save.style.cssText='flex:1;min-height:44px;border-radius:8px;background:#ccecd6;color:#142b40;font-weight:bold';save.addEventListener('click',exportResult);
     row.append(start,save);
     status=document.createElement('div');status.setAttribute('role','status');status.style.cssText='margin-top:7px;font-size:12px;line-height:1.4';
-    const hint=document.createElement('div');hint.textContent='C34：走行停止を3.5秒で検出。終了時JSON自動保存を試行。iPhoneでは保存・共有ボタンも利用できます。';hint.style.cssText='margin-top:5px;opacity:.85;font-size:11px';
+    const hint=document.createElement('div');hint.textContent='C36：OIOの過剰減速を抑制し、ブレーキのON/OFFを安定化。計測終了後にJSON保存。';hint.style.cssText='margin-top:5px;opacity:.85;font-size:11px';
     root.append(heading,select,row,status,hint);document.body.append(root);refresh();
   }
   window.__c30MobileComparison={run,exportResult,get:()=>result};
@@ -25751,7 +25776,10 @@ function advanceGameFrame(realDelta){
   for(let i=0;i<steps;i++){
     input.driftJustPressed=i===0&&driftEdge;input.brakeJustPressed=i===0&&brakeEdge;
     bridgeBeforeTick(step);tick(step,redcatDrivingActive()?(i===steps-1?dt:0):step);bridgeAfterTick(step);
-    if(C26_TRIAL_MODE)c26TrialAfterStep();
+    if(C26_TRIAL_MODE){try{c26TrialAfterStep();}catch(e){
+      if(c26TrialState.active){c26TrialState.notes.push("Diagnostic snapshot error: "+String(e?.message||e));c26TrialState.active=false;c26TrialState.finished=true;}
+      console.error("C35 trial snapshot",e);
+    }}
   }
   if((C15_BOT_MODE||C15_REPLAY_MODE)&&gameState==='goal'&&window.__c11Diagnostics?.downloadCompact){
     const state=C15_REPLAY_MODE?c15ReplayState:c15BotState;
