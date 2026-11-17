@@ -20452,6 +20452,151 @@ if(C15_REPLAY_MODE)window.__c15Replay={status:()=>({source:C15_REPLAY_MODE,axis:
       note:assisted?'補正あり：D/F物理の厳密比較には使用不可':'入力補正なし'};
   },reset:c15ReplayReset};
 
+// C26: opt-in, isolated REAL 3D corner input trial. No game UI/physics/boost changes.
+// Activate only with ?linephysics=F&c11diag=1&c26trial=2-oio (2-iii/10-oio/10-iii).
+// The C25 controller is ported verbatim where possible; C26 uses the actual game's
+// roadBendAt(s), steering and braking input APIs. 400m simulated straight NOT replayed.
+const C26_POLICIES={"2-iii":{"brakeLead":85.11820388957858,"brakeTarget":61.83024360705167,"look":0.11856127427890896,"gain":1.7313525367178955,"velGain":0.5675754825118929,"prepare":78.4221275083255,"begin":-15,"apex":0.5,"exit":1,"releaseProgress":1.3,"releaseGain":1,"lateRelease":false,"linkDelay":0.25,"brakeScale":0.7781500678043813,"brakeDecel":12.8806863615755,"brakeHorizon":32,"brakeMargin":1.56725571770221,"brakeBlend":0.843754929676652},"2-oio":{"brakeLead":110.98654481116682,"brakeTarget":52.57741338573396,"look":0.1355110146221705,"gain":2.277575544943102,"velGain":0.354023070295807,"prepare":135.97460887487978,"begin":-14.772384942276403,"apex":0.3642092232778668,"exit":1.7331449285149574,"releaseProgress":1.3,"releaseGain":1,"lateRelease":false,"linkDelay":0.25,"outer":-1.7559490560553968,"inner":0.822799891163595,"hold":0.14359666861128062,"brakeScale":0.8393004679493606,"brakeDecel":19.37453679717146,"brakeHorizon":32,"brakeMargin":2.9603997906669974,"brakeBlend":0.5196250438690185},"10-iii":{"brakeLead":114.22130711376667,"brakeTarget":53.84755639079958,"look":0.04210553155746311,"gain":1.2171440945356151,"velGain":0.4385014141490683,"prepare":85.82334210933186,"begin":-15,"apex":0.5,"exit":1,"releaseProgress":1.3,"releaseGain":1,"lateRelease":false,"linkDelay":0.25,"brakeScale":0.8086568795237691,"brakeDecel":15.690457268850878,"brakeHorizon":40,"brakeMargin":0.15019568894058466,"brakeBlend":0.8541299667209387},"10-oio":{"brakeLead":78.45944811124355,"brakeTarget":68.61467481590807,"look":0.2761016271542758,"gain":0.7024247707915492,"velGain":0.10478060740977524,"prepare":133.39505571662448,"begin":-11.633940043393523,"apex":0.34857421040302144,"exit":1.8301281107240355,"releaseProgress":1.3,"releaseGain":1,"lateRelease":false,"linkDelay":0.25,"outer":-2.375140941515565,"inner":1.1866168378503064,"hold":0.042125456817448136,"brakeScale":0.9566655125003309,"brakeDecel":17.232050243997946,"brakeHorizon":48,"brakeMargin":1.5884564341977239,"brakeBlend":0.651929909363389}};
+const C26_TRIAL_MODE=(()=>{try{
+  const p=new URLSearchParams(location.search),mode=p.get('c26trial')||'';
+  return Object.hasOwn(C26_POLICIES,mode)&&!C15_BOT_MODE&&!C15_REPLAY_MODE&&p.get('linephysics')==='F'?mode:'';
+}catch(_){return '';}})();
+const C26_PAW_REQUEST=(()=>{try{return new URLSearchParams(location.search).get('c26paw')==='1';}catch(_){return false;}})();
+const c26TrialState={active:false,finished:false,corner:null,mode:C26_TRIAL_MODE,frames:[],events:[],steps:0,
+  lastBrake:false,lastPaw:false,brakeStart:null,brakeRelease:null,pawDone:false,pawStart:null,spawnS:null,finishS:null,
+  entry:null,exit:null,finish:null,wallHits:0,brakeSeconds:0,pawSeconds:0,maxLoad:0,startedAt:0,lastS:0,firstWallS:null,
+  boostFrames:0,slideFrames:0,linkFrames:0,brakeTransitions:0,brakePhase:0,brakeHold:0,releaseCandidate:0,waterStart:100,notes:[]};
+function c26Smooth(x,a,b){if(b<=a)return x>=b?1:0;const t=THREE.MathUtils.clamp((x-a)/(b-a),0,1);return t*t*t*(10+t*(-15+6*t));}
+function c26Target(d,c,line,p){
+  const turn=c.dir||1,outer=line==='oio'?(p.outer??-2.15):-2.15,inner=line==='oio'?(p.inner??2.15):2.15;
+  const settle=line==='iii'?inner:outer;
+  const prep=settle*c26Smooth(d,0,p.prepare);
+  if(d<c.start+p.begin)return prep*turn;
+  if(line==='iii')return inner*turn;
+  const turnStart=c.start+p.begin,apex=c.start+(c.end-c.start)*p.apex,exit=c.start+(c.end-c.start)*p.exit;
+  if(d<apex)return (outer+(inner-outer)*c26Smooth(d,turnStart,apex))*turn;
+  return (inner+(outer-inner)*c26Smooth(d,Math.min(exit-.05,apex+(c.end-c.start)*(p.hold??0)),exit))*turn;
+}
+function c26Command(d,lat,lv,kmh,corner,line,p,prevBrake){
+  const target=c26Target(d,corner,line,p),projected=lat+lv*p.look;
+  const steer=THREE.MathUtils.clamp((target-projected)*p.gain-lv*p.velGain,-1,1);
+  let safe=Infinity;
+  for(let lookD=0;lookD<=p.brakeHorizon;lookD+=4){
+    const atD=d+lookD;if(atD>corner.end+8)break;
+    const k=Math.abs(roadBendAt(atD));
+    const gripSpeed=Math.sqrt(20*1.08**2/(k+.001));
+    const brakeDist=Math.max(0,lookD-p.brakeMargin);
+    const reachable=Math.sqrt(gripSpeed*gripSpeed+2*p.brakeDecel*brakeDist);
+    safe=Math.min(safe,reachable);
+  }
+  const targetSpeed=safe*p.brakeScale;
+  const brake=d>corner.start-130&&d<corner.end&&kmh/3.6>targetSpeed+(prevBrake?-.5:1.0);
+  return {steer,brake,target,targetSpeed:targetSpeed*3.6,roadK:roadBendAt(d)};
+}
+function c26Prepare(){
+  if(!C26_TRIAL_MODE)return {ok:false,error:'c26trial is not enabled'};
+  if(gameState!=='ready')return {ok:false,error:'Start from READY state'};
+  if(currentKey!=='irohaLocal'||catModel!=='nekomata'||driveMode!=='gachiTouge'||globalIsAssist)
+    return {ok:false,error:'Requires ねころん坂 / nekomata / gachiTouge / assist OFF',currentKey,catModel,driveMode};
+  const [number,line]=C26_TRIAL_MODE.split('-'),c=DRIVING_GUIDE_DATA.tracks.irohaLocal.corners.find(x=>x.number===Number(number));
+  if(!c)return {ok:false,error:'Corner not found'};
+  startRace();if(gameState!=='racing')return {ok:false,error:'Race did not start (launch screen may be open)'};
+  const p=C26_POLICIES[C26_TRIAL_MODE],turn=c.dir||1;
+  const initialLane=turn*(line==='iii'?2.15:(p.outer??-2.15));
+  // Start 55m before entry, AFTER the preceding corner. Both lines get identical
+  // speed (110km/h); lane is already settled. This is a local 3D trial, NOT a full lap.
+  s=c.start-55;lateral=initialLane;speed=110/3.6;elapsed=0;simulationElapsed=0;
+  resetPathHandling();resetSteeredLine();resetCornerPace();resetCornerDrive();
+  input.steer=0;input.brake=false;input.drift=false;input.brakeJustPressed=false;input.driftJustPressed=false;
+  Object.assign(c26TrialState,{active:true,finished:false,corner:c,frames:[],events:[],steps:0,
+    lastBrake:false,lastPaw:false,brakeStart:null,brakeRelease:null,pawDone:false,pawStart:null,spawnS:s,finishS:c.end+35,
+    entry:null,exit:null,finish:null,wallHits:0,brakeSeconds:0,pawSeconds:0,maxLoad:0,startedAt:0,lastS:s,firstWallS:null,
+    boostFrames:0,slideFrames:0,linkFrames:0,brakeTransitions:0,brakePhase:0,brakeHold:0,releaseCandidate:0,waterStart:waterLevel,notes:['Local spawn, not full lap','C25 controller applied to REAL 3D','No safety assistance']});
+  return {ok:true,mode:C26_TRIAL_MODE,corner:{start:c.start,end:c.end,dir:c.dir},spawnS:s,spawnKmh:110,lateral,finishS:c26TrialState.finishS,paw:C26_PAW_REQUEST};
+}
+function c26TrialStep(dt){
+  const st=c26TrialState;if(!st.active||st.finished||gameState!=='racing')return;
+  const c=st.corner,p=C26_POLICIES[C26_TRIAL_MODE],line=C26_TRIAL_MODE.split('-')[1];
+  const lv=pathHandling.ready?pathHandling.lateralVelocity:0;
+  const cmd=c26Command(s,lateral,lv,speed*3.6,c,line,p,st.lastBrake);
+  // C25 selects ONE brake/release phase. Filter raw speed-threshold chatter:
+  // minimum hold 0.16s, 0.10s of continuous release permission, then latch OFF.
+  // Do not create synthetic brake pulses (they break the real NIKUKYU edge).
+  let braking=false;
+  if(st.brakePhase===0&&cmd.brake){st.brakePhase=1;st.brakeStart={s,t:simulationElapsed,kmh:speed*3.6};st.brakeTransitions++;}
+  if(st.brakePhase===1){
+    st.brakeHold+=dt;
+    st.releaseCandidate=cmd.brake?0:st.releaseCandidate+dt;
+    if(st.brakeHold>=.16&&st.releaseCandidate>=.10){
+      st.brakePhase=2;st.brakeRelease={s,t:simulationElapsed,kmh:speed*3.6};st.brakeTransitions++;
+    }else braking=true;
+  }
+  let paw=false;
+  // Paw trial is separated from the no-paw timing comparison; one controlled press.
+  if(C26_PAW_REQUEST&&st.brakeRelease&&!st.pawDone){
+    const age=simulationElapsed-st.brakeRelease.t;
+    if(age>=p.linkDelay&&s<c.end&&st.pawStart===null)st.pawStart=simulationElapsed;
+    if(st.pawStart!==null){paw=simulationElapsed-st.pawStart<.18;if(!paw)st.pawDone=true;}
+  }
+  input.steer=cmd.steer;steerLeftPressed=false;steerRightPressed=false;joyActive=false;
+  input.brake=braking;input.brakePressed=false;input.brakeJustPressed=braking&&!st.lastBrake;
+  if(st.lastBrake&&!braking)lastBrakeReleaseTime=Date.now();
+  input.drift=paw;input.driftPressed=paw;input.driftJustPressed=paw&&!st.lastPaw;
+  if(braking)st.brakeSeconds+=dt;if(paw)st.pawSeconds+=dt;
+  st.lastBrake=braking;st.lastPaw=paw;st.command=cmd;
+}
+function c26TrialAfterStep(){
+  const st=c26TrialState;if(!st.active||st.finished)return;
+  st.steps++;st.maxLoad=Math.max(st.maxLoad,pathHandling.load||0);
+  if(isSliding)st.slideFrames++;
+  if((typeof boostTimer==='number'&&boostTimer>0)||(typeof exitBoostTimer==='number'&&exitBoostTimer>0))st.boostFrames++;
+  if(typeof cornerDrive!=='undefined'&&cornerDrive?.level>0)st.linkFrames++;
+  const hits=(typeof c10State!=='undefined'&&c10State.active?.events||[]).filter(e=>e.event==='wallHit'&&Number(e.s)>=st.spawnS);
+  st.wallHits=hits.length;if(hits.length&&!st.firstWallS)st.firstWallS=hits[0].s;
+  if(typeof c10State!=='undefined'&&c10State.active){c10State.active.controller='C26-local-'+C26_TRIAL_MODE;c10State.active.localTrial=true;}
+  const snap={s:+s.toFixed(3),t:+simulationElapsed.toFixed(4),kmh:+(speed*3.6).toFixed(3),lateral:+lateral.toFixed(4),
+    steer:+input.steer.toFixed(4),brake:!!input.brake,paw:!!input.drift,water:+waterLevel.toFixed(3),
+    load:+(pathHandling.load||0).toFixed(4),target:+(st.command?.target??0).toFixed(3),
+    ceiling:Number.isFinite(cornerPace.speedCeiling)?+(cornerPace.speedCeiling*3.6).toFixed(2):null,
+    boost:!!(boostTimer>0||exitBoostTimer>0),sliding:!!isSliding};
+  if(st.steps%3===0)st.frames.push(snap);
+  if(!st.entry&&s>=st.corner.start)st.entry=snap;
+  if(!st.exit&&s>=st.corner.end)st.exit=snap;
+  if(s>=st.finishS||gameState==='goal'||simulationElapsed>30){
+    st.finish=snap;st.finished=true;st.active=false;
+    input.steer=0;input.brake=false;input.drift=false;input.driftPressed=false;input.brakeJustPressed=false;input.driftJustPressed=false;
+  }
+  st.lastS=s;
+}
+if(C26_TRIAL_MODE)window.__c26Trial={prepare:c26Prepare,step:(dt=1/60)=>advanceGameFrame(dt),
+  status:()=>({mode:C26_TRIAL_MODE,paw:C26_PAW_REQUEST,active:c26TrialState.active,finished:c26TrialState.finished,
+    steps:c26TrialState.steps,spawnS:c26TrialState.spawnS,finishS:c26TrialState.finishS,entry:c26TrialState.entry,
+    exit:c26TrialState.exit,finish:c26TrialState.finish,wallHits:c26TrialState.wallHits,firstWallS:c26TrialState.firstWallS,
+    brakeSeconds:c26TrialState.brakeSeconds,brakeTransitions:c26TrialState.brakeTransitions,
+    pawSeconds:c26TrialState.pawSeconds,pawDone:c26TrialState.pawDone,slideFrames:c26TrialState.slideFrames,
+    boostFrames:c26TrialState.boostFrames,linkFrames:c26TrialState.linkFrames,
+    waterLoss:c26TrialState.waterStart-waterLevel,
+    physicsFFrames:(c10State.active?.frames||[]).filter(f=>f.physicsEffective==='F').length,
+    physicsOtherFrames:(c10State.active?.frames||[]).filter(f=>f.physicsEffective!=='F').length,
+    linkAwards:(c10State.active?.events||[]).filter(e=>e.event==='linkAward'&&e.to>e.from).length,
+    bonusStarts:(c10State.active?.events||[]).filter(e=>e.event==='bonus'&&e.to===true).length,
+    meatQualityFrames:(c10State.active?.frames||[]).filter(f=>f.meatQuality==='GOOD'||f.meatQuality==='PERFECT').length,
+    notes:c26TrialState.notes}),
+  get:()=>({status:window.__c26Trial.status(),frames:c26TrialState.frames}),
+  run:()=>{const init=c26Prepare();if(!init.ok)return Promise.resolve(init);
+    // The existing animate() loop advances the real game. Never inject a second tick loop.
+    // NIKUKYU uses Date.now()/setTimeout, so this must run in real browser time.
+    return new Promise(resolve=>{const started=Date.now();const check=()=>{
+      if(c26TrialState.finished){resolve(window.__c26Trial.status());return;}
+      if(!c26TrialState.active||Date.now()-started>45000){
+        c26TrialState.active=false;c26TrialState.finished=true;
+        c26TrialState.notes.push('Aborted: no progress or 45s real-time timeout');
+        resolve({...window.__c26Trial.status(),ok:false,error:'timeout or race interrupted'});return;
+      }
+      setTimeout(check,100);
+    };check();});},
+  download:()=>{const blob=new Blob([JSON.stringify(window.__c26Trial.get())],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='C26_'+C26_TRIAL_MODE+(C26_PAW_REQUEST?'_paw':'')+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1500);}};
+
 // C11: opt-in, PASSIVE real-game B/D telemetry with scope and clean exit measurement. No UI or physics changes.
 // URL: ?linephysics=B&c10diag=1 or ?linephysics=D&c10diag=1.
 // Ctrl+Shift+L downloads JSON; console: __c11Diagnostics.get()/download()/clear()/mark().
@@ -25317,6 +25462,7 @@ function advanceGameFrame(realDelta){
   pollKeys(dt);
   if(C15_BOT_MODE)c15BotStep(dt);
   if(C15_REPLAY_MODE)c15ReplayStep(dt);
+  if(C26_TRIAL_MODE)c26TrialStep(dt);
   // カウントはメニューやランキングを開いている間は止める
   if(countdown.active&&document.getElementById('courseDropdownMenu').style.display==='none'&&!document.getElementById('rankingModal').classList.contains('on'))stepCountdown(dt);
   stepRocketWindow();
@@ -25326,6 +25472,7 @@ function advanceGameFrame(realDelta){
   for(let i=0;i<steps;i++){
     input.driftJustPressed=i===0&&driftEdge;input.brakeJustPressed=i===0&&brakeEdge;
     bridgeBeforeTick(step);tick(step,redcatDrivingActive()?(i===steps-1?dt:0):step);bridgeAfterTick(step);
+    if(C26_TRIAL_MODE)c26TrialAfterStep();
   }
   if((C15_BOT_MODE||C15_REPLAY_MODE)&&gameState==='goal'&&window.__c11Diagnostics?.downloadCompact){
     const state=C15_REPLAY_MODE?c15ReplayState:c15BotState;
