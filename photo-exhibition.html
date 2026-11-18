@@ -3193,6 +3193,86 @@ function App() {
   const [microOpen,setMicroOpen]=useState(false),microOpenRef=useRef(false),microHighlightRef=useRef(null);
   const [showPreviewDimensions,setShowPreviewDimensions]=useState(true),showPreviewDimensionsRef=useRef(true);
   const resizeActiveRef=useRef(false);
+  const [measurement,setMeasurementState]=useState(null),measurementRef=useRef(null);
+  function setMeasurement(value){measurementRef.current=value;setMeasurementState(value);}
+  useEffect(()=>{setMeasurement(null);},[curRoomId,mode]);
+  function measurementItems(){
+    const d=dataRef.current;
+    return [['column',d.columns,'柱'],['block',d.blocks.filter(b=>!b.ceil),'台'],['furniture',d.furniture,'家具']]
+      .flatMap(([kind,items,name])=>items.map((o,i)=>({kind,id:o.id,label:o.name||name+' '+(i+1)})));
+  }
+  function measurementPanel(){
+    const items=measurementItems(),sel=selected&&items.find(o=>o.kind===selected.kind&&o.id===selected.id);
+    if(!sel&&!measurement)return null;
+    const key=o=>o.kind+':'+o.id,m=measurement;
+    return React.createElement('section',{'aria-label':'距離を測る',className:'rounded-xl border border-[var(--line)] p-3 space-y-2'},
+      React.createElement('b',{className:'text-xs'},'距離を測る（床面の隙間）'),
+      !m?React.createElement('button',{type:'button',className:'chip text-xs',onClick:()=>{
+        stopArtMove();setMeasurement({room:curRoomRef.current,a:sel,b:null});
+        setNotice('相手の柱・台・家具をタップするか、一覧から選んでください');
+      }},'この物から測る'):
+      React.createElement(React.Fragment,null,
+        React.createElement('p',{className:'small'},m.a.label+' ↔ '+(m.b?.label||'相手を選択')),
+        React.createElement('select',{'aria-label':'距離を測る相手',className:'field',value:m.b?key(m.b):'',onChange:e=>{
+          const b=items.find(o=>key(o)===e.target.value);if(b)setMeasurement({...measurementRef.current,b});
+        }},React.createElement('option',{value:''},'相手を選ぶ'),...items.filter(o=>key(o)!==key(m.a)).map(o=>React.createElement('option',{key:key(o),value:key(o)},o.label))),
+        React.createElement('p',{className:'small'},'端と端の最短の隙間です。選択して移動・サイズ変更すると更新します。'),
+        React.createElement('button',{type:'button',className:'chip text-xs',onClick:()=>setMeasurement(null)},'測定を終了')));
+  }
+  function measurementFootprint(target){
+    const d=dataRef.current,list={column:d.columns,block:d.blocks,furniture:d.furniture}[target.kind];
+    const o=list?.find(o=>o.id===target.id);if(!o)return null;
+    let w,h,rot=0,radius=0;
+    if(target.kind==='column'){w=colW(o);h=colD(o);}
+    else if(target.kind==='block'){w=o.w;h=o.d;}
+    else {const dm=FURN_DIM[o.type];w=dm.w;h=dm.d;rot=(o.rot||0)*Math.PI/180;if(dm.shape==='circle')radius=dm.r;}
+    if(radius)return Array.from({length:128},(_,i)=>({x:o.x+radius*Math.cos(i*Math.PI/64),z:o.z+radius*Math.sin(i*Math.PI/64)}));
+    return [[-w/2,-h/2],[w/2,-h/2],[w/2,h/2],[-w/2,h/2]].map(([x,z])=>({x:o.x+Math.cos(rot)*x+Math.sin(rot)*z,z:o.z-Math.sin(rot)*x+Math.cos(rot)*z}));
+  }
+  function measurementGap(a,b){
+    const dot=(p,q)=>p.x*q.x+p.z*q.z;
+    let overlap=Infinity;
+    for(const poly of [a,b])for(let i=0;i<poly.length;i++){
+      const p=poly[i],q=poly[(i+1)%poly.length],len=Math.hypot(q.x-p.x,q.z-p.z);
+      const n={x:-(q.z-p.z)/len,z:(q.x-p.x)/len},aa=a.map(p=>dot(p,n)),bb=b.map(p=>dot(p,n));
+      overlap=Math.min(overlap,Math.min(Math.max(...aa),Math.max(...bb))-Math.max(Math.min(...aa),Math.min(...bb)));
+    }
+    let best={distance:Infinity};
+    const visit=(points,edges,reverse)=>{for(const p of points)for(let i=0;i<edges.length;i++){
+      const v=edges[i],w=edges[(i+1)%edges.length],dx=w.x-v.x,dz=w.z-v.z;
+      const t=clamp(((p.x-v.x)*dx+(p.z-v.z)*dz)/(dx*dx+dz*dz),0,1),q={x:v.x+t*dx,z:v.z+t*dz},distance=Math.hypot(p.x-q.x,p.z-q.z);
+      if(distance<best.distance)best={distance,a:reverse?q:p,b:reverse?p:q};
+    }};
+    visit(a,b,false);visit(b,a,true);
+    return {...best,distance:overlap>=-1e-8?0:best.distance,status:overlap>1e-5?'重なり':overlap>=-1e-5?'接触':null};
+  }
+  function drawMeasurement(scene){
+    const m=measurementRef.current;
+    const a=m?.b&&m.room===curRoomRef.current&&stateRef.current.mode==='edit'&&measurementFootprint(m.a);
+    const b=a&&measurementFootprint(m.b);
+    const sig=JSON.stringify([m,a,b]);
+    const prev=measurementDrawingRef.current;
+    if(prev?.sig===sig)return;
+    if(prev){prev.group.traverse(o=>{o.geometry?.dispose();o.material?.map?.dispose();o.material?.dispose();});prev.group.removeFromParent();measurementDrawingRef.current=null;}
+    if(!a||!b)return;
+    const group=new THREE.Group();scene.add(group);measurementDrawingRef.current={group,sig};
+    const v=p=>new THREE.Vector3(p.x,floorSurface(dataRef.current.room,dataRef.current.blocks,p.x,p.z)+.06,p.z);
+    const line=(points,color,loop=false)=>{
+      const obj=new (loop?THREE.LineLoop:THREE.Line)(new THREE.BufferGeometry().setFromPoints(points.map(v)),new THREE.LineBasicMaterial({color,depthTest:false,depthWrite:false}));
+      obj.renderOrder=55;obj.raycast=()=>{};group.add(obj);
+    };
+    line(a,0x19b99a,true);line(b,0x3c94ff,true);
+    const gap=measurementGap(a,b);line([gap.a,gap.b],0xffb047);
+    const canvas=document.createElement('canvas');canvas.width=384;canvas.height=80;
+    const ctx=canvas.getContext('2d');ctx.fillStyle='rgba(20,24,26,.88)';ctx.fillRect(0,0,384,80);
+    ctx.fillStyle='white';ctx.font='bold 38px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(gap.status||((gap.distance*100).toFixed(1)+' cm'),192,40);
+    const tex=new THREE.CanvasTexture(canvas);tex.colorSpace=THREE.SRGBColorSpace;
+    const label=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,depthTest:false,depthWrite:false}));
+    label.position.copy(v({x:(gap.a.x+gap.b.x)/2,z:(gap.a.z+gap.b.z)/2}));label.position.y+=.2;
+    label.scale.set(.85,.18,1);label.renderOrder=56;label.raycast=()=>{};group.add(label);
+  }
+  const measurementDrawingRef=useRef(null);
   function togglePreviewDimensions(value){showPreviewDimensionsRef.current=value;setShowPreviewDimensions(value);}
   const [alignmentEnabled,setAlignmentEnabled]=useState(true),alignmentEnabledRef=useRef(true),alignmentGuideRef=useRef(null),positionGuideObjectsRef=useRef(null);
   useEffect(()=>{endMicro();alignmentGuideRef.current=null;microHighlightRef.current=null;microOpenRef.current=false;setMicroOpen(false);},[selected?.kind,selected?.id,personSel,mode,curRoomId,isFullscreen,tab,panelOpen]);
@@ -3815,6 +3895,11 @@ function App() {
     if (save) saveAll();
   }
   function selectObj(kind, id) {
+    const measuring=measurementRef.current;
+    if(measuring&&!measuring.b&&measurementItems().some(o=>o.kind===kind&&o.id===id)&&
+      (measuring.a.kind!==kind||measuring.a.id!==id)){
+      setMeasurement({...measuring,b:measurementItems().find(o=>o.kind===kind&&o.id===id)});
+    }
     if (artworkSwapRef.current && (kind !== "placement" || id !== artworkSwapRef.current.first) && !cancelArtworkSwap(false, () => selectObj(kind, id))) return;
     if (replacementRef.current && (kind !== "placement" || id !== replacementRef.current.placement) && !cancelReplacement(true, false, () => selectObj(kind, id))) return;
     const moving = dragIntentRef.current === "move";
@@ -5620,7 +5705,7 @@ function App() {
                   best = o;
                 }
               });
-              if (best) dimLine(V(m2.x, m2.z), V(best.x, best.z), `${bd.toFixed(2)} m（中心間）`);
+
             }
           }
         }
@@ -6055,6 +6140,7 @@ function App() {
       updateEntranceNames(camera,group);
       updateSelectionHoldFeedback();
       drawPositionGuides(scene);
+      drawMeasurement(scene);
       drawLightBindingGuides(scene);
       drawArrangeEndGuides(scene);
       drawWallLightingGuides(scene);
@@ -6122,6 +6208,7 @@ function App() {
       disposeWallLightingGuides();
       roundedFurnitureCache.forEach(g=>g?.dispose());roundedFurnitureCache.clear();
       renderer.dispose();
+      if(measurementDrawingRef.current){measurementDrawingRef.current.group.traverse(o=>{o.geometry?.dispose();o.material?.map?.dispose();o.material?.dispose();});measurementDrawingRef.current=null;}
       resizeLayer.remove();resizeStyle.remove();resizeButtons.clear();
       el.removeChild(renderer.domElement);
     };
@@ -9634,7 +9721,7 @@ function artworkActionSettings(p,part='all') {
   function windowRecessPanel(win){
     return React.createElement('label',{'aria-label':'窓の奥行き設定',className:'block'},React.createElement('span',{className:'flex justify-between text-sm font-bold'},React.createElement('span',null,'窓の奥行き（外側へ）'),React.createElement('b',null,(windowRecess(win)*100).toFixed(1)+' cm')),React.createElement(RangeNum,{'aria-label':'窓の外側への奥行き',className:'w-full',min:0,max:60,rstep:1,value:windowRecess(win)*100,onChange:e=>updateWindows(dataRef.current.windows.map(w=>w.id===win.id?{...w,recess:clamp((Number(e.target.value)||0)/100,0,.6)}:w))}),React.createElement('p',{className:'small'},'0cmで壁面に合わせ、数値を増やすとガラスが外側へ下がります。'));
   }
-  const objectEditBody = artworkSwap ? artworkSwapPanel() : replacement ? replacementPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, !isFullscreen&&!(isPhone&&personSel&&!selected)&&selectionPanelHeader(), selCol && resizeReviewPanel(), selPlace && artworkActionSettings(selPlace,'primary'), lightBindingPanel(), personSel&&!selected&&visitorPosePanel(), !selPlace && microPositionPanel(), selWin&&windowSunPanel(selWin), selWin&&windowRecessPanel(selWin), (selWin || selEnt && !selEnt.col) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "設置する壁"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1", role: "group", "aria-label": "設置する壁" }, ["北", "南", "東", "西"].map((wallOpt) => {
+  const objectEditBody = artworkSwap ? artworkSwapPanel() : replacement ? replacementPanel() : /* @__PURE__ */ React.createElement(React.Fragment, null, !isFullscreen&&!(isPhone&&personSel&&!selected)&&selectionPanelHeader(), selCol && resizeReviewPanel(), selPlace && artworkActionSettings(selPlace,'primary'), lightBindingPanel(), personSel&&!selected&&visitorPosePanel(), !selPlace && microPositionPanel(), measurementPanel(), selWin&&windowSunPanel(selWin), selWin&&windowRecessPanel(selWin), (selWin || selEnt && !selEnt.col) && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("p", { className: "text-xs font-bold" }, "設置する壁"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-4 gap-1", role: "group", "aria-label": "設置する壁" }, ["北", "南", "東", "西"].map((wallOpt) => {
     const cur = selWin ? selWin.wall : selEnt?.wall;
     const active = cur === wallOpt;
     return /* @__PURE__ */ React.createElement("button", { key: wallOpt, type: "button", "aria-pressed": active, onClick: () => {
