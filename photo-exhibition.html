@@ -1766,6 +1766,27 @@ function gallerySpatialMaterial(material,uniforms){
   };material.customProgramCacheKey=()=>key+'|spatial-painted-room-v3-soft-junction';return material;
 }
 
+// Architecture-only indirect irradiance: the same light rule for all themes.
+// No emissive surfaces, screen overlay, camera exposure change or photo correction.
+function galleryArchitecturalFill(material,uniforms){
+  const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
+  material.userData.galleryArchitecturalFill=true;
+  material.onBeforeCompile=shader=>{
+    previous.call(material,shader);Object.assign(shader.uniforms,uniforms);
+    shader.fragmentShader='uniform vec3 galleryArchitecturalIrradiance;\n'+shader.fragmentShader;
+    const marker='#include <lights_fragment_maps>';
+    if(!shader.fragmentShader.includes(marker))throw new Error('Architectural lighting shader hook unavailable');
+    shader.fragmentShader=shader.fragmentShader.replace(marker,`#include <lights_fragment_maps>
+      #ifdef RE_IndirectDiffuse
+        vec3 archWorldNormal=inverseTransformDirection(geometryNormal,viewMatrix);
+        float archReceiver=.65+.35*max(archWorldNormal.y,0.0)-.25*max(-archWorldNormal.y,0.0);
+        irradiance+=galleryArchitecturalIrradiance*archReceiver;
+      #endif`);
+  };
+  material.customProgramCacheKey=()=>key+'|architecture-lamp-return-v34';
+  return material;
+}
+
 function galleryGlazingMaterial(options) {
   const material=new THREE.MeshStandardMaterial({...options,transparent:true,depthWrite:false,side:THREE.DoubleSide});
   const u={galleryMirror:{value:null},galleryMirrorMatrix:{value:new THREE.Matrix4()},galleryMirrorReady:{value:0},galleryMirrorTexel:{value:new THREE.Vector2(1/384,1/384)}};
@@ -2134,7 +2155,16 @@ function galleryLightingResponse(room, env, lights, solarDay, apertureAccess = 1
   const energy = clamp(power / Math.max(60, area * 7.5), 0, 1);
   const reflectance = room.theme === "black" ? 0.55 : room.theme === "white" ? 1.14 : 1;
   const darkReturn=room.theme==="black"?.06*clamp(energy+daylight,0,1)*(1-daylight):0;
-  return { daylight, energy, reflectance, hemisphere: 0.19 + 0.65 * daylight + (0.09 + 0.17 * (1 - daylight)) * energy * reflectance + darkReturn, bounce: (0.17 + 0.28 * daylight + 0.10 * energy) * reflectance + darkReturn*.6 };
+  // Render-only diffuse room return. Use the entered lamp intensity, room
+  // area and finish reflectance; leave the artwork's direct illumination alone.
+  // A bounded partial compensation lets dark finishes retain visible shape
+  // under the display tone curve without turning a black room into a white one.
+  const floorHex=room.theme==='black'?0x2a2a2a:room.theme==='warm'?0xf1e4d2:0xffffff;
+  const linear=v=>{v/=255;return v<=.04045?v/12.92:Math.pow((v+.055)/1.055,2.4);};
+  const floorReturn=.2126*linear((floorHex>>16)&255)+.7152*linear((floorHex>>8)&255)+.0722*linear(floorHex&255);
+  const lampPresence=energy/(energy+.12);
+  const architectural=clamp(.24*lampPresence*(1-.75*daylight)/Math.sqrt(Math.max(.02,floorReturn)),0,1.5);
+  return { daylight, energy, reflectance, architectural, hemisphere: 0.19 + 0.65 * daylight + (0.09 + 0.17 * (1 - daylight)) * energy * reflectance + darkReturn, bounce: (0.17 + 0.28 * daylight + 0.10 * energy) * reflectance + darkReturn*.6 };
 }
 function galleryRoundedTop(source,type){
   source.computeBoundingBox();const b=source.boundingBox,size=b.getSize(new THREE.Vector3()),center=b.getCenter(new THREE.Vector3());
@@ -4077,6 +4107,7 @@ function App() {
     const polishedMarbleMaps={map:polishedMarbleTexture('color'),bumpMap:polishedMarbleTexture('bump'),roughnessMap:polishedMarbleTexture('rough')};
     const indirectTexture=new THREE.Data3DTexture(new Uint8Array(8*5*8*4),8,5,8);indirectTexture.format=THREE.RGBAFormat;indirectTexture.minFilter=indirectTexture.magFilter=THREE.LinearFilter;indirectTexture.unpackAlignment=1;indirectTexture.userData={cached:true,galleryIndirectField:true};indirectTexture.needsUpdate=true;
     const indirectUniforms={galleryIndirectField:{value:indirectTexture},galleryFieldMin:{value:new THREE.Vector3()},galleryFieldSize:{value:new THREE.Vector3(1,1,1)},galleryFieldScale:{value:.24}};
+    const architecturalUniforms={galleryArchitecturalIrradiance:{value:new THREE.Color(0,0,0)}};
     let indirectSignature='';
     function updateIndirectField(s,sun){const key=JSON.stringify([s.room,s.env,s.lights,s.windows,s.entrances,s.columns,s.blocks]);if(key===indirectSignature)return;const field=galleryIndirectSources(s.room,s.env,s.lights,s.windows,s.entrances,s.columns,s.blocks,sun),samples=galleryIndirectSamples(s.room,field.sources,field.boxes);indirectTexture.image.data.set(samples.data);indirectTexture.needsUpdate=true;indirectUniforms.galleryFieldMin.value.set(-s.room.w/2,0,-s.room.d/2);indirectUniforms.galleryFieldSize.value.set(s.room.w,samples.boundsHeight,s.room.d);indirectUniforms.galleryFieldScale.value=s.room.theme==='warm'?.285:.24;indirectSignature=key;}
     function finishMaterial(kind, properties, role="wall") {
@@ -4098,7 +4129,7 @@ function App() {
       // Room diffuse bounce and direct specular have separate lighting paths.
       mat.userData.surfaceFinish = kind;
       gallerySoftShadowMaterial(mat,sunShadowParameters);
-      if(kind==='wall'){const finish=galleryPaint(stateRef.current.room.theme,role);mat.bumpScale=finish.bumpScale;mat.envMapIntensity=reflectionLevel*finish.reflection;mat.userData.paintRole=role;gallerySpatialMaterial(mat,indirectUniforms);}else if(kind==='floor')galleryFloorFinish(mat,reflectionLevel,finishTheme,indirectUniforms);return mat;
+      if(kind==='wall'){const finish=galleryPaint(stateRef.current.room.theme,role);mat.bumpScale=finish.bumpScale;mat.envMapIntensity=reflectionLevel*finish.reflection;mat.userData.paintRole=role;gallerySpatialMaterial(mat,indirectUniforms);}else if(kind==='floor')galleryFloorFinish(mat,reflectionLevel,finishTheme,indirectUniforms);galleryArchitecturalFill(mat,architecturalUniforms);return mat;
     }
     function finishUV(geometry, kind) {
       const pos = geometry.getAttribute("position"), normal = geometry.getAttribute("normal"), uv = new Float32Array(pos.count * 2), tile = kind === "wall" ? 1.05 : 0.5;
@@ -4365,6 +4396,9 @@ function App() {
       const reflectedLamp = new THREE.Color(1, 1, 1);
       if (power > 0) reflectedLamp.setRGB(red / power, green / power, blue / power);
       const floorAlbedo = new THREE.Color(floorC);
+      // Mostly neutral indirect room light, with a restrained lamp-colour return.
+      // Its level is exactly zero when lamps are off or all intensities are zero.
+      architecturalUniforms.galleryArchitecturalIrradiance.value.setRGB(1,1,1).lerp(reflectedLamp,.18).multiplyScalar(fill.architectural);
       const sunReturn=gallerySunReturn(s.room,s.env,s.windows,s.entrances,s.columns,sol2);
       // A mostly neutral floor return opens dark midtones without recoloring
       // photo textures or changing the user's lamp power, aim, or beam angle.
