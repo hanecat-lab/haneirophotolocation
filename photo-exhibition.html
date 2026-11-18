@@ -4051,6 +4051,76 @@ function App() {
     // Keep layout independent of the canvas drawing buffer dimensions.
     Object.assign(renderer.domElement.style, { position: "absolute", inset: "0", display: "block", width: "100%", height: "100%", WebkitTouchCallout: "none", userSelect: "none" });
     el.appendChild(renderer.domElement);
+    const resizeLayer=document.createElement("div");
+    Object.assign(resizeLayer.style,{position:"absolute",inset:"0",pointerEvents:"none",zIndex:"9"});
+    el.appendChild(resizeLayer);
+    const resizeButtons=new Map();
+    let activeResize=null;
+    const resizeName={thickness:"幅",depth:"奥行き",w:"幅",d:"奥行き",h:"高さ",
+      width:"幅",height:"高さ",pos:"位置",center:"高さ"};
+    function resizePointerDown(ev,meta){
+      if(!canResizeObject(meta.kind,meta.id))return;
+      ev.preventDefault();ev.stopPropagation();
+      cancelSelectionHold();
+      const button=ev.currentTarget;
+      button.setPointerCapture(ev.pointerId);
+      activeResize={...meta,pointerId:ev.pointerId,plane:dragPlaneFor(meta.kind,meta.id,meta.handleType),
+        snapshot:snapStr(),moved:false};
+      setIsDragging(true);
+    }
+    function resizePointerMove(ev){
+      if(!activeResize||activeResize.pointerId!==ev.pointerId)return;
+      ev.preventDefault();ev.stopPropagation();
+      const ray=getRay(ev),point=new THREE.Vector3();
+      if(!ray.ray.intersectPlane(activeResize.plane,point))return;
+      activeResize.moved=true;
+      applyHandle(activeResize.kind,activeResize.id,activeResize.handleType,point);
+    }
+    function resizePointerEnd(ev){
+      if(!activeResize||activeResize.pointerId!==ev.pointerId)return;
+      ev.preventDefault();ev.stopPropagation();
+      if(activeResize.moved&&canResizeObject(activeResize.kind,activeResize.id)){
+        pushHistoryRaw(activeResize.snapshot);
+        saveAll();
+        setNotice("サイズを更新しました");
+      }
+      activeResize=null;setIsDragging(false);dragInfoRef.current=null;
+    }
+    function updateResizeOverlay(camera,group){
+      const found=new Set(),rect=el.getBoundingClientRect();
+      group.updateMatrixWorld(true);
+      group.traverse(anchor=>{
+        const meta=anchor.userData;
+        if(!meta?.resizeAnchor||!canResizeObject(meta.kind,meta.id))return;
+        const key=meta.kind+":"+meta.id+":"+meta.handleType;
+        found.add(key);
+        let button=resizeButtons.get(key);
+        if(!button){
+          button=document.createElement("button");
+          button.type="button";button.setAttribute("aria-label",resizeName[meta.handleType]+"をプレビューで調整");
+          button.textContent=(["height","h","center"].includes(meta.handleType)?"↕ ":"↔ ")+resizeName[meta.handleType];
+          Object.assign(button.style,{position:"absolute",pointerEvents:"auto",touchAction:"none",
+            minWidth:"52px",height:"44px",padding:"0 8px",borderRadius:"22px",
+            border:"2px solid white",background:"#f28d40",color:"#161616",
+            boxShadow:"0 2px 8px #0008",fontSize:"12px",fontWeight:"800",
+            transform:"translate(-50%,-50%)",whiteSpace:"nowrap",cursor:"grab"});
+          button.addEventListener("pointerdown",ev=>resizePointerDown(ev,meta));
+          button.addEventListener("pointermove",resizePointerMove);
+          button.addEventListener("pointerup",resizePointerEnd);
+          button.addEventListener("pointercancel",resizePointerEnd);
+          button.addEventListener("lostpointercapture",resizePointerEnd);
+          resizeLayer.appendChild(button);resizeButtons.set(key,button);
+        }
+        const world=anchor.getWorldPosition(new THREE.Vector3()).project(camera);
+        const px=(world.x+1)*rect.width/2,py=(1-world.y)*rect.height/2;
+        button.style.display=world.z<-1||world.z>1||px<30||px>rect.width-30||
+          py<30||py>rect.height-30?"none":"block";
+        button.style.left=px+"px";button.style.top=py+"px";
+      });
+      for(const [key,button] of resizeButtons)if(!found.has(key)&&(!activeResize||key!==activeResize.kind+":"+activeResize.id+":"+activeResize.handleType)){
+        button.remove();resizeButtons.delete(key);
+      }
+    }
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(1710618);
     sceneRef.current = scene;
@@ -4444,14 +4514,13 @@ function App() {
           st.selected?.kind!==kind || st.selected.id!==id ||
           replacementRef.current || artworkSwapRef.current || arrangeRef.current ||
           placeRef.current || batchFocusRef.current || lightBindingRef.current) return;
-      const h = new THREE.Mesh(new THREE.SphereGeometry(0.09, 20, 20), new THREE.MeshStandardMaterial({ color: 16734762, emissive: 16726528, emissiveIntensity: 0.9, roughness: 0.3 }));
-      h.position.set(x, y, z);
-      h.userData = { handle: true, kind, id, handleType: handle };
-      parent.add(h);
-      const ring = new THREE.Mesh(new THREE.SphereGeometry(0.13, 16, 16), new THREE.MeshBasicMaterial({ color: 16777215, transparent: true, opacity: 0.35 }));
-      ring.position.copy(h.position);
-      ring.raycast=()=>{};
-      parent.add(ring);
+      // A projected DOM control owns touch input, so walls and objects cannot
+      // intercept the size gesture. The anchor has no 3D hit area or material.
+      if(kind==="column"&&(x<0||z<0))return;
+      const anchor=new THREE.Object3D();
+      anchor.position.set(x,y,z);
+      anchor.userData={resizeAnchor:true,kind,id,handleType:handle};
+      parent.add(anchor);
     }
     function addWire(parent, w, h, d) {
       const m = new THREE.Mesh(new THREE.BoxGeometry(w + 0.12, h + 0.12, d + 0.12), new THREE.MeshBasicMaterial({ color: SEL_C, wireframe: true, transparent: true, opacity: 0.95 }));
@@ -5936,6 +6005,7 @@ function App() {
         build();
         rebN++;
       }
+      updateResizeOverlay(camera,group);
       updateEntranceNames(camera,group);
       updateSelectionHoldFeedback();
       drawPositionGuides(scene);
@@ -6006,6 +6076,7 @@ function App() {
       disposeWallLightingGuides();
       roundedFurnitureCache.forEach(g=>g?.dispose());roundedFurnitureCache.clear();
       renderer.dispose();
+      resizeLayer.remove();resizeButtons.clear();
       el.removeChild(renderer.domElement);
     };
   }, []);
