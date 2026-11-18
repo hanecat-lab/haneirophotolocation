@@ -1791,23 +1791,28 @@ function galleryGlazingMaterial(options) {
   material.customProgramCacheKey=()=> 'gallery-glazing-room-v1';
   return material;
 }
-// Warm floor: actual direct lights produce both diffuse and GGX specular.
-// The existing room field provides diffuse-only bounced light. There is no
-// synthetic room environment, fixed luminous panel, or projected light blob.
+// Warm floor: direct light, diffuse room bounce and rough room reflection
+// are separate paths. Reflection uses the actual room without luminous apertures.
+// No synthetic environment, fixed luminous panels or projected light blobs.
 function galleryFloorFinish(material,strength,theme,indirectUniforms){
   if(theme==='warm'){
     const previous=material.onBeforeCompile,key=material.customProgramCacheKey();
     material.userData.galleryFloorFinish=true;
-    material.userData.galleryFloorLighting='room-direct-and-indirect-v32';
+    material.userData.galleryFloorLighting='room-separated-lighting-v33';
+    const mirror={galleryFloorRoomImage:{value:null},galleryFloorRoomMatrix:{value:new THREE.Matrix4()},galleryFloorRoomReady:{value:0},galleryFloorRoomHeight:{value:0},galleryFloorRoomPixelsPerRadian:{value:1},galleryFloorRoomMaxMip:{value:8}};
+    material.userData.galleryFloorRoomReflection=mirror;
     material.onBeforeCompile=shader=>{
       previous.call(material,shader);
-      Object.assign(shader.uniforms,indirectUniforms);
-      shader.vertexShader='varying vec3 galleryFloorWorld;\n'+shader.vertexShader;
+      Object.assign(shader.uniforms,indirectUniforms,mirror);
+      shader.vertexShader='uniform mat4 galleryFloorRoomMatrix; varying vec3 galleryFloorWorld; varying vec4 galleryFloorRoomUV;\n'+shader.vertexShader;
       shader.vertexShader=shader.vertexShader.replace('#include <project_vertex>',
-        '#include <project_vertex>\ngalleryFloorWorld=(modelMatrix*vec4(transformed,1.0)).xyz;');
+        '#include <project_vertex>\ngalleryFloorWorld=(modelMatrix*vec4(transformed,1.0)).xyz;galleryFloorRoomUV=galleryFloorRoomMatrix*vec4(galleryFloorWorld,1.0);');
       shader.fragmentShader=`uniform highp sampler3D galleryIndirectField;
         uniform vec3 galleryFieldMin; uniform vec3 galleryFieldSize;
-        uniform float galleryFieldScale; varying vec3 galleryFloorWorld;\n`+shader.fragmentShader;
+        uniform float galleryFieldScale; varying vec3 galleryFloorWorld;
+        uniform sampler2D galleryFloorRoomImage; uniform float galleryFloorRoomReady; uniform float galleryFloorRoomHeight;
+        uniform float galleryFloorRoomPixelsPerRadian; uniform float galleryFloorRoomMaxMip;
+        varying vec4 galleryFloorRoomUV;\n`+shader.fragmentShader;
       // Add irradiance before RE_IndirectDiffuse applies the material BRDF.
       // PI converts the existing field's diffuse-radiance convention to irradiance.
       // This hook never modifies directDiffuse, directSpecular or clearcoat.
@@ -1821,8 +1826,28 @@ function galleryFloorFinish(material,strength,theme,indirectUniforms){
           vec3 galleryFloorBounce=texture(galleryIndirectField,galleryFloorFieldUV).rgb*galleryFieldScale;
           irradiance+=PI*galleryFloorBounce*galleryFloorUp;
         #endif`);
+      // The room image enters only the indirect-specular BRDF. Calling this
+      // with zero irradiance adds no diffuse illumination or extra spot light.
+      shader.fragmentShader=shader.fragmentShader.replace('#include <lights_fragment_end>',`#include <lights_fragment_end>
+        #ifdef RE_IndirectSpecular
+          if(galleryFloorRoomReady>.5 && galleryFloorRoomUV.w>0.0 && abs(galleryFloorWorld.y-galleryFloorRoomHeight)<.01){
+            vec3 roomWorldNormal=inverseTransformDirection(geometryNormal,viewMatrix);
+            vec2 roomUV=galleryFloorRoomUV.xy/galleryFloorRoomUV.w;
+            if(roomWorldNormal.y>.9 && all(greaterThan(roomUV,vec2(0.0))) && all(lessThan(roomUV,vec2(1.0)))){
+              float roomBorder=smoothstep(0.0,.015,min(min(roomUV.x,roomUV.y),min(1.0-roomUV.x,1.0-roomUV.y)));
+              float roomLod=clamp(log2(max(1.0,2.0*pow(material.roughness,2.0)*galleryFloorRoomPixelsPerRadian)),0.0,galleryFloorRoomMaxMip);
+              vec3 roomRadiance=textureLod(galleryFloorRoomImage,roomUV,roomLod).rgb*roomBorder;
+              vec3 roomCoatRadiance=vec3(0.0);
+              #ifdef USE_CLEARCOAT
+                float roomCoatLod=clamp(log2(max(1.0,2.0*pow(material.clearcoatRoughness,2.0)*galleryFloorRoomPixelsPerRadian)),0.0,galleryFloorRoomMaxMip);
+                roomCoatRadiance=textureLod(galleryFloorRoomImage,roomUV,roomCoatLod).rgb*roomBorder;
+              #endif
+              RE_IndirectSpecular(roomRadiance,vec3(0.0),roomCoatRadiance,geometryPosition,geometryNormal,geometryViewDir,geometryClearcoatNormal,material,reflectedLight);
+            }
+          }
+        #endif`);
     };
-    material.customProgramCacheKey=()=>key+'|warm-floor-room-lighting-v32';
+    material.customProgramCacheKey=()=>key+'|warm-floor-room-lighting-v33';
     return material;
   }
   // Preserve the white/black floor's existing planar reflection and finish.
@@ -1924,6 +1949,99 @@ function createGalleryGlazingReflection(renderer,scene,camera){
 }
 // With MSAA, pixel centers can lie outside a covered silhouette. Keep shadow
 // coordinates at a covered centroid so a ceiling-edge pixel cannot sample lit sky.
+// A separate, HDR room reflection for warm floors. No new lamps and no
+// compositing into outgoingLight: the material owns its physical reflectance.
+// Roughness selects a continuous mip footprint, rather than shifted frame copies.
+function createGalleryFloorRoomReflection(renderer,scene,camera){
+  const surfaces=[],virtual=new THREE.PerspectiveCamera(),matrix=new THREE.Matrix4();
+  let target=null,previous=null,lastPose='',last=-Infinity,dirty=true,failed=false;
+  const disable=()=>{for(const mesh of surfaces)mesh.material.userData.galleryFloorRoomReflection.galleryFloorRoomReady.value=0;};
+  const bind=()=>{
+    if(!previous||!target)return;
+    for(const mesh of surfaces){
+      const plane=galleryMirrorPlane(mesh);
+      if(plane.normal.dot(previous.normal)<.999||Math.abs(plane.origin.sub(previous.origin).dot(previous.normal))>.01)continue;
+      const u=mesh.material.userData.galleryFloorRoomReflection;
+      u.galleryFloorRoomImage.value=target.texture;u.galleryFloorRoomMatrix.value.copy(previous.matrix);
+      u.galleryFloorRoomHeight.value=previous.origin.y;
+      u.galleryFloorRoomPixelsPerRadian.value=target.height*.5*Math.abs(camera.projectionMatrix.elements[5]);
+      u.galleryFloorRoomMaxMip.value=Math.log2(target.height);u.galleryFloorRoomReady.value=1;
+    }
+  };
+  return {
+    register(mesh){
+      if(!mesh.material?.userData?.galleryFloorRoomReflection)return;
+      mesh.geometry.computeBoundingBox();
+      mesh.userData.galleryMirrorNormal=new THREE.Vector3(0,1,0);
+      mesh.userData.galleryMirrorPoint=new THREE.Vector3(0,mesh.geometry.boundingBox.max.y,0);
+      surfaces.push(mesh);dirty=true;
+    },
+    reset(){disable();surfaces.length=0;previous=null;lastPose='';dirty=true;},
+    update(now){
+      if(failed||!surfaces.length||typeof renderer.setRenderTarget!=='function')return false;
+      scene.updateMatrixWorld(true);camera.updateMatrixWorld(true);
+      const pose=camera.matrixWorld.elements.concat(camera.projectionMatrix.elements).map(x=>x.toFixed(5)).join(',');
+      if(!dirty&&pose===lastPose)return false;
+      if(target&&now-last<100)return false;
+      const frustum=new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse));
+      let chosen=null,score=0;
+      for(const mesh of surfaces){
+        if(!mesh.visible||!frustum.intersectsObject(mesh))continue;
+        let visible=true;for(let p=mesh.parent;p;p=p.parent)if(!p.visible)visible=false;
+        if(!visible)continue;
+        const plane=galleryMirrorPlane(mesh),delta=camera.position.clone().sub(plane.origin);
+        if(delta.dot(plane.normal)<=.015)continue;
+        const box=mesh.geometry.boundingBox,size=box.getSize(new THREE.Vector3());
+        const value=size.x*size.z/Math.max(.25,delta.lengthSq());
+        if(value>score){chosen=mesh;score=value;}
+      }
+      if(!chosen){disable();return false;}
+      let pending=false;scene.traverse(o=>{if(o.isLight&&o.castShadow&&o.shadow&&!o.shadow.map&&o.visible&&o.intensity>0)pending=true;});
+      if(pending||!galleryMirrorView(chosen,camera,virtual,matrix))return false;
+      if(!target){
+        try{
+          // Without a renderable HDR target, retain diffuse/direct specular;
+          // an LDR substitute would silently clip the reflected light energy.
+          if(!renderer.extensions.has('EXT_color_buffer_float')){failed=true;disable();return false;}
+          target=new THREE.WebGLRenderTarget(256,256,{type:THREE.HalfFloatType,minFilter:THREE.LinearMipmapLinearFilter,magFilter:THREE.LinearFilter,generateMipmaps:true,depthBuffer:true});
+          target.texture.colorSpace=THREE.LinearSRGBColorSpace;
+          target.texture.userData={cached:true,galleryFloorRoomReflection:true};
+        }catch{failed=true;disable();return false;}
+      }
+      const hidden=[],oldTarget=renderer.getRenderTarget(),viewport=renderer.getViewport(new THREE.Vector4());
+      const oldTone=renderer.toneMapping,oldSpace=renderer.outputColorSpace,oldXR=renderer.xr?.enabled;
+      const oldShadowAuto=renderer.shadowMap.autoUpdate,oldShadowDirty=renderer.shadowMap.needsUpdate;
+      const hide=o=>{if(o.visible){hidden.push(o);o.visible=false;}};
+      for(const mesh of surfaces)hide(mesh);
+      scene.traverse(o=>{
+        const d=o.userData||{};
+        // Direct spotlights already provide the luminous-aperture highlight.
+        // Keep those sources out of this room-only reflection to avoid counting twice.
+        if(o.isSprite||o.isLine||o.type==='ArrowHelper'||d.kind==='light'||d.fixtureDetail==='lens'||d.fixtureDetail==='faintLightBeam'||d.handle||d.selectionMarker||d.floorTileLines||d.positionGuide||d.lightBindingGuide||d.arrangeEndGuide||o.material?.wireframe||o.material?.userData?.galleryGlazing)hide(o);
+      });
+      let success=false;
+      try{
+        if(renderer.xr)renderer.xr.enabled=false;
+        renderer.toneMapping=THREE.NoToneMapping;renderer.outputColorSpace=THREE.LinearSRGBColorSpace;
+        renderer.shadowMap.autoUpdate=false;renderer.shadowMap.needsUpdate=false;
+        renderer.setRenderTarget(target);renderer.state?.buffers?.depth?.setMask(true);renderer.clear();renderer.render(scene,virtual);
+        success=true;
+      }catch{failed=true;disable();}
+      finally{
+        for(const o of hidden)o.visible=true;
+        renderer.toneMapping=oldTone;renderer.outputColorSpace=oldSpace;
+        renderer.shadowMap.autoUpdate=oldShadowAuto;renderer.shadowMap.needsUpdate=oldShadowDirty;
+        if(renderer.xr)renderer.xr.enabled=oldXR;
+        renderer.setRenderTarget(oldTarget);renderer.setViewport(viewport);
+      }
+      if(!success)return false;
+      disable();previous={...galleryMirrorPlane(chosen),matrix:matrix.clone()};bind();
+      dirty=false;lastPose=pose;last=now;return true;
+    },
+    dispose(){disable();target?.dispose();target=null;surfaces.length=0;previous=null;}
+  };
+}
+
 function galleryCentroidShadowChunk(source){
   return source.replace(/(^|\n)([ \t]*)varying[ \t]+vec4[ \t]+(v(?:DirectionalShadowCoord|SpotLightCoord|PointShadowCoord))\b/g,'$1$2centroid varying vec4 $3');
 }
@@ -3864,6 +3982,7 @@ function App() {
     scene.add(group);
     groupRef.current = group;
     const glazingReflection=createGalleryGlazingReflection(renderer,scene,camera);
+    const floorRoomReflection=createGalleryFloorRoomReflection(renderer,scene,camera);
     let resizePending = true, renderWidth = 0, renderHeight = 0;
     // ResizeObserver runs after animation callbacks in some browsers. Resizing
     // here clears WebGL's buffer after it was drawn, exposing an empty frame.
@@ -4122,6 +4241,7 @@ function App() {
     };
     const disposeGroup = () => {
       glazingReflection.reset();
+      floorRoomReflection.reset();
       group.traverse((o) => {
         if (o.userData && o.userData.keepRes) return;
         if(!o.geometry?.userData.galleryRoundedFurniture&&!o.geometry?.userData.galleryWoodGrain)o.geometry?.dispose();
@@ -5408,6 +5528,7 @@ function App() {
         spriteLabel(di.text, new THREE.Vector3(di.pos.x, di.pos.y + 1.05, di.pos.z), 1.45);
       }
       group.traverse(o=>{if(!o.isMesh)return;for(const mat of Array.isArray(o.material)?o.material:[o.material]){if(!mat?.isMeshStandardMaterial)continue;if(!mat.userData.gallerySoftShadow)gallerySoftShadowMaterial(mat,sunShadowParameters);gallerySpotProfile(mat);}});
+      group.traverse(o=>{if(o.isMesh)floorRoomReflection.register(o);});
       pruneFrameTex();
       frameFinishCache.forEach((maps,key)=>{if(!frameFinishUsed.has(key)){disposeFrameFinish(maps);frameFinishCache.delete(key);}});
       furnitureFinishCache.forEach((mat,key)=>{if(!furnitureFinishUsed.has(key)){mat.dispose();furnitureFinishCache.delete(key);}});
@@ -5686,6 +5807,7 @@ function App() {
       drawLightBindingGuides(scene);
       drawArrangeEndGuides(scene);
       drawWallLightingGuides(scene);
+      floorRoomReflection.update(now);
       glazingReflection.update(now);
       renderer.render(scene, camera);
       if(now-cameraLastSavedAtRef.current>1400){
@@ -5737,6 +5859,7 @@ function App() {
       sunLight.shadow.dispose();
       furnitureFinishCache.forEach(mat=>mat.dispose());furnitureFinishCache.clear();
       glazingReflection.dispose();
+      floorRoomReflection.dispose();
       woodGeometryCache.forEach(g=>g.dispose());woodGeometryCache.clear();
       indirectTexture.dispose();
       reflectionTarget?.dispose();
