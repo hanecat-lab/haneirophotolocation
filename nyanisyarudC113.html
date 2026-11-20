@@ -15415,7 +15415,7 @@ function fBaseCurrentStep(dt=1/60){
     THREE.MathUtils.smoothstep(Math.min(.28,fSteeringRecovery.elapsed+step),0,.28));
   const wideL=snowfieldWidenAt(s,-1),wideR=snowfieldWidenAt(s,1);
   const room=Math.max(0,3.05+(held<0?wideL:wideR)-Math.sign(held)*lateral);
-  const rate=fRateForForce(speed,force,base)*THREE.MathUtils.smoothstep(room,0,.9)*fEntryRateScale(s,held);
+  const rate=fRateForForce(speed,force,base)*THREE.MathUtils.smoothstep(room,0,.9);
   const command=fCommandStep(lateral,steeredLineVelocity,held,rate,3.05,wideL,wideR,step);
   return fYawStep(s,lateral,speed,pathHandling.heading,command.offset,step,force);
 }
@@ -15514,18 +15514,24 @@ function fStepUnwind(value,dt){
   fUnwind.t=neutral?fUnwind.t+dt:0;
   return fUnwindInput(value,lineHoldTLat);
 }
-// C113 F E1: from F_ENTRY_RATE.before metres ahead of a corner to its apex,
-// a steering input TOWARD the inside moves the command at F_ENTRY_RATE.scale
-// of the normal rate, so a held button reaches the inside later (later apex).
-// Outward input, exits and other physics modes are unchanged.
-// ?fentryrate=0.2..1 overrides the scale for tests.
-const F_ENTRY_RATE=(()=>{let k=.65;try{const v=parseFloat(new URLSearchParams(location.search).get('fentryrate'));
-  if(Number.isFinite(v)&&v>=.2&&v<=1)k=v;}catch(_){}return Object.freeze({scale:k,before:25});})();
-function fEntryRateScale(distance,value){
-  if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled()||Math.abs(value)<=.02||F_ENTRY_RATE.scale>=1)return 1;
+// C113 F A2: the player's brake sets the entry speed. When the brake is
+// released between F_ENTRY_HOLD.before m ahead of a corner and its apex, the
+// automatic throttle does not exceed that release speed until the apex.
+// It only withholds acceleration; it never brakes. ?fentryhold=0 disables.
+const F_ENTRY_HOLD=(()=>{let on=true;try{on=new URLSearchParams(location.search).get('fentryhold')!=='0';}catch(_){}
+  return Object.freeze({on,before:45});})();
+const fEntryHold={curve:null,corner:null,cap:null,braking:false};
+function fStepEntryHold(braking){
+  if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled()||!F_ENTRY_HOLD.on){Object.assign(fEntryHold,{curve:null,corner:null,cap:null,braking});return;}
   const corners=DRIVING_GUIDE_DATA.tracks[currentKey]?.corners||[];
-  const c=corners.find(x=>distance>=x.start-F_ENTRY_RATE.before&&distance<=getCornerDriveProfile(x).apex);
-  return c&&Math.sign(value)===(c.dir||1)?F_ENTRY_RATE.scale:1;
+  const c=corners.find(x=>s>=x.start-F_ENTRY_HOLD.before&&s<getCornerDriveProfile(x).apex)||null;
+  if(fEntryHold.curve!==curve||!c||fEntryHold.corner&&fEntryHold.corner!==c){fEntryHold.curve=curve;fEntryHold.corner=null;fEntryHold.cap=null;}
+  if(braking){fEntryHold.corner=null;fEntryHold.cap=null;}
+  else if(fEntryHold.braking&&c){fEntryHold.corner=c;fEntryHold.cap=speed;}
+  fEntryHold.braking=braking;
+}
+function fEntryHoldCap(){
+  return fEntryHold.corner&&fEntryHold.curve===curve&&Number.isFinite(fEntryHold.cap)?fEntryHold.cap:null;
 }
 function fDriftTireScale(){
   const c=fDriftHold.corner;
@@ -15706,7 +15712,7 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
       const base=fSteeringBaseRate(velocity,recoveryAllowed,THREE.MathUtils.smoothstep(elapsed,0,.28));
       const wideL=snowfieldWidenAt(distance,-1),wideR=snowfieldWidenAt(distance,1);
       const room=Math.max(0,3.05+(held<0?wideL:wideR)-Math.sign(held)*offset);
-      const rate=fRateForForce(velocity,turnForce,base)*THREE.MathUtils.smoothstep(room,0,.9)*fEntryRateScale(distance,held);
+      const rate=fRateForForce(velocity,turnForce,base)*THREE.MathUtils.smoothstep(room,0,.9);
       const nextCommand=fCommandStep(offset,command,held,rate,3.05,wideL,wideR,dt);
       let motion=fYawStep(distance,offset,velocity,heading,nextCommand.offset,dt,turnForce);
       command=nextCommand.velocity;
@@ -15768,18 +15774,21 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
   const targetRebased=!braking&&!safetyHold&&accepted.safe&&plan.accel>0
     &&currentLimit<plannedSpeed&&instantLimit>speed;
   const effectiveLimit=targetRebased?instantLimit:currentLimit;
-  const target=braking?0:safetyHold?Math.min(speed,effectiveLimit):effectiveLimit;
+  const baseTarget=braking?0:safetyHold?Math.min(speed,effectiveLimit):effectiveLimit;
+  const entryCap=braking?null:fEntryHoldCap();
+  const target=entryCap!==null&&baseTarget>speed?Math.min(baseTarget,Math.max(speed,entryCap)):baseTarget;
+  const entryHeld=target<baseTarget-1e-9;
   const result={currentCurvature:targetRebased?first.motion.curvature:currentCurvature,
     observedCurvature:currentCurvature,observedLimit:currentLimit,instantLimit,targetRebased,
     previewCurvature:accepted.previewCurvature,demandCurvature:accepted.demandCurvature,
     demandTire:instantTire,currentLimit:effectiveLimit,previewLimit:safetyHold?Math.min(speed,effectiveLimit):effectiveLimit,
-    physicalLimit:effectiveLimit,target,tire:targetRebased?instantTire:tire,instantTire,budget,force,tireScale,horizon,
+    physicalLimit:effectiveLimit,target,baseTarget,entryCapKmh:entryCap===null?null:entryCap*3.6,entryHeld,tire:targetRebased?instantTire:tire,instantTire,budget,force,tireScale,horizon,
     minClearance:accepted.minClearance,maxUndersteer:accepted.maxUndersteer,
     wallRisk:baseline.wallRisk,missedTurn:baseline.missedTurn,samples:accepted.samples,evaluations,
     forecastMethod:'shared-motion-time-budget',candidateSafe:accepted.safe,
     terminalTrackingError:accepted.terminalTrackingError,plannedAccel:plan.accel,planAuthority:plan.authority,
     reason:braking?'braking':baseline.wallRisk?'wall-forecast':baseline.missedTurn?'understeer-forecast':
-      wallHitCooldown>0?'wall-recovery':targetRebased?'current-step-release':plan.authority<1?'acceleration-feasibility':'current-grip'};
+      wallHitCooldown>0?'wall-recovery':entryHeld?'entry-hold':targetRebased?'current-step-release':plan.authority<1?'acceleration-feasibility':'current-grip'};
   result.limitAcceleration=(request,axis=normalAxis)=>{
     // Match the realized current tick, including any style transition or request clamp.
     const actualMotion={...first.motion,heading:pathHandling.heading,curvature:pathHandling.turnCurvature,
@@ -16718,7 +16727,7 @@ function stepSteeredLine(inputValue,rate,limit,dt,correction,response,externalVe
   const wideL=snowfieldWidenAt(s,-1),wideR=snowfieldWidenAt(s,1);
   if(!pathHandlingExcluded()&&!TRACKS[currentKey]?.skySlide&&!dragonOrdinary()){
     const room=Math.max(0,3.05+(input<0?wideL:wideR)-Math.sign(input)*lineHoldTLat);
-    rate=fSteeringCommandRate()*THREE.MathUtils.smoothstep(room,0,.9)*fEntryRateScale(s,input);limit=3.05;
+    rate=fSteeringCommandRate()*THREE.MathUtils.smoothstep(room,0,.9);limit=3.05;
   }
   const target=input*rate,tau=input ? .10 : .045;
   const gain=1-Math.exp(-step/tau);
@@ -22695,6 +22704,7 @@ function tick(dt,renderDt=dt){
   // linePhysicsATireForce(). Avoid applying the same wet-grip multiplier twice.
   // Keep excluded paths and every non-F mode on their original calculation.
   if(LINE_PHYSICS_MODE==='F'){if(pathExcluded)resetFDriftHold();else stepFDriftHold(dt);}
+  if(LINE_PHYSICS_MODE==='F')fStepEntryHold(isBraking);
   let fPathDrive=LINE_PHYSICS_MODE==='F'&&!pathExcluded?fPathDriveSnapshot(isBraking,dt,true):null;
   // C111: write the resolved F diagnostics after drift/style updates.
   const pathGripBase=fPathDrive?fPathDrive.currentLimit:pathExcluded?cornerGripSpeed(handlingCurvature):pathGripSpeed();
@@ -23281,7 +23291,7 @@ function tick(dt,renderDt=dt){
     forecastMethod:fPathDrive.forecastMethod,candidateSafe:fPathDrive.candidateSafe,
     plannedAccel:fPathDrive.plannedAccel,planAuthority:fPathDrive.planAuthority,
     observedCurvature:fPathDrive.observedCurvature,observedLimitKmh:fPathDrive.observedLimit*3.6,
-    instantLimitKmh:fPathDrive.instantLimit*3.6,targetRebased:Boolean(fPathDrive.targetRebased),
+    instantLimitKmh:fPathDrive.instantLimit*3.6,targetRebased:Boolean(fPathDrive.targetRebased),entryCapKmh:fPathDrive.entryCapKmh,entryHeld:Boolean(fPathDrive.entryHeld),
     instantCurvature:fPathDrive.instantTire?fPathDrive.samples?.[0]?.curvature:null,
     evaluations:fPathDrive.evaluations,terminalTrackingError:fPathDrive.terminalTrackingError}:null;
   const c6PostManualTarget=(C6_DIAG_ENABLED||C10_DIAG_ENABLED)?tSpd:0;
