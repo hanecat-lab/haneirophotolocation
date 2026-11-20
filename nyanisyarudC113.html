@@ -15408,7 +15408,7 @@ function resetFDriftHold(){Object.assign(fDriftHold,{curve:null,corner:null,extr
 // Read-only: it never advances steering, receipts, input or clocks.
 function fBaseCurrentStep(dt=1/60){
   const force=linePhysicsATireForce(false);
-  const held=Math.abs(steerInput)>.02?steerInput:0;
+  const held=fUnwindInput(Math.abs(steerInput)>.02?steerInput:0,lateral);
   const horizon=Math.min(.38,10/Math.max(speed*.62,3));
   const step=Math.max(.00001,Math.min(.1,dt,horizon));
   const base=fSteeringBaseRate(speed,fOrdinarySteeringAllowed(),
@@ -15491,6 +15491,28 @@ function fScrubDecel(){
   if(!(slip>0)||!(F_SCRUB.k>0))return 0;
   const force=linePhysicsATireForce(false,fDriftTireScale());
   return Math.min(F_SCRUB.maxDecel,F_SCRUB.k*force*.62*Math.sin(slip));
+}
+// C113 F B1: after the apex, a neutral steering input lets the command
+// drift toward the outside at F_UNWIND.rate (as an unwound wheel would),
+// up to F_UNWIND.stopOutside from the centre, until corner end + until.
+// Braking or any steering input keeps the existing behaviour.
+const F_UNWIND=Object.freeze({rate:1.2,ramp:.5,stopOutside:2.2,until:6});
+const fUnwind={t:0};
+function fUnwindCorner(position=s){
+  const corners=DRIVING_GUIDE_DATA.tracks[currentKey]?.corners||[];
+  return corners.find(c=>position>getCornerDriveProfile(c).apex&&position<=c.end+F_UNWIND.until)||null;
+}
+function fUnwindInput(value,offset,ramp=THREE.MathUtils.smoothstep(fUnwind.t,0,F_UNWIND.ramp)){
+  if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled()||Math.abs(value)>.02||input.brake||input.brakePressed)return value;
+  const c=fUnwindCorner();if(!c||!(ramp>0))return value;
+  const dir=c.dir||1;if(offset*dir<=-F_UNWIND.stopOutside)return 0;
+  const rate=Math.max(.1,fSteeringCommandRate());
+  return -dir*Math.min(1,F_UNWIND.rate/rate)*ramp;
+}
+function fStepUnwind(value,dt){
+  const neutral=LINE_PHYSICS_MODE==='F'&&linePhysicsBEnabled()&&Math.abs(value)<=.02&&!input.brake&&!input.brakePressed&&Boolean(fUnwindCorner());
+  fUnwind.t=neutral?fUnwind.t+dt:0;
+  return fUnwindInput(value,lineHoldTLat);
 }
 function fDriftTireScale(){
   const c=fDriftHold.corner;
@@ -15633,7 +15655,7 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
     resolve:()=>fPathDriveSnapshot(braking,stepDt,false)};
   const initial={s,lateral,speed,heading:pathHandling.heading,command:steeredLineVelocity,
     front:fBrakeLoad.front,extra:fDriftHold.extra,owner:fDriftHold.corner,under:pathHandling.understeer};
-  const held=Math.abs(steerInput)>.02?steerInput:0;
+  const held=fUnwindInput(Math.abs(steerInput)>.02?steerInput:0,lateral);
   const horizon=Math.min(.38,10/Math.max(speed*.62,3));
   const firstDt=Math.max(.00001,Math.min(.1,stepDt,horizon));
   const startWalls=roadWallsAt(s),startClearance=Math.min(lateral-startWalls.left,startWalls.right-lateral);
@@ -16676,7 +16698,9 @@ function stepSteeredLine(inputValue,rate,limit,dt,correction,response,externalVe
     limit=THREE.MathUtils.lerp(steeredHandoffLimit,limit,blend);
   }
   steeredCommandRate=rate;steeredCommandLimit=limit;
-  const input=Math.abs(inputValue)>.02?inputValue:0;
+  let input=Math.abs(inputValue)>.02?inputValue:0;
+  // C113 F B1: neutral exit unwind (no-op outside F / exits / with input).
+  if(LINE_PHYSICS_MODE==='F'&&linePhysicsBEnabled())input=fStepUnwind(input,step);
   // 雪原越えの大雪原は、広げた壁の分だけ外へ寄れる
   const wideL=snowfieldWidenAt(s,-1),wideR=snowfieldWidenAt(s,1);
   if(!pathHandlingExcluded()&&!TRACKS[currentKey]?.skySlide&&!dragonOrdinary()){
