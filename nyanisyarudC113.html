@@ -15531,7 +15531,28 @@ function fStepEntryHold(braking){
   fEntryHold.braking=braking;
 }
 function fEntryHoldCap(){
+  // C113 F: a meat slide keeps its own acceleration (drift feel); see F_SLIDE_GUARD.
+  if(isSliding)return null;
   return fEntryHold.corner&&fEntryHold.curve===curve&&Number.isFinite(fEntryHold.cap)?fEntryHold.cap:null;
+}
+// C113 F: a neutral steering input settles the meat slide only after
+// F_SLIDE_NEUTRAL s (legacy .16 s), so releasing at the apex keeps the drift.
+const F_SLIDE_NEUTRAL=.4;
+// C113 F: during a meat slide the automatic throttle may accelerate, but not
+// beyond F_SLIDE_GUARD.margin x the grip speed (current force, earned hold
+// included) of a TIGHTENING road ahead at the current offset. Never brakes.
+const F_SLIDE_GUARD=(()=>{let m=1.06;try{const v=parseFloat(new URLSearchParams(location.search).get('fslidemargin'));
+  if(Number.isFinite(v)&&v>=1&&v<=1.3)m=v;}catch(_){}return Object.freeze({seconds:1.3,step:2,minDistance:12,tighten:1.05,margin:m});})();
+function fSlideGuardCap(force){
+  const G=F_SLIDE_GUARD,reach=Math.max(G.minDistance,speed*.62*G.seconds);
+  const k0=roadBendAt(s),here=Math.abs(k0)/THREE.MathUtils.clamp(1-k0*lateral,.3,1.8);
+  let cap=Infinity;
+  for(let d=G.step;d<=reach+1e-9;d+=G.step){
+    const k=roadBendAt(Math.min(totalLength,s+d)),curvature=Math.abs(k)/THREE.MathUtils.clamp(1-k*lateral,.3,1.8);
+    if(curvature<=here*G.tighten)continue;
+    cap=Math.min(cap,Math.sqrt(force/(curvature+.001)));
+  }
+  return Number.isFinite(cap)?THREE.MathUtils.clamp(cap*G.margin,8,TOP_SPEED):null;
 }
 function fDriftTireScale(){
   const c=fDriftHold.corner;
@@ -15776,19 +15797,22 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
   const effectiveLimit=targetRebased?instantLimit:currentLimit;
   const baseTarget=braking?0:safetyHold?Math.min(speed,effectiveLimit):effectiveLimit;
   const entryCap=braking?null:fEntryHoldCap();
-  const target=entryCap!==null&&baseTarget>speed?Math.min(baseTarget,Math.max(speed,entryCap)):baseTarget;
-  const entryHeld=target<baseTarget-1e-9;
+  let target=entryCap!==null&&baseTarget>speed?Math.min(baseTarget,Math.max(speed,entryCap)):baseTarget;
+  const slideCap=!braking&&isSliding?fSlideGuardCap(force):null;
+  const guarded=slideCap!==null&&target>speed?Math.min(target,Math.max(speed,slideCap)):target;
+  const slideGuarded=guarded<target-1e-9;target=guarded;
+  const entryHeld=!slideGuarded&&target<baseTarget-1e-9;
   const result={currentCurvature:targetRebased?first.motion.curvature:currentCurvature,
     observedCurvature:currentCurvature,observedLimit:currentLimit,instantLimit,targetRebased,
     previewCurvature:accepted.previewCurvature,demandCurvature:accepted.demandCurvature,
     demandTire:instantTire,currentLimit:effectiveLimit,previewLimit:safetyHold?Math.min(speed,effectiveLimit):effectiveLimit,
-    physicalLimit:effectiveLimit,target,baseTarget,entryCapKmh:entryCap===null?null:entryCap*3.6,entryHeld,tire:targetRebased?instantTire:tire,instantTire,budget,force,tireScale,horizon,
+    physicalLimit:effectiveLimit,target,baseTarget,entryCapKmh:entryCap===null?null:entryCap*3.6,entryHeld,slideGuardKmh:slideCap===null?null:slideCap*3.6,slideGuarded,tire:targetRebased?instantTire:tire,instantTire,budget,force,tireScale,horizon,
     minClearance:accepted.minClearance,maxUndersteer:accepted.maxUndersteer,
     wallRisk:baseline.wallRisk,missedTurn:baseline.missedTurn,samples:accepted.samples,evaluations,
     forecastMethod:'shared-motion-time-budget',candidateSafe:accepted.safe,
     terminalTrackingError:accepted.terminalTrackingError,plannedAccel:plan.accel,planAuthority:plan.authority,
     reason:braking?'braking':baseline.wallRisk?'wall-forecast':baseline.missedTurn?'understeer-forecast':
-      wallHitCooldown>0?'wall-recovery':entryHeld?'entry-hold':targetRebased?'current-step-release':plan.authority<1?'acceleration-feasibility':'current-grip'};
+      wallHitCooldown>0?'wall-recovery':slideGuarded?'slide-guard':entryHeld?'entry-hold':targetRebased?'current-step-release':plan.authority<1?'acceleration-feasibility':'current-grip'};
   result.limitAcceleration=(request,axis=normalAxis)=>{
     // Match the realized current tick, including any style transition or request clamp.
     const actualMotion={...first.motion,heading:pathHandling.heading,curvature:pathHandling.turnCurvature,
@@ -22870,7 +22894,7 @@ function tick(dt,renderDt=dt){
 
     // おかわり肉球(D6)
     if(input.driftJustPressed&&meatRefillReady()){meatRefillUsed=true;slideTime=MEAT_REFILL.resume;slideNeutralTime=0;playSfx('judgeGood');}
-    if(!slideExitActive && ((slideTime>=.35&&slideNeutralTime>=.16)||slideTime>=MEAT_FEEDBACK.duration)){
+    if(!slideExitActive && ((slideTime>=.35&&slideNeutralTime>=(LINE_PHYSICS_MODE==='F'&&linePhysicsBEnabled()?F_SLIDE_NEUTRAL:.16))||slideTime>=MEAT_FEEDBACK.duration)){
       slideExitActive=true;slideExitTime=0;
       if(slideTime>=MEAT_FEEDBACK.duration||meatPerfectHold>=MEAT_EXIT.perfectHold){
       // 終了時にPERFECTなら肉球ブースト
@@ -23291,7 +23315,7 @@ function tick(dt,renderDt=dt){
     forecastMethod:fPathDrive.forecastMethod,candidateSafe:fPathDrive.candidateSafe,
     plannedAccel:fPathDrive.plannedAccel,planAuthority:fPathDrive.planAuthority,
     observedCurvature:fPathDrive.observedCurvature,observedLimitKmh:fPathDrive.observedLimit*3.6,
-    instantLimitKmh:fPathDrive.instantLimit*3.6,targetRebased:Boolean(fPathDrive.targetRebased),entryCapKmh:fPathDrive.entryCapKmh,entryHeld:Boolean(fPathDrive.entryHeld),
+    instantLimitKmh:fPathDrive.instantLimit*3.6,targetRebased:Boolean(fPathDrive.targetRebased),entryCapKmh:fPathDrive.entryCapKmh,entryHeld:Boolean(fPathDrive.entryHeld),slideGuardKmh:fPathDrive.slideGuardKmh,slideGuarded:Boolean(fPathDrive.slideGuarded),
     instantCurvature:fPathDrive.instantTire?fPathDrive.samples?.[0]?.curvature:null,
     evaluations:fPathDrive.evaluations,terminalTrackingError:fPathDrive.terminalTrackingError}:null;
   const c6PostManualTarget=(C6_DIAG_ENABLED||C10_DIAG_ENABLED)?tSpd:0;
