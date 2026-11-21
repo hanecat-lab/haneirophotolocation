@@ -15554,6 +15554,29 @@ function fSlideGuardCap(force){
   }
   return Number.isFinite(cap)?THREE.MathUtils.clamp(cap*G.margin,8,TOP_SPEED):null;
 }
+// C113 F: visual drift tail. When a meat slide settles inside a corner, the
+// body yaw/bank and tyre smoke keep the drift look until F_DRIFT_TAIL.hold m
+// before the corner end, then unwind by F_DRIFT_TAIL.unwind m before it.
+// Presentation only: slide state, grading, links, bonus and physics are unchanged.
+const F_DRIFT_TAIL=Object.freeze({hold:12,unwind:2,maxDeg:30});
+const fDriftTail={curve:null,corner:null,dir:0,yaw:0,start:0};
+function captureFDriftTail(){
+  fDriftTail.corner=null;
+  if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled())return;
+  const c=(DRIVING_GUIDE_DATA.tracks[currentKey]?.corners||[]).find(x=>s>=x.start-8&&s<x.end-F_DRIFT_TAIL.unwind);
+  if(!c||!slideDir)return;
+  Object.assign(fDriftTail,{curve,corner:c,dir:slideDir,start:s,
+    yaw:THREE.MathUtils.degToRad(Math.min(F_DRIFT_TAIL.maxDeg,12+slideTime*6))});
+}
+function fDriftTailFade(){
+  const c=fDriftTail.corner;
+  if(!c||fDriftTail.curve!==curve||LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled()||isBrakingDrift||wallHitCooldown>0)return 0;
+  if(isSliding&&!slideExitActive)return 0;
+  const end=c.end-F_DRIFT_TAIL.unwind,from=Math.max(fDriftTail.start,c.end-F_DRIFT_TAIL.hold);
+  if(s<fDriftTail.start-1||s>=end){fDriftTail.corner=null;return 0;}
+  return 1-THREE.MathUtils.smoothstep(s,from,end);
+}
+function fDriftTailVisual(){return fDriftTailFade()>.3;}
 function fDriftTireScale(){
   const c=fDriftHold.corner;
   const fade=c?1-THREE.MathUtils.smoothstep(s,c.end,c.end+18):0;
@@ -16772,7 +16795,7 @@ function stepSteeredLine(inputValue,rate,limit,dt,correction,response,externalVe
   steeredLineOffset=THREE.MathUtils.lerp(steeredLineOffset,correction,Math.min(1,step*response));
   return lineHoldTLat+steeredLineOffset;
 }
-function resetSlideExit(){if(LINE_PHYSICS_MODE==='F')fMeatPoseScale=1;slideDriveCorner=findDriveCorner();if(LINE_PHYSICS_MODE==='F')captureFMeatEntry(slideDriveCorner);slideNeutralTime=0;slideExitActive=false;slideExitTime=0;slideLastKTech=1;window._prevSlideSpeed=undefined;resetSoloSlide();resetMeatAssessment();}
+function resetSlideExit(){fDriftTail.corner=null;if(LINE_PHYSICS_MODE==='F')fMeatPoseScale=1;slideDriveCorner=findDriveCorner();if(LINE_PHYSICS_MODE==='F')captureFMeatEntry(slideDriveCorner);slideNeutralTime=0;slideExitActive=false;slideExitTime=0;slideLastKTech=1;window._prevSlideSpeed=undefined;resetSoloSlide();resetMeatAssessment();}
 // A successful drift belongs to one corner, independently of its animation
 // and of the 1200 ms input-link window. Geometry is sampled once per curve.
 // Shared handling budget. Steering never removes sustained overspeed push.
@@ -20272,7 +20295,7 @@ function updateBrakeDriftVisual(dt){
   const target=pressed?(isBrakingDrift?1:.45):0;
   state.amount=THREE.MathUtils.lerp(state.amount,target,1-Math.exp(-dt*(pressed?20:12)));
   // 肉球ドリフトで滑っている間も、ブレーキドリフトと同じ踏ん張る姿勢で脚を止める(約0.12秒で寄せ、終わったら戻す)
-  const sliding=isSliding&&!slideExitActive&&speed>2.5;
+  const sliding=(isSliding&&!slideExitActive||fDriftTailVisual())&&speed>2.5;
   state.slide=THREE.MathUtils.lerp(state.slide||0,sliding?1:0,1-Math.exp(-dt*(sliding?20:12)));
   const pose=catPoseAmount();
   state.tail=THREE.MathUtils.lerp(state.tail,pose,1-Math.exp(-dt*7));
@@ -22895,7 +22918,7 @@ function tick(dt,renderDt=dt){
     // おかわり肉球(D6)
     if(input.driftJustPressed&&meatRefillReady()){meatRefillUsed=true;slideTime=MEAT_REFILL.resume;slideNeutralTime=0;playSfx('judgeGood');}
     if(!slideExitActive && ((slideTime>=.35&&slideNeutralTime>=(LINE_PHYSICS_MODE==='F'&&linePhysicsBEnabled()?F_SLIDE_NEUTRAL:.16))||slideTime>=MEAT_FEEDBACK.duration)){
-      slideExitActive=true;slideExitTime=0;
+      slideExitActive=true;slideExitTime=0;captureFDriftTail();
       if(slideTime>=MEAT_FEEDBACK.duration||meatPerfectHold>=MEAT_EXIT.perfectHold){
       // 終了時にPERFECTなら肉球ブースト
       try{
@@ -23167,6 +23190,8 @@ function tick(dt,renderDt=dt){
       if(LINE_PHYSICS_MODE==='F'&&linePhysicsBEnabled())fMeatPoseScale=1-unwind;
     }
   }
+  // C113 F: drift-tail pose after the slide has settled (presentation only).
+  {const fade=fDriftTailFade();if(fade>0){tRel=THREE.MathUtils.lerp(tRel,fDriftTail.dir*fDriftTail.yaw,fade);tBank=THREE.MathUtils.lerp(tBank,fDriftTail.dir*.45,fade);}}
   if(pathExcluded){
   // The handling limit opens with a successful exit; it never attracts to the
   // inside. Nyansapo handles excess speed by braking, Gachi by user braking.
@@ -23733,6 +23758,15 @@ function tick(dt,renderDt=dt){
         }catch(e){}
       }catch(e){}
     }
+    if(smokeTimer<=0){
+      smokeTimer=0.08;
+      const track=getTrackAtDist(s); const worldPos=track.p.clone().add(track.n.clone().multiplyScalar(lateral));
+      spawnSmoke(worldPos.clone().add(new THREE.Vector3((Math.random()-0.5)*0.6,0,(Math.random()-0.5)*0.6)),{pawTrail:true});
+    }
+  }
+  // C113 F: drift-tail smoke only (no skid stamps or kawaii score).
+  if(!(isSliding&&!slideExitActive)&&fDriftTailVisual()&&speed>8){
+    smokeTimer-=dt;
     if(smokeTimer<=0){
       smokeTimer=0.08;
       const track=getTrackAtDist(s); const worldPos=track.p.clone().add(track.n.clone().multiplyScalar(lateral));
