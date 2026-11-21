@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // nyanisyarud F-physics regression suite (real input path: joystick/keys -> pollKeys -> tick).
-// Usage: node run.js [--target ../../nyanisyarudC113.html] [--ref <older build>] [--update] [--only a,b]
+// Usage: node run.js [--target ../../nyanisyarudC113.html] [--baseline baseline.json] [--ref <older build>] [--update] [--only a,b]
 // Groups: nonf (needs --ref), digital, meat, theory, shortcut, swipe, c8.
 // --update writes baseline.json from the target; otherwise results are compared to it.
 const fs=require('fs');const path=require('path');const {load}=require('./lib/load.js');
 const arg=(k,d)=>{const i=process.argv.indexOf(k);return i>0?process.argv[i+1]:d;};
 const TARGET=path.resolve(arg('--target',path.join(__dirname,'../../nyanisyarudC113.html')));
 const REF=arg('--ref',null),UPDATE=process.argv.includes('--update');
+const BASE=path.resolve(__dirname,arg('--baseline','baseline.json'));
 const ONLY=(arg('--only','')||'').split(',').filter(Boolean);
 const want=g=>!ONLY.length||ONLY.includes(g);
 const HARNESS=fs.readFileSync(path.join(__dirname,'lib/harness_page.js'),'utf8');
@@ -70,9 +71,9 @@ const groups={
 (async()=>{
   const names=Object.keys(groups).filter(want);
   const results=Object.fromEntries(await Promise.all(names.map(async n=>[n,await groups[n]()])));
-  const base=fs.existsSync(path.join(__dirname,'baseline.json'))?JSON.parse(fs.readFileSync(path.join(__dirname,'baseline.json'),'utf8')):{};
+  const base=fs.existsSync(BASE)?JSON.parse(fs.readFileSync(BASE,'utf8')):{};
   fs.writeFileSync(path.join(__dirname,'results.json'),JSON.stringify(results,null,1));
-  if(UPDATE){fs.writeFileSync(path.join(__dirname,'baseline.json'),JSON.stringify({...base,...results},null,1));console.log('baseline updated:',names.join(','));}
+  if(UPDATE){fs.writeFileSync(BASE,JSON.stringify({...base,...results},null,1));console.log('baseline updated:',names.join(','));}
   let fail=0;const say=(ok,msg)=>{if(!ok)fail++;console.log((ok?'PASS ':'FAIL ')+msg);};
   if(results.nonf&&!results.nonf.skipped)for(const [q,v] of Object.entries(results.nonf))say(v.identical,`nonf ${q}: ${v.n} runs identical to --ref`);
   if(results.swipe){const k=results.swipe.keyboard,w=results.swipe.swipe;
