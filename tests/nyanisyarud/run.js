@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // nyanisyarud F-physics regression suite (real input path: joystick/keys -> pollKeys -> tick).
 // Usage: node run.js [--target ../../nyanisyarudC113.html] [--ref <older build>] [--update] [--only a,b]
-// Groups: nonf (needs --ref), digital, meat, theory, shortcut, swipe.
+// Groups: nonf (needs --ref), digital, meat, theory, shortcut, swipe, c8.
 // --update writes baseline.json from the target; otherwise results are compared to it.
 const fs=require('fs');const path=require('path');const {load}=require('./lib/load.js');
 const arg=(k,d)=>{const i=process.argv.indexOf(k);return i>0?process.argv[i+1]:d;};
@@ -56,6 +56,12 @@ const groups={
         if(r.jumped){jumped++;const k=r.attempt?.rank||'?';ranks[k]=(ranks[k]||0)+1;}}
       return {jumped,n,ranks};});
   },
+  async c8(){
+    const src=fs.readFileSync(path.join(__dirname,'lib/c8_page.js'),'utf8');
+    return withPage(TARGET,F,src,async p=>{const r=[];
+      for(const a of [[-1.8,-25,-12,110],[-1.8,-20,-6,110],[-1.8,-15,-2,100],[2.4,-25,-12,110],[2.4,-20,-6,110]])r.push({case:a,...await p.evaluate(a=>window.__C8(...a),a)});
+      return r;});
+  },
   async swipe(){
     const src=fs.readFileSync(path.join(__dirname,'lib/swipe_page.js'),'utf8');
     return withPage(TARGET,F,src,async p=>({keyboard:await p.evaluate(()=>window.__SW('keyboard')),swipe:await p.evaluate(()=>window.__SW('swipe'))}));
@@ -71,6 +77,8 @@ const groups={
   if(results.nonf&&!results.nonf.skipped)for(const [q,v] of Object.entries(results.nonf))say(v.identical,`nonf ${q}: ${v.n} runs identical to --ref`);
   if(results.swipe){const k=results.swipe.keyboard,w=results.swipe.swipe;
     say(Boolean(w.link)&&w.brakeType===k.brakeType&&w.sliding,`swipe: brake ${w.brakeType}/${k.brakeType}, link ${w.link}/${k.link}, sliding ${w.sliding}`);}
+  if(results.c8){const r=results.c8;
+    say(r.slice(0,4).every(x=>x.grade&&!x.jump)&&r[4].jump,`c8: grades ${r.map(x=>x.jump?'JUMP':(x.grade||'-')).join(',')} (outside/early releases graded; inside release in the takeoff window jumps)`);}
   if(results.shortcut){const b=base.shortcut;say(!b||results.shortcut.jumped>=b.jumped,`shortcut: jumped ${results.shortcut.jumped}/${results.shortcut.n} (baseline ${b?b.jumped:'-'}) ${JSON.stringify(results.shortcut.ranks)}`);}
   for(const g of ['digital','meat']){if(!results[g])continue;const b=base[g];
     const tot=results[g].reduce((a,x)=>a+x.time,0),walls=results[g].reduce((a,x)=>a+x.wall,0);
