@@ -12,21 +12,22 @@ function lineTarget(d,c,P){
   if(d<apex)return dir*(-P.outer+(P.inner+P.outer)*smooth(d,turnIn,apex));
   return dir*(P.inner+(-P.exitLat-P.inner)*smooth(d,apex,exit));
 }
-function setup(){
+function setup(track='irohaLocal'){
   const lt=document.getElementById('launchTitle');if(lt)lt.hidden=true;
-  if(currentKey!=='irohaLocal')rebuildTrack('irohaLocal');
+  if(currentKey!==track)rebuildTrack(track);
   if(catModel!=='nekomata')setCatModel('nekomata');
   if(driveMode!=='gachiTouge')setDriveMode('gachiTouge');
 }
 function run(P){
-  setup();
+  const track=P.track||'irohaLocal';setup(track);
   if(gameState!=='ready')resetRace();
   if(racePause.on)setPause(false);
   const app=document.getElementById('app');app.dataset.raceMenu='off';
   startRace();
   if(gameState!=='racing')return {ok:false,error:'not racing',gs:gameState};
   countdown.active=false;
-  const c=DRIVING_GUIDE_DATA.tracks.irohaLocal.corners.find(x=>x.number===P.corner);
+  const c=DRIVING_GUIDE_DATA.tracks[track].corners.find(x=>x.number===P.corner);
+  if(P.VeFactor){let kmax=0;for(let d=c.start;d<=c.end;d+=2)kmax=Math.max(kmax,Math.abs(roadBendAt(d)));P={...P,Ve:cornerGripSpeed(kmax)*3.6*P.VeFactor};}
   const dt=1/60;
   s=c.start-P.spawnBack;lateral=lineTarget(s,c,P);speed=P.spawnKmh/3.6;elapsed=0;simulationElapsed=0;
   resetPathHandling();resetSteeredLine();resetCornerPace();resetCornerDrive();
@@ -36,7 +37,7 @@ function run(P){
   let t=0,wall=0,lastCooldown=0,frames=0,brakeSec=0,scrubSum=0,underMax=0,minKmh=1e9,entry=null,exit=null,apexKmh=null;
   let slideOut=0,slideT=0,prevLat=null,latProf={pushMin:9,exit10:null,exit30:null},exitStats={reasons:{},t:0,accelSum:0,ordSum:0,planSum:0},brakeTurn={t:0,kmh:0,over:0},bdFrames=0,quals={},brakeType=null,linkFlag=null;let lastBrake=false,brakeRelease=null,pawStart=null,pawDone=false,lv=0,maxScale=1,receipt=null,slid=0,maxExcess=0;
   const trace=[];
-  let prevS=s,prevT=0;
+  let prevS=s,prevT=0,fOn=0,fFrames=0;
   while(s<finish&&t<30&&gameState==='racing'){prevS=s;prevT=t;
     lv=pathHandling.ready?pathHandling.lateralVelocity:0;
     const look=P.look,target=lineTarget(s+speed*.62*look,c,P),proj=lateral+lv*look;
@@ -62,7 +63,7 @@ function run(P){
     if(lastBrake&&!brake&&brakeRelease===null)brakeRelease=t;
     lastBrake=brake;
     clock.ms+=dt*1000;
-    advanceGameFrame(dt);
+    advanceGameFrame(dt);fFrames++;if(linePhysicsBEnabled())fOn++;
     t+=dt;frames++;if(brake)brakeSec+=dt;if(isSliding)slid+=dt;
     if(wallHitCooldown>lastCooldown+1e-6)wall++;lastCooldown=wallHitCooldown;
     const d=fC94DriveDiag;if(d){scrubSum+=(d.scrubDecel||0)*dt;underMax=Math.max(underMax,d.understeer||0);maxScale=Math.max(maxScale,d.tireScale||1);}
@@ -81,7 +82,7 @@ function run(P){
   }
   input.brake=false;input.drift=false;joyVec.x=0;joyActive=false;
   const tf=s>=finish&&s>prevS?prevT+(t-prevT)*(finish-prevS)/(s-prevS):t;
-  return {ok:s>=finish,time:tf,wall,entry,exit,finishKmh:speed*3.6,minKmh,brakeSec,scrubLossKmh:scrubSum*3.6,underMax,maxScale,receipt,slid,quals,brakeType,linkFlag,bdFrames,brakeTurn,exitStats,latProf,slideOut,slideT,
+  return {ok:s>=finish,time:tf,fOnShare:fFrames?fOn/fFrames:0,Ve:P.Ve,wall,entry,exit,finishKmh:speed*3.6,minKmh,brakeSec,scrubLossKmh:scrubSum*3.6,underMax,maxScale,receipt,slid,quals,brakeType,linkFlag,bdFrames,brakeTurn,exitStats,latProf,slideOut,slideT,
     coreTime:exit&&entry?exit.t-entry.t:null,afterTime:exit?t-exit.t:null,trace:P.trace?trace:undefined};
 }
 window.__H={run,lineTarget};
