@@ -8708,7 +8708,11 @@ function buildBay777Scenery(def){
 // C114 F: 湾岸777の大橋の仕掛け(物理F・普通猫・ガチ峠のときだけ)
 // 前半：横風ゾーン(突風が横方向の指令を押し流す。当て舵で車線を保つ)
 // 後半：工事車線のスラローム(片側の車線を柵でふさぎ、壁を道の中心付近まで寄せる)
-const F_BAY777=Object.freeze({wind:2.0,gustLen:110,warn:100,gusts:4,closures:4,closeLen:60,taper:20,closeGap:100,closedEdge:.4});
+// works：工事区間の並び(K=片側ふさぎ、S=S字にうねるコーンの通り道)。料金所の門の手前workEnd mまで続ける
+// S字：通り道の中心が振幅snakeAmp m・波長snakeWave mで2波うねる。幅は±snakeHalf m(コーンは柵ではないので物理Fの壁沿いの制限で自動ではよけない)
+const F_BAY777=Object.freeze({wind:(()=>{try{const v=parseFloat(new URLSearchParams(location.search).get('fbaywind'));if(Number.isFinite(v))return v;}catch(_){}return 5.5;})(),gustLen:140,warn:100,gusts:4,
+  works:['K','K','S','K','K','S'],closeLen:50,taper:20,closedEdge:.4,workEnd:40,
+  snakeAmp:2.0,snakeWave:170,snakeWaves:2,snakeRamp:30,snakeHalf:1.4,catHalf:.5,coneEvery:25});
 let fBay777PlanCache=null;
 function fBay777GimmickOn(){
   return LINE_PHYSICS_MODE==='F'&&currentKey==='bay777'&&driveMode==='gachiTouge'&&Boolean(TRACKS.bay777?.bay777)&&linePhysicsBEnabled();
@@ -8722,10 +8726,15 @@ function fBay777Plan(){
   const B=F_BAY777,gusts=[],closures=[];
   const g0=bridgeIn+150,g1=c5.start-60;
   for(let i=0;i<B.gusts;i++){const from=g0+(g1-g0-B.gustLen)*(i+.5)/B.gusts;gusts.push({i,from,to:from+B.gustLen,dir:i%2?1:-1});}
-  const z0=c5.end+80,span=B.closures*(B.closeLen+2*B.taper)+(B.closures-1)*B.closeGap,z1=Math.min(bridgeOut-60,z0+span);
-  const step=(z1-z0)/B.closures;
-  for(let i=0;i<B.closures;i++){const from=z0+i*step;closures.push({i,from,to:from+B.closeLen+B.taper,side:i%2?-1:1});}
-  fBay777PlanCache={curve,bridgeIn,bridgeOut,gusts,closures,windZone:[g0-B.warn,g1],workZone:[z0,closures[closures.length-1].to]};
+  // 工事区間：C5の出口から料金所の門(ヘアピンのtollBefore m手前)の手前まで。区間の間のすき間は等しく割る
+  const snakes=[],gate=indexDistance(curve,def.points,def.bay777.marks.hairpin)-BAY777.tollBefore;
+  const z0=c5.end+80,z1=gate-B.workEnd,kLen=B.closeLen+B.taper,sLen=2*B.snakeRamp+B.snakeWaves*B.snakeWave;
+  const used=B.works.reduce((a,w)=>a+(w==='K'?kLen:sLen),0),gap=Math.max(40,(z1-z0-used)/(B.works.length-1));
+  let at=z0,kSide=1,sDir=1;
+  for(const w of B.works){if(w==='K'){closures.push({i:closures.length,from:at,to:at+kLen,side:kSide});kSide=-kSide;at+=kLen+gap;}
+    else{snakes.push({i:snakes.length,from:at,to:at+sLen,dir:sDir});sDir=-sDir;at+=sLen+gap;}}
+  const ends=[...closures,...snakes].map(x=>x.to);
+  fBay777PlanCache={curve,bridgeIn,bridgeOut,gate,gusts,closures,snakes,windZone:[g0-B.warn,g1],workZone:[z0,Math.max(...ends)]};
   return fBay777PlanCache;
 }
 function fBay777ClosureAt(d){
@@ -8749,7 +8758,8 @@ function fBay777Event(e){try{if(typeof c10State!=='undefined'&&c10State.active)c
 function buildFBay777Works(group){
   const plan=fBay777Plan();if(!plan)return null;
   const works=new THREE.Group();works.name='bay777Works';
-  const cones=[];for(const c of plan.closures)for(let d=c.from;d<=c.to;d+=3){const cl=fBay777ClosureAtPlan(c,d);if(cl<=.05)continue;cones.push({d,lat:c.side*THREE.MathUtils.lerp(ROAD_HALF,F_BAY777.closedEdge,cl)});}
+  const cones=[];for(const sn of plan.snakes)for(let d=sn.from;d<=sn.to;d+=4){const m=fBay777SnakeCenter(sn,d);for(const k of [-1,1])cones.push({d,lat:m+k*(F_BAY777.snakeHalf+.1)});}
+  for(const c of plan.closures)for(let d=c.from;d<=c.to;d+=3){const cl=fBay777ClosureAtPlan(c,d);if(cl<=.05)continue;cones.push({d,lat:c.side*THREE.MathUtils.lerp(ROAD_HALF,F_BAY777.closedEdge,cl)});}
   const coneMesh=new THREE.InstancedMesh(new THREE.ConeGeometry(.22,.62,10),new THREE.MeshLambertMaterial({color:0xff7a1a}),Math.max(1,cones.length));
   const dummy=new THREE.Object3D();
   cones.forEach((o,i)=>{const tr=getTrackAtDist(o.d);dummy.position.set(tr.p.x+tr.n.x*o.lat,tr.p.y+.33,tr.p.z+tr.n.z*o.lat);dummy.rotation.set(0,0,0);dummy.updateMatrix();coneMesh.setMatrixAt(i,dummy.matrix);});
@@ -8762,13 +8772,34 @@ function buildFBay777Works(group){
     works.add(g);}
   group.add(works);return works;
 }
+// S字の通り道の中心(m)。入口と出口のsnakeRamp mで振幅を0から上げ下げする
+function fBay777SnakeCenter(sn,d){const B=F_BAY777;if(d<sn.from||d>sn.to)return 0;
+  const env=THREE.MathUtils.smoothstep(d,sn.from,sn.from+B.snakeRamp)*(1-THREE.MathUtils.smoothstep(d,sn.to-B.snakeRamp,sn.to));
+  return sn.dir*B.snakeAmp*env*Math.sin(2*Math.PI*(d-sn.from-B.snakeRamp)/B.snakeWave);}
+function fBay777SnakeAt(d){const plan=fBay777Plan();if(!plan)return null;for(const sn of plan.snakes)if(d>=sn.from&&d<=sn.to)return sn;return null;}
 // 柵は区間の入口で一気にふさぐ(物理Fの壁沿いの制限で自動的によけないように)。出口だけ三角コーンで車線を戻す
 function fBay777ClosureAtPlan(c,d){return d<c.from||d>c.to?0:1-THREE.MathUtils.smoothstep(d,c.to-F_BAY777.taper,c.to);}
 // 毎コマ(tick)：工事の柵の入口を、ふさがれた車線のまま通ったら岩と同じように当たって減速し、空いている車線へ押し出す
-let fBay777Prev={s:0,lat:0};
+let fBay777Prev={s:0,lat:0,cone:{armed:true,next:0},windHit:new Set()};
 function updateFBay777Barriers(){
   const prevS=fBay777Prev.s,prevLat=fBay777Prev.lat;fBay777Prev.s=s;fBay777Prev.lat=lateral;
   if(!fBay777GimmickOn()||gameState!=='racing')return;const plan=fBay777Plan();if(!plan)return;
+  // 横風：突風に押されて壁際(物理Fの壁沿いの制限)まで寄せられたら、突風1回につき1度だけ壁接触として減速する
+  const q=fBay777GustAt(s);
+  if(q&&!q.warn&&!fBay777Prev.windHit.has(q.g.i)){const side=q.g.dir,limit=3.05+fWallWide(s,side);
+    if(lateral*side>=limit-.05){fBay777Prev.windHit.add(q.g.i);stopWallDrive();wallHitCooldown=.65;lastWallHitTime=simulationElapsed;speed*=.8;
+      const tr=getTrackAtDist(s),hp=tr.p.clone().addScaledVector(tr.n,side*(limit+.5));hp.y+=.6;
+      spawnHit(hp,0xdfefff);spillWater(10);updateCup();triggerCupHit();playSfx('hazardHit');showDriveNotice('横風で壁に接触','減速 · 水 −10%');if(navigator.vibrate)navigator.vibrate([40,30,40]);
+      fBay777Event({event:'bay777GustWall',i:q.g.i,dir:side});}}
+  // S字：コーンの線から出ようとすると線の内側へ戻し、触れた最初と、触れたままconeEvery m進むごとに減速する
+  const sn=fBay777SnakeAt(s),cone=fBay777Prev.cone;if(s<prevS-1){cone.armed=true;cone.next=0;fBay777Prev.windHit.clear();}
+  if(sn){const B=F_BAY777,m=fBay777SnakeCenter(sn,s),lim=B.snakeHalf-B.catHalf,off=lateral-m;
+    if(Math.abs(off)>lim){lateral=m+Math.sign(off)*lim;fBay777Prev.lat=lateral;
+      if(cone.armed||s>=cone.next){cone.armed=false;cone.next=s+B.coneEvery;stopWallDrive();wallHitCooldown=.65;lastWallHitTime=simulationElapsed;speed*=.72;
+        const tr=getTrackAtDist(s),hp=tr.p.clone().addScaledVector(tr.n,m+Math.sign(off)*(B.snakeHalf+.1));hp.y+=.4;
+        spawnHit(hp,0xff7a1a);spillWater(8);updateCup();triggerCupHit();playSfx('hazardHit');showDriveNotice('コーンに接触','減速 · 水 −8%');if(navigator.vibrate)navigator.vibrate([30]);
+        fBay777Event({event:'bay777Cone',i:sn.i,side:Math.sign(off)});}}
+    else if(Math.abs(off)<lim-.3)cone.armed=true;}
   for(const c of plan.closures){if(!(prevS<c.from&&s>=c.from))continue;
     const open=F_BAY777.closedEdge-.75;if(prevLat*c.side<=open)continue;
     lateral=c.side*open;if(wallHitCooldown>.6){fBay777Prev.lat=lateral;continue;}// 同じコマで壁接触の減速が済んでいれば二重に減速しない
@@ -8796,9 +8827,10 @@ function updateFBay777(dt){
       const before=smokeGroup.children.length;spawnSmoke(p);const m=smokeGroup.children[before];
       if(m){m.material.color.setHex(0xf4fbff);m.material.opacity=.32;m.userData.life=.5;m.userData.maxLife=.5;m.userData.baseOpacity=.32;m.userData.scale0=.28;m.scale.setScalar(.28);}}
   }
+  for(const sn of plan.snakes){if(s>=sn.from-F_BAY777.warn&&s<sn.from&&!z.warned.has('s'+sn.i)){z.warned.add('s'+sn.i);showDriveNotice('S字の工事区間','コーンの間をうねって抜ける · 速いと曲がりきれない','spin');}}
   for(const c of plan.closures){if(s>=c.from-F_BAY777.warn&&s<c.from&&!z.warned.has('w'+c.i)){z.warned.add('w'+c.i);showDriveNotice('工事中',c.side>0?'右車線ふさがり ← 左へ':'左車線ふさがり → 右へ','spin');}}
   if(!z.windDone&&s>plan.windZone[1]){z.windDone=true;fBay777Event({event:'bay777WindZone',clean:!z.windHit});if(!z.windHit)showDriveNotice('横風クリア！','壁に触れずに大橋を抜けた');}
-  if(!z.workDone&&s>plan.workZone[1]){z.workDone=true;fBay777Event({event:'bay777WorkZone',clean:!z.workHit});if(!z.workHit)showDriveNotice('工事区間クリア！','柵に触れずに抜けた');}
+  if(!z.workDone&&s>plan.workZone[1]){z.workDone=true;fBay777Event({event:'bay777WorkZone',clean:!z.workHit});if(!z.workHit)showDriveNotice('工事区間クリア！','柵とコーンに触れずに抜けた');}
 }
 // REDCATが777km/hに届いた時に1回だけ「777」を出す(スタートに戻ると、また出せる)
 function updateBay777(){
@@ -21780,7 +21812,7 @@ function c10CourseCorners(track){
 function c10NewRun(){
   const r={id:c10State.nextId++,track:currentKey,mode:LINE_PHYSICS_MODE||'original',cat:catModel,driveMode,
     corners:c10CourseCorners(currentKey),frames:[],events:[],label:c14RequestedLabel(),controller:C15_REPLAY_MODE?(C15_REPLAY_ASSIST?'C16-selective-assisted-replay':'C16-strict-input-replay'):(C15_BOT_MODE?'C15-auto-steer':'human'),botPaw:C15_BOT_PAW,replaySource:C15_REPLAY_MODE||null,replayAxis:C15_REPLAY_MODE?C15_REPLAY_AXIS:null,replayAssist:C15_REPLAY_MODE?C15_REPLAY_ASSIST:null,startedAt:new Date().toISOString(),telemetryVersion:LINE_PHYSICS_MODE==='F'?19:6,
-    ...(LINE_PHYSICS_MODE==='F'?{physicsRevision:'C114-bay777-works'}:{})};
+    ...(LINE_PHYSICS_MODE==='F'?{physicsRevision:'C114-bay777-works2'}:{})};
   c10State.runs.push(r);if(c10State.runs.length>8)c10State.runs.shift();c10State.active=r;
   r.events.push({event:'raceStart',t:simulationElapsed,s});return r;
 }
