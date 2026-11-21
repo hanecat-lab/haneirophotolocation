@@ -8675,7 +8675,7 @@ function loadBay777Props(){
   return bay777Props;
 }
 function buildBay777Scenery(def){
-  const group=new THREE.Group();group.name='bay777Scenery';bay777Run={flashed:false};
+  const group=new THREE.Group();group.name='bay777Scenery';bay777Run={flashed:false,group};
   const box=new THREE.Box3().setFromPoints(def.points);
   const sea=new THREE.Mesh(new THREE.PlaneGeometry(box.max.x-box.min.x+3000,box.max.z-box.min.z+3000),new THREE.MeshLambertMaterial({color:0x3b7d9a}));
   sea.rotation.x=-Math.PI/2;sea.position.set((box.min.x+box.max.x)/2,BAY777.sea,(box.min.z+box.max.z)/2);sea.name='bay777Sea';group.add(sea);
@@ -8705,8 +8705,104 @@ function buildBay777Scenery(def){
   });
   return group;
 }
+// C114 F: 湾岸777の大橋の仕掛け(物理F・普通猫・ガチ峠のときだけ)
+// 前半：横風ゾーン(突風が横方向の指令を押し流す。当て舵で車線を保つ)
+// 後半：工事車線のスラローム(片側の車線を柵でふさぎ、壁を道の中心付近まで寄せる)
+const F_BAY777=Object.freeze({wind:2.0,gustLen:110,warn:100,gusts:4,closures:4,closeLen:60,taper:20,closeGap:100,closedEdge:.4});
+let fBay777PlanCache=null;
+function fBay777GimmickOn(){
+  return LINE_PHYSICS_MODE==='F'&&currentKey==='bay777'&&driveMode==='gachiTouge'&&Boolean(TRACKS.bay777?.bay777)&&linePhysicsBEnabled();
+}
+function fBay777Plan(){
+  if(fBay777PlanCache&&fBay777PlanCache.curve===curve)return fBay777PlanCache;
+  const def=TRACKS.bay777,cs=DRIVING_GUIDE_DATA.tracks.bay777?.corners||[];
+  const c4=cs.find(c=>c.number===4),c5=cs.find(c=>c.number===5);
+  if(!def?.bay777||!c4||!c5)return null;
+  const bridgeIn=indexDistance(curve,def.points,def.bay777.marks.bridgeIn),bridgeOut=indexDistance(curve,def.points,def.bay777.marks.bridgeOut);
+  const B=F_BAY777,gusts=[],closures=[];
+  const g0=bridgeIn+150,g1=c5.start-60;
+  for(let i=0;i<B.gusts;i++){const from=g0+(g1-g0-B.gustLen)*(i+.5)/B.gusts;gusts.push({i,from,to:from+B.gustLen,dir:i%2?1:-1});}
+  const z0=c5.end+80,span=B.closures*(B.closeLen+2*B.taper)+(B.closures-1)*B.closeGap,z1=Math.min(bridgeOut-60,z0+span);
+  const step=(z1-z0)/B.closures;
+  for(let i=0;i<B.closures;i++){const from=z0+i*step;closures.push({i,from,to:from+B.closeLen+B.taper,side:i%2?-1:1});}
+  fBay777PlanCache={curve,bridgeIn,bridgeOut,gusts,closures,windZone:[g0-B.warn,g1],workZone:[z0,closures[closures.length-1].to]};
+  return fBay777PlanCache;
+}
+function fBay777ClosureAt(d){
+  if(!fBay777GimmickOn())return null;const plan=fBay777Plan();if(!plan)return null;
+  const B=F_BAY777;
+  for(const c of plan.closures){if(d<c.from||d>c.to)continue;
+    const k=fBay777ClosureAtPlan(c,d);
+    return k>0?{side:c.side,k,c}:null;}
+  return null;
+}
+function fBay777GustAt(d){
+  if(!fBay777GimmickOn()||gameState!=='racing')return null;const plan=fBay777Plan();if(!plan)return null;
+  for(const g of plan.gusts){if(d>=g.from-F_BAY777.warn&&d<=g.to)return {g,warn:d<g.from,u:d<g.from?0:(d-g.from)/(g.to-g.from)};}
+  return null;
+}
+function fBay777Wind(){
+  const q=fBay777GustAt(s);if(!q||q.warn)return 0;
+  return q.g.dir*F_BAY777.wind*Math.sin(Math.PI*q.u);
+}
+function fBay777Event(e){try{if(typeof c10State!=='undefined'&&c10State.active)c10State.active.events.push({...e,t:simulationElapsed,s,kmh:speed*3.6});}catch(_){}}
+function buildFBay777Works(group){
+  const plan=fBay777Plan();if(!plan)return null;
+  const works=new THREE.Group();works.name='bay777Works';
+  const cones=[];for(const c of plan.closures)for(let d=c.from;d<=c.to;d+=3){const cl=fBay777ClosureAtPlan(c,d);if(cl<=.05)continue;cones.push({d,lat:c.side*THREE.MathUtils.lerp(ROAD_HALF,F_BAY777.closedEdge,cl)});}
+  const coneMesh=new THREE.InstancedMesh(new THREE.ConeGeometry(.22,.62,10),new THREE.MeshLambertMaterial({color:0xff7a1a}),Math.max(1,cones.length));
+  const dummy=new THREE.Object3D();
+  cones.forEach((o,i)=>{const tr=getTrackAtDist(o.d);dummy.position.set(tr.p.x+tr.n.x*o.lat,tr.p.y+.33,tr.p.z+tr.n.z*o.lat);dummy.rotation.set(0,0,0);dummy.updateMatrix();coneMesh.setMatrixAt(i,dummy.matrix);});
+  coneMesh.count=cones.length;coneMesh.instanceMatrix.needsUpdate=true;coneMesh.computeBoundingSphere();works.add(coneMesh);
+  const board=new THREE.MeshLambertMaterial({color:0xffe9d6}),stripe=new THREE.MeshLambertMaterial({color:0xe2462b});
+  for(const c of plan.closures){const d=c.from,tr=getTrackAtDist(d),mid=c.side*(ROAD_HALF+F_BAY777.closedEdge)/2,w=ROAD_HALF-F_BAY777.closedEdge;
+    const g=new THREE.Group();g.position.set(tr.p.x+tr.n.x*mid,tr.p.y,tr.p.z+tr.n.z*mid);g.rotation.y=Math.atan2(tr.t.x,tr.t.z);
+    const b=new THREE.Mesh(new THREE.BoxGeometry(w,.5,.12),board);b.position.y=.75;g.add(b);
+    for(let k=0;k<4;k++){const sm=new THREE.Mesh(new THREE.BoxGeometry(w/8,.5,.13),stripe);sm.position.set(-w/2+w/8*(2*k+.5),.75,0);g.add(sm);}
+    works.add(g);}
+  group.add(works);return works;
+}
+// 柵は区間の入口で一気にふさぐ(物理Fの壁沿いの制限で自動的によけないように)。出口だけ三角コーンで車線を戻す
+function fBay777ClosureAtPlan(c,d){return d<c.from||d>c.to?0:1-THREE.MathUtils.smoothstep(d,c.to-F_BAY777.taper,c.to);}
+// 毎コマ(tick)：工事の柵の入口を、ふさがれた車線のまま通ったら岩と同じように当たって減速し、空いている車線へ押し出す
+let fBay777Prev={s:0,lat:0};
+function updateFBay777Barriers(){
+  const prevS=fBay777Prev.s,prevLat=fBay777Prev.lat;fBay777Prev.s=s;fBay777Prev.lat=lateral;
+  if(!fBay777GimmickOn()||gameState!=='racing')return;const plan=fBay777Plan();if(!plan)return;
+  for(const c of plan.closures){if(!(prevS<c.from&&s>=c.from))continue;
+    const open=F_BAY777.closedEdge-.75;if(prevLat*c.side<=open)continue;
+    lateral=c.side*open;if(wallHitCooldown>.6){fBay777Prev.lat=lateral;continue;}// 同じコマで壁接触の減速が済んでいれば二重に減速しない
+    stopWallDrive();wallHitCooldown=.65;speed=Math.max(speed*.32,Math.min(speed*.75,20,activeGripLimit*.9));lastWallHitTime=simulationElapsed;
+    const tr=getTrackAtDist(s),hp=tr.p.clone().addScaledVector(tr.n,c.side*(F_BAY777.closedEdge+.6));hp.y+=.6;
+    spawnHit(hp,0xff7a1a);spillWater(18);updateCup();triggerCupHit();playSfx('hazardHit');showDriveNotice('工事の柵にぶつかった','減速 · 水 −18%');if(navigator.vibrate)navigator.vibrate([60,40,60]);
+    fBay777Prev.lat=lateral;fBay777Event({event:'bay777Barrier',i:c.i,side:c.side});}
+}
+function updateFBay777(dt){
+  const r=bay777Run;if(!r)return;
+  const on=fBay777GimmickOn();
+  if(!r.works&&r.group&&fBay777Plan())r.works=buildFBay777Works(r.group);
+  if(r.works)r.works.visible=on;
+  if(!on||gameState!=='racing'){r.fz=null;return;}
+  const plan=fBay777Plan();if(!plan)return;
+  if(!r.fz||s<40)r.fz={warned:new Set(),started:new Set(),windHit:false,workHit:false,windDone:false,workDone:false,cool:wallHitCooldown,dust:0};
+  const z=r.fz,hit=wallHitCooldown>z.cool+1e-6;z.cool=wallHitCooldown;
+  const inWind=s>=plan.windZone[0]&&s<=plan.windZone[1],inWork=s>=plan.workZone[0]&&s<=plan.workZone[1];
+  if(hit&&inWind)z.windHit=true;if(hit&&inWork)z.workHit=true;
+  const q=fBay777GustAt(s);
+  if(q){const g=q.g;
+    if(q.warn&&!z.warned.has(g.i)){z.warned.add(g.i);showDriveNotice('横風',g.dir>0?'右へ押される ← 当て舵':'左へ押される → 当て舵','spin');fBay777Event({event:'bay777GustWarn',i:g.i,dir:g.dir});}
+    if(!q.warn&&!z.started.has(g.i)){z.started.add(g.i);fBay777Event({event:'bay777Gust',i:g.i,dir:g.dir});}
+    z.dust-=dt;if(z.dust<=0&&appAnimationsEnabled){z.dust=.07;const tr=getTrackAtDist(s+6),p=tr.p.clone().addScaledVector(tr.n,lateral-g.dir*2.6);
+      const before=smokeGroup.children.length;spawnSmoke(p);const m=smokeGroup.children[before];
+      if(m){m.material.color.setHex(0xf4fbff);m.material.opacity=.32;m.userData.life=.5;m.userData.maxLife=.5;m.userData.baseOpacity=.32;m.userData.scale0=.28;m.scale.setScalar(.28);}}
+  }
+  for(const c of plan.closures){if(s>=c.from-F_BAY777.warn&&s<c.from&&!z.warned.has('w'+c.i)){z.warned.add('w'+c.i);showDriveNotice('工事中',c.side>0?'右車線ふさがり ← 左へ':'左車線ふさがり → 右へ','spin');}}
+  if(!z.windDone&&s>plan.windZone[1]){z.windDone=true;fBay777Event({event:'bay777WindZone',clean:!z.windHit});if(!z.windHit)showDriveNotice('横風クリア！','壁に触れずに大橋を抜けた');}
+  if(!z.workDone&&s>plan.workZone[1]){z.workDone=true;fBay777Event({event:'bay777WorkZone',clean:!z.workHit});if(!z.workHit)showDriveNotice('工事区間クリア！','柵に触れずに抜けた');}
+}
 // REDCATが777km/hに届いた時に1回だけ「777」を出す(スタートに戻ると、また出せる)
 function updateBay777(){
+  try{updateFBay777(1/60);}catch(e){}
   const r=bay777Run;if(!r||gameState!=='racing')return;
   if(s<40)r.flashed=false;
   if(!r.flashed&&redcatDrivingActive()&&speed*3.6>=BAY777.flashKmh){r.flashed=true;playSfx('levelUp');showDriveNotice('777','スリーセブン！ 最高速','bounce');if(navigator.vibrate)navigator.vibrate([30,30,60]);}
@@ -10634,7 +10730,10 @@ function roadWallsAt(d){
   const b=branchRun;if(b&&b.route==='B'&&d>b.F+(b.MB-b.F)/2)d-=b.delta;
   // 中央分離帯はまたげるので、その所は自分の道の両端が壁
   if(medianZone(b,d))return ROAD_WALLS;
-  if(!b||d<b.noseF||d>b.noseM){const w=narrowRoadAt(d),l=snowfieldWidenAt(d,-1),r=snowfieldWidenAt(d,1);if(w===ROAD_HALF&&!l&&!r)return ROAD_WALLS;narrowWalls.left=-w-l;narrowWalls.right=w+r;return narrowWalls;}
+  if(!b||d<b.noseF||d>b.noseM){const w=narrowRoadAt(d),l=snowfieldWidenAt(d,-1),r=snowfieldWidenAt(d,1),cl=fBay777ClosureAt(d);if(w===ROAD_HALF&&!l&&!r&&!cl)return ROAD_WALLS;narrowWalls.left=-w-l;narrowWalls.right=w+r;
+    // C114 F: 湾岸777の工事の柵(ふさいだ側の壁を道の中心付近へ)
+    if(cl){if(cl.side>0)narrowWalls.right=Math.min(narrowWalls.right,THREE.MathUtils.lerp(w+r,F_BAY777.closedEdge,cl.k));else narrowWalls.left=Math.max(narrowWalls.left,-THREE.MathUtils.lerp(w+l,F_BAY777.closedEdge,cl.k));}
+    return narrowWalls;}
   const w=Math.min(ROAD_HALF,Math.max(.6,b.half[THREE.MathUtils.clamp(Math.round(d-Math.floor(b.F)),0,b.half.length-1)]+.15));
   branchWalls.left=b.route==='B'?-w:-ROAD_HALF;branchWalls.right=b.route==='A'?w:ROAD_HALF;return branchWalls;
 }
@@ -21681,7 +21780,7 @@ function c10CourseCorners(track){
 function c10NewRun(){
   const r={id:c10State.nextId++,track:currentKey,mode:LINE_PHYSICS_MODE||'original',cat:catModel,driveMode,
     corners:c10CourseCorners(currentKey),frames:[],events:[],label:c14RequestedLabel(),controller:C15_REPLAY_MODE?(C15_REPLAY_ASSIST?'C16-selective-assisted-replay':'C16-strict-input-replay'):(C15_BOT_MODE?'C15-auto-steer':'human'),botPaw:C15_BOT_PAW,replaySource:C15_REPLAY_MODE||null,replayAxis:C15_REPLAY_MODE?C15_REPLAY_AXIS:null,replayAssist:C15_REPLAY_MODE?C15_REPLAY_ASSIST:null,startedAt:new Date().toISOString(),telemetryVersion:LINE_PHYSICS_MODE==='F'?19:6,
-    ...(LINE_PHYSICS_MODE==='F'?{physicsRevision:'C114-tail-cap'}:{})};
+    ...(LINE_PHYSICS_MODE==='F'?{physicsRevision:'C114-bay777-works'}:{})};
   c10State.runs.push(r);if(c10State.runs.length>8)c10State.runs.shift();c10State.active=r;
   r.events.push({event:'raceStart',t:simulationElapsed,s});return r;
 }
@@ -23520,6 +23619,7 @@ function tick(dt,renderDt=dt){
   if(redcatDriving){
     stepRedcatSteering(dt,keyboardSteer()+steerBtnInput,isBraking,input.drift||input.driftPressed,redcatFree,joyActive?joyVec.x:0);
   }else if(lineMode){
+    if(currentKey==='bay777')outwardVelocity+=fBay777Wind();
     lateral=stepSteeredLine(eff,lineRate,lineLimit,dt,tLat-lineHoldTLat,sharpLateral,outwardVelocity);
   } else {
     lateral=THREE.MathUtils.lerp(lateral,tLat,dt*sharpLateral);
@@ -24039,6 +24139,7 @@ function tick(dt,renderDt=dt){
   updateYokaiLanterns(dt);
   updateOniHazards(dt);
   if(tunnelRun?.rocks)updateTunnelRocks();
+  if(currentKey==='bay777')updateFBay777Barriers();
   updateCornerGrades();
   updateSnowDrift(dt);
 
