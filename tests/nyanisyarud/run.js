@@ -91,7 +91,8 @@ const groups={
     say(r.slice(0,4).every(x=>x.grade&&!x.jump)&&r[4].jump,`c8: grades ${r.map(x=>x.jump?'JUMP':(x.grade||'-')).join(',')} (outside/early releases graded; inside release in the takeoff window jumps)`);}
   if(results.wind&&!results.wind.skipped){const w=results.wind,g=w.gate;
     say(g['nekomata/gachiTouge']==='normal'&&g['nekomata/nyanSapo']==='sapo'&&g['redcat/gachiTouge']==='redcat'&&g['redcat/nyanSapo']==='redcat'&&g['suberi/gachiTouge']===null,`wind gate: ${JSON.stringify(g)}`);
-    say(w.free.lobesHit*2>=w.free.lobes,`wind free 260km/h: ${w.free.lobesHit}/${w.free.lobes} 回の向きで壁接触 (半分以上)`);
+    // 壁に当たると速さが2割落ち、低速では風が弱まる(救済)ので、何もしない時の接触は3分の1以上を合格とする
+    say(w.free.lobesHit*3>=w.free.lobes,`wind free 260km/h: ${w.free.lobesHit}/${w.free.lobes} 回の向きで壁接触 (3分の1以上)`);
     say(w.counter.walls===0&&w.counter.done,`wind counter 260km/h 反応0.3秒: 壁 ${w.counter.walls} 横 ${w.counter.lat}`);
     say(w.sapo.walls===0&&w.sapo.done,`wind にゃんサポ counter 250km/h: 壁 ${w.sapo.walls} 横 ${w.sapo.lat}`);
     say(w.redcat.zmode==='redcat'&&w.redcat.arrowFrames>0&&w.redcat.done,`wind REDCAT 777km/h: 矢印 ${w.redcat.arrowFrames}コマ 壁 ${w.redcat.walls}`);}
