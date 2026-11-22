@@ -8713,11 +8713,17 @@ function buildBay777Scenery(def){
 // ?fbaywind=1.2 で強さを全部まとめて倍にできる(調整用)
 const F_BAY777=Object.freeze({scale:(()=>{try{const v=parseFloat(new URLSearchParams(location.search).get('fbaywind'));if(Number.isFinite(v))return v;}catch(_){}return 1;})(),
   startAfter:100,windEnd:300,waves:[500,350,250,300],share:[.45,.6,.75,.5],
-  jitter:[0,.12,-.1,.15,-.13,.05,-.08,.14,-.15,.09,-.04,.11,-.12,.07,-.09,.13],preTurn:.5,arrowSide:1.5});
+  jitter:[0,.12,-.1,.15,-.13,.05,-.08,.14,-.15,.09,-.04,.11,-.12,.07,-.09,.13],preTurn:.5,arrowSide:1.5,
+  // REDCAT：区間はヘアピンのブレーキ(777→180km/h、REDCAT.brakeで減速)の始まりのredcatMargin m手前まで。波の長さはredcatWave倍、強さは方向キー全開で横へ寄れる速さredcatLat(実測4m/s)のredcatShare
+  redcatHairpinKmh:180,redcatMargin:100,redcatWave:2,redcatShare:.6,redcatLastShare:.3,redcatLat:4});
 let fBay777PlanCache=null;
-function fBay777GimmickOn(){
-  return LINE_PHYSICS_MODE==='F'&&currentKey==='bay777'&&driveMode==='gachiTouge'&&Boolean(TRACKS.bay777?.bay777)&&linePhysicsBEnabled();
+// 横風が吹く猫：'normal'(物理Fの普通猫) / 'redcat' / null
+function fBay777Mode(){
+  if(LINE_PHYSICS_MODE!=='F'||currentKey!=='bay777'||driveMode!=='gachiTouge'||!TRACKS.bay777?.bay777)return null;
+  if(linePhysicsBEnabled())return 'normal';
+  return redcatDrivingActive()?'redcat':null;
 }
+function fBay777GimmickOn(){return fBay777Mode()!==null;}
 function fBay777Plan(){
   if(fBay777PlanCache&&fBay777PlanCache.curve===curve)return fBay777PlanCache;
   const def=TRACKS.bay777,cs=DRIVING_GUIDE_DATA.tracks.bay777?.corners||[];
@@ -8728,22 +8734,30 @@ function fBay777Plan(){
   const start=bridgeIn+B.startAfter,end=gate-B.windEnd;
   // 段階：前半(〜C4)・中盤(〜C5)・後半(〜橋の終わり)・終盤(〜風が止む所、強さを0へ)
   const phases=[c4.start,c5.start,bridgeOut,end].map((to,k,a)=>({from:k?a[k-1]:start,to,wave:B.waves[k],w:B.share[k]*B.scale,fade:k===a.length-1}));
-  const lobes=[];let at=start,dir=-1;
-  while(at<end-1){const ph=phases.find(x=>at<x.to)||phases[phases.length-1],len=ph.wave/2*(1+B.jitter[lobes.length%B.jitter.length]);
-    let to=Math.min(at+len,end);if(end-to<len*.3)to=end;
-    const mid=(at+to)/2,w=ph.fade?ph.w*Math.max(0,1-(mid-ph.from)/Math.max(1,ph.to-ph.from)):ph.w;
-    lobes.push({i:lobes.length,from:at,to,dir,w});dir=-dir;at=to;}
-  fBay777PlanCache={curve,bridgeIn,bridgeOut,gate,start,end,phases,lobes};
+  const makeLobes=(end,waveScale,share)=>{const lobes=[];let at=start,dir=-1;
+    while(at<end-1){const ph=phases.find(x=>at<x.to)||phases[phases.length-1],len=ph.wave*waveScale/2*(1+B.jitter[lobes.length%B.jitter.length]);
+      let to=Math.min(at+len,end);if(end-to<len*.3)to=end;
+      const mid=(at+to)/2,w=share!==undefined?share*B.scale:ph.fade?ph.w*Math.max(0,1-(mid-ph.from)/Math.max(1,ph.to-ph.from)):ph.w;
+      lobes.push({i:lobes.length,from:at,to,dir,w});dir=-dir;at=to;}
+    return lobes;};
+  const lobes=makeLobes(end,1);
+  // REDCAT：C4・C5は777km/hのまま抜けられるので、ブレーキが要るのはヘアピン。その減速の始まりの手前で止める
+  const vMax=REDCAT.maxKmh/3.6,vHair=B.redcatHairpinKmh/3.6,redEnd=Math.min(end,mark('hairpin')-(vMax*vMax-vHair*vHair)/(2*REDCAT.brake)-B.redcatMargin);
+  const redLobes=makeLobes(redEnd,B.redcatWave,B.redcatShare);if(redLobes.length)redLobes[redLobes.length-1].w=B.redcatLastShare*B.scale;
+  fBay777PlanCache={curve,bridgeIn,bridgeOut,gate,start,end,phases,lobes,normal:{start,end,lobes},redcat:{start,end:redEnd,lobes:redLobes}};
   return fBay777PlanCache;
 }
+// 今の猫の横風の区間{start,end,lobes}
+function fBay777Zone(){const m=fBay777Mode();if(!m)return null;const plan=fBay777Plan();return plan?plan[m]:null;}
 function fBay777LobeAt(d){
-  if(!fBay777GimmickOn()||gameState!=='racing')return null;const plan=fBay777Plan();if(!plan||d<plan.start||d>=plan.end)return null;
-  for(const l of plan.lobes)if(d<l.to)return l;return null;
+  if(gameState!=='racing')return null;const z=fBay777Zone();if(!z||d<z.start||d>=z.end)return null;
+  for(const l of z.lobes)if(d<l.to)return l;return null;
 }
 // 強さ(m/s)＝share×今の方向キーで寄れる速さ。速さやブレーキで寄れる速さが変わっても、全開の当て舵が必ず勝つ
 function fBay777Wind(){
   const l=fBay777LobeAt(s);if(!l)return 0;
-  return l.dir*l.w*fSteeringCommandRate()*Math.sin(Math.PI*(s-l.from)/(l.to-l.from));
+  const rate=fBay777Mode()==='redcat'?F_BAY777.redcatLat:fSteeringCommandRate();
+  return l.dir*l.w*rate*Math.sin(Math.PI*(s-l.from)/(l.to-l.from));
 }
 function fBay777Event(e){try{if(typeof c10State!=='undefined'&&c10State.active)c10State.active.events.push({...e,t:simulationElapsed,s,kmh:speed*3.6});}catch(_){}}
 // 毎コマ(tick)：横風に押されて壁際(物理Fの壁沿いの制限)まで寄せられたら、左右の向き1回につき1度だけ壁接触として減速する
@@ -8751,7 +8765,8 @@ let fBay777Prev={s:0,windHit:new Set()};
 function updateFBay777Barriers(){
   const prevS=fBay777Prev.s;fBay777Prev.s=s;if(s<prevS-1)fBay777Prev.windHit.clear();
   const l=fBay777LobeAt(s);if(!l||fBay777Prev.windHit.has(l.i))return;
-  const side=l.dir,limit=3.05+fWallWide(s,side);if(lateral*side<limit-.05)return;
+  // REDCATは壁に浅く触れてもガードレールに沿って滑るだけで減速しないので、風で押し付けられた時はここで減速させる(REDCATの当たりの壁の位置で判定)
+  const side=l.dir,red=fBay777Mode()==='redcat',rw=red?redcatContactWalls(s,lateral):null,limit=red?side*(side>0?rw.right:rw.left)-.2:3.05+fWallWide(s,side);if(lateral*side<limit-.05||fBay777Wind()*side<.5)return;// 風が壁の側へ押している時だけ
   fBay777Prev.windHit.add(l.i);stopWallDrive();wallHitCooldown=.65;lastWallHitTime=simulationElapsed;speed*=.8;
   const tr=getTrackAtDist(s),hp=tr.p.clone().addScaledVector(tr.n,side*(limit+.5));hp.y+=.6;
   spawnHit(hp,0xdfefff);spillWater(10);updateCup();triggerCupHit();playSfx('hazardHit');showDriveNotice('横風で壁に接触','減速 · 水 −10%');if(navigator.vibrate)navigator.vibrate([40,30,40]);
@@ -8763,9 +8778,9 @@ function placeFBay777Arrow(){
   const l=fBay777LobeAt(s),el=fBay777ArrowEl;
   if(!l){if(el)el.hidden=true;return;}
   if(!el){fBay777ArrowEl=document.createElement('div');fBay777ArrowEl.className='bay777-wind-arrow';fBay777ArrowEl.setAttribute('aria-hidden','true');document.getElementById('app').appendChild(fBay777ArrowEl);return;}
-  const plan=fBay777Plan(),next=plan.lobes[l.i+1],turn=next&&(l.to-s)/Math.max(speed,1)<F_BAY777.preTurn;
-  const show=turn?next:l,dir=show.dir,u=(s-l.from)/(l.to-l.from),k=turn?1:Math.sin(Math.PI*u)*l.w/Math.max(...F_BAY777.share);
-  if(!turn&&k<.12){el.hidden=true;return;}
+  const zone=fBay777Zone(),next=zone.lobes[l.i+1],turn=next&&(l.to-s)/Math.max(speed,1)<F_BAY777.preTurn;
+  const show=turn?next:l,dir=show.dir,u=(s-l.from)/(l.to-l.from),k=turn?1:Math.sin(Math.PI*u)*l.w/Math.max(...zone.lobes.map(x=>x.w));
+  if(!turn&&!(k>=.12)){el.hidden=true;return;}
   const tr=getTrackAtDist(s),[p0,p1]=fBay777ArrowP;
   p0.copy(catRoot.position).addScaledVector(tr.n,-dir*F_BAY777.arrowSide);p0.y+=.5;p1.copy(p0).addScaledVector(tr.n,dir);
   p0.project(camera);p1.project(camera);if(p0.z<-1||p0.z>1){el.hidden=true;return;}
@@ -8778,7 +8793,7 @@ function updateFBay777(dt){
   const r=bay777Run;if(!r)return;
   const on=fBay777GimmickOn();
   if(!on||gameState!=='racing'){r.fz=null;if(fBay777ArrowEl)fBay777ArrowEl.hidden=true;return;}
-  const plan=fBay777Plan();if(!plan)return;
+  const plan=fBay777Zone();if(!plan)return;
   if(!r.fz||s<40)r.fz={warned:new Set(),windHit:false,windDone:false,cool:wallHitCooldown,dust:0};
   const z=r.fz,hit=wallHitCooldown>z.cool+1e-6;z.cool=wallHitCooldown;
   if(hit&&s>=plan.start&&s<=plan.end)z.windHit=true;
@@ -15696,7 +15711,7 @@ function fDriftTailVisual(){return fDriftTailFade()>.3;}
 const F_HUD=(()=>{try{return new URLSearchParams(location.search).get('fhud')==='1';}catch(_){return false;}})();
 let fHudEl=null,fHudMax=null;
 // 物理Fの版の名前(走行ログのphysicsRevisionと、?fhud=1 の1行目に出す。実機でどの版が動いているかを見分ける)
-const F_REVISION='C114-bay777-wind-share';
+const F_REVISION='C114-bay777-wind-redcat';
 function fHudUpdate(tRelNow){
   if(!F_HUD||gameState!=='racing')return;
   if(!fHudEl){fHudEl=document.createElement('pre');fHudEl.setAttribute('aria-hidden','true');
@@ -23607,6 +23622,8 @@ function tick(dt,renderDt=dt){
   if(skyPoyoRebounding()){outwardVelocity=0;const impulse=suberiActive()?suberiBounce.v:skyRun.impulse;if(!cushionHop&&eff*impulse<0)lineRate*=.15;}
   if(redcatDriving){
     stepRedcatSteering(dt,keyboardSteer()+steerBtnInput,isBraking,input.drift||input.driftPressed,redcatFree,joyActive?joyVec.x:0);
+    // C114: 湾岸777の横風(REDCATは横位置を直接ずらす)
+    if(currentKey==='bay777'&&redcatFree)lateral+=fBay777Wind()*dt;
   }else if(lineMode){
     if(currentKey==='bay777')outwardVelocity+=fBay777Wind();
     lateral=stepSteeredLine(eff,lineRate,lineLimit,dt,tLat-lineHoldTLat,sharpLateral,outwardVelocity);
