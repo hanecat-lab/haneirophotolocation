@@ -85,10 +85,15 @@ const groups={
   if(UPDATE){fs.writeFileSync(BASE,JSON.stringify({...base,...results},null,1));console.log('baseline updated:',names.join(','));}
   let fail=0;const say=(ok,msg)=>{if(!ok)fail++;console.log((ok?'PASS ':'FAIL ')+msg);};
   if(results.nonf&&!results.nonf.skipped)for(const [q,v] of Object.entries(results.nonf))say(v.identical,`nonf ${q}: ${v.n} runs identical to --ref`);
+  // 判定の中身(ブレーキの判定・連携・受け取り)も基準と比べる。形だけの確認では、判定が全部WEAKに変わっても合格してしまうため
+  const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
   if(results.swipe){const k=results.swipe.keyboard,w=results.swipe.swipe;
-    say(Boolean(w.link)&&w.brakeType===k.brakeType&&w.sliding,`swipe: brake ${w.brakeType}/${k.brakeType}, link ${w.link}/${k.link}, sliding ${w.sliding}`);}
+    say(Boolean(w.link)&&w.brakeType===k.brakeType&&w.sliding,`swipe: brake ${w.brakeType}/${k.brakeType}, link ${w.link}/${k.link}, sliding ${w.sliding}`);
+    if(base.swipe)say(same(results.swipe,base.swipe)||UPDATE,`swipe: identical to baseline (brake/link/receipt)`);}
   if(results.c8){const r=results.c8;
-    say(r.slice(0,4).every(x=>x.grade&&!x.jump)&&r[4].jump,`c8: grades ${r.map(x=>x.jump?'JUMP':(x.grade||'-')).join(',')} (outside/early releases graded; inside release in the takeoff window jumps)`);}
+    say(r.slice(0,4).every(x=>x.grade&&!x.jump)&&r[4].jump,`c8: grades ${r.map(x=>x.jump?'JUMP':(x.grade||'-')).join(',')} (outside/early releases graded; inside release in the takeoff window jumps)`);
+    if(base.c8){const b=base.c8,diff=r.filter((x,i)=>!same(x,b[i]));
+      say(diff.length===0||UPDATE,`c8: identical to baseline (grade/link/jump)${diff.length?' changed: '+diff.map(x=>JSON.stringify(x.case)+' '+x.grade+'/'+x.maxLink+(x.jump?'/JUMP':'')).join('; ')+' baseline '+b.map(x=>x.jump?'JUMP':(x.grade||'-')).join(','):''}`);}}
   if(results.wind&&!results.wind.skipped){const w=results.wind,g=w.gate;
     say(g['nekomata/gachiTouge']==='normal'&&g['nekomata/nyanSapo']==='sapo'&&g['redcat/gachiTouge']==='redcat'&&g['redcat/nyanSapo']==='redcat'&&g['suberi/gachiTouge']===null,`wind gate: ${JSON.stringify(g)}`);
     // 壁に当たると速さが2割落ち、低速では風が弱まる(救済)ので、何もしない時の接触は3分の1以上を合格とする
