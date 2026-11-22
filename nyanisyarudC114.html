@@ -15265,6 +15265,37 @@ function captureMeatLink(){
     ?{curve,corner:slideDriveCorner,brakeType:window._lastBrakeJustTypeOrig||brakeJustType||'OK',since,releaseAt:lastBrakeReleaseTime}:null;
   recordLinkPracticeMeatEntry(since,meatLinkContext);
 }
+// C114 F：ブレーキの判定と壁(案A・案B)。物理F(ガチ峠の普通猫)だけ
+// span/steps：離した時の先読みの長さ(秒)と刻み。revokeSec：離してからこの秒数以内か、コーナーの頂点より手前で壁に当たったら判定を取り消す
+const F_BRAKE_WALL=Object.freeze({span:1.3,steps:14,revokeSec:1.5});
+function fBrakeReleaseTooFast(){
+  if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled())return false;
+  const c=findDriveCorner();if(!c)return false;const dir=c.dir||1;
+  const f=fPathDriveSnapshot(false)?.outerWallForecast?.(dir,F_BRAKE_WALL.span,F_BRAKE_WALL.steps);
+  return Boolean(f&&f.wallRisk&&(f.wallSides&(dir>0?1:2)));
+}
+let fBrakeRevoke=null,fBrakeRevokeCool=0;
+function fArmBrakeRevoke(){
+  if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled()){fBrakeRevoke=null;return;}
+  const c=findDriveCorner();
+  fBrakeRevoke={t:simulationElapsed,releaseAt:lastBrakeReleaseTime,apex:c?getCornerDriveProfile(c).apex:-Infinity,corner:c?.number??null,type:brakeJustType};
+  fBrakeRevokeCool=wallHitCooldown;
+}
+// 毎コマ(tick)：案B。離した後すぐ(または頂点の手前)で壁に当たったら、出した(出す予定の)判定を「ブレーキ不足」に差し替え、加速ボーナスを取り消す
+function fUpdateBrakeRevoke(){
+  const r=fBrakeRevoke,hit=wallHitCooldown>fBrakeRevokeCool+1e-6;fBrakeRevokeCool=wallHitCooldown;
+  if(!r)return;
+  const braking=Boolean(input.brake||input.brakePressed);
+  if(gameState!=='racing'||braking&&simulationElapsed>r.t+.1||simulationElapsed>r.t+F_BRAKE_WALL.revokeSec&&s>r.apex){fBrakeRevoke=null;return;}
+  if(!hit)return;
+  fBrakeRevoke=null;
+  if(meatLinkContext?.releaseAt===r.releaseAt)return;// 肉球につないだ時は連携の結果(壁で切れた表示)に任せる
+  if(brakeJudgmentHold){clearTimeout(brakeJudgmentHold);brakeJudgmentHold=null;}
+  exitBoostPower=0;exitBoostTimer=0;brakeJustType='';try{window._lastExitBoostOrig=0;window._lastBrakeJustTypeOrig='';}catch(e){}
+  if(fBrakeAssessment&&fBrakeAssessment.t===r.t)fBrakeAssessment.revoked=true;
+  try{if(typeof c10State!=='undefined'&&c10State.active)c10State.active.events.push({event:'brakeRevokedByWall',t:simulationElapsed,s,kmh:speed*3.6,corner:r.corner,was:r.type});}catch(e){}
+  showBrakeJudgment('WEAK',{text:'ブレーキ不足 · 壁に当たった',cls:'advice'});
+}
 // ブレーキを離してから0.5秒待ち、その間に肉球へつながらなかった時だけブレーキの判定を単独で出す
 let brakeJudgmentHold=null;
 function holdBrakeJudgment(type,feedback){
@@ -15724,7 +15755,7 @@ function fDriftFxDiag(){
     tail:typeof fDriftTailVisual==='function'?Boolean(fDriftTailVisual()):false,fade:typeof fDriftTailFade==='function'?+fDriftTailFade().toFixed(2):0};
 }
 // 物理Fの版の名前(走行ログのphysicsRevisionと、?fhud=1 の1行目に出す。実機でどの版が動いているかを見分ける)
-const F_REVISION='C114-wind-slowfade';
+const F_REVISION='C114-brake-wall';
 function fHudUpdate(tRelNow){
   if(!F_HUD||gameState!=='racing')return;
   if(!fHudEl){fHudEl=document.createElement('pre');fHudEl.setAttribute('aria-hidden','true');
@@ -15904,7 +15935,7 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
     resolve:()=>fPathDriveSnapshot(braking,stepDt,false)};
   const initial={s,lateral,speed,heading:pathHandling.heading,command:steeredLineVelocity,
     front:fBrakeLoad.front,extra:fDriftHold.extra,owner:fDriftHold.corner,under:pathHandling.understeer};
-  const held=fUnwindInput(Math.abs(steerInput)>.02?steerInput:0,lateral);
+  let held=fUnwindInput(Math.abs(steerInput)>.02?steerInput:0,lateral);
   const horizon=Math.min(.38,10/Math.max(speed*.62,3));
   const firstDt=Math.max(.00001,Math.min(.1,stepDt,horizon));
   const startWalls=roadWallsAt(s),startClearance=Math.min(lateral-startWalls.left,startWalls.right-lateral);
@@ -15922,7 +15953,7 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
     let distance=initial.s,offset=initial.lateral,velocity=initial.speed,heading=initial.heading,command=initial.command;
     let front=initial.front,extra=initial.extra,owner=initial.owner,time=0,firstAccel=0;
     let minClearance=startClearance,maxUndersteer=initial.under,terminalTrackingError=0;
-    let previewCurvature=0,demandCurvature=0,wallRisk=false,maxCircle=0,firstMotion=null;
+    let previewCurvature=0,demandCurvature=0,wallRisk=false,wallSides=0,maxCircle=0,firstMotion=null;
     const samples=keepSamples?[]:null;
     // Current tick has its real dt. The remaining existing horizon is six steps.
     for(let i=0;i<=steps;i++){
@@ -15960,7 +15991,7 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
       offset=advance.lateral;distance=Math.min(totalLength,distance+advance.ds);time+=dt;
       const walls=roadWallsAt(distance),clearance=Math.min(offset-walls.left,walls.right-offset);
       minClearance=Math.min(minClearance,clearance);
-      if(clearance<=.12&&clearance<startClearance-1e-5)wallRisk=true;
+      if(clearance<=.12&&clearance<startClearance-1e-5){wallRisk=true;wallSides|=walls.right-offset<offset-walls.left?2:1;}
       maxUndersteer=Math.max(maxUndersteer,motion.understeer);terminalTrackingError=motion.tracking;
       previewCurvature=Math.max(previewCurvature,motion.curvature);
       const world=Math.max(.1,(nextVelocity-accel*dt)*.62);
@@ -15969,7 +16000,7 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
         force:turnForce,axis:longAxis,engineKmh:nextVelocity*3.6,curvature:motion.curvature,clearance,understeer:motion.understeer,tracking:motion.tracking,scale,front});
     }
     const missedTurn=maxUndersteer>.08||terminalTrackingError>.08;
-    return {safe:!wallRisk&&!missedTurn,wallRisk,missedTurn,firstAccel,firstMotion,
+    return {safe:!wallRisk&&!missedTurn,wallRisk,wallSides,missedTurn,firstAccel,firstMotion,
       minClearance,maxUndersteer,terminalTrackingError,previewCurvature,demandCurvature,maxCircle,samples,horizon};
   };
   const normalAxis=linePhysicsATireForce(false,tireScale)*.62;
@@ -16028,6 +16059,8 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
     terminalTrackingError:accepted.terminalTrackingError,plannedAccel:plan.accel,planAuthority:plan.authority,
     reason:braking?'braking':baseline.wallRisk?'wall-forecast':baseline.missedTurn?'understeer-forecast':
       wallHitCooldown>0?'wall-recovery':slideGuarded?'slide-guard':entryHeld?'entry-hold':targetRebased?'current-step-release':plan.authority<1?'acceleration-feasibility':'current-grip'};
+  // C114: ブレーキを離した時の判定用。コーナーの内側へ方向キー全開(held=dir)のまま加速せず進んでも、外側の壁に当たるか(wallSides 1=左 2=右)
+  result.outerWallForecast=(dir,span,steps)=>{const keep=held;held=dir;try{return forecast(0,normalAxis,0,0,false,null,span,steps);}finally{held=keep;}};
   result.limitAcceleration=(request,axis=normalAxis)=>{
     // Match the realized current tick, including any style transition or request clamp.
     const actualMotion={...first.motion,heading:pathHandling.heading,curvature:pathHandling.turnCurvature,
@@ -22709,6 +22742,9 @@ function tick(dt,renderDt=dt){
       &&fDriftEntryReady());
     const perfectEntry=(brakePosLabel==='best'||fLatePhysicalPosition)&&lineError<=1&&Math.abs(relYaw)>=20*Math.PI/180&&wt>=.99;
     if(!perfectEntry)exitBoostPower=Math.min(exitBoostPower,goodEntry?.75:.55);
+    // C114 F(案A)：離した時の速さでは、内側へ全開で曲げても外側の壁に当たる(物理Fの先読み)なら、WEAKまでに抑えて加速ボーナスも付けない
+    const fTooFast=fBrakeReleaseTooFast();
+    if(fTooFast)exitBoostPower=Math.min(exitBoostPower,.32);
     // V234：閾値上げ PERFECT 0.6→0.75、GOOD 0.42→0.55
     if(exitBoostPower>0.75){ brakeJustType='PERFECT'; exitBoostTimer=2.4; }
     else if(exitBoostPower>0.55){ brakeJustType='GOOD'; exitBoostTimer=2.0; }
@@ -22728,14 +22764,15 @@ function tick(dt,renderDt=dt){
       lateral,idealLateral:fEntry?.ideal??t_opt,lineError,position:brakePosLabel,distance:cornerDist,
       geometryValid:fEntry?.valid??false,roadCurvature:fEntry?.curvature??null,
       roadRadius:fEntry?.radius??null,radiusFactor:rBonus,geometryRadiusFactor:fEntry?.radiusFactor??null,referenceFactor:fEntry?.factor??null,
-      goodEntry,perfectEntry,latePhysicalPosition:fLatePhysicalPosition,
+      goodEntry,perfectEntry,latePhysicalPosition:fLatePhysicalPosition,tooFast:fTooFast,
       rawScore:combined,afterGates:exitBoostPower,hold:brakeTime};
     captureBrakeCoach(coachSnapshot);
     recordLinkPracticeBrake(coachSnapshot);
     const previousMemo=brakeCoachRun?.previous.get(findDriveCorner()?.number);
     // 肉球につないだ時は連携の結果だけを出す。つながらなければブレーキの判定を単独で出す
     beginLinkFeedback();
-    holdBrakeJudgment(brakeJustType,{text:brakePraise(coachSnapshot,previousMemo),cls:brakeJustType==='PERFECT'?'perfect-advice':'advice'});
+    holdBrakeJudgment(brakeJustType,fTooFast?{text:'ブレーキが足りない · このままだと壁',cls:'advice'}:{text:brakePraise(coachSnapshot,previousMemo),cls:brakeJustType==='PERFECT'?'perfect-advice':'advice'});
+    fArmBrakeRevoke();
   }
   wasBraking = isBraking;
   if(exitBoostTimer>0){
@@ -24162,6 +24199,7 @@ function tick(dt,renderDt=dt){
   updateOniHazards(dt);
   if(tunnelRun?.rocks)updateTunnelRocks();
   if(currentKey==='bay777')updateFBay777Barriers();
+  fUpdateBrakeRevoke();
   updateCornerGrades();
   updateSnowDrift(dt);
 
