@@ -15266,27 +15266,30 @@ function captureMeatLink(){
   recordLinkPracticeMeatEntry(since,meatLinkContext);
 }
 // C114 F：ブレーキの判定と壁(案A・案B)。物理F(ガチ峠の普通猫)だけ
-// span/steps：離した時の先読みの長さ(秒)と刻み。revokeSec：離してからこの秒数以内か、コーナーの頂点より手前で壁に当たったら判定を取り消す
-const F_BRAKE_WALL=Object.freeze({span:1.3,steps:14,revokeSec:1.5});
+// 先読みはコーナーの出口+exitPad mまで(最長maxSpan秒、stepSec秒刻み)。revokeSec：離してからこの秒数以内か、コーナーの出口+exitPad mより手前で壁に当たったら判定を取り消す
+// (速すぎる時の壁は頂点の先、離して2〜3秒後に来ることが多いので、出口まで見る)
+// margin：先読みは長いほど厳しめに外れるので、今の速さのmargin倍でも壁に当たる時だけ「速すぎ」とする
+const F_BRAKE_WALL=Object.freeze({exitPad:5,maxSpan:4,stepSec:.1,revokeSec:1.5,margin:(()=>{try{const v=parseFloat(new URLSearchParams(location.search).get('fbrakemargin'));if(Number.isFinite(v))return v;}catch(_){}return .9;})()});
 function fBrakeReleaseTooFast(){
   if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled())return false;
-  const c=findDriveCorner();if(!c)return false;const dir=c.dir||1;
-  const f=fPathDriveSnapshot(false)?.outerWallForecast?.(dir,F_BRAKE_WALL.span,F_BRAKE_WALL.steps);
+  const c=findDriveCorner();if(!c)return false;const dir=c.dir||1,B=F_BRAKE_WALL;
+  const span=THREE.MathUtils.clamp((c.end+B.exitPad-s)/Math.max(speed*.62,3),.4,B.maxSpan),steps=Math.max(4,Math.ceil(span/B.stepSec));
+  const f=fPathDriveSnapshot(false)?.outerWallForecast?.(dir,span,steps,B.margin);
   return Boolean(f&&f.wallRisk&&(f.wallSides&(dir>0?1:2)));
 }
 let fBrakeRevoke=null,fBrakeRevokeCool=0;
 function fArmBrakeRevoke(){
   if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled()){fBrakeRevoke=null;return;}
   const c=findDriveCorner();
-  fBrakeRevoke={t:simulationElapsed,releaseAt:lastBrakeReleaseTime,apex:c?getCornerDriveProfile(c).apex:-Infinity,corner:c?.number??null,type:brakeJustType};
+  fBrakeRevoke={t:simulationElapsed,releaseAt:lastBrakeReleaseTime,until:c?c.end+F_BRAKE_WALL.exitPad:-Infinity,corner:c?.number??null,type:brakeJustType};
   fBrakeRevokeCool=wallHitCooldown;
 }
-// 毎コマ(tick)：案B。離した後すぐ(または頂点の手前)で壁に当たったら、出した(出す予定の)判定を「ブレーキ不足」に差し替え、加速ボーナスを取り消す
+// 毎コマ(tick)：案B。離した後すぐ(またはコーナーの出口の手前)で壁に当たったら、出した(出す予定の)判定を「ブレーキ不足」に差し替え、加速ボーナスを取り消す
 function fUpdateBrakeRevoke(){
   const r=fBrakeRevoke,hit=wallHitCooldown>fBrakeRevokeCool+1e-6;fBrakeRevokeCool=wallHitCooldown;
   if(!r)return;
   const braking=Boolean(input.brake||input.brakePressed);
-  if(gameState!=='racing'||braking&&simulationElapsed>r.t+.1||simulationElapsed>r.t+F_BRAKE_WALL.revokeSec&&s>r.apex){fBrakeRevoke=null;return;}
+  if(gameState!=='racing'||braking&&simulationElapsed>r.t+.1||simulationElapsed>r.t+F_BRAKE_WALL.revokeSec&&s>r.until){fBrakeRevoke=null;return;}
   if(!hit)return;
   fBrakeRevoke=null;
   if(meatLinkContext?.releaseAt===r.releaseAt)return;// 肉球につないだ時は連携の結果(壁で切れた表示)に任せる
@@ -15298,12 +15301,14 @@ function fUpdateBrakeRevoke(){
 }
 // ブレーキを離してから0.5秒待ち、その間に肉球へつながらなかった時だけブレーキの判定を単独で出す
 let brakeJudgmentHold=null;
-function holdBrakeJudgment(type,feedback){
+function holdBrakeJudgment(type,feedback,tooFast=false){
   clearTimeout(brakeJudgmentHold);
   const releaseAt=lastBrakeReleaseTime;
   brakeJudgmentHold=setTimeout(()=>{
     brakeJudgmentHold=null;
     if(gameState!=='racing'||lastBrakeReleaseTime!==releaseAt||meatLinkContext?.releaseAt===releaseAt)return;
+    // C114 F(案A)：肉球につながず単独で出す時、離した時の速さが速すぎた(先読みで外側の壁)ならWEAKにして加速ボーナスを取り消す
+    if(tooFast){type='WEAK';feedback={text:'ブレーキが足りない · このままだと壁',cls:'advice'};exitBoostPower=0;exitBoostTimer=0;brakeJustType='';try{window._lastExitBoostOrig=0;window._lastBrakeJustTypeOrig='';}catch(e){}}
     showBrakeJudgment(type,feedback);
     if(navigator.vibrate){
       if(type==='PERFECT') navigator.vibrate([20,20,40]);
@@ -16060,7 +16065,7 @@ function fPathDriveSnapshot(braking=false,stepDt=1/60,defer=false){
     reason:braking?'braking':baseline.wallRisk?'wall-forecast':baseline.missedTurn?'understeer-forecast':
       wallHitCooldown>0?'wall-recovery':slideGuarded?'slide-guard':entryHeld?'entry-hold':targetRebased?'current-step-release':plan.authority<1?'acceleration-feasibility':'current-grip'};
   // C114: ブレーキを離した時の判定用。コーナーの内側へ方向キー全開(held=dir)のまま加速せず進んでも、外側の壁に当たるか(wallSides 1=左 2=右)
-  result.outerWallForecast=(dir,span,steps)=>{const keep=held;held=dir;try{return forecast(0,normalAxis,0,0,false,null,span,steps);}finally{held=keep;}};
+  result.outerWallForecast=(dir,span,steps,speedScale=1)=>{const keep=held,v=initial.speed;held=dir;initial.speed=v*speedScale;try{return forecast(0,normalAxis,0,0,false,null,span,steps);}finally{held=keep;initial.speed=v;}};
   result.limitAcceleration=(request,axis=normalAxis)=>{
     // Match the realized current tick, including any style transition or request clamp.
     const actualMotion={...first.motion,heading:pathHandling.heading,curvature:pathHandling.turnCurvature,
@@ -22742,9 +22747,9 @@ function tick(dt,renderDt=dt){
       &&fDriftEntryReady());
     const perfectEntry=(brakePosLabel==='best'||fLatePhysicalPosition)&&lineError<=1&&Math.abs(relYaw)>=20*Math.PI/180&&wt>=.99;
     if(!perfectEntry)exitBoostPower=Math.min(exitBoostPower,goodEntry?.75:.55);
-    // C114 F(案A)：離した時の速さでは、内側へ全開で曲げても外側の壁に当たる(物理Fの先読み)なら、WEAKまでに抑えて加速ボーナスも付けない
+    // C114 F(案A)：離した時の速さでは、内側へ全開で曲げても外側の壁に当たる(物理Fの先読み)か。
+    // 肉球ドリフトにつなげば曲がれることがあるので、ここでは判定を下げず、単独の判定を出す時(holdBrakeJudgment)にWEAKへ下げる
     const fTooFast=fBrakeReleaseTooFast();
-    if(fTooFast)exitBoostPower=Math.min(exitBoostPower,.32);
     // V234：閾値上げ PERFECT 0.6→0.75、GOOD 0.42→0.55
     if(exitBoostPower>0.75){ brakeJustType='PERFECT'; exitBoostTimer=2.4; }
     else if(exitBoostPower>0.55){ brakeJustType='GOOD'; exitBoostTimer=2.0; }
@@ -22771,7 +22776,7 @@ function tick(dt,renderDt=dt){
     const previousMemo=brakeCoachRun?.previous.get(findDriveCorner()?.number);
     // 肉球につないだ時は連携の結果だけを出す。つながらなければブレーキの判定を単独で出す
     beginLinkFeedback();
-    holdBrakeJudgment(brakeJustType,fTooFast?{text:'ブレーキが足りない · このままだと壁',cls:'advice'}:{text:brakePraise(coachSnapshot,previousMemo),cls:brakeJustType==='PERFECT'?'perfect-advice':'advice'});
+    holdBrakeJudgment(brakeJustType,{text:brakePraise(coachSnapshot,previousMemo),cls:brakeJustType==='PERFECT'?'perfect-advice':'advice'},fTooFast);
     fArmBrakeRevoke();
   }
   wasBraking = isBraking;
