@@ -13,7 +13,7 @@
 - `node run.js --update` … 基準値を作り直す
 - `node run.js --target ../../nyanisyarudC114.html --baseline baseline_c114.json` … C114を、C114用の基準値と比較
 - `node run.js --ref <旧版.html>` … 物理F以外のモードで旧版と一致するか確認
-- `--only digital,meat,theory,shortcut,swipe,nonf` で一部だけ実行
+- `--only digital,meat,theory,shortcut,swipe,nonf,wind` で一部だけ実行
 
 ## グループ
 - digital: ボタン入力（0/±1）のボットでのコーナー走行
@@ -23,3 +23,4 @@
 - swipe: スマホのスワイプとキーボード順で、ブレーキ採点と連携が同じになるか
 - nonf: 物理F以外のモードで旧版と完全一致するか
 - c8: ショートカットの分岐直後のC8で、踏み切れない離し方ならブレーキ採点が付き、踏み切れる離し方ならジャンプするか
+- wind: 湾岸777の横風（C114以降。無い版では飛ばす）。吹く猫の判定、何もしないと半分以上の向きで壁に当たるか、反応0.3秒の当て舵で壁に当たらないか（ガチ峠260km/h・にゃんサポ250km/h）、REDCATで矢印が出るか
