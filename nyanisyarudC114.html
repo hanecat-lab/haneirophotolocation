@@ -14721,8 +14721,13 @@ const MEAT_FEEDBACK=Object.freeze({duration:2.5,first:.12,step:.25,cap:10,hold:9
 // 肉球の出口ブースト(D4)：PERFECTを perfectHold 秒以上続けていれば、2.5秒の時間切れでなくても(操舵を戻して抜けても)出す
 // おかわり肉球(D6)：残り window 秒の間に、コーナーが minLeft m 以上残っていて GOOD 以上なら、肉球をもう一度押すと経過時間を resume 秒に戻して続く(1回のドリフトで1回)
 const MEAT_EXIT=Object.freeze({perfectHold:.5}),MEAT_REFILL=Object.freeze({window:.5,minLeft:10,resume:.8});
+// C114 F 連続肉球：物理Fの普通猫は、おかわり肉球を1回のドリフトでmax回までつなげる。n回目は経過時間をresume[n-1]秒に戻す(回を重ねるほど延びる時間は短い)
+const F_MEAT_CHAIN=Object.freeze({max:3,resume:[.8,1.2,1.6]});
+let meatRefillCount=0;
+function meatRefillLeft(){return LINE_PHYSICS_MODE==='F'&&linePhysicsBEnabled()?meatRefillCount<F_MEAT_CHAIN.max:!meatRefillUsed;}
+function meatRefillResume(){return LINE_PHYSICS_MODE==='F'&&linePhysicsBEnabled()?F_MEAT_CHAIN.resume[Math.min(meatRefillCount,F_MEAT_CHAIN.resume.length-1)]:MEAT_REFILL.resume;}
 function meatRefillCornerOK(){return Boolean((DRIVING_GUIDE_DATA.tracks[currentKey]?.corners||[]).find(c=>s>=c.start&&s<=c.end-MEAT_REFILL.minLeft));}
-function meatRefillReady(){return !meatRefillUsed&&isSliding&&!slideExitActive&&slideTime>=MEAT_FEEDBACK.duration-MEAT_REFILL.window&&slideTime<MEAT_FEEDBACK.duration&&(slideLastQuality==='GOOD'||slideLastQuality==='PERFECT')&&meatRefillCornerOK();}
+function meatRefillReady(){return meatRefillLeft()&&isSliding&&!slideExitActive&&slideTime>=MEAT_FEEDBACK.duration-MEAT_REFILL.window&&slideTime<MEAT_FEEDBACK.duration&&(slideLastQuality==='GOOD'||slideLastQuality==='PERFECT')&&meatRefillCornerOK();}
 let meatFeedbackRunning=false,meatFeedbackEnded=false,meatFeedbackValidTime=0;
 let meatDurationAria=-1;
 // Presentation state is independent of scoring and drift physics.
@@ -15270,19 +15275,26 @@ function captureMeatLink(){
 // 先読みはコーナーの出口+exitPad mまで(最長maxSpan秒、stepSec秒刻み)。revokeSec：離してからこの秒数以内か、コーナーの出口+exitPad mより手前で壁に当たったら判定を取り消す
 // (速すぎる時の壁は頂点の先、離して2〜3秒後に来ることが多いので、出口まで見る)
 // margin：先読みは長いほど厳しめに外れるので、今の速さのmargin倍でも壁に当たる時だけ「速すぎ」とする
-const F_BRAKE_WALL=Object.freeze({exitPad:5,maxSpan:4,stepSec:.1,revokeSec:1.5,margin:(()=>{try{const v=parseFloat(new URLSearchParams(location.search).get('fbrakemargin'));if(Number.isFinite(v))return v;}catch(_){}return .9;})()});
-function fBrakeReleaseTooFast(){
-  if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled())return false;
-  const c=findDriveCorner();if(!c)return false;const dir=c.dir||1,B=F_BRAKE_WALL;
+const F_BRAKE_WALL=Object.freeze({exitPad:5,maxSpan:4,stepSec:.1,revokeSec:1.5,safeMin:.4,safeSteps:6,margin:(()=>{try{const v=parseFloat(new URLSearchParams(location.search).get('fbrakemargin'));if(Number.isFinite(v))return v;}catch(_){}return .9;})()});
+// 離した時の確認：{tooFast,safeKmh,kmh}。速すぎる時は、先読みで外側の壁に当たらない一番速い速さを二分探索(safeSteps回)し、
+// 先読みの厳しさの分(margin)を戻して「安全な速さ」(km/h)にする
+function fBrakeReleaseCheck(){
+  const none={tooFast:false,safeKmh:null,kmh:speed*3.6};
+  if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled())return none;
+  const c=findDriveCorner();if(!c)return none;const dir=c.dir||1,B=F_BRAKE_WALL,outer=dir>0?1:2;
   const span=THREE.MathUtils.clamp((c.end+B.exitPad-s)/Math.max(speed*.62,3),.4,B.maxSpan),steps=Math.max(4,Math.ceil(span/B.stepSec));
-  const f=fPathDriveSnapshot(false)?.outerWallForecast?.(dir,span,steps,B.margin);
-  return Boolean(f&&f.wallRisk&&(f.wallSides&(dir>0?1:2)));
+  const snap=fPathDriveSnapshot(false);if(!snap?.outerWallForecast)return none;
+  const hits=k=>{const f=snap.outerWallForecast(dir,span,steps,k);return Boolean(f.wallRisk&&(f.wallSides&outer));};
+  if(!hits(B.margin))return none;
+  let lo=B.safeMin,hi=B.margin;if(hits(lo))return {tooFast:true,safeKmh:null,kmh:speed*3.6};
+  for(let i=0;i<B.safeSteps;i++){const m=(lo+hi)/2;if(hits(m))hi=m;else lo=m;}
+  return {tooFast:true,safeKmh:Math.floor(speed*3.6*lo/B.margin),kmh:speed*3.6};
 }
 let fBrakeRevoke=null,fBrakeRevokeCool=0;
 function fArmBrakeRevoke(){
   if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled()){fBrakeRevoke=null;return;}
   const c=findDriveCorner();
-  fBrakeRevoke={t:simulationElapsed,releaseAt:lastBrakeReleaseTime,until:c?c.end+F_BRAKE_WALL.exitPad:-Infinity,corner:c?.number??null,type:brakeJustType};
+  fBrakeRevoke={t:simulationElapsed,releaseAt:lastBrakeReleaseTime,safeKmh:fBrakeAssessment?.t===simulationElapsed?fBrakeAssessment.safeKmh:null,until:c?c.end+F_BRAKE_WALL.exitPad:-Infinity,corner:c?.number??null,type:brakeJustType};
   fBrakeRevokeCool=wallHitCooldown;
 }
 // 毎コマ(tick)：案B。離した後すぐ(またはコーナーの出口の手前)で壁に当たったら、出した(出す予定の)判定を「ブレーキ不足」に差し替え、加速ボーナスを取り消す
@@ -15298,24 +15310,24 @@ function fUpdateBrakeRevoke(){
   exitBoostPower=0;exitBoostTimer=0;brakeJustType='';try{window._lastExitBoostOrig=0;window._lastBrakeJustTypeOrig='';}catch(e){}
   if(fBrakeAssessment&&fBrakeAssessment.t===r.t)fBrakeAssessment.revoked=true;
   try{if(typeof c10State!=='undefined'&&c10State.active)c10State.active.events.push({event:'brakeRevokedByWall',t:simulationElapsed,s,kmh:speed*3.6,corner:r.corner,was:r.type});}catch(e){}
-  showBrakeJudgment('WEAK',{text:'ブレーキ不足 · 壁に当たった',cls:'advice'});
+  showBrakeJudgment('WEAK',{text:r.safeKmh?`ブレーキ不足 · 壁に当たった(安全な速さ ${r.safeKmh}km/h)`:'ブレーキ不足 · 壁に当たった',cls:'advice'});
 }
 // ブレーキを離してから0.5秒待ち、その間に肉球へつながらなかった時だけブレーキの判定を単独で出す
 // ブレーキを離した時刻・つなぎの受付時間はゲームの時計(ミリ秒)で測る。一時停止の間は進まないので、止めている間に受付が切れない(C114)
 function linkNow(){return simulationElapsed*1000+1;}
 let brakeJudgmentHold=null;
-function holdBrakeJudgment(type,feedback,tooFast=false){
-  brakeJudgmentHold={releaseAt:lastBrakeReleaseTime,due:linkNow()+500,type,feedback,tooFast};
+function holdBrakeJudgment(type,feedback,check=null){
+  brakeJudgmentHold={releaseAt:lastBrakeReleaseTime,due:linkNow()+500,type,feedback,check};
 }
 // 毎コマ(tick)：離してからゲームの時計で0.5秒たったら、肉球につながっていない時だけ判定を出す
 function updateBrakeJudgmentHold(){
   const h=brakeJudgmentHold;if(!h||linkNow()<h.due)return;
   brakeJudgmentHold=null;
-  let {type,feedback,tooFast}=h;const releaseAt=h.releaseAt;
+  let {type,feedback,check}=h;const releaseAt=h.releaseAt,tooFast=Boolean(check?.tooFast);
   {
     if(gameState!=='racing'||lastBrakeReleaseTime!==releaseAt||meatLinkContext?.releaseAt===releaseAt)return;
     // C114 F(案A)：肉球につながず単独で出す時、離した時の速さが速すぎた(先読みで外側の壁)ならWEAKにして加速ボーナスを取り消す
-    if(tooFast){type='WEAK';feedback={text:'ブレーキが足りない · このままだと壁',cls:'advice'};exitBoostPower=0;exitBoostTimer=0;brakeJustType='';try{window._lastExitBoostOrig=0;window._lastBrakeJustTypeOrig='';}catch(e){}}
+    if(tooFast){type='WEAK';feedback={text:check.safeKmh?`ブレーキが足りない · 安全な速さ ${check.safeKmh}km/h(今${Math.round(check.kmh)})`:'ブレーキが足りない · このままだと壁',cls:'advice'};exitBoostPower=0;exitBoostTimer=0;brakeJustType='';try{window._lastExitBoostOrig=0;window._lastBrakeJustTypeOrig='';}catch(e){}}
     showBrakeJudgment(type,feedback);
     if(navigator.vibrate){
       if(type==='PERFECT') navigator.vibrate([20,20,40]);
@@ -15759,15 +15771,22 @@ function fDriftTailVisual(){return fDriftTailFade()>.3;}
 // C113 F: ?fhud=1 on-device diagnostic overlay for the drift look (read-only).
 const F_HUD=(()=>{try{return new URLSearchParams(location.search).get('fhud')==='1';}catch(_){return false;}})();
 let fHudEl=null,fHudMax=null;
+// ドリフト音の大きさ。滑っている間は max(.3,slidePower)。C114 F：見た目のドリフトの続き(fDriftTailFade 1→0)の間も、tailLevel×続きの濃さで鳴らし続けて、見た目と一緒に消す
+const F_DRIFT_TAIL_SOUND=Object.freeze({tailLevel:.3});
+function fDriftLoopLevel(){
+  if(isSliding&&!slideExitActive)return Math.max(.3,slidePower);
+  const fade=typeof fDriftTailFade==='function'?fDriftTailFade():0;
+  return fade>0?F_DRIFT_TAIL_SOUND.tailLevel*fade:0;
+}
 // C114: ドリフト音と見た目の状態(走行ログと ?fhud=1 に出す)
 function fDriftFxDiag(){
-  const want=isSliding&&!slideExitActive?Math.max(.3,slidePower):0,w=typeof driftLoop!=='undefined'?driftLoop:null;
+  const want=fDriftLoopLevel(),w=typeof driftLoop!=='undefined'?driftLoop:null;
   return {exit:Boolean(slideExitActive),power:+slidePower.toFixed(2),slideT:+slideTime.toFixed(2),snd:+want.toFixed(2),on:Boolean(w?.on),
     gain:w?+w.env.gain.value.toFixed(3):0,ctx:gutterAudio?.state||'none',sound:Boolean(soundEnabled),
     tail:typeof fDriftTailVisual==='function'?Boolean(fDriftTailVisual()):false,fade:typeof fDriftTailFade==='function'?+fDriftTailFade().toFixed(2):0};
 }
 // 物理Fの版の名前(走行ログのphysicsRevisionと、?fhud=1 の1行目に出す。実機でどの版が動いているかを見分ける)
-const F_REVISION='C114-link-gameclock';
+const F_REVISION='C114-safe-tail-chain';
 function fHudUpdate(tRelNow){
   if(!F_HUD||gameState!=='racing')return;
   if(!fHudEl){fHudEl=document.createElement('pre');fHudEl.setAttribute('aria-hidden','true');
@@ -22443,7 +22462,7 @@ if(LINE400_ENABLED){
 const COURSE_GRAVITY=9.81;
 function tick(dt,renderDt=dt){
   if(gameState==='practiceResult')return;
-  if(gameState==='racing'){const wf=waterfallInfo(s),wind=windInfo(s);waterfallWanted=wf.level;waterfallGrandWanted=wf.grand;windWanted=redcatDrivingActive()?Math.max(wind.level,THREE.MathUtils.smoothstep(speed*3.6,120,590)*.75):wind.level;windPitchWanted=redcatDrivingActive()?Math.max(wind.pitch,THREE.MathUtils.smoothstep(speed*3.6,160,600)):wind.pitch;driftLoopWanted=isSliding&&!slideExitActive?Math.max(.3,slidePower):0;driftLoopQuality=slideLastQuality||'OK';driftLoopKmh=speed*3.6;}else{waterfallWanted=0;windWanted=0;driftLoopWanted=0;}
+  if(gameState==='racing'){const wf=waterfallInfo(s),wind=windInfo(s);waterfallWanted=wf.level;waterfallGrandWanted=wf.grand;windWanted=redcatDrivingActive()?Math.max(wind.level,THREE.MathUtils.smoothstep(speed*3.6,120,590)*.75):wind.level;windPitchWanted=redcatDrivingActive()?Math.max(wind.pitch,THREE.MathUtils.smoothstep(speed*3.6,160,600)):wind.pitch;driftLoopWanted=fDriftLoopLevel();driftLoopQuality=slideLastQuality||'OK';driftLoopKmh=speed*3.6;}else{waterfallWanted=0;windWanted=0;driftLoopWanted=0;}
   const realDt=dt;updateDragonWorld(realDt);clearSkyImpactOffset();updateSkyLandingSpray(realDt);updateSkyWaterStream(realDt);dt*=skyCrestTimeScale(realDt);
   updateLinkPracticeInput();
   updateBranchRoute();
@@ -22756,7 +22775,7 @@ function tick(dt,renderDt=dt){
     if(!perfectEntry)exitBoostPower=Math.min(exitBoostPower,goodEntry?.75:.55);
     // C114 F(案A)：離した時の速さでは、内側へ全開で曲げても外側の壁に当たる(物理Fの先読み)か。
     // 肉球ドリフトにつなげば曲がれることがあるので、ここでは判定を下げず、単独の判定を出す時(holdBrakeJudgment)にWEAKへ下げる
-    const fTooFast=fBrakeReleaseTooFast();
+    const fBrakeCheck=fBrakeReleaseCheck(),fTooFast=fBrakeCheck.tooFast;
     // V234：閾値上げ PERFECT 0.6→0.75、GOOD 0.42→0.55
     if(exitBoostPower>0.75){ brakeJustType='PERFECT'; exitBoostTimer=2.4; }
     else if(exitBoostPower>0.55){ brakeJustType='GOOD'; exitBoostTimer=2.0; }
@@ -22776,14 +22795,14 @@ function tick(dt,renderDt=dt){
       lateral,idealLateral:fEntry?.ideal??t_opt,lineError,position:brakePosLabel,distance:cornerDist,
       geometryValid:fEntry?.valid??false,roadCurvature:fEntry?.curvature??null,
       roadRadius:fEntry?.radius??null,radiusFactor:rBonus,geometryRadiusFactor:fEntry?.radiusFactor??null,referenceFactor:fEntry?.factor??null,
-      goodEntry,perfectEntry,latePhysicalPosition:fLatePhysicalPosition,tooFast:fTooFast,
+      goodEntry,perfectEntry,latePhysicalPosition:fLatePhysicalPosition,tooFast:fTooFast,safeKmh:fBrakeCheck.safeKmh,
       rawScore:combined,afterGates:exitBoostPower,hold:brakeTime};
     captureBrakeCoach(coachSnapshot);
     recordLinkPracticeBrake(coachSnapshot);
     const previousMemo=brakeCoachRun?.previous.get(findDriveCorner()?.number);
     // 肉球につないだ時は連携の結果だけを出す。つながらなければブレーキの判定を単独で出す
     beginLinkFeedback();
-    holdBrakeJudgment(brakeJustType,{text:brakePraise(coachSnapshot,previousMemo),cls:brakeJustType==='PERFECT'?'perfect-advice':'advice'},fTooFast);
+    holdBrakeJudgment(brakeJustType,{text:brakePraise(coachSnapshot,previousMemo),cls:brakeJustType==='PERFECT'?'perfect-advice':'advice'},fBrakeCheck);
     fArmBrakeRevoke();
   }
   wasBraking = isBraking;
@@ -22835,7 +22854,7 @@ function tick(dt,renderDt=dt){
       isBrakingDrift=false;
       beginLinkFeedback();
       resetSlideExit();
-      isSliding=true; slideDir=Math.sign(eff)||brakeDriftDir; slideTime=0; meatPerfectHold=0; meatRefillUsed=false; meatSparkleDone=false; slidePower=brakeDriftPower||0.9;
+      isSliding=true; slideDir=Math.sign(eff)||brakeDriftDir; slideTime=0; meatPerfectHold=0; meatRefillUsed=false; meatRefillCount=0; meatSparkleDone=false; slidePower=brakeDriftPower||0.9;
       slideEntrySpeed=speed; slideEntryTime=performance.now()/1000; slideFailTimer=0; slideQualityTimer=0; 
       slideLastQuality='OK'; // Quality is earned after the transition.
       // C113 F: classify an unlinked transition as a solo slide, exactly as
@@ -22888,7 +22907,7 @@ function tick(dt,renderDt=dt){
     if(speed >= minEntrySpeed){
       beginLinkFeedback();
       resetSlideExit();
-      isSliding=true; slideDir=Math.sign(eff); slideTime=0; meatPerfectHold=0; meatRefillUsed=false; meatSparkleDone=false; slidePower=0.7; isBrakingDrift=false; brakeTime=0;
+      isSliding=true; slideDir=Math.sign(eff); slideTime=0; meatPerfectHold=0; meatRefillUsed=false; meatRefillCount=0; meatSparkleDone=false; slidePower=0.7; isBrakingDrift=false; brakeTime=0;
       slideEntrySpeed=speed; slideEntryTime=performance.now()/1000; slideFailTimer=0; slideQualityTimer=0; slideLastQuality=''; slideWasBad=false; featherSlideStart();
       beginSoloSlide();beginMeatDriftFeedback();
       try{ slideEntryR = (typeof kappaAbs!=='undefined' && kappaAbs>0.001) ? 1/kappaAbs : 999; }catch(e){ slideEntryR=999; }
@@ -23175,7 +23194,8 @@ function tick(dt,renderDt=dt){
     const meatMidScale=cornerEntryTime>0&&simulationElapsed-cornerEntryTime>.8&&speed>11.7?.95:1;
 
     // おかわり肉球(D6)
-    if(input.driftJustPressed&&meatRefillReady()){meatRefillUsed=true;slideTime=MEAT_REFILL.resume;slideNeutralTime=0;playSfx('judgeGood');}
+    if(input.driftJustPressed&&meatRefillReady()){slideTime=meatRefillResume();meatRefillUsed=true;meatRefillCount++;slideNeutralTime=0;playSfx('judgeGood',meatRefillCount>1?{rate:1+.12*(meatRefillCount-1)}:undefined);
+      try{if(typeof c10State!=='undefined'&&c10State.active)c10State.active.events.push({event:'meatRefill',n:meatRefillCount,t:simulationElapsed,s,kmh:speed*3.6,quality:slideLastQuality});}catch(e){}}
     if(!slideExitActive && ((slideTime>=.35&&slideNeutralTime>=(LINE_PHYSICS_MODE==='F'&&linePhysicsBEnabled()?F_SLIDE_NEUTRAL:.16))||slideTime>=MEAT_FEEDBACK.duration)){
       slideExitActive=true;slideExitTime=0;captureFDriftTail();
       if(slideTime>=MEAT_FEEDBACK.duration||meatPerfectHold>=MEAT_EXIT.perfectHold){
