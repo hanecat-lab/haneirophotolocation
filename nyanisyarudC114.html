@@ -15266,16 +15266,39 @@ function captureMeatLink(){
     ?{curve,corner:slideDriveCorner,brakeType:window._lastBrakeJustTypeOrig||brakeJustType||'OK',since,releaseAt:lastBrakeReleaseTime}:null;
   recordLinkPracticeMeatEntry(since,meatLinkContext);
 }
-// C114 F：ブレーキの判定と壁(案A)。物理F(ガチ峠の普通猫)だけ
-// 先読みはコーナーの出口+exitPad mまで(最長maxSpan秒、stepSec秒刻み)。速すぎる時の壁は頂点の先、離して2〜3秒後に来ることが多いので、出口まで見る
+// C114 F：ブレーキの判定と壁(案A・案B)。物理F(ガチ峠の普通猫)だけ
+// 先読みはコーナーの出口+exitPad mまで(最長maxSpan秒、stepSec秒刻み)。revokeSec：離してからこの秒数以内か、コーナーの出口+exitPad mより手前で壁に当たったら判定を取り消す
+// (速すぎる時の壁は頂点の先、離して2〜3秒後に来ることが多いので、出口まで見る)
 // margin：先読みは長いほど厳しめに外れるので、今の速さのmargin倍でも壁に当たる時だけ「速すぎ」とする
-const F_BRAKE_WALL=Object.freeze({exitPad:5,maxSpan:4,stepSec:.1,margin:(()=>{try{const v=parseFloat(new URLSearchParams(location.search).get('fbrakemargin'));if(Number.isFinite(v))return v;}catch(_){}return .9;})()});
+const F_BRAKE_WALL=Object.freeze({exitPad:5,maxSpan:4,stepSec:.1,revokeSec:1.5,margin:(()=>{try{const v=parseFloat(new URLSearchParams(location.search).get('fbrakemargin'));if(Number.isFinite(v))return v;}catch(_){}return .9;})()});
 function fBrakeReleaseTooFast(){
   if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled())return false;
   const c=findDriveCorner();if(!c)return false;const dir=c.dir||1,B=F_BRAKE_WALL;
   const span=THREE.MathUtils.clamp((c.end+B.exitPad-s)/Math.max(speed*.62,3),.4,B.maxSpan),steps=Math.max(4,Math.ceil(span/B.stepSec));
   const f=fPathDriveSnapshot(false)?.outerWallForecast?.(dir,span,steps,B.margin);
   return Boolean(f&&f.wallRisk&&(f.wallSides&(dir>0?1:2)));
+}
+let fBrakeRevoke=null,fBrakeRevokeCool=0;
+function fArmBrakeRevoke(){
+  if(LINE_PHYSICS_MODE!=='F'||!linePhysicsBEnabled()){fBrakeRevoke=null;return;}
+  const c=findDriveCorner();
+  fBrakeRevoke={t:simulationElapsed,releaseAt:lastBrakeReleaseTime,until:c?c.end+F_BRAKE_WALL.exitPad:-Infinity,corner:c?.number??null,type:brakeJustType};
+  fBrakeRevokeCool=wallHitCooldown;
+}
+// 毎コマ(tick)：案B。離した後すぐ(またはコーナーの出口の手前)で壁に当たったら、出した(出す予定の)判定を「ブレーキ不足」に差し替え、加速ボーナスを取り消す
+function fUpdateBrakeRevoke(){
+  const r=fBrakeRevoke,hit=wallHitCooldown>fBrakeRevokeCool+1e-6;fBrakeRevokeCool=wallHitCooldown;
+  if(!r)return;
+  const braking=Boolean(input.brake||input.brakePressed);
+  if(gameState!=='racing'||braking&&simulationElapsed>r.t+.1||simulationElapsed>r.t+F_BRAKE_WALL.revokeSec&&s>r.until){fBrakeRevoke=null;return;}
+  if(!hit)return;
+  fBrakeRevoke=null;
+  if(meatLinkContext?.releaseAt===r.releaseAt)return;// 肉球につないだ時は連携の結果(壁で切れた表示)に任せる
+  if(brakeJudgmentHold){clearTimeout(brakeJudgmentHold);brakeJudgmentHold=null;}
+  exitBoostPower=0;exitBoostTimer=0;brakeJustType='';try{window._lastExitBoostOrig=0;window._lastBrakeJustTypeOrig='';}catch(e){}
+  if(fBrakeAssessment&&fBrakeAssessment.t===r.t)fBrakeAssessment.revoked=true;
+  try{if(typeof c10State!=='undefined'&&c10State.active)c10State.active.events.push({event:'brakeRevokedByWall',t:simulationElapsed,s,kmh:speed*3.6,corner:r.corner,was:r.type});}catch(e){}
+  showBrakeJudgment('WEAK',{text:'ブレーキ不足 · 壁に当たった',cls:'advice'});
 }
 // ブレーキを離してから0.5秒待ち、その間に肉球へつながらなかった時だけブレーキの判定を単独で出す
 let brakeJudgmentHold=null;
@@ -22755,6 +22778,7 @@ function tick(dt,renderDt=dt){
     // 肉球につないだ時は連携の結果だけを出す。つながらなければブレーキの判定を単独で出す
     beginLinkFeedback();
     holdBrakeJudgment(brakeJustType,{text:brakePraise(coachSnapshot,previousMemo),cls:brakeJustType==='PERFECT'?'perfect-advice':'advice'},fTooFast);
+    fArmBrakeRevoke();
   }
   wasBraking = isBraking;
   if(exitBoostTimer>0){
@@ -24181,6 +24205,7 @@ function tick(dt,renderDt=dt){
   updateOniHazards(dt);
   if(tunnelRun?.rocks)updateTunnelRocks();
   if(currentKey==='bay777')updateFBay777Barriers();
+  fUpdateBrakeRevoke();
   updateCornerGrades();
   updateSnowDrift(dt);
 
