@@ -12,6 +12,7 @@
 - `node run.js` … baseline.json と比較
 - `node run.js --update` … 基準値を作り直す
 - `node run.js --target ../../nyanisyarudC114.html --baseline baseline_c114.json` … C114を、C114用の基準値と比較
+- `node run.js --target ../../nyanisyarudkai.html --baseline baseline_c114.json` … kai v001（URL指定なしで物理F）を、C114用の基準値と比較（kai v001時点で13 PASS）
 - `node run.js --ref <旧版.html>` … 物理F以外のモードで旧版と一致するか確認
 - `--only digital,meat,theory,shortcut,swipe,nonf,wind` で一部だけ実行
 
