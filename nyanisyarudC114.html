@@ -15881,7 +15881,7 @@ function fDriftFxDiag(){
     tail:typeof fDriftTailVisual==='function'?Boolean(fDriftTailVisual()):false,fade:typeof fDriftTailFade==='function'?+fDriftTailFade().toFixed(2):0};
 }
 // 物理Fの版の名前(走行ログのphysicsRevisionと、?fhud=1 の1行目に出す。実機でどの版が動いているかを見分ける)
-const F_REVISION='C114-nitro-rain';
+const F_REVISION='C114-nitro-ahead';
 function fHudUpdate(tRelNow){
   if(!F_HUD||gameState!=='racing')return;
   if(!fHudEl){fHudEl=document.createElement('pre');fHudEl.setAttribute('aria-hidden','true');
@@ -19469,7 +19469,8 @@ function updateReadyCourse(){
 // 撃つとsec秒、撃った時の横位置のままコーナーに沿って走り(方向キーは効かない)、タイヤのグリップをgrip倍・普段の加速をaccel倍・最高速をtop倍にする
 // 切れた後は普通の物理F。速さがコーナーの限界を超えていればアウトへ膨らむ。最高速の上乗せはtopFade秒かけて戻す
 // 充電：ブレーキPERFECT・肉球PERFECT・連続肉球2回目・横風クリアでそれぞれ1個
-const ROBO_NITRO=Object.freeze({max:3,start:1,sec:1.5,grip:6,accel:1.5,top:1.1,topFade:1.5,warn:.3,gripMargin:.97});
+// lookPad・aheadMargin：先の曲がりを見る余り(m)と、その曲がれる速さに対する余裕。brake：上限を越えている時に発動中に落とす強さ(m/s²)
+const ROBO_NITRO=Object.freeze({max:3,start:1,sec:1.5,grip:6,accel:1.5,top:1.1,topFade:1.5,warn:.3,gripMargin:.97,lookPad:12,aheadMargin:.88,brake:16});
 const roboNitro={charges:ROBO_NITRO.start,until:-1,endedAt:-99,warned:false,flame:0,holdCmd:null};
 function roboNitroEnabled(){return catModel==='robo'&&LINE_PHYSICS_MODE==='F'&&driveMode==='gachiTouge'&&fCourseEnabled(currentKey)&&normalCatSpeed();}
 function roboNitroActive(){return roboNitro.until>simulationElapsed&&roboNitroEnabled()&&gameState==='racing';}
@@ -19477,7 +19478,14 @@ function roboNitroGripScale(){return roboNitroActive()?ROBO_NITRO.grip:1;}
 // 発動中に伸ばす速さの上限：最高速×topと、グリップgrip倍での今と先の曲がれる速さ(×gripMargin)の小さい方。
 // 曲がれる速さを越えて伸ばすと横位置を保てずアウトへ流れる(実機の録画：グリップ3倍のC3で126→155km/hの間に横位置-0.55→+1.96。gripを6倍にして保てるようにした)
 function roboNitroSpeedCap(preview){const g=Math.min(Number.isFinite(activeGripLimit)?activeGripLimit:Infinity,Number.isFinite(preview)?preview:Infinity);
-  return Math.min(raceSpeedLimit(),g*ROBO_NITRO.gripMargin);}
+  return Math.min(raceSpeedLimit(),g*ROBO_NITRO.gripMargin,roboNitroAheadCap());}
+// ニトロの残り時間で進む先(＋lookPad m)の一番きつい曲がりを、保っている横位置で曲がれる速さ×aheadMargin。
+// 直線で伸ばしたまま急なヘアピンへ入ると、グリップ6倍でも向きが追いつかず外へ流れる(実機の表示：C6で118/122km/h・保つ0.71→1.24m)
+function roboNitroAheadCap(){
+  const N=ROBO_NITRO,left=Math.max(0,roboNitro.until-simulationElapsed),reach=speed*.62*left+N.lookPad,hold=roboNitro.holdCmd??lateral;let k=0;
+  for(let d=0;d<=reach;d+=2){const b=roadBendAt(Math.min(totalLength,s+d)),m=THREE.MathUtils.clamp(1-b*hold,.3,1.8);k=Math.max(k,Math.abs(b)/m);}
+  return Math.sqrt(linePhysicsATireForce(false,1)/(k+.001))*N.aheadMargin;
+}
 function roboNitroTopScale(){if(!roboNitroEnabled())return 1;if(roboNitroActive())return ROBO_NITRO.top;
   const k=1-(simulationElapsed-roboNitro.endedAt)/ROBO_NITRO.topFade;return k>0?1+(ROBO_NITRO.top-1)*k:1;}
 // ?fhud=1 と走行ログ用：ニトロ中に横へ流れる原因を見分ける(保つ指令と実際の横位置・横の速さ・滑っているか・物理Fの理由・グリップの限界)
@@ -23842,7 +23850,9 @@ function tick(dt,renderDt=dt){
   if(goldExtra>0&&!isBraking){tSpd=TOP_SPEED+goldExtra/3.6;throttleScale=Math.max(throttleScale,1);}
   if(suberiBurstActive()&&!isBraking&&!gutterRun.active){tSpd=Math.max(tSpd,raceSpeedLimit());throttleScale=Math.max(throttleScale,1);}
   // C114 ロボ猫ニトロ：すべり猫の解放と同じく、発動中は速さの目標を最高速(×top)まで上げ、アクセルを全開にする(物理Fの控える判断を越える)
-  if(roboNitroActive()&&!isBraking&&!gutterRun.active){tSpd=Math.max(tSpd,roboNitroSpeedCap(previewGripLimit));throttleScale=Math.max(throttleScale,1);}
+  if(roboNitroActive()&&!isBraking&&!gutterRun.active){const cap=roboNitroSpeedCap(previewGripLimit);tSpd=Math.max(tSpd,cap);throttleScale=Math.max(throttleScale,1);
+    // 発動中は横位置を必ず保てるよう、先の曲がりに対して速すぎれば落とす(切れた後に膨らむかどうかは今までどおり)
+    if(speed>cap)speed=Math.max(cap,speed-ROBO_NITRO.brake*dt);}
   const ordinaryCoast=!gutterRun.active&&!isBraking&&speed>tSpd&&(!globalIsAssist||(!pathExcluded&&rescueDecel===0));
   const manualGripOverspeed=ordinaryCoast&&(pathExcluded?(!isSliding&&!isBrakingDrift&&!cornerLaunch):true);
   if(C5_DIAG_ENABLED)c5RecordPhysics({dt,tSpd,throttleScale,activeGripLimit,previewGripLimit,envBase,gripGoal,manualGripOverspeed,ordinaryCoast,cornerLaunch});
