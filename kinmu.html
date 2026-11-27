@@ -796,6 +796,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   async function openFile(file) {
     if (!file) return;
     if (dirty && !confirm('保存していない変更があります。別のファイルを開きますか？')) return;
+    if (!$('bkBanner').classList.contains('hidden')) {
+      if (!confirm('前回の保存していない作業が残っています。\nこのファイルを開いて編集すると、前回の作業は消えます。開きますか？')) return;
+      $('bkBanner').classList.add('hidden');
+    }
     try {
       setStatus('読み込み中…');
       lastBuf = await file.arrayBuffer();
@@ -927,8 +931,13 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       if (focusName) setTimeout(function () { input.focus(); }, 50);
     }, function () { renderStaff(); });
   }
+  // 職員の並び・人数が変わったときだけ「元に戻す」の履歴を消す（行番号がずれるため）。
+  // 画面幅の切り替えや保存エラー後の描き直しでは履歴を残す
+  var lastStaffOrder = null;
   function renderStaff(focusIndex) {
-    resetUndo();
+    var same = lastStaffOrder && lastStaffOrder.length === data.staff.length && data.staff.every(function (s, i) { return s === lastStaffOrder[i]; });
+    if (!same) resetUndo();
+    lastStaffOrder = data.staff.slice();
     var list = $('staffList'); list.innerHTML = '';
     var full = data.staff.length >= data.capacity, narrow = isNarrow(); lastNarrow = narrow;
     if (narrow) {
@@ -1061,8 +1070,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     var y = Number(data.year);
     $('reiwa').textContent = y >= 2019 ? '令和 ' + (y - 2018) + '年 ' + data.month + '月' : '';
   }
-  $('year').addEventListener('input', function (e) { data.year = e.target.value; markDirty(); renderMonth(); });
-  $('month').addEventListener('change', function (e) { data.month = e.target.value; markDirty(); renderMonth(); });
+  $('year').addEventListener('input', function (e) { data.year = e.target.value; markDirty(); renderMonth(); renderGrid(); });
+  $('month').addEventListener('change', function (e) { data.month = e.target.value; markDirty(); renderMonth(); renderGrid(); });
   $('clearShifts').addEventListener('change', function (e) { $('clearWarn').classList.toggle('hidden', !e.target.checked); markDirty(); });
 
   /* ---------- 当直看護師 ---------- */
@@ -1160,6 +1169,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
   // 夜勤を外したら、翌日の「×」（明け）を「／」（休み）に戻す。戻したら true
   function isNight(v) { return !!v && v.indexOf('当') >= 0; }
+  // 夜勤（当）を入れたら、翌日が空いていて固定でなければ「×」を入れる（表・範囲・貼り付け・全画面で共通）
+  // tgt：同じ操作で値を入れるマス（そこには「×」を入れない）
+  function autoAkeNext(r, d, v, batch, tgt) {
+    if (!isNight(v) || r === 'n' || !$('autoAke').checked || d >= daysIn()) return false;
+    if (tgt && tgt[r + '_' + (d + 1)]) return false;
+    if (getV(r, d + 1) !== '' || isLocked(r, d + 1)) return false;
+    setV(r, d + 1, '×', batch); return true;
+  }
   function unAke(r, d, oldV, newV, batch, skip) {
     if (r === 'n' || !$('autoAke').checked || !isNight(oldV) || isNight(newV)) return false;
     var nd = d + 1; if (nd > daysIn() || (skip && skip[r + '_' + nd])) return false;
@@ -1169,8 +1186,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   function applySymbol(v) {
     if (!sel) return;
     if (hasRange()) { fillRange(v); return; }
-    var batch = [], N = daysIn(), lm = false;
-    if (isLocked(sel.r, sel.d) && !lm) {
+    var batch = [], N = daysIn();
+    if (isLocked(sel.r, sel.d)) {
       var who0 = (data.staff[sel.r].name || '').replace(/[\s　]+/g, '');
       if (!confirm(who0 + ' さんの ' + data.month + '/' + sel.d + ' は希望休として固定されています（' + shown(getV(sel.r, sel.d)) + '）。\n変更しますか？')) return;
     }
@@ -1180,9 +1197,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     }
     var old1 = getV(sel.r, sel.d);
     setV(sel.r, sel.d, v, batch);
-    if (lm && sel.r !== 'n') setLock(sel.r, sel.d, v !== '', batch);
     var unaked = unAke(sel.r, sel.d, old1, v, batch);
-    if (v && sel.r !== 'n' && v.indexOf('当') >= 0 && $('autoAke').checked && sel.d < N && getV(sel.r, sel.d + 1) === '' && !isLocked(sel.r, sel.d + 1)) setV(sel.r, sel.d + 1, '×', batch);
+    autoAkeNext(sel.r, sel.d, v, batch);
     if (batch.length) { pushUndo(batch); markDirty(); }
     var step = (v && v.indexOf('当') >= 0 && $('autoAke').checked && sel.r !== 'n' && sel.d < N && getV(sel.r, sel.d + 1) === '×') ? 2 : 1;
     selEnd = null;
@@ -1249,17 +1265,17 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     renderPalette();
   }
   document.addEventListener('mouseup', function () { if (dragging) { dragging = false; renderPalette(); } });
-  // 範囲に記号を入れる（固定のマスは「希望休として入れる」がオンのとき以外は飛ばす）
+  // 範囲に記号を入れる（固定のマスは飛ばす）
   function fillRange(v) {
-    var batch = [], skip = 0, ng = 0, lm = false, tgt = {}, un = 0;
+    var batch = [], skip = 0, ng = 0, tgt = {}, un = 0;
     rangeCells().forEach(function (c) { tgt[c.r + '_' + c.d] = true; });
     rangeCells().forEach(function (c) {
-      if (isLocked(c.r, c.d) && !lm) { skip++; return; }
+      if (isLocked(c.r, c.d)) { skip++; return; }
       if (violates(c.r, c.d, v)) { ng++; return; }
       var o = getV(c.r, c.d);
       setV(c.r, c.d, v, batch);
       if (unAke(c.r, c.d, o, v, batch, tgt)) un++;
-      if (lm && c.r !== 'n') setLock(c.r, c.d, v !== '', batch);
+      autoAkeNext(c.r, c.d, v, batch, tgt);
     });
     if (batch.length) { pushUndo(batch); markDirty(); }
     recountShifts(); renderGrid();
@@ -1277,18 +1293,19 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
   function pasteMatrix(m) {
     if (!sel || !m || !m.length) return;
-    var rows = rowList(), N = daysIn(), batch = [], skip = 0, ng = 0, lm = false, bx = rangeBox();
+    var rows = rowList(), N = daysIn(), batch = [], skip = 0, ng = 0, bx = rangeBox();
     var one = m.length === 1 && m[0].length === 1, tgt = {};
     if (one && hasRange()) rangeCells().forEach(function (c) { tgt[c.r + '_' + c.d] = true; });
     else m.forEach(function (line, i) { var ri = bx.r1 + i; if (ri < rows.length) line.forEach(function (_, j) { tgt[rows[ri] + '_' + (bx.d1 + j)] = true; }); });
     var put = function (r, d, v) {
-      if (isLocked(r, d) && !lm) { skip++; return; }
+      if (isLocked(r, d)) { skip++; return; }
       if (violates(r, d, v)) { ng++; return; }
       var o = getV(r, d);
-      setV(r, d, v, batch); if (lm && r !== 'n') setLock(r, d, v !== '', batch);
+      setV(r, d, v, batch);
       unAke(r, d, o, v, batch, tgt);
+      autoAkeNext(r, d, v, batch, tgt);
     };
-    if (one && hasRange()) rangeCells().forEach(function (c) { put(c.r, c.d, m[0][0]); });
+    if (one && hasRange()) rangeCells().forEach(function (c) { put(c.r, c.d, String(m[0][0]).trim()); });
     else m.forEach(function (line, i) {
       var ri = bx.r1 + i; if (ri >= rows.length) return;
       line.forEach(function (v, j) { var d = bx.d1 + j; if (d <= N) put(rows[ri], d, String(v).trim()); });
@@ -1418,6 +1435,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // 公休の数え方（公休計算シートと同じ）：／・公＝1日、AM・PM・PM´・BM・公/有＝0.5日
   var KOU_W = { '／': 1, '公': 1, 'AM': 0.5, 'PM': 0.5, 'PM´': 0.5, 'BM': 0.5, '公/有': 0.5 };
   function kouOf(v, catOf) { var c = catOf[v]; return c ? (KOU_W[c] || 0) : (KOU_W[v] || 0); }
+  // 入力欄（西暦など）にフォーカスが残ったままだと、矢印キー等がその欄を書き換えるため外す
+  function blurField() {
+    var a = document.activeElement, tg = a && (a.tagName || '').toLowerCase();
+    if (tg === 'input' || tg === 'select' || tg === 'textarea') a.blur();
+  }
   function buildTable(opt) {
     var N = daysIn(), si = symInfo(), lim = data.limits || {};
     var catOf = {}; data.symbols.forEach(function (x) { if (x.sym) catOf[x.sym] = x.cat; });
@@ -1468,7 +1490,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         var td = el('td', { 'class': cls, text: v, 'data-r': String(r), 'data-d': String(d),
           title: (rq ? '希望：' + REQ[rq].long + (violates(r, d, v) ? '（合っていません）' : '') + ' ' : '') + ((!isNurse && run > 0) ? run + '連勤目' : '') });
         if (opt.onDown) {
-          td.addEventListener('mousedown', function (e) { e.preventDefault(); opt.onDown(r, d, e); });
+          td.addEventListener('mousedown', function (e) { e.preventDefault(); blurField(); opt.onDown(r, d, e); });
           td.addEventListener('mouseenter', function () { if (opt.onEnter) opt.onEnter(r, d); });
         } else td.addEventListener('click', function () { opt.onCell(r, d, td); });
         tr.appendChild(td);
@@ -1509,6 +1531,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   function renderGrid() {
     if (!model) return;
     if (sel && sel.r !== 'n' && sel.r >= data.staff.length) sel = null;
+    if (sel && sel.d > daysIn()) { sel = { r: sel.r, d: daysIn() }; selEnd = null; }
+    if (sel && viewMode === 'day' && sel.r === 'n') sel = data.staff.length ? { r: data.staff.length - 1, d: sel.d } : null;
     $('gridwrap').classList.toggle('hidden', viewMode === 'day'); $('dayview').classList.toggle('hidden', viewMode !== 'day');
     { var yy = Number(data.year); $('shiftYm').textContent = (yy >= 2019 ? '令和' + (yy - 2018) + '年 ' : '') + data.month + '月'; }
     if (viewMode === 'day') { renderDay(); return; }
@@ -1617,12 +1641,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
   function setFromPop(r, d, v) {
     var batch = [], N = daysIn();
-    if (isLocked(r, d) && !false && !confirm('この日は希望休として固定されています（' + shown(getV(r, d)) + '）。変更しますか？')) return;
+    if (isLocked(r, d) && !confirm('この日は希望休として固定されています（' + shown(getV(r, d)) + '）。変更しますか？')) return;
     if (violates(r, d, v) && !confirm('この日は「' + reqWord(r, d) + '」の希望です。「' + v + '」を入れますか？')) return;
     var o2 = getV(r, d);
     setV(r, d, v, batch);
-    if (false && r !== 'n') setLock(r, d, v !== '', batch);
-    if (v && r !== 'n' && v.indexOf('当') >= 0 && $('autoAke').checked && d < N && getV(r, d + 1) === '') setV(r, d + 1, '×', batch);
+    autoAkeNext(r, d, v, batch);
     var un2 = unAke(r, d, o2, v, batch);
     if (batch.length) { pushUndo(batch); markDirty(); }
     recountShifts(); closePop(); renderFs();
@@ -1781,7 +1804,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'c' && viewMode === 'grid') { e.preventDefault(); copyRange(); return; }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'v') return;   // 貼り付けは paste イベントで
     if (e.key === 'Escape' && selEnd) { selEnd = null; renderGrid(); return; }
-    var N = daysIn(), rows = data.staff.map(function (_, i) { return i; }).concat(['n']), ri = rows.indexOf(sel.r);
+    var N = daysIn(), rows = data.staff.map(function (_, i) { return i; }).concat(viewMode === 'day' ? [] : ['n']), ri = rows.indexOf(sel.r);
     if (e.shiftKey && viewMode === 'grid' && /^Arrow/.test(e.key)) {
       var cur = selEnd || { r: sel.r, d: sel.d }, ci = rows.indexOf(cur.r);
       if (e.key === 'ArrowRight') cur = { r: cur.r, d: Math.min(N, cur.d + 1) };
@@ -1868,7 +1891,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   async function newMonth() {
     if (!model) return;
     var y = Number(data.year), m = Number(data.month);
-    if (!(y >= 2000 && m >= 1 && m <= 12)) { alert('今の年月が正しくありません。［年月］タブで確認してください。'); return; }
+    if (!(y >= 2000 && m >= 1 && m <= 12)) { alert('今の年月が正しくありません。上の「年月」で確認してください。'); return; }
     var ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1;
     var v = validate();
     if (v.errs.length) { alert('作れません：\n・' + v.errs.join('\n・')); renderAll(); return; }
@@ -1884,7 +1907,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           setStatus(m + '月を保存中…');
           await doSave(false, monthName());
         } else if (ans === 'discard') {
-          if (lastBuf) { model = await KinmuCore.load(lastBuf, deps); data = model.data; data.staff.forEach(function (s) { s.isNew = false; }); }
+          // 開いたファイルの内容に戻す。ただしアプリで作った未保存の月は元のファイルが別の月なので戻さない（今の内容から翌月を作る）
+          if (lastBuf && !isNewUnsaved) {
+            model = await KinmuCore.load(lastBuf, deps); data = model.data; data.staff.forEach(function (s) { s.isNew = false; });
+            y = Number(data.year); m = Number(data.month); ny = m === 12 ? y + 1 : y; nm = m === 12 ? 1 : m + 1;
+          }
         }
       } else {
         var ok = await choose(ny + '年' + nm + '月の勤務表を作ります', what,
