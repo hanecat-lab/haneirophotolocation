@@ -7077,6 +7077,13 @@ const vlogMotionSequence=(n,kind,loops,holdFrames)=>{
   return seq;
 };
 // 保存・持ち出すボタンの色（濃いオレンジに白の太字。白文字の見やすさ 5.2）。ミントの「作る・入れる」と分ける。
+// 動画の拡大（素材ごとに固定）。_zoom={z:倍率1〜3, x,y:拡大の中心（画面に対する0〜1）}。画面の外が見えないよう中心を収める。
+const vlogZoomOf=clip=>{
+  const z=Math.max(1,Math.min(3,Number(clip?._zoom?.z)||1));
+  if(z<=1.001) return null;
+  const lim=0.5/z, c=v=>Math.max(lim,Math.min(1-lim,Number.isFinite(v)?v:0.5));
+  return {z,x:c(clip._zoom.x),y:c(clip._zoom.y)};
+};
 // 画面の比率（幅÷高さ）。4:5 はインスタのフィード投稿向け。
 const vlogAspectRatio=mode=>mode==='16:9'?16/9:mode==='4:5'?4/5:9/16;
 const VLOG_SAVE_BUTTON_STYLE={background:'#C2410C',color:'#FFFFFF',fontWeight:700,border:'1px solid #9A3412'};
@@ -12405,6 +12412,9 @@ function App(){
   const fogTextureCacheRef = useRef(new Map());
   const [fogLengthPickerId, setFogLengthPickerId] = useState(null);
   const [speedPickerId, setSpeedPickerId] = useState(null);
+  // 動画の拡大の欄を開いている素材。開いている間はプレビューを指で動かして位置・倍率を決める。
+  const [zoomPickerId, setZoomPickerId] = useState(null);
+  const zoomGestureRef = useRef({pointers:new Map(),pinch:null,before:null});
   // 逆再生・ブーメラン：設定の欄を開いている素材、選んでいる設定、作っている最中の状態。
   const [motionPickerId, setMotionPickerId] = useState(null);
   const [motionOpts, setMotionOpts] = useState({kind:'boomerang',loops:2,cap:3,hold:0,speed:1.5});
@@ -13082,6 +13092,7 @@ function App(){
       const correcting=hasLightCorrection(light) && !(modeRef.current==='hikariyomi' && lightCompareHeldRef.current && lightCompareClipIdRef.current===clip.id);
       let lightCanvas=null;
       let ctx=outputCtx;
+      let zoomSaved=false;
       try{
         if(correcting){
           lightCanvas=lightFrameCanvasRef.current || document.createElement('canvas');
@@ -13092,6 +13103,7 @@ function App(){
           ctx.filter='none';
         }
         const finishClip=()=>{
+          if(zoomSaved){ ctx.restore(); zoomSaved=false; }
           if(correcting){
             try{
               const pixels=ctx.getImageData(0,0,cw,ch);
@@ -13228,6 +13240,16 @@ function App(){
           }
           return finishClip();
         } else {
+          // 拡大: 素材の窓の中で、中心を窓の真ん中に持ってきて z 倍にする（窓の外にははみ出さない）。
+          const zoom=vlogZoomOf(clip);
+          if(zoom){
+            const win={x:(cw-cw*scale)/2+offsetX,y:(ch-ch*scale)/2+offsetY,w:cw*scale,h:ch*scale};
+            ctx.save(); zoomSaved=true;
+            ctx.beginPath(); ctx.rect(win.x,win.y,win.w,win.h); ctx.clip();
+            ctx.translate(win.x+win.w/2,win.y+win.h/2);
+            ctx.scale(zoom.z,zoom.z);
+            ctx.translate(-(win.x+zoom.x*win.w),-(win.y+zoom.y*win.h));
+          }
           const v=videoRefs.current.get(clip.id);
           if(!v || v.readyState<1){
             if(exportClips && exportJobRef.current){
@@ -13330,6 +13352,7 @@ function App(){
         }
         return false;
       }finally{
+        if(zoomSaved){ try{ ctx.restore(); }catch{} zoomSaved=false; }
         try{ ctx.globalAlpha=1; ctx.filter='none'; }catch{}
       }
     };
@@ -23999,6 +24022,59 @@ const vlogSnapCutsToBeats=(clips,beats)=>{
     setBeatSnapNote(`${snapped}か所を拍にそろえました${skipped?`（${skipped}か所は動画の長さが足りないなどで、そのまま）`:''}。`);
     requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
   };
+  // 動画の拡大を変える。record で「戻す」用に記録する。
+  const applyClipZoom=(clipId,zoom)=>{
+    const next=clipsRef.current.map(c=>{
+      if(c.id!==clipId) return c;
+      if(!zoom || zoom.z<=1.001){ const {_zoom,...rest}=c; return rest; }
+      const z=Math.round(Math.max(1,Math.min(3,zoom.z))*100)/100, lim=0.5/z;
+      const fit=v=>Math.round(Math.max(lim,Math.min(1-lim,v))*1000)/1000;
+      return {...c,_zoom:{z,x:fit(zoom.x),y:fit(zoom.y)}};
+    });
+    clipsRef.current=next; setClips(next);
+    requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
+  };
+  const beginZoomEdit=()=>{ if(!zoomGestureRef.current.before) zoomGestureRef.current.before=editSnapshot(); };
+  const finishZoomEdit=()=>{ const before=zoomGestureRef.current.before; zoomGestureRef.current.before=null; if(before) recordEdit(before,{label:'拡大'}); };
+  const openZoomPicker=clip=>{
+    if(zoomPickerId===clip.id){ setZoomPickerId(null); return; }
+    handleStop();
+    setZoomPickerId(clip.id);
+    const t=clip.timelineStart+Math.min(clip.duration/2,Math.max(0,clip.duration-0.05));
+    timeRef.current=t; setCurrentTime(t);
+    requestAnimationFrame(()=>drawFrameRef.current(t));
+  };
+  // プレビューの上の操作面: 1本指で位置、2本指で倍率。
+  const zoomPointer=(e,type)=>{
+    const clip=clipsRef.current.find(c=>c.id===zoomPickerId);
+    if(!clip) return;
+    const g=zoomGestureRef.current, rect=e.currentTarget.getBoundingClientRect();
+    const cur=()=>{ const zz=clipsRef.current.find(c=>c.id===zoomPickerId)?._zoom; return {z:zz?.z||1,x:zz?.x??0.5,y:zz?.y??0.5}; };
+    if(type==='down'){
+      e.preventDefault();
+      try{ e.currentTarget.setPointerCapture(e.pointerId); }catch{}
+      beginZoomEdit();
+      g.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+      if(g.pointers.size===2){ const [a,b]=[...g.pointers.values()]; g.pinch={dist:Math.hypot(a.x-b.x,a.y-b.y)||1,z:cur().z}; }
+      return;
+    }
+    if(type==='move'){
+      const prev=g.pointers.get(e.pointerId);
+      if(!prev) return;
+      g.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+      const now=cur();
+      if(g.pinch && g.pointers.size>=2){
+        const [a,b]=[...g.pointers.values()];
+        applyClipZoom(clip.id,{...now,z:g.pinch.z*(Math.hypot(a.x-b.x,a.y-b.y)||1)/g.pinch.dist});
+      }else if(g.pointers.size===1 && now.z>1.001 && rect.width && rect.height){
+        applyClipZoom(clip.id,{...now,x:now.x-(e.clientX-prev.x)/rect.width/now.z,y:now.y-(e.clientY-prev.y)/rect.height/now.z});
+      }
+      return;
+    }
+    g.pointers.delete(e.pointerId);
+    if(g.pointers.size<2) g.pinch=null;
+    if(g.pointers.size===0) finishZoomEdit();
+  };
   const openProjectList=()=>{handleStop();setProjectBulkIds(null);refreshProjectList().catch(error=>setProjectError(error?.message||'作業一覧を開けません。'));setProjectGate(true);};
   return React.createElement('div', {className:'soft-editorial-ui camera-shell min-h-[100vh] bg-[#0a0a0b] text-white flex flex-col select-none', style:{fontFamily:'-apple-system,BlinkMacSystemFont,sans-serif'}},
     // 1段目「この作品」: 作品名（押すと作業一覧）と保存の状態（押すと今すぐ保存）、おまかせ・書き出し。
@@ -24644,6 +24720,16 @@ const vlogSnapCutsToBeats=(clips,beats)=>{
           )
         ),
 
+        // 拡大の欄を開いている間だけ、プレビューを指で動かして拡大の位置・倍率を決める。
+        zoomPickerId && mode==='normal' && clips.some(c=>c.id===zoomPickerId) && React.createElement('div', {
+          'data-no-physics':true, 'aria-label':'拡大の位置（ドラッグ）と倍率（2本指）',
+          onPointerDown:e=>zoomPointer(e,'down'), onPointerMove:e=>zoomPointer(e,'move'),
+          onPointerUp:e=>zoomPointer(e,'up'), onPointerCancel:e=>zoomPointer(e,'up'),
+          style:{position:'absolute',inset:0,zIndex:24,touchAction:'none',cursor:'grab',border:'2px dashed #C2410C',borderRadius:'4px'}
+        },
+          React.createElement('div', {style:{position:'absolute',left:'8px',bottom:'8px',padding:'2px 8px',borderRadius:'9999px',background:'rgba(194,65,12,0.9)',color:'#fff',fontSize:'10px',fontWeight:700,pointerEvents:'none'}},
+            `🔍 拡大の調整中 ${Math.round((clips.find(c=>c.id===zoomPickerId)?._zoom?.z||1)*100)}%`)
+        ),
         clips.length>0 && mode!=='finder' && mode!=='hikariyomi' && React.createElement('button', {
           type:'button',
           onClick: openFilterSheet,
@@ -26057,6 +26143,13 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   className:`px-3 py-1.5 rounded-full border-2 text-[11px] font-bold min-w-[64px] min-h-[32px] touch-manipulation ${(c._playbackRate||1)!==1 ? 'bg-amber-500/30 border-amber-400 text-amber-100 shadow-[0_0_8px_rgba(251,191,36,0.4)]' : 'bg-white/15 border-white/30 text-white/80 hover:bg-white/25'}`,
                   title: (c._playbackRate||1)===1 ? 'タップで速度を変更' : `速度 ${(c._playbackRate||1)}x`
                 }, `${(c._playbackRate||1)>1?'🐇':'🐢'}${(c._playbackRate||1)}x`),
+                // 動画の拡大（素材ごとに固定）。
+                !isPhoto && !c._splitScreen && React.createElement('button', {
+                  type:'button', 'aria-expanded':zoomPickerId===c.id,
+                  onClick:e=>{ e.stopPropagation(); openZoomPicker(c); },
+                  className:`px-3 py-1.5 rounded-full border-2 text-[11px] font-bold min-h-[32px] touch-manipulation ${c._zoom?.z>1.001 ? 'bg-orange-500/20 border-orange-400' : 'bg-white/10 border-white/20'}`,
+                  title:'動画の一部を拡大して書き出す'
+                }, c._zoom?.z>1.001 ? `🔍 ${Math.round(c._zoom.z*100)}%` : '🔍 拡大'),
                 // 逆再生・ブーメラン（作った後は印が変わる）。
                 !isPhoto && !c._splitScreen && React.createElement('button', {
                   type:'button',
@@ -26221,6 +26314,26 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                   !working && React.createElement('button',{type:'button',onClick:e=>{e.stopPropagation();setMotionPickerId(null);},
                     className:'w-full mt-2 min-h-9 rounded-full bg-white/10 text-[11px]'},'閉じる'));
               })(),
+              zoomPickerId===c.id && !isPhoto && React.createElement('div', {
+                className:'camera-detail-panel self-start ml-2 mt-2 w-full max-w-[360px] rounded-2xl border border-orange-500/40 bg-[#1a1a1c] p-3 shadow-xl',
+                onClick:e=>e.stopPropagation()
+              },
+                React.createElement('div',{className:'text-[12px] font-bold text-white'},'🔍 動画の一部を拡大'),
+                React.createElement('div',{className:'text-[10px] text-white/60 mt-1'},'上のプレビューをドラッグで位置、2本指で倍率を変えられます。書き出しにも反映されます。'),
+                React.createElement('div',{className:'flex items-center gap-2 mt-2'},
+                  React.createElement('span',{className:'text-[10px] text-white/60 w-10 shrink-0'},'倍率'),
+                  React.createElement('input',{type:'range',min:1,max:3,step:0.05,value:c._zoom?.z||1,'aria-label':'拡大の倍率',
+                    onPointerDown:beginZoomEdit,onPointerUp:finishZoomEdit,onPointerCancel:finishZoomEdit,onFocus:beginZoomEdit,onBlur:finishZoomEdit,
+                    onChange:e=>{ beginZoomEdit(); applyClipZoom(c.id,{z:parseFloat(e.target.value),x:c._zoom?.x??0.5,y:c._zoom?.y??0.5}); },
+                    className:'flex-1 accent-orange-500'}),
+                  React.createElement('span',{className:'text-[11px] font-mono w-12 text-right'},`${Math.round((c._zoom?.z||1)*100)}%`)),
+                React.createElement('div',{className:'flex gap-2 mt-2'},
+                  React.createElement('button',{type:'button',disabled:!(c._zoom?.z>1.001),
+                    onClick:()=>{ const before=editSnapshot(); applyClipZoom(c.id,null); recordEdit(before,{label:'拡大を元に戻す'}); },
+                    className:'flex-1 min-h-9 rounded-full bg-white/10 text-[11px] disabled:opacity-40'},'元に戻す（拡大なし）'),
+                  React.createElement('button',{type:'button',onClick:()=>setZoomPickerId(null),
+                    className:'flex-1 min-h-9 rounded-full bg-white/10 text-[11px]'},'閉じる'))
+              ),
               speedPickerId===c.id && React.createElement('div', {
                 className:'camera-detail-panel self-start ml-2 mt-2 w-full max-w-[360px] rounded-2xl border border-amber-500/30 bg-[#1a1a1c] p-3 shadow-xl',
                 onClick:e=>e.stopPropagation()
@@ -29911,7 +30024,7 @@ root.render(React.createElement(App));
       // シアター/ファインダー中は物理ドラッグ無効
       const isFullscreen = document.body.style.overflow==='hidden' || document.querySelector('.theater-mode') || document.querySelector('.finder-mode') || document.querySelector('.hikariyomi-mode');
       if(isFullscreen) return;
-      if(e.target.closest('button, label')) return;
+      if(e.target.closest('button, label, [data-no-physics]')) return;
       if(e.target.closest('.preview-wrap.stamp-mode')) return;
       dragging=true;
       startX=e.clientX; startY=e.clientY;
