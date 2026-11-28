@@ -7084,6 +7084,55 @@ const vlogZoomOf=clip=>{
   const lim=0.5/z, c=v=>Math.max(lim,Math.min(1-lim,Number.isFinite(v)?v:0.5));
   return {z,x:c(clip._zoom.x),y:c(clip._zoom.y)};
 };
+// 拡大したときの「くっきり」の強さ（0=なし・1=弱・2=中・3=強）→ アンシャープマスクの量。拡大していなければ0。
+const VLOG_ZOOM_SHARP_AMOUNTS=[0,0.35,0.7,1.1];
+const vlogZoomSharpAmount=clip=>{
+  if(!vlogZoomOf(clip)) return 0;
+  const level=Number.isFinite(clip?._zoom?.sharp)?clip._zoom.sharp:1;
+  return VLOG_ZOOM_SHARP_AMOUNTS[Math.max(0,Math.min(3,Math.round(level)))]||0;
+};
+// くっきり補正（アンシャープマスク）を WebGL でかける。WebGL が使えなければ何もしない（画素の計算は重いため）。
+let vlogSharpenRenderer;
+const createVlogSharpenRenderer=()=>{
+  const surface=document.createElement('canvas');
+  const gl=surface.getContext('webgl',{alpha:true,premultipliedAlpha:false,preserveDrawingBuffer:true,antialias:false});
+  if(!gl) return null;
+  const shader=(type,source)=>{ const item=gl.createShader(type);gl.shaderSource(item,source);gl.compileShader(item);
+    if(!gl.getShaderParameter(item,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(item)); return item; };
+  const program=gl.createProgram();
+  gl.attachShader(program,shader(gl.VERTEX_SHADER,'attribute vec2 position;varying vec2 uv;void main(){uv=(position+1.0)*0.5;gl_Position=vec4(position,0.0,1.0);}'));
+  gl.attachShader(program,shader(gl.FRAGMENT_SHADER,`precision highp float;varying vec2 uv;uniform sampler2D source;uniform vec2 texel;uniform float amount;
+    void main(){vec4 c=texture2D(source,uv);
+      vec3 blur=(texture2D(source,uv+vec2(texel.x,0.0)).rgb+texture2D(source,uv-vec2(texel.x,0.0)).rgb+texture2D(source,uv+vec2(0.0,texel.y)).rgb+texture2D(source,uv-vec2(0.0,texel.y)).rgb)*0.25;
+      gl_FragColor=vec4(clamp(c.rgb+(c.rgb-blur)*amount,0.0,1.0),c.a);}`));
+  gl.linkProgram(program);
+  if(!gl.getProgramParameter(program,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  gl.useProgram(program);
+  const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+  const position=gl.getAttribLocation(program,'position');gl.enableVertexAttribArray(position);gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
+  const texture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,texture);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  const texelAt=gl.getUniformLocation(program,'texel'), amountAt=gl.getUniformLocation(program,'amount');
+  return (canvas,amount)=>{
+    if(surface.width!==canvas.width || surface.height!==canvas.height){ surface.width=canvas.width; surface.height=canvas.height; }
+    gl.viewport(0,0,surface.width,surface.height);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,canvas);
+    gl.uniform2f(texelAt,1/canvas.width,1/canvas.height); gl.uniform1f(amountAt,amount);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+    const out=canvas.getContext('2d'); out.save(); out.globalAlpha=1; out.filter='none';
+    out.clearRect(0,0,canvas.width,canvas.height); out.drawImage(surface,0,0); out.restore();
+  };
+};
+const applyVlogSharpen=(canvas,amount)=>{
+  if(!(amount>0)) return false;
+  if(vlogSharpenRenderer===undefined){ try{ vlogSharpenRenderer=createVlogSharpenRenderer(); }catch{ vlogSharpenRenderer=null; } }
+  if(!vlogSharpenRenderer) return false;
+  try{ vlogExportProfileMeasure('filter.sharpen',()=>vlogSharpenRenderer(canvas,amount)); return true; }
+  catch{ vlogSharpenRenderer=null; return false; }
+};
 // 画面の比率（幅÷高さ）。4:5 はインスタのフィード投稿向け。
 const vlogAspectRatio=mode=>mode==='16:9'?16/9:mode==='4:5'?4/5:9/16;
 const VLOG_SAVE_BUTTON_STYLE={background:'#C2410C',color:'#FFFFFF',fontWeight:700,border:'1px solid #9A3412'};
@@ -13096,8 +13145,11 @@ function App(){
       let lightCanvas=null;
       let ctx=outputCtx;
       let zoomSaved=false;
+      // 拡大した動画の「くっきり」補正も、明るさ補正と同じく一時の面に描いてから補正して重ねる。
+      const sharpAmount=(!isPhoto && !clip._splitScreen) ? vlogZoomSharpAmount(clip) : 0;
+      const isolated=correcting || sharpAmount>0;
       try{
-        if(correcting){
+        if(isolated){
           lightCanvas=lightFrameCanvasRef.current || document.createElement('canvas');
           lightFrameCanvasRef.current=lightCanvas;
           if(lightCanvas.width!==cw || lightCanvas.height!==ch){ lightCanvas.width=cw; lightCanvas.height=ch; }
@@ -13107,11 +13159,14 @@ function App(){
         }
         const finishClip=()=>{
           if(zoomSaved){ ctx.restore(); zoomSaved=false; }
-          if(correcting){
-            try{
-              const pixels=ctx.getImageData(0,0,cw,ch);
-              ctx.putImageData(correctLightPixels(pixels,light),0,0);
-            }catch{} // 画素の読み取りができない素材でも元のフレームは表示する。
+          if(isolated){
+            if(correcting){
+              try{
+                const pixels=ctx.getImageData(0,0,cw,ch);
+                ctx.putImageData(correctLightPixels(pixels,light),0,0);
+              }catch{} // 画素の読み取りができない素材でも元のフレームは表示する。
+            }
+            if(sharpAmount>0) applyVlogSharpen(lightCanvas,sharpAmount);
             outputCtx.save();
             outputCtx.filter=creativeFilter;
             outputCtx.globalAlpha=1;
@@ -13248,6 +13303,7 @@ function App(){
           if(zoom){
             const win={x:(cw-cw*scale)/2+offsetX,y:(ch-ch*scale)/2+offsetY,w:cw*scale,h:ch*scale};
             ctx.save(); zoomSaved=true;
+            ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
             ctx.beginPath(); ctx.rect(win.x,win.y,win.w,win.h); ctx.clip();
             ctx.translate(win.x+win.w/2,win.y+win.h/2);
             ctx.scale(zoom.z,zoom.z);
@@ -24032,7 +24088,8 @@ const vlogSnapCutsToBeats=(clips,beats)=>{
       if(!zoom || zoom.z<=1.001){ const {_zoom,...rest}=c; return rest; }
       const z=Math.round(Math.max(1,Math.min(3,zoom.z))*100)/100, lim=0.5/z;
       const fit=v=>Math.round(Math.max(lim,Math.min(1-lim,v))*1000)/1000;
-      return {...c,_zoom:{z,x:fit(zoom.x),y:fit(zoom.y)}};
+      const sharp=Number.isFinite(zoom.sharp)?zoom.sharp:(Number.isFinite(c._zoom?.sharp)?c._zoom.sharp:1);
+      return {...c,_zoom:{z,x:fit(zoom.x),y:fit(zoom.y),sharp}};
     });
     clipsRef.current=next; setClips(next);
     requestAnimationFrame(()=>drawFrameRef.current(timeRef.current));
@@ -24771,6 +24828,14 @@ const vlogSnapCutsToBeats=(clips,beats)=>{
               React.createElement('button', {type:'button','aria-label':'拡大',style:barButton,
                 onClick:()=>{ const before=editSnapshot(); stepClipZoom(zc.id,0.1); recordEdit(before,{label:'拡大'}); }}, '＋'),
               React.createElement('span', {style:{fontSize:'11px',fontWeight:700,fontFamily:'monospace',minWidth:'40px',textAlign:'right'}}, `${Math.round(zv*100)}%`),
+              zv>1.001 && React.createElement('div', {role:'group','aria-label':'くっきり補正',style:{display:'flex',alignItems:'center',gap:'3px',flexBasis:'100%'}},
+                React.createElement('span',{style:{fontSize:'10px',marginRight:'2px'}},'くっきり'),
+                ['なし','弱','中','強'].map((label,level)=>{
+                  const on=(Number.isFinite(zc._zoom?.sharp)?zc._zoom.sharp:1)===level;
+                  return React.createElement('button',{key:level,type:'button','aria-pressed':on,
+                    onClick:()=>{ const before=editSnapshot(); applyClipZoom(zc.id,{...zc._zoom,sharp:level}); recordEdit(before,{label:'拡大のくっきり'}); },
+                    style:{...barButton,minWidth:'36px',height:'28px',fontSize:'11px',background:on?'#C2410C':'rgba(255,255,255,0.92)',color:on?'#fff':'#293A34'}},label);
+                })),
               React.createElement('button', {type:'button',disabled:!(zv>1.001),style:{...barButton,padding:'0 10px',fontSize:'11px',opacity:zv>1.001?1:0.45},
                 onClick:()=>{ const before=editSnapshot(); applyClipZoom(zc.id,null); recordEdit(before,{label:'拡大を元に戻す'}); }}, '元に戻す'),
               React.createElement('button', {type:'button',style:{...barButton,padding:'0 12px',fontSize:'11px',background:'#B8DDCE',border:'1px solid #527D70'},
@@ -26383,6 +26448,16 @@ React.createElement('div', {className:'relative grid grid-cols-2 gap-3 mb-4'},
                     onChange:e=>{ beginZoomEdit(); applyClipZoom(c.id,{z:parseFloat(e.target.value),x:c._zoom?.x??0.5,y:c._zoom?.y??0.5}); },
                     className:'flex-1 accent-orange-500'}),
                   React.createElement('span',{className:'text-[11px] font-mono w-12 text-right'},`${Math.round((c._zoom?.z||1)*100)}%`)),
+                c._zoom?.z>1.001 && React.createElement('div',{className:'flex items-center gap-1 mt-2',role:'group','aria-label':'くっきり補正'},
+                  React.createElement('span',{className:'text-[10px] text-white/60 w-10 shrink-0'},'くっきり'),
+                  ['なし','弱','中','強'].map((label,level)=>{
+                    const on=(Number.isFinite(c._zoom?.sharp)?c._zoom.sharp:1)===level;
+                    return React.createElement('button',{key:level,type:'button','aria-pressed':on,
+                      onClick:()=>{ const before=editSnapshot(); applyClipZoom(c.id,{...c._zoom,sharp:level}); recordEdit(before,{label:'拡大のくっきり'}); },
+                      'data-paper-preserve':true,
+                      style:on?{background:'#C2410C',color:'#fff',border:'1px solid #9A3412'}:undefined,
+                      className:`flex-1 min-h-8 rounded-full text-[11px] font-bold ${on?'':'bg-white/10'}`},label);
+                  })),
                 React.createElement('div',{className:'flex gap-2 mt-2'},
                   React.createElement('button',{type:'button',disabled:!(c._zoom?.z>1.001),
                     onClick:()=>{ const before=editSnapshot(); applyClipZoom(c.id,null); recordEdit(before,{label:'拡大を元に戻す'}); },
